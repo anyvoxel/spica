@@ -1,0 +1,58 @@
+{
+  "Comment": "An example of the Amazon States Language using a map state to process elements of an array with a max concurrency of 2.",
+  "StartAt": "Authorize Charge",
+  "States": {
+    "Authorization Failed": {
+      "Cause": "Charge could not be authorized",
+      "Type": "Fail"
+    },
+    "Authorize Charge": {
+      "Next": "Check Authorization",
+      "Type": "Pass"
+    },
+    "Check Authorization": {
+      "Choices": [
+        {
+          "Next": "Retrieve Items",
+          "Condition": "{% $states.input.chargeAuthorization.AuthorizationSucceeded = true %}"
+        }
+      ],
+      "Default": "Authorization Failed",
+      "Type": "Choice"
+    },
+    "Complete Charge": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Map": {
+      "ItemProcessor": {
+        "StartAt": "Lock Item",
+        "States": {
+          "Lock Item": {
+            "Next": "Pull Item",
+            "Type": "Pass"
+          },
+          "Pack Item": {
+            "End": true,
+            "Type": "Pass"
+          },
+          "Pull Item": {
+            "Next": "Pack Item",
+            "Type": "Pass"
+          }
+        }
+      },
+      "MaxConcurrency": 40,
+      "Next": "Print Label",
+      "Type": "Map"
+    },
+    "Print Label": {
+      "Next": "Complete Charge",
+      "Type": "Pass"
+    },
+    "Retrieve Items": {
+      "Next": "Map",
+      "Type": "Pass"
+    }
+  }
+}

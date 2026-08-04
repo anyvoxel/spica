@@ -1,0 +1,85 @@
+{
+  "Comment": "An example of the MediaLive to MediaPackage workflow",
+  "StartAt": "MediaPackageCreateChannel",
+  "States": {
+    "Done": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "IsMediaLiveChannelIdle": {
+      "Choices": [
+        {
+          "Next": "MediaLiveStartChannel",
+          "Condition": "{% $states.input.medialive.channel.State = 'IDLE' %}"
+        }
+      ],
+      "Default": "WaitForIdleState",
+      "Type": "Choice"
+    },
+    "IsMediaLiveChannelRunning": {
+      "Choices": [
+        {
+          "Next": "Done",
+          "Condition": "{% $states.input.medialive.channel.State = 'RUNNING' %}"
+        }
+      ],
+      "Default": "WaitForRunningState",
+      "Type": "Choice"
+    },
+    "MediaLiveAttachRole": {
+      "Next": "MediaLiveCreateInput",
+      "Resource": "${medialiveAttachRoleArn}",
+      "Type": "Task"
+    },
+    "MediaLiveCreateChannel": {
+      "Next": "WaitForIdleState",
+      "Resource": "${medialiveCreateChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveCreateInput": {
+      "Next": "MediaLiveCreateChannel",
+      "Resource": "${medialiveCreateInputArn}",
+      "Type": "Task"
+    },
+    "MediaLiveDescribeChannel1": {
+      "Next": "IsMediaLiveChannelIdle",
+      "Resource": "${medialiveDescribeChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveDescribeChannel2": {
+      "Next": "IsMediaLiveChannelRunning",
+      "Resource": "${medialiveDescribeChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveStartChannel": {
+      "Next": "WaitForRunningState",
+      "Resource": "${medialiveStartChannelArn}",
+      "Type": "Task"
+    },
+    "MediaPackageCreateChannel": {
+      "Next": "MediaPackageCreateEndpoints",
+      "Resource": "${mediapackageCreateChannelArn}",
+      "Type": "Task"
+    },
+    "MediaPackageCreateEndpoints": {
+      "Next": "SystemsManagerCreateParameters",
+      "Resource": "${mediapackageCreateEndpointsArn}",
+      "Type": "Task"
+    },
+    "SystemsManagerCreateParameters": {
+      "Next": "MediaLiveAttachRole",
+      "Resource": "${systemsmanagerCreateParametersArn}",
+      "Type": "Task"
+    },
+    "WaitForIdleState": {
+      "Next": "MediaLiveDescribeChannel1",
+      "Seconds": 1,
+      "Type": "Wait"
+    },
+    "WaitForRunningState": {
+      "Next": "MediaLiveDescribeChannel2",
+      "Seconds": 5,
+      "Type": "Wait"
+    }
+  }
+}

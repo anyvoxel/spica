@@ -1,0 +1,8 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "Type": "Fail"
+    }
+  }
+}

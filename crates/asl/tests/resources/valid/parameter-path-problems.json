@@ -1,0 +1,37 @@
+{
+  "StartAt": "FNORD",
+  "States": {
+    "FNORD": {
+      "End": true,
+      "Type": "Pass",
+      "Output": {
+        "bad1": 23,
+        "bad2": "{% 23 %}",
+        "bad5": "{% $states.context.23 %}",
+        "f0": 1,
+        "f3": {
+          "bad3": [
+            1,
+            2,
+            3
+          ],
+          "f5": [
+            "f6",
+            {
+              "f7": {
+                "bad4": {
+                  "f9": 1
+                },
+                "good3": "{% $states.input.x.y.z[2] %}"
+              }
+            }
+          ],
+          "good2": "{% $states.input.b[23] %}"
+        },
+        "good1": "{% $states.input.g1 %}",
+        "good4": "{% $states.context %}",
+        "good5": "{% $states.context.g5 %}"
+      }
+    }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "Comment": "A state machine that orchestrates business rules execution and there by auditing the same",
+  "StartAt": "Audit Request",
+  "States": {
+    "Audit Request": {
+      "Next": "Execute Ruleset",
+      "Arguments": {
+        "FunctionName": "${AuditLambaPath}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Audit Response": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${AuditLambaPath}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Execute Ruleset": {
+      "Next": "Audit Response",
+      "Arguments": {
+        "FunctionName": "${ExecuteRulesetLambdaPath}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}

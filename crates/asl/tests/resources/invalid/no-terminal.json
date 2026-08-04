@@ -1,0 +1,39 @@
+{
+  "StartAt": "FirstState",
+  "States": {
+    "ChoiceState": {
+      "Choices": [
+        {
+          "Next": "FirstMatchState",
+          "Condition": "{% $states.input.foo = 3 %}"
+        },
+        {
+          "Next": "SecondMatchState",
+          "Condition": "{% $states.input.foo = 4 %}"
+        }
+      ],
+      "Default": "NextState",
+      "Type": "Choice"
+    },
+    "FirstMatchState": {
+      "Next": "NextState",
+      "Resource": "arn:aws:lambda:us-east-1::function:OnFirstMatch",
+      "Type": "Task"
+    },
+    "FirstState": {
+      "Next": "ChoiceState",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:FUNCTION_NAME",
+      "Type": "Task"
+    },
+    "NextState": {
+      "Next": "SecondMatchState",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:FUNCTION_NAME",
+      "Type": "Task"
+    },
+    "SecondMatchState": {
+      "Next": "NextState",
+      "Resource": "arn:aws:lambda:us-east-1::function:OnSecondMatch",
+      "Type": "Task"
+    }
+  }
+}

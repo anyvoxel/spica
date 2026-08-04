@@ -1,0 +1,118 @@
+{
+  "Comment": "Serverless image cataloging state machine solution",
+  "StartAt": "Check for inappropriate content",
+  "States": {
+    "Check for inappropriate content": {
+      "Next": "Inappropriate content detected?",
+      "Arguments": {
+        "Image": {
+          "S3Object": {
+            "Bucket": "{% $states.input.bucket %}",
+            "Name": "{% $states.input.key %}"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rekognition:detectModerationLabels",
+      "Type": "Task"
+    },
+    "Inappropriate content detected?": {
+      "Choices": [
+        {
+          "Next": "Notify content moderators",
+          "Condition": "{% $exists($states.input.moderationResult.ModerationLabels[0]) = true %}"
+        }
+      ],
+      "Default": "Process image",
+      "Type": "Choice"
+    },
+    "Notify content moderators": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.input %}",
+        "TopicArn": "${ModeratorSNSTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Process image": {
+      "Branches": [
+        {
+          "StartAt": "Detect objects in image",
+          "States": {
+            "Detect objects in image": {
+              "Next": "Record objects in database",
+              "Arguments": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "{% $states.input.bucket %}",
+                    "Name": "{% $states.input.key %}"
+                  }
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+              "Type": "Task"
+            },
+            "Record objects in database": {
+              "End": true,
+              "Arguments": {
+                "ExpressionAttributeValues": {
+                  ":o": {
+                    "S": "{% States.JsonToString($.output.Labels) %}"
+                  }
+                },
+                "Key": {
+                  "Id": {
+                    "S": "{% $states.input.key %}"
+                  }
+                },
+                "TableName": "${CatalogTable}",
+                "UpdateExpression": "set detectedObjects=:o"
+              },
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "Detect text in image",
+          "States": {
+            "Detect text in image": {
+              "Next": "Record text in database",
+              "Arguments": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "{% $states.input.bucket %}",
+                    "Name": "{% $states.input.key %}"
+                  }
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectText",
+              "Type": "Task"
+            },
+            "Record text in database": {
+              "End": true,
+              "Arguments": {
+                "ExpressionAttributeValues": {
+                  ":t": {
+                    "S": "{% States.JsonToString($.output.TextDetections) %}"
+                  }
+                },
+                "Key": {
+                  "Id": {
+                    "S": "{% $states.input.key %}"
+                  }
+                },
+                "TableName": "${CatalogTable}",
+                "UpdateExpression": "set detectedText=:t"
+              },
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "End": true,
+      "Type": "Parallel"
+    }
+  }
+}

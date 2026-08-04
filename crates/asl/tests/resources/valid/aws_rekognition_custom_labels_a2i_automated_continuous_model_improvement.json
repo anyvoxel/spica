@@ -1,0 +1,230 @@
+{
+  "Comment": "Rekognition Custom Labels with A2I Workflows",
+  "StartAt": "Event",
+  "States": {
+    "A2I HumanLoop Data": {
+      "Next": "Add Training Image",
+      "Resource": "${LambdaA2IHumanLoopData}",
+      "Type": "Task"
+    },
+    "A2I Off": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Add Training Image": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Apply Parameter": {
+      "End": true,
+      "Resource": "${LambdaUpdateEventRules}",
+      "Type": "Task"
+    },
+    "Check A2I": {
+      "Choices": [
+        {
+          "Next": "Create HumanLoop",
+          "Condition": "{% $states.input.message.Task.UserSettings.EnableA2IWorkflow = true %}"
+        }
+      ],
+      "Default": "A2I Off",
+      "Type": "Choice"
+    },
+    "Check Confidence": {
+      "Choices": [
+        {
+          "Next": "Pass Confidence",
+          "Condition": "{% $states.input.message.NextTask = 'End' %}"
+        }
+      ],
+      "Default": "Failed Confidence",
+      "Type": "Choice"
+    },
+    "Check Last Sample": {
+      "Next": "Check Sampling Interval",
+      "Resource": "${LambdaCheckHumanSampling}",
+      "Type": "Task"
+    },
+    "Check New Training": {
+      "Choices": [
+        {
+          "Next": "Initiate Training",
+          "Condition": "{% $states.input.message.NextTask = 'CreateManifest' %}"
+        }
+      ],
+      "Default": "No New Training",
+      "Type": "Choice"
+    },
+    "Check Sampling Interval": {
+      "Choices": [
+        {
+          "Next": "No New Sample",
+          "Condition": "{% $states.input.message.NextTask = 'End' %}"
+        }
+      ],
+      "Default": "Create Human Sample",
+      "Type": "Choice"
+    },
+    "Create Human Sample": {
+      "Next": "Check Last Sample",
+      "Seconds": 5,
+      "Type": "Wait"
+    },
+    "Create HumanLoop": {
+      "End": true,
+      "Resource": "${LambdaA2ICreateHumanLoop}",
+      "Type": "Task"
+    },
+    "Create Manifest": {
+      "Next": "Create Project Version",
+      "Resource": "${LambdaCreateTrainingManifest}",
+      "Type": "Task"
+    },
+    "Create Project Version": {
+      "Next": "Wait for Training",
+      "Resource": "${LambdaTrainDeployModel}",
+      "Type": "Task"
+    },
+    "Deploy Endpoint": {
+      "End": true,
+      "Resource": "${LambdaTrainDeployModel}",
+      "Type": "Task"
+    },
+    "Event": {
+      "Choices": [
+        {
+          "Next": "Parameter Store",
+          "Condition": "{% $states.input.source = 'aws.ssm' %}"
+        },
+        {
+          "Next": "Rekongition Detection",
+          "Condition": "{% $states.input.source = 's3-detection-event' %}"
+        },
+        {
+          "Next": "A2I HumanLoop Data",
+          "Condition": "{% $states.input.source = 's3-a2i-event' %}"
+        },
+        {
+          "Next": "Rekongition Model",
+          "Condition": "{% $states.input.resources[0] = 'arn:aws:events:*-scheduled-poll' %}"
+        },
+        {
+          "Next": "Human Sampling",
+          "Condition": "{% $states.input.resources[0] = 'arn:aws:events:*-sampling-poll' %}"
+        }
+      ],
+      "Default": "Unknown Event",
+      "Type": "Choice"
+    },
+    "Failed Confidence": {
+      "Next": "Check A2I",
+      "Type": "Pass"
+    },
+    "Failed F1 Score": {
+      "Next": "Failure",
+      "Type": "Pass"
+    },
+    "Failure": {
+      "Type": "Fail"
+    },
+    "Get Model Status": {
+      "Next": "Starting-in-Progress",
+      "Resource": "${LambdaTrainDeployModel}",
+      "Type": "Task"
+    },
+    "Get Training Status": {
+      "Next": "Training-in-Progress",
+      "Resource": "${LambdaTrainDeployModel}",
+      "Type": "Task"
+    },
+    "Human Sampling": {
+      "Next": "Check Last Sample",
+      "Type": "Pass"
+    },
+    "Initiate Training": {
+      "Next": "Create Manifest",
+      "Type": "Pass"
+    },
+    "Model Started": {
+      "Next": "Deploy Endpoint",
+      "Type": "Pass"
+    },
+    "No New Sample": {
+      "Type": "Succeed"
+    },
+    "No New Training": {
+      "Type": "Succeed"
+    },
+    "Parameter Store": {
+      "Next": "Apply Parameter",
+      "Type": "Pass"
+    },
+    "Pass Confidence": {
+      "Type": "Succeed"
+    },
+    "Rekongition Detection": {
+      "Next": "Check Confidence",
+      "Resource": "${LambdaRekognitionDetectLabel}",
+      "Type": "Task"
+    },
+    "Rekongition Model": {
+      "Next": "Check New Training",
+      "Resource": "${LambdaCheckAutoTraining}",
+      "Type": "Task"
+    },
+    "Start Model": {
+      "Next": "Wait for Start",
+      "Resource": "${LambdaTrainDeployModel}",
+      "Type": "Task"
+    },
+    "Starting-in-Progress": {
+      "Choices": [
+        {
+          "Next": "Wait for Start",
+          "Condition": "{% $states.input.message.NextTask = 'DescribeProjectVersions' %}"
+        },
+        {
+          "Next": "Model Started",
+          "Condition": "{% $states.input.message.NextTask = 'ModelRunning' %}"
+        }
+      ],
+      "Default": "Failure",
+      "Type": "Choice"
+    },
+    "Training Completed": {
+      "Next": "Start Model",
+      "Type": "Pass"
+    },
+    "Training-in-Progress": {
+      "Choices": [
+        {
+          "Next": "Wait for Training",
+          "Condition": "{% $states.input.message.NextTask = 'DescribeProjectVersions' %}"
+        },
+        {
+          "Next": "Training Completed",
+          "Condition": "{% $states.input.message.NextTask = 'StartProjectVersion' %}"
+        },
+        {
+          "Next": "Failed F1 Score",
+          "Condition": "{% $states.input.message.NextTask = 'FailedF1Evaluation' %}"
+        }
+      ],
+      "Default": "Failure",
+      "Type": "Choice"
+    },
+    "Unknown Event": {
+      "Type": "Fail"
+    },
+    "Wait for Start": {
+      "Next": "Get Model Status",
+      "Seconds": 300,
+      "Type": "Wait"
+    },
+    "Wait for Training": {
+      "Next": "Get Training Status",
+      "Seconds": 300,
+      "Type": "Wait"
+    }
+  }
+}

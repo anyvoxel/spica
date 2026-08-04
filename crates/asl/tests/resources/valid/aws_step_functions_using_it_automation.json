@@ -1,0 +1,88 @@
+{
+  "StartAt": "EvaluateRequest",
+  "States": {
+    "ActionRequest": {
+      "Choices": [
+        {
+          "Next": "OpenIncidentTicket",
+          "Condition": "{% $states.input.EvaluateRequestOutput.body.complianceType = 'NON_COMPLIANT' %}"
+        },
+        {
+          "Next": "NoActionRequired",
+          "Condition": "{% $states.input.EvaluateRequestOutput.body.complianceType = 'COMPLIANT' %}"
+        },
+        {
+          "Next": "NoActionRequired",
+          "Condition": "{% $states.input.EvaluateRequestOutput.body.complianceType = 'NOT_APPLICABLE' %}"
+        },
+        {
+          "Next": "NotifyOperationsTeam",
+          "Condition": "{% $states.input.EvaluateRequestOutput.body.complianceType = 'MANUAL' %}"
+        }
+      ],
+      "Default": "NotifyOperationsTeam",
+      "Type": "Choice"
+    },
+    "CloseTicket": {
+      "Next": "NotifyOperationsTeam",
+      "Resource": "${PrepareMessage.Arn}",
+      "Type": "Task"
+    },
+    "EvaluateRequest": {
+      "Next": "ActionRequest",
+      "Resource": "arn:aws:lambda:ap-south-1:039553791689:function:EvaluateRequest",
+      "Type": "Task"
+    },
+    "NoActionRequired": {
+      "Type": "Succeed"
+    },
+    "NotifyOperationsTeam": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.input.CloseTicketResponse.message %}",
+        "MessageAttributes": {
+          "myattributeno1": {
+            "DataType": "String",
+            "StringValue": "value of my attribute no 1"
+          },
+          "myattributeno2": {
+            "DataType": "String",
+            "StringValue": "value of my attribute no 2"
+          }
+        },
+        "MessageStructure": "json",
+        "TopicArn": "${!Ref StepFunctionsStateMachine}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "OpenIncidentTicket": {
+      "Next": "ResolveIssue",
+      "Resource": "${OpenIncident.Arn}",
+      "Retry": [
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "ResolveIssue": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "HandledError"
+          ],
+          "Next": "NotifyOperationsTeam"
+        }
+      ],
+      "Next": "CloseTicket",
+      "Resource": "${ResolveIncident.Arn}",
+      "Type": "Task"
+    }
+  }
+}

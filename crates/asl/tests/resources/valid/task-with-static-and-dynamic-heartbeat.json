@@ -1,0 +1,11 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "HeartbeatSeconds": 30,
+      "Resource": "foo:bar",
+      "Type": "Task"
+    }
+  }
+}

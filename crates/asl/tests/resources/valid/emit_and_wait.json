@@ -1,0 +1,110 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Emit - PHASE 1",
+  "States": {
+    "Emit - PHASE 1": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "TIMEOUT"
+        }
+      ],
+      "HeartbeatSeconds": 300,
+      "Next": "Emit - PHASE 2",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "The workflow has reached Phase 2",
+              "TaskToken": "{% $states.context.Task.Token %}"
+            },
+            "DetailType": "Phase",
+            "EventBusName": "Default",
+            "Source": "emitAndWait"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents.waitForTaskToken",
+      "Type": "Task"
+    },
+    "Emit - PHASE 2": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "TIMEOUT"
+        }
+      ],
+      "HeartbeatSeconds": 300,
+      "Next": "Emit - PHASE 3",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "The workflow has reached Phase 2",
+              "TaskToken": "{% $states.context.Task.Token %}"
+            },
+            "DetailType": "Phase",
+            "EventBusName": "Default",
+            "Source": "emitAndWait"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents.waitForTaskToken",
+      "Type": "Task"
+    },
+    "Emit - PHASE 3": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "TIMEOUT"
+        }
+      ],
+      "End": true,
+      "HeartbeatSeconds": 300,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "The workflow has reached Phase 3",
+              "TaskToken": "{% $states.context.Task.Token %}"
+            },
+            "DetailType": "Phase",
+            "EventBusName": "Default",
+            "Source": "emitAndWait"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents.waitForTaskToken",
+      "Type": "Task"
+    },
+    "Emit - TIMEDOUT": {
+      "End": true,
+      "HeartbeatSeconds": 300,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "The workflow has reached timedout",
+              "TaskToken": "{% $states.context.Task.Token %}"
+            },
+            "DetailType": "timeout",
+            "EventBusName": "Default",
+            "Source": "emitAndWait"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "TIMEOUT": {
+      "Next": "Emit - TIMEDOUT",
+      "Type": "Pass"
+    }
+  }
+}

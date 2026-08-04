@@ -1,0 +1,168 @@
+{
+  "Comment": "A distributed saga example.",
+  "StartAt": "BookTrip",
+  "States": {
+    "BookTrip": {
+      "Branches": [
+        {
+          "StartAt": "BookHotel",
+          "States": {
+            "BookHotel": {
+              "End": true,
+              "Resource": "${BookHotelFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "BookFlight",
+          "States": {
+            "BookFlight": {
+              "End": true,
+              "Resource": "${BookFlightFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "BookCar",
+          "States": {
+            "BookCar": {
+              "End": true,
+              "Resource": "${BookCarFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Trip Booking Failed"
+        }
+      ],
+      "Next": "Validate HTTP Status Code",
+      "Type": "Parallel"
+    },
+    "CancelTrip": {
+      "Branches": [
+        {
+          "StartAt": "CancelHotel",
+          "States": {
+            "CancelHotel": {
+              "End": true,
+              "Resource": "${CancelHotelFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "CancelFlight",
+          "States": {
+            "CancelFlight": {
+              "End": true,
+              "Resource": "${CancelFlightFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "CancelCar",
+          "States": {
+            "CancelCar": {
+              "End": true,
+              "Resource": "${CancelCarFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "Trip Booking Cancelled",
+      "Type": "Parallel"
+    },
+    "Trip Booking Cancelled": {
+      "Cause": "Trip cancelled due to error.",
+      "Error": "TripCancelledError",
+      "Type": "Fail"
+    },
+    "Trip Booking Failed": {
+      "Next": "CancelTrip",
+      "Type": "Pass"
+    },
+    "Trip Booking Successful": {
+      "Type": "Succeed"
+    },
+    "Validate HTTP Status Code": {
+      "Choices": [
+        {
+          "Next": "Trip Booking Failed",
+          "Condition": "{% (% $states.input.[0].Result.statusCode >= 300 %) or (% $states.input.[1].Result.statusCode >= 300 %) or (% $states.input.[2].Result.statusCode >= 300 %) %}"
+        }
+      ],
+      "Default": "Trip Booking Successful",
+      "Type": "Choice"
+    }
+  }
+}

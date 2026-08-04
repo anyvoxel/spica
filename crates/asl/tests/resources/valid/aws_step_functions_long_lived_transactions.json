@@ -1,0 +1,235 @@
+{
+  "Comment": "Managing Long Lived Transactions with AWS Step Functions State Machine",
+  "StartAt": "ProcessOrder",
+  "States": {
+    "OrderFailed": {
+      "Type": "Fail"
+    },
+    "OrderSucceeded": {
+      "Type": "Succeed"
+    },
+    "ProcessOrder": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrProcessOrder"
+          ],
+          "Next": "UpdateOrderStatus"
+        }
+      ],
+      "Comment": "First transaction to save the order and set the order status to new",
+      "Next": "ProcessPayment",
+      "Arguments": {
+        "FunctionName": "${NewOrderFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "ProcessPayment": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrProcessPayment"
+          ],
+          "Next": "ProcessRefund"
+        }
+      ],
+      "Comment": "Task processes the order payment",
+      "Next": "ReserveInventory",
+      "Arguments": {
+        "FunctionName": "${DebitPaymentFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "ProcessRefund": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrProcessRefund"
+          ],
+          "Next": "sns:NotifyProcessRefundFail"
+        }
+      ],
+      "Comment": "Task to process order refund",
+      "Next": "UpdateOrderStatus",
+      "Arguments": {
+        "FunctionName": "${CreditPaymentFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "ReleaseInventory": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrReleaseInventory"
+          ],
+          "Next": "sns:NotifyReleaseInventoryFail"
+        }
+      ],
+      "Comment": "Task to release order items back to inventory",
+      "Next": "ProcessRefund",
+      "Arguments": {
+        "FunctionName": "${ReleaseInventoryFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "ReserveInventory": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrReserveInventory"
+          ],
+          "Next": "ReleaseInventory"
+        }
+      ],
+      "Comment": "Task to reserve order items in inventory",
+      "Next": "sns:NotifySuccess",
+      "Arguments": {
+        "FunctionName": "${ReserveInventoryFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "UpdateOrderStatus": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ErrUpdateOrderStatus"
+          ],
+          "Next": "sns:NotifyUpdateOrderFail"
+        }
+      ],
+      "Comment": "Task sets the order status to \"pending\".",
+      "Next": "OrderFailed",
+      "Arguments": {
+        "FunctionName": "${UpdateOrderFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Type": "Task"
+    },
+    "sns:NotifyProcessRefundFail": {
+      "Next": "OrderFailed",
+      "Arguments": {
+        "Message": "{% $states.input.order_id %}",
+        "TopicArn": "${SagaTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "sns:NotifyReleaseInventoryFail": {
+      "Next": "OrderFailed",
+      "Arguments": {
+        "Message": "{% $states.input.order_id %}",
+        "TopicArn": "${SagaTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "sns:NotifySuccess": {
+      "Next": "OrderSucceeded",
+      "Arguments": {
+        "Message": "{% $states.input.order_id %}",
+        "TopicArn": "${SagaTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "sns:NotifyUpdateOrderFail": {
+      "Next": "OrderFailed",
+      "Arguments": {
+        "Message": "{% $states.input.order_id %}",
+        "TopicArn": "${SagaTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    }
+  },
+  "TimeoutSeconds": 15
+}

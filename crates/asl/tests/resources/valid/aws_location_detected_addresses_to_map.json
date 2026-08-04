@@ -1,0 +1,105 @@
+{
+  "StartAt": "Detect text language",
+  "States": {
+    "Detect addresses in text": {
+      "Next": "Get coordinates for each address",
+      "Arguments": {
+        "FunctionName": "${DetectAddressesInText}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Detect text language": {
+      "Next": "Is it English?",
+      "Arguments": {
+        "FunctionName": "${DetectTextLanguage}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Generate map with markers": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${GenerateMapWithMarkers}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Get coordinates for each address": {
+      "Next": "Generate map with markers",
+      "Arguments": {
+        "FunctionName": "${GetCoordinatesForEachAddress}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Is it English?": {
+      "Choices": [
+        {
+          "Next": "Detect addresses in text",
+          "Condition": "{% $states.input.lang_code = 'en' %}"
+        }
+      ],
+      "Default": "Language not supported",
+      "Type": "Choice"
+    },
+    "Language not supported": {
+      "Cause": "Amazon Comprehend supports PII detection in only English text.",
+      "Error": "DetectTextLanguage returned something that is not \"en\"",
+      "Type": "Fail"
+    }
+  },
+  "TimeoutSeconds": 30
+}

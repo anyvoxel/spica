@@ -1,0 +1,101 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "StateTask",
+  "States": {
+    "StateTask": {
+      "Type": "Task",
+      "Next": "StateWait",
+      "HeartbeatSeconds": 200,
+      "Resource": "task1",
+      "TimeoutSeconds": 300
+    },
+    "StateWait": {
+      "Type": "Wait",
+      "Next": "StatePass",
+      "Seconds": 1
+    },
+    "StatePass": {
+      "Type": "Pass",
+      "Next": "StateParallel"
+    },
+    "StateParallel": {
+      "Type": "Parallel",
+      "Next": "StateMap",
+      "Branches": [
+        {
+          "StartAt": "Branch1Pass",
+          "States": {
+            "Branch1Pass": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Branch2Pass",
+          "States": {
+            "Branch2Pass": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      ]
+    },
+    "StateMap": {
+      "Type": "Map",
+      "Next": "StateChoice",
+      "ItemProcessor": {
+        "StartAt": "Map1Parallel",
+        "States": {
+          "Map1Parallel": {
+            "Next": "Map1Pass",
+            "Type": "Parallel",
+            "Branches": [
+              {
+                "StartAt": "Map1ParallelBranch1",
+                "States": {
+                  "Map1ParallelBranch1": {
+                    "Type": "Pass",
+                    "End": true
+                  }
+                }
+              },
+              {
+                "StartAt": "Map1ParallelBranch2",
+                "States": {
+                  "Map1ParallelBranch2": {
+                    "Type": "Pass",
+                    "End": true
+                  }
+                }
+              }
+            ]
+          },
+          "Map1Pass": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      }
+    },
+    "StateChoice": {
+      "Type": "Choice",
+      "Default": "StateSucceed",
+      "Choices": [
+        {
+          "Next": "StateFail",
+          "Condition": "{% $exists($states.input.status) = false %}"
+        }
+      ]
+    },
+    "StateSucceed": {
+      "Type": "Succeed"
+    },
+    "StateFail": {
+      "Type": "Fail",
+      "Error": "EnterFailState",
+      "Cause": "execution failed"
+    }
+  }
+}

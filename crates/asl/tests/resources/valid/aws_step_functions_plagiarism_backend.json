@@ -1,0 +1,69 @@
+{
+  "Comment": "Developing with AWS Step Functions Demo",
+  "StartAt": "RegisterIncident",
+  "States": {
+    "HasStudentPassedExam": {
+      "Choices": [
+        {
+          "Next": "ResolveIncident",
+          "Condition": "{% $states.input.Exams[0].Result = 0 %}"
+        },
+        {
+          "Next": "ScheduleExam",
+          "Condition": "{% $states.input.Exams[0].Result = 1 %}"
+        },
+        {
+          "Next": "TakeAdministrativeAction",
+          "Condition": "{% $states.input.Exams[0].Result = 2 %}"
+        }
+      ],
+      "Comment": "If the student has a score less than 67, they need to reschedule",
+      "Type": "Choice"
+    },
+    "RegisterIncident": {
+      "Comment": "Register the plagiarism incident in the system and begin workflow execution.",
+      "Next": "ScheduleExam",
+      "Resource": "${RegisterIncidentFunctionArn}",
+      "Type": "Task"
+    },
+    "ResolveIncident": {
+      "Comment": "Resolves the incident for the student.",
+      "End": true,
+      "Resource": "${ResolveIncidentFunctionArn}",
+      "Type": "Task"
+    },
+    "ScheduleExam": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "StudentExceededAllowableExamRetries"
+          ],
+          "Next": "TakeAdministrativeAction"
+        }
+      ],
+      "Comment": "Set the next exam deadline for the student to complete the exam.",
+      "Next": "SendNotification",
+      "Resource": "${ScheduleExamFunctionArn}",
+      "Type": "Task"
+    },
+    "SendNotification": {
+      "Comment": "Send email confirming exam details and exam deadline. Wait for callback.",
+      "Next": "HasStudentPassedExam",
+      "Arguments": {
+        "FunctionName": "${SendExamNotificationFunctionName}",
+        "Payload": {
+          "TaskToken": "{% $states.context.Task.Token %}",
+          "input": "{% $states.input %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Type": "Task"
+    },
+    "TakeAdministrativeAction": {
+      "Comment": "Take administrative action if student does not sit exam or fails all three attempts.",
+      "End": true,
+      "Resource": "${TakeAdministrativeActionFunctionArn}",
+      "Type": "Task"
+    }
+  }
+}

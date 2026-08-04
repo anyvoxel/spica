@@ -1,0 +1,20 @@
+{
+  "Comment": "Map state using null for Items",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": null,
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

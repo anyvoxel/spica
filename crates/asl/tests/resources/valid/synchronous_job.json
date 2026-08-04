@@ -1,0 +1,53 @@
+{
+  "Comment": "An example of the Amazon States Language for notification on an AWS Batch job completion",
+  "StartAt": "Submit Batch Job",
+  "States": {
+    "Notify Failure": {
+      "End": true,
+      "Arguments": {
+        "Message": "Batch job submitted through Step Functions failed",
+        "TopicArn": "${TopicArn}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Notify Success": {
+      "End": true,
+      "Arguments": {
+        "Message": "Batch job submitted through Step Functions succeeded",
+        "TopicArn": "${TopicArn}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Submit Batch Job": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Notify Failure"
+        }
+      ],
+      "Next": "Notify Success",
+      "Arguments": {
+        "JobDefinition": "${jobDefinitionArn}",
+        "JobName": "BatchJobNotification",
+        "JobQueue": "${jobQueueArn}"
+      },
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    }
+  },
+  "TimeoutSeconds": 3600
+}

@@ -1,0 +1,81 @@
+{
+  "StartAt": "GetFileInventory",
+  "States": {
+    "AggregateResults": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CleanupIntermediateResults"
+        }
+      ],
+      "Next": "CleanupIntermediateResults",
+      "Resource": "${ReducerFunction}",
+      "Type": "Task"
+    },
+    "CleanupIntermediateResults": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Notify"
+        }
+      ],
+      "Next": "Notify",
+      "Resource": "${CleanupFunction}",
+      "Type": "Task"
+    },
+    "GetFileInventory": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Notify"
+        }
+      ],
+      "Next": "ProcessAllFiles",
+      "Resource": "${InitializerFunction}",
+      "Type": "Task"
+    },
+    "Notify": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.input %}",
+        "TopicArn": "${TopicName}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "ProcessAllFiles": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Notify"
+        }
+      ],
+      "ItemProcessor": {
+        "StartAt": "ProcessData",
+        "States": {
+          "ProcessData": {
+            "End": true,
+            "Resource": "${MapperFunction}",
+            "Type": "Task"
+          }
+        }
+      },
+      "MaxConcurrency": 3,
+      "Next": "WaitTenSeconds",
+      "Type": "Map"
+    },
+    "WaitTenSeconds": {
+      "Next": "AggregateResults",
+      "Seconds": 10,
+      "Type": "Wait"
+    }
+  }
+}

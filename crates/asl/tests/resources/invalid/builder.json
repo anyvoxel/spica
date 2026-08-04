@@ -1,0 +1,51 @@
+{
+  "Comment": "Builder Example",
+  "StartAt": "FetchValidateCreateFn",
+  "States": {
+    "Built?": {
+      "Choices": [
+        {
+          "Next": "Success",
+          "Condition": "{% $states.input.Built = true %}"
+        },
+        {
+          "Next": "Fail",
+          "Condition": "{% $states.input.Error = true %}"
+        }
+      ],
+      "Default": "CleanUpFailureFn",
+      "Type": "Choice"
+    },
+    "CheckBuilt": {
+      "Comment": "Is the build finished, has it errored?",
+      "Next": "Built?",
+      "Resource": "go://localhost/CheckBuilt",
+      "Type": "Task"
+    },
+    "CheckBuiltFn": {
+      "Next": "CheckBuilt",
+      "Type": "Pass"
+    },
+    "Fail": {
+      "Type": "Fail"
+    },
+    "FetchValidateCreate": {
+      "Comment": "Fetch, Validate, Create Resources",
+      "Next": "WaitForBuilt",
+      "Resource": "go://localhost/FetchValidateCreate",
+      "Type": "Task"
+    },
+    "FetchValidateCreateFn": {
+      "Next": "FetchValidateCreate",
+      "Type": "Pass"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "WaitForBuilt": {
+      "Next": "CheckBuiltFn",
+      "Seconds": 20,
+      "Type": "Wait"
+    }
+  }
+}

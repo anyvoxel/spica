@@ -1,0 +1,45 @@
+{
+  "Comment": "A Service Integrations demonstration",
+  "StartAt": "Write to DynamoDB",
+  "States": {
+    "Publish to SNS": {
+      "End": true,
+      "Arguments": {
+        "Message": {
+          "Input": "Hello from Step Functions!"
+        },
+        "TopicArn": "${DemoTopicArn}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Send Message to SQS": {
+      "Next": "Publish to SNS",
+      "Arguments": {
+        "MessageBody": "{% $states.input.DynamoDB %}",
+        "QueueUrl": "${DemoQueueUrl}"
+      },
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Type": "Task"
+    },
+    "Write to DynamoDB": {
+      "Next": "Send Message to SQS",
+      "Arguments": {
+        "Item": {
+          "Channel": {
+            "S": "{% $states.input.Channel %}"
+          },
+          "Name": {
+            "S": "Mar\u00eda Garc\u00eda"
+          },
+          "id": {
+            "S": "{% $states.context.Execution.Id %}"
+          }
+        },
+        "TableName": "${DemoTableName}"
+      },
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Type": "Task"
+    }
+  }
+}

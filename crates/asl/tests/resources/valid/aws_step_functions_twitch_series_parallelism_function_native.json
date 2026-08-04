@@ -1,0 +1,18 @@
+{
+  "Comment": "A Hello World example demonstrating various state types of the Amazon States Language",
+  "StartAt": "Do Stuff",
+  "States": {
+    "Do Stuff": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${DoStuffFunctionArn}",
+        "Payload": {
+          "bucket": "${TestBucketName}",
+          "prefix": "{% $states.input.prefix %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Type": "Task"
+    }
+  }
+}

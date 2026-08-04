@@ -1,0 +1,141 @@
+{
+  "Comment": "A Know Your Customer (KYC) process consists of a number of customer identity checks that precede a decision to approve a new customer and start  the on-boarding process.",
+  "StartAt": "Check identity",
+  "States": {
+    "Approve or decline": {
+      "Choices": [
+        {
+          "Next": "Update risk profile",
+          "Condition": "{% $states.input.checksPassed = true %}"
+        },
+        {
+          "Next": "New account declined",
+          "Condition": "{% $states.input.checksPassed = false %}"
+        }
+      ],
+      "Comment": "Approve or decline the new account request",
+      "Default": "New account declined",
+      "Type": "Choice"
+    },
+    "Check identity": {
+      "Branches": [
+        {
+          "StartAt": "Check name and address",
+          "States": {
+            "Check name and address": {
+              "Comment": "Validate name & address \u2013 check customer identity.",
+              "End": true,
+              "Type": "Pass"
+            }
+          }
+        },
+        {
+          "StartAt": "Agency security clearance",
+          "States": {
+            "Agency security clearance": {
+              "Comment": "Validate name with national securty agency \u2013 check the name against  lists of known people.",
+              "End": true,
+              "Type": "Pass"
+            }
+          }
+        }
+      ],
+      "Next": "Identity check completed",
+      "Type": "Parallel"
+    },
+    "Failed": {
+      "Type": "Fail"
+    },
+    "Identity check completed": {
+      "Comment": "Publish event when identity check has been completed",
+      "Next": "Verify risk profile",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": "{% $states.input %}",
+            "DetailType": "Identity check completed",
+            "EventBusName": "${CentralEventBusName}",
+            "Source": "com.aws.kyc"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "New account approved": {
+      "Comment": "Publish event new customer account request has been approved",
+      "Next": "Succeeded",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": "{% $states.input %}",
+            "DetailType": "New account approved",
+            "EventBusName": "${CentralEventBusName}",
+            "Source": "com.aws.kyc"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "New account declined": {
+      "Comment": "Publish event new account request has been declined",
+      "Next": "Failed",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": "{% $states.input %}",
+            "DetailType": "New account declined",
+            "EventBusName": "${CentralEventBusName}",
+            "Source": "com.aws.kyc"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Succeeded": {
+      "Type": "Succeed"
+    },
+    "Update risk profile": {
+      "Comment": "Update risk profile",
+      "Next": "New account approved",
+      "Type": "Pass"
+    },
+    "Verify risk profile": {
+      "Comment": "Calculate the customer\u2019s risk of being involved in illegal activity.",
+      "Next": "Approve or decline",
+      "Type": "Pass"
+    }
+  }
+}

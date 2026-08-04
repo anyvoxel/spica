@@ -1,0 +1,307 @@
+{
+  "StartAt": "Create idempotency settings (key and ttl)",
+  "States": {
+    "Create and lock idempotency record": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.TransactionCanceledException"
+          ],
+          "Next": "Get idempotency record from DynamoDB"
+        }
+      ],
+      "Next": "Your Workflow",
+      "Arguments": {
+        "TransactItems": [
+          {
+            "Update": {
+              "ConditionExpression": "attribute_not_exists(#s) or #s = :failed",
+              "ExpressionAttributeNames": {
+                "#e": "execution",
+                "#s": "executionstatus",
+                "#st": "starttime",
+                "#ttl": "ttl"
+              },
+              "ExpressionAttributeValues": {
+                ":e": {
+                  "S": "{% $states.context.Execution.Id %}"
+                },
+                ":failed": {
+                  "S": "FAILED"
+                },
+                ":inprogress": {
+                  "S": "IN_PROGRESS"
+                },
+                ":st": {
+                  "S": "{% $states.context.Execution.StartTime %}"
+                },
+                ":ttl": {
+                  "N": "{% $states.input.idempotencyConfig.ttl %}"
+                }
+              },
+              "Key": {
+                "id": {
+                  "S": "{% $states.input.idempotencyConfig.idempotencyKey %}"
+                }
+              },
+              "TableName": "${DDBTable}",
+              "UpdateExpression": "set #s = :inprogress, #e = :e, #st = :st, #ttl = :ttl"
+            }
+          }
+        ]
+      },
+      "Resource": "${DDBTransactWriteItems}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "DynamoDb.ProvisionedThroughputExceededException",
+            "DynamoDb.RequestLimitExceeded",
+            "DynamoDb.ThrottlingException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Create idempotency settings (key and ttl)": {
+      "Next": "Create and lock idempotency record",
+      "Resource": "${IdempotencyConfigFunctionArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        },
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "De-serialize previous results": {
+      "Next": "Success",
+      "Type": "Pass",
+      "Output": {
+        "previous_results": "{% States.StringToJson($.idempotencyTable.Item.executionresult.S) %}"
+      }
+    },
+    "Failure": {
+      "Cause": "The child workflow failed. The full exception is available in DynamoDB",
+      "Error": "ChildWorkflowException",
+      "Type": "Fail"
+    },
+    "Get idempotency record from DynamoDB": {
+      "Next": "Previous or concurrent execution SUCCEEDED, IN_PROGRESS, or FAILED?",
+      "Arguments": {
+        "ConsistentRead": false,
+        "Key": {
+          "id": {
+            "S": "{% $states.input.idempotencyConfig.idempotencyKey %}"
+          }
+        },
+        "ProjectionExpression": "executionstatus,executionresult",
+        "TableName": "${DDBTable}"
+      },
+      "Resource": "${DDBGetItem}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "DynamoDb.ProvisionedThroughputExceededException",
+            "DynamoDb.RequestLimitExceeded",
+            "DynamoDb.ThrottlingException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Previous or concurrent execution SUCCEEDED, IN_PROGRESS, or FAILED?": {
+      "Choices": [
+        {
+          "Next": "De-serialize previous results",
+          "Condition": "{% (% $states.input.idempotencyTable.Item.executionstatus.S = 'SUCCEEDED' %) and (% $exists($states.input.idempotencyTable.Item.executionresult.S) = true %) %}"
+        },
+        {
+          "Next": "Create and lock idempotency record",
+          "Condition": "{% $states.input.idempotencyTable.Item.executionstatus.S = 'FAILED' %}"
+        },
+        {
+          "Next": "Still IN_PROGRESS, wait for 10s",
+          "Condition": "{% $states.input.idempotencyTable.Item.executionstatus.S = 'IN_PROGRESS' %}"
+        }
+      ],
+      "Default": "Undefined execution state in idempotency record",
+      "Type": "Choice"
+    },
+    "Save execution results": {
+      "Next": "Success",
+      "Arguments": {
+        "ExpressionAttributeNames": {
+          "#r": "executionresult",
+          "#s": "executionstatus"
+        },
+        "ExpressionAttributeValues": {
+          ":r": {
+            "S": "{% States.JsonToString($.results) %}"
+          },
+          ":s": {
+            "S": "SUCCEEDED"
+          }
+        },
+        "Key": {
+          "id": {
+            "S": "{% $states.input.idempotencyConfig.idempotencyKey %}"
+          }
+        },
+        "TableName": "${DDBTable}",
+        "UpdateExpression": "SET #s = :s, #r = :r"
+      },
+      "Resource": "${DDBUpdateItem}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "DynamoDb.ProvisionedThroughputExceededException",
+            "DynamoDb.RequestLimitExceeded",
+            "DynamoDb.ThrottlingException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Save failure": {
+      "Next": "Failure",
+      "Arguments": {
+        "ExpressionAttributeNames": {
+          "#r": "executionresult",
+          "#s": "executionstatus"
+        },
+        "ExpressionAttributeValues": {
+          ":r": {
+            "S": "{% States.JsonToString($.errors.childworkflow) %}"
+          },
+          ":s": {
+            "S": "FAILED"
+          }
+        },
+        "Key": {
+          "id": {
+            "S": "{% $states.input.idempotencyConfig.idempotencyKey %}"
+          }
+        },
+        "TableName": "${DDBTable}",
+        "UpdateExpression": "SET #s = :s, #r = :r"
+      },
+      "Resource": "${DDBUpdateItem}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "DynamoDb.ProvisionedThroughputExceededException",
+            "DynamoDb.RequestLimitExceeded",
+            "DynamoDb.ThrottlingException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Still IN_PROGRESS, wait for 10s": {
+      "Next": "Get idempotency record from DynamoDB",
+      "Seconds": 10,
+      "Type": "Wait"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "Undefined execution state in idempotency record": {
+      "Cause": "The idempotency records exists but the executionstatus is neither SUCCEEDED, IN_PROGRESS, or FAILED",
+      "Error": "UndefinedExecutionState",
+      "Type": "Fail"
+    },
+    "Your Workflow": {
+      "Branches": [
+        {
+          "StartAt": "Here",
+          "States": {
+            "(which can fail occasionally)": {
+              "End": true,
+              "Resource": "${FailureInjectFunctionArn}",
+              "Retry": [
+                {
+                  "BackoffRate": 2,
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6
+                }
+              ],
+              "Type": "Task"
+            },
+            "Goes": {
+              "Next": "Your",
+              "Type": "Pass",
+              "Output": {
+                "result": "Output of step 2"
+              }
+            },
+            "Here": {
+              "Next": "Goes",
+              "Type": "Pass",
+              "Output": {
+                "result": "Output of step 1"
+              }
+            },
+            "Workflow": {
+              "Next": "(which can fail occasionally)",
+              "Type": "Pass",
+              "Output": {
+                "result": "Output of step 4"
+              }
+            },
+            "Your": {
+              "Next": "Workflow",
+              "Type": "Pass",
+              "Output": {
+                "result": "Output of step 3"
+              }
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Save failure"
+        }
+      ],
+      "Next": "Save execution results",
+      "Type": "Parallel"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Seconds": 1,
+      "Type": "Wait"
+    }
+  }
+}

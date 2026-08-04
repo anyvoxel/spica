@@ -1,0 +1,21 @@
+{
+  "Comment": "Map state using an out-of-range ToleratedFailurePercentage",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": [1, 2, 3],
+      "ToleratedFailurePercentage": 101,
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

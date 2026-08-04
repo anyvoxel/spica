@@ -1,0 +1,21 @@
+{
+  "StartAt": "ChoiceState",
+  "States": {
+    "ChoiceState": {
+      "Choices": [
+        {
+          "Next": "SucceedState",
+          "Condition": "{% $type($states.context.value) != 'null' %}"
+        }
+      ],
+      "Default": "FailState",
+      "Type": "Choice"
+    },
+    "FailState": {
+      "Type": "Fail"
+    },
+    "SucceedState": {
+      "Type": "Succeed"
+    }
+  }
+}

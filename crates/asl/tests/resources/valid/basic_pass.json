@@ -1,0 +1,10 @@
+{
+  "Comment": "Adds some coordinates to the input",
+  "StartAt": "Coords",
+  "States": {
+    "Coords": {
+      "End": true,
+      "Type": "Pass"
+    }
+  }
+}

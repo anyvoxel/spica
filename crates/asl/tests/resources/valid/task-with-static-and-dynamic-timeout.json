@@ -1,0 +1,11 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Resource": "foo:bar",
+      "TimeoutSeconds": 30,
+      "Type": "Task"
+    }
+  }
+}

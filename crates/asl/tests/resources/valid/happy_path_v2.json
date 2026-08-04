@@ -1,0 +1,66 @@
+{
+  "Comment": "v2 - Moderate uploaded images",
+  "StartAt": "Moderator",
+  "States": {
+    "Moderation Result?": {
+      "Choices": [
+        {
+          "Next": "Resizer",
+          "Condition": "{% $states.input.moderationResult = true %}"
+        },
+        {
+          "Next": "RecordFailState",
+          "Condition": "{% $states.input.moderationResult = false %}"
+        }
+      ],
+      "Default": "RecordFailState",
+      "Type": "Choice"
+    },
+    "Moderator": {
+      "Next": "Moderation Result?",
+      "Resource": "${ModeratorFunctionArn}",
+      "Type": "Task"
+    },
+    "Publish": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${PublishFunctionArn}",
+        "Payload": {
+          "Input": "{% $states.input %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Type": "Task"
+    },
+    "RecordFailState": {
+      "End": true,
+      "Arguments": {
+        "ExpressionAttributeValues": {
+          ":detail": {
+            "S": "{% $states.input.workflowDetail %}"
+          },
+          ":newStatus": {
+            "S": "FAILED_MODERATION"
+          }
+        },
+        "Key": {
+          "PK": {
+            "S": "workflow"
+          },
+          "SK": {
+            "S": "{% $states.input.detail.ID %}"
+          }
+        },
+        "TableName": "${DDBTable}",
+        "UpdateExpression": "set objStatus = :newStatus, detail = :detail"
+      },
+      "Resource": "${DDBUpdateItem}",
+      "Type": "Task"
+    },
+    "Resizer": {
+      "Next": "Publish",
+      "Resource": "${ResizerFunctionArn}",
+      "Type": "Task"
+    }
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "Comment": "A state machine to integrate a human approver",
+  "StartAt": "Notify Approver",
+  "States": {
+    "Approved?": {
+      "Choices": [
+        {
+          "Next": "Handle approval",
+          "Condition": "{% (% $exists($states.input.approvalStatus) = true %) and (% $exists($states.input.approvalStatus.result) = true %) and (% $states.input.approvalStatus.result = true %) %}"
+        },
+        {
+          "Next": "Handle rejection",
+          "Condition": "{% (% $exists($states.input.approvalStatus) = true %) and (% $exists($states.input.approvalStatus.result) = true %) %}"
+        }
+      ],
+      "Default": "Handle failure",
+      "Type": "Choice"
+    },
+    "Handle approval": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${ProcessingLambda}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Handle failure": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${ProcessingLambda}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Handle rejection": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${ProcessingLambda}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Notify Approver": {
+      "Next": "Approved?",
+      "Arguments": {
+        "Message": {
+          "message": "{% $states.input %}",
+          "token": "{% $states.context.Task.Token %}"
+        },
+        "TopicArn": "${TopicName}"
+      },
+      "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+      "Type": "Task"
+    }
+  }
+}

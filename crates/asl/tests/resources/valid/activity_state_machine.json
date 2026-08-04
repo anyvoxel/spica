@@ -1,0 +1,16 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Step Functions Run Activity",
+  "States": {
+    "Step Functions Run Activity": {
+      "HeartbeatSeconds": 200,
+      "Next": "Success",
+      "Resource": "${ActivityArn}",
+      "TimeoutSeconds": 300,
+      "Type": "Task"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

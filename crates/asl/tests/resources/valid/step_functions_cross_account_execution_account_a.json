@@ -1,0 +1,23 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "State Machine B Invoke",
+  "States": {
+    "State Machine B Invoke": {
+      "End": true,
+      "Arguments": {
+        "ApiEndpoint": "{% $states.input.ApiUrl %}",
+        "AuthType": "RESOURCE_POLICY",
+        "Headers": {},
+        "Method": "POST",
+        "Path": "/execution",
+        "RequestBody": {
+          "input": "{% $states.input.body %}",
+          "stateMachineArn": "{% $states.input.stateMachineArn %}"
+        },
+        "Stage": "dev"
+      },
+      "Resource": "arn:aws:states:::apigateway:invoke",
+      "Type": "Task"
+    }
+  }
+}

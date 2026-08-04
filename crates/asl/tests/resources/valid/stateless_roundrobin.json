@@ -1,0 +1,62 @@
+{
+  "Comment": "A round robin based on task exuections and input array",
+  "StartAt": "ListExecutions",
+  "States": {
+    "Call out to API": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${CallToAPIFunctionName}",
+        "Payload": {
+          "assignee": "{% $states.input.userId.Payload %}",
+          "html_notes": "{% States.Format('<body>------Message:{} ------ Share <a href=\"https://www.stickermule.com/account/reorder\">these stickers</a> with {}</body>',$.body.message,$.body.requestor) %}",
+          "title": "{% States.Format('Sticker request: for {}.', $.body.requestor) %}",
+          "type": "1202131426886762"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "ListExecutions": {
+      "Next": "Modulo",
+      "Arguments": {
+        "StateMachineArn": "{% $states.context.StateMachine.Id %}",
+        "StatusFilter": "SUCCEEDED"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listExecutions",
+      "Type": "Task"
+    },
+    "Modulo": {
+      "Next": "Call out to API",
+      "Arguments": {
+        "FunctionName": "${ModuloFunctionName}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}

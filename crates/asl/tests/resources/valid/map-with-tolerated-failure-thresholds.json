@@ -1,0 +1,22 @@
+{
+  "Comment": "Map state with tolerated failure thresholds",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": [1, 2, 3],
+      "ToleratedFailurePercentage": 12.5,
+      "ToleratedFailureCount": 3,
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

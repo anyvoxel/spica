@@ -1,0 +1,17 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "Choices": [
+        {
+          "Next": "x",
+          "Condition": "{% $states.input.foo = 'x' %}"
+        }
+      ],
+      "Type": "Choice"
+    },
+    "x": {
+      "Type": "Succeed"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "ListExecutions",
+  "States": {
+    "List Executions nextPage": {
+      "Next": "more results?",
+      "Arguments": {
+        "NextToken": "{% $states.input.executions.NextToken %}",
+        "StateMachineArn": "{% $states.context.StateMachine.Id %}",
+        "StatusFilter": "SUCCEEDED"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listExecutions",
+      "Type": "Task"
+    },
+    "ListExecutions": {
+      "Next": "more results?",
+      "Arguments": {
+        "StateMachineArn": "{% $states.context.StateMachine.Id %}",
+        "StatusFilter": "SUCCEEDED"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listExecutions",
+      "Type": "Task"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "more results?": {
+      "Choices": [
+        {
+          "Next": "List Executions nextPage",
+          "Condition": "{% $exists($states.input.executions.NextToken) = true %}"
+        }
+      ],
+      "Default": "Success",
+      "Type": "Choice"
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "Comment": "A State Machine to initialize the account",
+  "StartAt": "Build Folder List",
+  "States": {
+    "Build Folder List": {
+      "Comment": "Build a list of folders that should be created in s3",
+      "Next": "Create Default Folders",
+      "Type": "Pass"
+    },
+    "Create Default Folders": {
+      "ItemProcessor": {
+        "StartAt": "Ensure Folder Exists",
+        "States": {
+          "Ensure Folder Exists": {
+            "End": true,
+            "Arguments": {
+              "FunctionName": "${LambdaCreateS3Folder}",
+              "Payload": {
+                "folder_path": "{% $states.input %}"
+              }
+            },
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "Type": "Task"
+          }
+        }
+      },
+      "Next": "Get Glue Crawler List",
+      "Type": "Map"
+    },
+    "Get Glue Crawler List": {
+      "Next": "Run Glue Crawlers",
+      "Arguments": {
+        "FunctionName": "${LambdaListGlueCrawlers}",
+        "Payload": {
+          "crawler_prefix": "${GlueCrawlerPrefix}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Run Glue Crawlers": {
+      "End": true,
+      "ItemProcessor": {
+        "StartAt": "Start Glue Crawler",
+        "States": {
+          "Start Glue Crawler": {
+            "End": true,
+            "Arguments": {
+              "FunctionName": "${LambdaStartGlueCrawler}",
+              "Payload": {
+                "crawler_name": "{% $states.input %}"
+              }
+            },
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "Type": "Task"
+          }
+        }
+      },
+      "Type": "Map"
+    }
+  }
+}

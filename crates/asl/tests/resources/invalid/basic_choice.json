@@ -1,0 +1,41 @@
+{
+  "Comment": "Adds some coordinates to the input",
+  "StartAt": "ChoiceStateX",
+  "States": {
+    "ChoiceStateX": {
+      "Choices": [
+        {
+          "Next": "Public",
+          "Condition": "{% not(% $states.input.type = 'Private' %) %}"
+        },
+        {
+          "Next": "ValueIsZero",
+          "Condition": "{% $states.input.value = 0 %}"
+        },
+        {
+          "Next": "ValueInTwenties",
+          "Condition": "{% (% $states.input.value >= 20 %) and (% $states.input.value < 30 %) %}"
+        }
+      ],
+      "Default": "DefaultState",
+      "Type": "Choice"
+    },
+    "DefaultState": {
+      "Cause": "No Matches!",
+      "Error": "ERROR",
+      "Type": "Fail"
+    },
+    "Public": {
+      "Next": "NextState",
+      "Type": "Pass"
+    },
+    "ValueInTwenties": {
+      "Next": "NextState",
+      "Type": "Pass"
+    },
+    "ValueIsZero": {
+      "Next": "NextState",
+      "Type": "Pass"
+    }
+  }
+}

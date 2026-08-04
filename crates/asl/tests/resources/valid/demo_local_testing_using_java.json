@@ -1,0 +1,192 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Validation",
+  "States": {
+    "Add to FollowUp": {
+      "Next": "CustomerAddedToFollowup",
+      "Arguments": {
+        "Item": {
+          "PK": {
+            "S": "{% $states.input.identity.email %}"
+          }
+        },
+        "TableName": "${FollowUpTableName}"
+      },
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Type": "Task"
+    },
+    "CustomValidationFailed": {
+      "End": true,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "Validation Failed"
+            },
+            "DetailType": "ValidationFailed",
+            "EventBusName": "default",
+            "Source": "LocalTestingSource"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "CustomerAddedToFollowup": {
+      "End": true,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "EmailAddress": "{% $states.input.identity.email %}",
+              "Message": "Customer Added for follow up"
+            },
+            "DetailType": "CustomerAdded",
+            "EventBusName": "default",
+            "Source": "LocalTestingSource"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "DetectSentiment": {
+      "Next": "Is Positive Sentiment?",
+      "Arguments": {
+        "LanguageCode": "en",
+        "Text": "{% $states.input.data.comments %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:comprehend:detectSentiment",
+      "Retry": [
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "InternalServerException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3
+        }
+      ],
+      "Type": "Task"
+    },
+    "Is Positive Sentiment?": {
+      "Choices": [
+        {
+          "Next": "Add to FollowUp",
+          "Condition": "{% $states.input.results.sentimentAnalysis.Sentiment = 'POSITIVE' %}"
+        }
+      ],
+      "Default": "NegativeSentimentDetected",
+      "Type": "Choice"
+    },
+    "NegativeSentimentDetected": {
+      "End": true,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Data": "{% $states.input.data %}",
+              "Message": "Negative Sentiment Detected"
+            },
+            "DetailType": "NegativeSentiment",
+            "EventBusName": "default",
+            "Source": "LocalTestingSource"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "Validation": {
+      "Branches": [
+        {
+          "StartAt": "Check Identity",
+          "States": {
+            "Check Identity": {
+              "End": true,
+              "Arguments": {
+                "FunctionName": "${CheckIdentityFunctionArn}",
+                "Payload": "{% $states.input %}"
+              },
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "CustomValidationError"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "Check Address",
+          "States": {
+            "Check Address": {
+              "End": true,
+              "Arguments": {
+                "FunctionName": "${CheckAddressFunctionArn}",
+                "Payload": "{% $states.input %}"
+              },
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Retry": [
+                {
+                  "BackoffRate": 1,
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "CustomValidationError"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "CustomValidationError"
+          ],
+          "Next": "CustomValidationFailed"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ValidationException"
+        }
+      ],
+      "Next": "DetectSentiment",
+      "Type": "Parallel"
+    },
+    "ValidationException": {
+      "End": true,
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "Message": "Validation Exception"
+            },
+            "DetailType": "ValidationException",
+            "EventBusName": "default",
+            "Source": "LocalTestingSource"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    }
+  }
+}

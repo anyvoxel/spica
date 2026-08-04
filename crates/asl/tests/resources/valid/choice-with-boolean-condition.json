@@ -1,0 +1,31 @@
+{
+  "Comment": "Choice state using boolean Condition literals",
+  "StartAt": "AlwaysRoute",
+  "States": {
+    "AlwaysRoute": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": true,
+          "Next": "Matched"
+        },
+        {
+          "Condition": false,
+          "Next": "Unreachable"
+        }
+      ],
+      "Default": "Fallback"
+    },
+    "Matched": {
+      "Type": "Succeed"
+    },
+    "Unreachable": {
+      "Type": "Fail",
+      "Error": "ShouldNotMatch",
+      "Cause": "False condition should not be selected"
+    },
+    "Fallback": {
+      "Type": "Succeed"
+    }
+  }
+}

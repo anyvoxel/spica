@@ -1,0 +1,34 @@
+{
+  "Comment": "A Catch example of the Amazon States Language using an AWS Lambda Function",
+  "StartAt": "LongRunningFunction",
+  "States": {
+    "CatchAllFallback": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "LongRunningFunction": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "TimeoutFallback"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CatchAllFallback"
+        }
+      ],
+      "End": true,
+      "Resource": "${LongRunningFunctionArn}",
+      "TimeoutSeconds": 5,
+      "Type": "Task"
+    },
+    "TimeoutFallback": {
+      "End": true,
+      "Type": "Pass"
+    }
+  }
+}

@@ -1,0 +1,141 @@
+{
+  "Comment": "CalculationStateMachine",
+  "StartAt": "CleanInput",
+  "States": {
+    "Add": {
+      "Next": "Divide",
+      "Arguments": {
+        "FunctionName": "${AddFunctionArn}",
+        "Payload": {
+          "input": "{% $states.input.Payload %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Choice": {
+      "Choices": [
+        {
+          "Next": "Subtract",
+          "Condition": "{% $states.input.Payload.result >= 20 %}"
+        }
+      ],
+      "Default": "Notify",
+      "Type": "Choice"
+    },
+    "CleanInput": {
+      "Next": "Multiply",
+      "Arguments": {
+        "FunctionName": "${CleanFunctionArn}",
+        "Payload": {
+          "input": "{% $states.input %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Divide": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${DivideFunctionArn}",
+        "Payload": {
+          "input": "{% $states.input.Payload %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Multiply": {
+      "Next": "Choice",
+      "Arguments": {
+        "FunctionName": "${MultiplyFunctionArn}",
+        "Payload": {
+          "input": "{% $states.input.Payload %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Notify": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.context %}",
+        "Subject": "Failed Test",
+        "TopicArn": "${TopicArn}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "Subtract": {
+      "Next": "Add",
+      "Arguments": {
+        "FunctionName": "${SubtractFunctionArn}",
+        "Payload": {
+          "input": "{% $states.input.Payload %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1.5,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}
