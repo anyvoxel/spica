@@ -1,0 +1,20 @@
+{
+  "Comment": "Map state using a bare string for Items",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": "orders",
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

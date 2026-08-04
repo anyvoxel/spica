@@ -1,0 +1,75 @@
+{
+  "StartAt": "Start Athena Query",
+  "States": {
+    "Fail": {
+      "Type": "Fail"
+    },
+    "Get query result": {
+      "Next": "Has query finished?",
+      "Arguments": {
+        "QueryExecutionId": "{% $states.input.QueryExecutionId %}"
+      },
+      "Resource": "arn:aws:states:::athena:getQueryExecution",
+      "Type": "Task"
+    },
+    "Has query finished?": {
+      "Choices": [
+        {
+          "Next": "Process results",
+          "Condition": "{% $states.input.QueryExecution.Status.State = 'SUCCEEDED' %}"
+        },
+        {
+          "Next": "Fail",
+          "Condition": "{% $states.input.QueryExecution.Status.State = 'FAILED' %}"
+        },
+        {
+          "Next": "Fail",
+          "Condition": "{% $states.input.QueryExecution.Status.State = 'CANCELLED' %}"
+        }
+      ],
+      "Default": "Wait",
+      "Type": "Choice"
+    },
+    "Process results": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${ProcessResultsFunctionArn}",
+        "Payload": {
+          "resultLocation": "{% $states.input.QueryExecution.ResultConfiguration.OutputLocation %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Start Athena Query": {
+      "Next": "Get query result",
+      "Arguments": {
+        "QueryExecutionContext": {
+          "Database": "{% $states.input.Database %}"
+        },
+        "QueryString": "{% States.Format('SELECT * FROM \"{}\" LIMIT 10', $.Table) %}",
+        "ResultConfiguration": {},
+        "WorkGroup": "{% $states.input.Workgroup %}"
+      },
+      "Resource": "arn:aws:states:::athena:startQueryExecution",
+      "Type": "Task"
+    },
+    "Wait": {
+      "Next": "Get query result",
+      "Seconds": 5,
+      "Type": "Wait"
+    }
+  }
+}

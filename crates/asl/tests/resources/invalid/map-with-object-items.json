@@ -1,0 +1,22 @@
+{
+  "Comment": "Map state using an object for Items",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": {
+        "orderId": 1
+      },
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,203 @@
+{
+  "Comment": "A HELLO World example of the Amazon States Language using Pass states...",
+  "StartAt": "Validate input csv",
+  "States": {
+    "Error Notification": {
+      "Next": "Fail",
+      "Arguments": {
+        "executionname": "{% $states.context.Execution.Name %}",
+        "msg": "{% $states.input.msg %}",
+        "status": "{% $states.input.Status %}"
+      },
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NotificationFunction}",
+      "Type": "Task"
+    },
+    "FAIL - Move file to error folder": {
+      "Next": "Error Notification",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ArchiveFunction}",
+      "Type": "Task"
+    },
+    "Fail": {
+      "Cause": "validation failed",
+      "Error": "ValidationError",
+      "Type": "Fail"
+    },
+    "Move file to archive": {
+      "Next": "Success Notification",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ArchiveFunction}",
+      "Type": "Task"
+    },
+    "Partitioned File Crawler Finished?": {
+      "Choices": [
+        {
+          "Next": "Partitioned File Crawler Wait",
+          "Condition": "{% (% $states.input.taskresult.Status = 'STOPPING' %) or (% $states.input.taskresult.Status = 'RUNNING' %) %}"
+        },
+        {
+          "Next": "Move file to archive",
+          "Condition": "{% $states.input.taskresult.Status = 'READY' %}"
+        },
+        {
+          "Next": "FAIL - Move file to error folder",
+          "Condition": "{% $states.input.taskresult.Status = 'RETRYLIMITREACH' %}"
+        },
+        {
+          "Next": "FAIL - Move file to error folder",
+          "Condition": "{% $states.input.taskresult.Status = 'FAILED' %}"
+        }
+      ],
+      "Default": "FAIL - Move file to error folder",
+      "Type": "Choice"
+    },
+    "Partitioned File Crawler Status Check": {
+      "Next": "Partitioned File Crawler Finished?",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CrawlerStatusCheckFunction}",
+      "Type": "Task"
+    },
+    "Partitioned File Crawler Wait": {
+      "Next": "Partitioned File Crawler Status Check",
+      "Seconds": 30,
+      "Type": "Wait"
+    },
+    "Raw File Crawler Finished?": {
+      "Choices": [
+        {
+          "Next": "Raw File Crawler Wait",
+          "Condition": "{% (% $states.input.taskresult.Status = 'STOPPING' %) or (% $states.input.taskresult.Status = 'RUNNING' %) %}"
+        },
+        {
+          "Next": "Run Glue Job",
+          "Condition": "{% $states.input.taskresult.Status = 'READY' %}"
+        },
+        {
+          "Next": "FAIL - Move file to error folder",
+          "Condition": "{% $states.input.taskresult.Status = 'RETRYLIMITREACH' %}"
+        },
+        {
+          "Next": "FAIL - Move file to error folder",
+          "Condition": "{% $states.input.taskresult.Status = 'FAILED' %}"
+        }
+      ],
+      "Default": "FAIL - Move file to error folder",
+      "Type": "Choice"
+    },
+    "Raw File Crawler Status Check": {
+      "Next": "Raw File Crawler Finished?",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CrawlerStatusCheckFunction}",
+      "Type": "Task"
+    },
+    "Raw File Crawler Wait": {
+      "Next": "Raw File Crawler Status Check",
+      "Seconds": 30,
+      "Type": "Wait"
+    },
+    "Run Glue Job": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FAIL - Move file to error folder"
+        }
+      ],
+      "Next": "Start Crawler For Partitioned File",
+      "Arguments": {
+        "JobName": "${GlueJob}"
+      },
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Type": "Task"
+    },
+    "Start Crawler For Partitioned File": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "CrawlerRunningException"
+          ],
+          "Next": "FAIL - Move file to error folder"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FAIL - Move file to error folder"
+        }
+      ],
+      "Next": "Partitioned File Crawler Status Check",
+      "Arguments": {
+        "Crawler_Name": "${CrawlPartitionedFile}"
+      },
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StartCrawlerFunction}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "CrawlerRunningException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Start Crawler For Raw File": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "CrawlerRunningException"
+          ],
+          "Next": "FAIL - Move file to error folder"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FAIL - Move file to error folder"
+        }
+      ],
+      "Next": "Raw File Crawler Status Check",
+      "Arguments": {
+        "Crawler_Name": "${CrawlRawFile}"
+      },
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StartCrawlerFunction}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "CrawlerRunningException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 10
+        }
+      ],
+      "Type": "Task"
+    },
+    "Success Notification": {
+      "End": true,
+      "Arguments": {
+        "executionname": "{% $states.context.Execution.Name %}",
+        "msg": "{% $states.input.msg %}",
+        "status": "{% $states.input.Status %}"
+      },
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NotificationFunction}",
+      "Type": "Task"
+    },
+    "Validate input csv": {
+      "Next": "Validation Success?",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${InputValidationFunction}",
+      "Type": "Task"
+    },
+    "Validation Success?": {
+      "Choices": [
+        {
+          "Next": "Start Crawler For Raw File",
+          "Condition": "{% $states.input.taskresult.Validation = 'SUCCESS' %}"
+        },
+        {
+          "Next": "FAIL - Move file to error folder",
+          "Condition": "{% $states.input.taskresult.Validation = 'FAILURE' %}"
+        }
+      ],
+      "Type": "Choice"
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "Comment": "A utility state machine to run a glue crawler and monitor it until completion",
+  "StartAt": "StartCrawler",
+  "States": {
+    "GetCrawler": {
+      "Next": "Is Running?",
+      "Arguments": {
+        "Name": "{% $states.input.crawler_name %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 8
+        }
+      ],
+      "Type": "Task"
+    },
+    "Is Running?": {
+      "Choices": [
+        {
+          "Next": "Wait for Crawler To Complete",
+          "Condition": "{% (% $states.input.response.get_crawler.Crawler.State = 'RUNNING' %) or (% $states.input.response.get_crawler.Crawler.State = 'STOPPING' %) %}"
+        }
+      ],
+      "Default": "Prepare Output",
+      "Type": "Choice"
+    },
+    "Prepare Output": {
+      "End": true,
+      "Type": "Pass",
+      "Output": {
+        "LastCrawl": "{% $states.input.response.get_crawler.Crawler.LastCrawl %}",
+        "crawler_name": "{% $states.input.crawler_name %}"
+      }
+    },
+    "StartCrawler": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "Next": "GetCrawler"
+        }
+      ],
+      "Next": "GetCrawler",
+      "Arguments": {
+        "Name": "{% $states.input.crawler_name %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Retry": [
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 0
+        },
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 0
+        }
+      ],
+      "Type": "Task"
+    },
+    "Wait for Crawler To Complete": {
+      "Next": "GetCrawler",
+      "Seconds": 5,
+      "Type": "Wait"
+    }
+  }
+}

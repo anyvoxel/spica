@@ -1,0 +1,84 @@
+{
+  "Comment": "Defect detection state machine",
+  "StartAt": "ModifyState",
+  "States": {
+    "AllowWithNotification": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.input.taskresult.message %}",
+        "Subject": "Policy change detected!",
+        "TopicArn": "${AlertTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "AskUser": {
+      "Next": "usersChoice",
+      "Arguments": {
+        "FunctionName": "${AskUserArn}",
+        "Payload": {
+          "token": "{% $states.context.Task.Token %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Type": "Task"
+    },
+    "ChooseAction": {
+      "Choices": [
+        {
+          "Next": "RevertPolicyArn",
+          "Condition": "{% $states.input.taskresult.action = 'remedy' %}"
+        },
+        {
+          "Next": "AllowWithNotification",
+          "Condition": "{% $states.input.taskresult.action = 'alert' %}"
+        }
+      ],
+      "Default": "AllowWithNotification",
+      "Type": "Choice"
+    },
+    "ModifyState": {
+      "Next": "ValidatePolicy",
+      "Type": "Pass",
+      "Output": {
+        "accountId": "{% $states.input.detail.userIdentity.accountId %}",
+        "policy": "{% $states.input.detail.requestParameters.policyDocument %}",
+        "policyMeta": "{% $states.input.detail.responseElements.policy %}",
+        "region": "{% $states.input.region %}"
+      }
+    },
+    "RevertPolicyArn": {
+      "Next": "AskUser",
+      "Resource": "${RevertPolicyArn}",
+      "Type": "Task"
+    },
+    "ValidatePolicy": {
+      "Next": "ChooseAction",
+      "Resource": "${ValidatePolicyArn}",
+      "Type": "Task"
+    },
+    "approved": {
+      "End": true,
+      "Resource": "${ApprovedArn}",
+      "Type": "Task"
+    },
+    "denied": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "usersChoice": {
+      "Choices": [
+        {
+          "Next": "denied",
+          "Condition": "{% $states.input.taskresult.action = 'delete' %}"
+        },
+        {
+          "Next": "approved",
+          "Condition": "{% $states.input.taskresult.action = 'allow' %}"
+        }
+      ],
+      "Default": "denied",
+      "Type": "Choice"
+    }
+  }
+}

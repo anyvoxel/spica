@@ -1,0 +1,22 @@
+{
+  "Comment": "Choice state using a bare string Condition instead of JSONata",
+  "StartAt": "Route",
+  "States": {
+    "Route": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "true",
+          "Next": "Matched"
+        }
+      ],
+      "Default": "Fallback"
+    },
+    "Matched": {
+      "Type": "Succeed"
+    },
+    "Fallback": {
+      "Type": "Succeed"
+    }
+  }
+}

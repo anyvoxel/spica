@@ -1,0 +1,75 @@
+{
+  "StartAt": "Start Athena Query",
+  "States": {
+    "Done": {
+      "Comment": "All results in the query are processed successfully",
+      "Type": "Succeed"
+    },
+    "Get Query Results with NextToken": {
+      "Next": "Map State",
+      "Arguments": {
+        "MaxResults": 2,
+        "NextToken": "{% $states.input.StartQueryParams.NextToken %}",
+        "QueryExecutionId": "{% $states.input.QueryExecution.QueryExecutionId %}"
+      },
+      "Resource": "arn:aws:states:::athena:getQueryResults",
+      "Type": "Task"
+    },
+    "Get Query Results without token": {
+      "Next": "Map State",
+      "Arguments": {
+        "MaxResults": 2,
+        "QueryExecutionId": "{% $states.input.QueryExecution.QueryExecutionId %}"
+      },
+      "Resource": "arn:aws:states:::athena:getQueryResults",
+      "Type": "Task"
+    },
+    "Has More Results?": {
+      "Choices": [
+        {
+          "Next": "Prepare Next Query Params",
+          "Condition": "{% $exists($states.input.GetQueryResults.NextToken) = true %}"
+        }
+      ],
+      "Default": "Done",
+      "Type": "Choice"
+    },
+    "Map State": {
+      "ItemProcessor": {
+        "StartAt": "ProcessResult",
+        "States": {
+          "ProcessResult": {
+            "End": true,
+            "Type": "Pass"
+          }
+        }
+      },
+      "MaxConcurrency": 1,
+      "Next": "Has More Results?",
+      "Type": "Map"
+    },
+    "Prepare Next Query Params": {
+      "Next": "Get Query Results with NextToken",
+      "Type": "Pass",
+      "Output": {
+        "NextToken": "{% $states.input.GetQueryResults.NextToken %}",
+        "QueryExecutionId": "{% $states.input.QueryExecution.QueryExecutionId %}"
+      }
+    },
+    "Start Athena Query": {
+      "Next": "Get Query Results without token",
+      "Arguments": {
+        "QueryExecutionContext": {
+          "Database": "${DBname}"
+        },
+        "QueryString": "SELECT title FROM ${CrawlerBucketname} limit 10",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://${AthenaBucketname}"
+        }
+      },
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Type": "Task"
+    }
+  },
+  "TimeoutSeconds": 3600
+}

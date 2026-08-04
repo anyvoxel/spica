@@ -1,0 +1,45 @@
+{
+  "StartAt": "A",
+  "States": {
+    "A": {
+      "Branches": [
+        {
+          "StartAt": "Sub1_1",
+          "States": {
+            "Sub1_1": {
+              "Next": "Sub2_1",
+              "Type": "Pass"
+            }
+          }
+        },
+        {
+          "StartAt": "Sub2_1",
+          "States": {
+            "Sub2_1": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      ],
+      "Next": "X",
+      "Type": "Parallel"
+    },
+    "X": {
+      "Choices": [
+        {
+          "Next": "Sub1_1",
+          "Condition": "{% $states.input.x = 1 %}"
+        },
+        {
+          "Next": "Z",
+          "Condition": "{% $states.input.x = 1 %}"
+        }
+      ],
+      "Default": "Sub1_1",
+      "Type": "Choice"
+    },
+    "Z": {
+      "Type": "Succeed"
+    }
+  }
+}

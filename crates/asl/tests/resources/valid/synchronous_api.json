@@ -1,0 +1,54 @@
+{
+  "Comment": "An example of the Amazon States Language for starting a task and waiting for a callback.",
+  "StartAt": "ParallelState",
+  "States": {
+    "ParallelState": {
+      "Branches": [
+        {
+          "StartAt": "sumFunction",
+          "States": {
+            "sumFunction": {
+              "End": true,
+              "Arguments": {
+                "FunctionName": "${sumFunction}",
+                "Payload": "{% $states.input %}"
+              },
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "AvgFunction",
+          "States": {
+            "AvgFunction": {
+              "End": true,
+              "Arguments": {
+                "FunctionName": "${AvgFunction}",
+                "Payload": "{% $states.input %}"
+              },
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "MaxMinFunction",
+          "States": {
+            "MaxMinFunction": {
+              "End": true,
+              "Arguments": {
+                "FunctionName": "${MaxMinFunction}",
+                "Payload": "{% $states.input %}"
+              },
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "End": true,
+      "Type": "Parallel"
+    }
+  }
+}

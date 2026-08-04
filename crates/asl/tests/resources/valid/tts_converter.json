@@ -1,0 +1,64 @@
+{
+  "Comment": "Text to Speech using AWS Polly",
+  "StartAt": "GetTextFile",
+  "States": {
+    "Failed": {
+      "Cause": "transcription job failed",
+      "Error": "FAILED",
+      "Type": "Fail"
+    },
+    "GetSpeechSynthesisTask": {
+      "Next": "SpeechSynthesisTaskStatus",
+      "Arguments": {
+        "TaskId": "{% $states.input.SynthesisTask.TaskId %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:polly:getSpeechSynthesisTask",
+      "Type": "Task"
+    },
+    "GetTextFile": {
+      "Next": "StartSpeechSynthesisTask",
+      "Arguments": {
+        "Bucket": "{% $states.input.detail.bucket.name %}",
+        "Key": "{% $states.input.detail.object.key %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Type": "Task"
+    },
+    "SpeechSynthesisTaskStatus": {
+      "Choices": [
+        {
+          "Next": "Success",
+          "Condition": "{% $states.input.TaskStatus = 'completed' %}"
+        },
+        {
+          "Next": "Failed",
+          "Condition": "{% $states.input.TaskStatus = 'failed' %}"
+        }
+      ],
+      "Default": "Wait",
+      "Type": "Choice"
+    },
+    "StartSpeechSynthesisTask": {
+      "Next": "Wait",
+      "Arguments": {
+        "OutputFormat": "mp3",
+        "OutputS3BucketName": "bucket-776177632559-us-east-1-transcript-results",
+        "OutputS3KeyPrefix": "audio",
+        "Text": "{% $states.input.filecontent %}",
+        "TextType": "text",
+        "VoiceId": "Amy"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:polly:startSpeechSynthesisTask",
+      "Type": "Task"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "Wait": {
+      "Next": "GetSpeechSynthesisTask",
+      "Seconds": 10,
+      "Type": "Wait"
+    }
+  },
+  "TimeoutSeconds": 900
+}

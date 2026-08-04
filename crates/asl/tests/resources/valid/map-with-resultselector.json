@@ -1,0 +1,18 @@
+{
+  "StartAt": "m",
+  "States": {
+    "m": {
+      "End": true,
+      "ItemProcessor": {
+        "StartAt": "x",
+        "States": {
+          "x": {
+            "End": true,
+            "Type": "Pass"
+          }
+        }
+      },
+      "Type": "Map"
+    }
+  }
+}

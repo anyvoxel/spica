@@ -1,0 +1,19 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "Branches": [
+        {
+          "StartAt": "x",
+          "States": {
+            "x": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      ],
+      "End": true,
+      "Type": "Parallel"
+    }
+  }
+}

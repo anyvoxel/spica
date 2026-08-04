@@ -1,0 +1,105 @@
+{
+  "Comment": "This is your state machine",
+  "StartAt": "Generate startup log message using States.Format and Context Object",
+  "States": {
+    "Add array of unique ages using JSONPath Expression": {
+      "Next": "Recreate Pet List Using JSONPath Expression",
+      "Type": "Pass",
+      "Output": {
+        "pets": "{% $states.input %}",
+        "uniqueAges": "{% $states.input..age %}"
+      }
+    },
+    "Convert JSON string bagk to array using Stats.StringToJson": {
+      "Next": "Create Pets",
+      "Type": "Pass",
+      "Output": {
+        "myArray": "{% States.StringToJson($.mySerializedArray) %}"
+      }
+    },
+    "Convert the array to JSON string using States.JsonToString": {
+      "Next": "Convert JSON string bagk to array using Stats.StringToJson",
+      "Type": "Pass",
+      "Output": {
+        "mySerializedArray": "{% States.JsonToString($.myArray) %}"
+      }
+    },
+    "Create Pets": {
+      "ItemProcessor": {
+        "StartAt": "Choice",
+        "States": {
+          "Choice": {
+            "Choices": [
+              {
+                "Next": "Create Dog",
+                "Condition": "{% (% $type($states.input) = 'number' %) and (true) %}"
+              },
+              {
+                "Next": "Create Cat",
+                "Condition": "{% (% $type($states.input) = 'number' %) and (true) %}"
+              }
+            ],
+            "Type": "Choice"
+          },
+          "Create Cat": {
+            "End": true,
+            "Type": "Pass",
+            "Output": {
+              "age": "{% $states.input %}",
+              "createdBy": "{% $states.context.State.Name %}",
+              "species": "cat"
+            }
+          },
+          "Create Dog": {
+            "End": true,
+            "Type": "Pass",
+            "Output": {
+              "age": "{% $states.input %}",
+              "createdBy": "{% $states.context.State.Name %}",
+              "species": "dog"
+            }
+          }
+        }
+      },
+      "Next": "Create separate list of cats and dogs using JSONPath Expressions",
+      "Type": "Map"
+    },
+    "Create separate list of cats and dogs using JSONPath Expressions": {
+      "Next": "Add array of unique ages using JSONPath Expression",
+      "Type": "Pass",
+      "Output": {
+        "cats": {
+          "old": "{% $states.input.pets[?(@.species == 'cat' && @.age>=5)] %}",
+          "young": "{% $states.input.pets[?(@.species == 'cat' && @.age<5)] %}"
+        },
+        "dogs": {
+          "old": "{% $states.input.pets[?(@.species == 'dog' && @.age>=5)] %}",
+          "young": "{% $states.input.pets[?(@.species == 'dog' && @.age<5)] %}"
+        }
+      }
+    },
+    "Generate an array using States.Array": {
+      "Next": "Convert the array to JSON string using States.JsonToString",
+      "Type": "Pass",
+      "Output": {
+        "myArray": "{% States.Array(1,2,3,4,5,6,7,8,9,10) %}"
+      }
+    },
+    "Generate startup log message using States.Format and Context Object": {
+      "Next": "Generate an array using States.Array",
+      "Type": "Pass",
+      "Output": {
+        "startupLogMessage": "{% States.Format('Starting execution of {} at {} with role of {}',$$.StateMachine.Name,$$.Execution.StartTime,$$.Execution.RoleArn) %}"
+      }
+    },
+    "Recreate Pet List Using JSONPath Expression": {
+      "End": true,
+      "Type": "Pass",
+      "Output": {
+        "flattenedPets": "{% $states.input.pets[*][*][*] %}",
+        "groupedPets": "{% $states.input.pets %}",
+        "uniqueAges": "{% $states.input..age %}"
+      }
+    }
+  }
+}

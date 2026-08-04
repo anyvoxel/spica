@@ -1,0 +1,11 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Arguments": "I'm a parameter!",
+      "Resource": "foo:bar",
+      "Type": "Task"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Arguments": {
+        "abc": "{% States.Format('{} xyz {}', 1, 'def') %}"
+      },
+      "Resource": "foo:bar",
+      "Type": "Task"
+    }
+  }
+}

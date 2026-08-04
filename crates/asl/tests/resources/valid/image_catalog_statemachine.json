@@ -1,0 +1,118 @@
+{
+  "Comment": "Beispielworkflow: Automatisierter Bilderkatalog",
+  "StartAt": "Auf unpassende Inhalte pruefen",
+  "States": {
+    "Auf unpassende Inhalte pruefen": {
+      "Next": "Unpassende Inhalte entdeckt?",
+      "Arguments": {
+        "Image": {
+          "S3Object": {
+            "Bucket": "{% $states.input.detail.bucket.name %}",
+            "Name": "{% $states.input.detail.object.key %}"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rekognition:detectModerationLabels",
+      "Type": "Task"
+    },
+    "Bild verarbeiten": {
+      "Branches": [
+        {
+          "StartAt": "Objekte im Bild erkennen",
+          "States": {
+            "Objekte im Bild erkennen": {
+              "Next": "Objekte in Datenbank speichern",
+              "Arguments": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "{% $states.input.detail.bucket.name %}",
+                    "Name": "{% $states.input.detail.object.key %}"
+                  }
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+              "Type": "Task"
+            },
+            "Objekte in Datenbank speichern": {
+              "End": true,
+              "Arguments": {
+                "ExpressionAttributeValues": {
+                  ":o": {
+                    "S": "{% States.JsonToString($.output.Labels) %}"
+                  }
+                },
+                "Key": {
+                  "Id": {
+                    "S": "{% $states.input.detail.object.key %}"
+                  }
+                },
+                "TableName": "${CatalogTable}",
+                "UpdateExpression": "set detectedObjects=:o"
+              },
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "Text im Bild erkennen",
+          "States": {
+            "Text im Bild erkennen": {
+              "Next": "Text in Datenbank abspeichern",
+              "Arguments": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "{% $states.input.detail.bucket.name %}",
+                    "Name": "{% $states.input.detail.object.key %}"
+                  }
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectText",
+              "Type": "Task"
+            },
+            "Text in Datenbank abspeichern": {
+              "End": true,
+              "Arguments": {
+                "ExpressionAttributeValues": {
+                  ":t": {
+                    "S": "{% States.JsonToString($.output.TextDetections) %}"
+                  }
+                },
+                "Key": {
+                  "Id": {
+                    "S": "{% $states.input.detail.object.key %}"
+                  }
+                },
+                "TableName": "${CatalogTable}",
+                "UpdateExpression": "set detectedText=:t"
+              },
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "End": true,
+      "Type": "Parallel"
+    },
+    "Moderatoren benachrichtigen": {
+      "End": true,
+      "Arguments": {
+        "Message": "{% $states.input %}",
+        "TopicArn": "${ModeratorSNSTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Unpassende Inhalte entdeckt?": {
+      "Choices": [
+        {
+          "Next": "Moderatoren benachrichtigen",
+          "Condition": "{% $exists($states.input.moderationResult.ModerationLabels[0]) = true %}"
+        }
+      ],
+      "Default": "Bild verarbeiten",
+      "Type": "Choice"
+    }
+  }
+}

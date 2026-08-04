@@ -1,0 +1,104 @@
+{
+  "Comment": "A sample state machine called from AWS CodePipeline that deploys a Lambda function through Cloudformation",
+  "StartAt": "Check Stack Existence",
+  "States": {
+    "Change Set Created?": {
+      "Choices": [
+        {
+          "Next": "Inspect Change Set Changes",
+          "Condition": "{% $states.input.changeSetCreationStatus = 'complete' %}"
+        }
+      ],
+      "Default": "Wait Change Set Creation",
+      "Type": "Choice"
+    },
+    "Check Stack Existence": {
+      "Next": "Does Stack Exist?",
+      "Resource": "${CheckStackExistsStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Create Change Set": {
+      "Next": "Wait Change Set Creation",
+      "Resource": "${CreateChangeSetStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Create Stack": {
+      "Next": "Wait Stack Creation",
+      "Resource": "${CreateStackStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Delete Change Set": {
+      "Next": "Deployment Failed",
+      "Resource": "${ExecuteChangeSetStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Deployment Failed": {
+      "Cause": "Deployment Failed",
+      "Error": "Deployment Failed",
+      "Type": "Fail"
+    },
+    "Deployment Succeeded": {
+      "Type": "Succeed"
+    },
+    "Does Stack Exist?": {
+      "Choices": [
+        {
+          "Next": "Create Stack",
+          "Condition": "{% $states.input.doesStackExists = false %}"
+        }
+      ],
+      "Default": "Create Change Set",
+      "Type": "Choice"
+    },
+    "Execute Change Set": {
+      "Next": "Deployment Succeeded",
+      "Resource": "${ExecuteChangeSetStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Get Change Set Creation Status": {
+      "Next": "Change Set Created?",
+      "Resource": "${CheckChangeSetCreationStatusStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Get Stack Creation Status": {
+      "Next": "Stack Created?",
+      "Resource": "${CheckStackCreationStatusStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Inspect Change Set Changes": {
+      "Next": "Safe to Update Infra?",
+      "Resource": "${InspectChangeSetStateMachineTask.Arn}",
+      "Type": "Task"
+    },
+    "Safe to Update Infra?": {
+      "Choices": [
+        {
+          "Next": "Execute Change Set",
+          "Condition": "{% $states.input.changeSetAction = 'CAN-SAFELY-UPDATE-EXISTING-STACK' %}"
+        }
+      ],
+      "Default": "Delete Change Set",
+      "Type": "Choice"
+    },
+    "Stack Created?": {
+      "Choices": [
+        {
+          "Next": "Deployment Succeeded",
+          "Condition": "{% $states.input.stackCreationStatus = 'complete' %}"
+        }
+      ],
+      "Default": "Wait Stack Creation",
+      "Type": "Choice"
+    },
+    "Wait Change Set Creation": {
+      "Next": "Get Change Set Creation Status",
+      "Seconds": 10,
+      "Type": "Wait"
+    },
+    "Wait Stack Creation": {
+      "Next": "Get Stack Creation Status",
+      "Seconds": 10,
+      "Type": "Wait"
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "Comment": "v3 - Check dimensions/file type",
+  "StartAt": "Check Dimensions",
+  "States": {
+    "Check Dimensions": {
+      "Next": "Dimensions Result?",
+      "Resource": "${DimensionsFunctionArn}",
+      "Type": "Task"
+    },
+    "Dimensions Result?": {
+      "Choices": [
+        {
+          "Next": "Moderator",
+          "Condition": "{% $states.input.dimensionsResult = true %}"
+        },
+        {
+          "Next": "RecordFailState",
+          "Condition": "{% $states.input.dimensionsResult = false %}"
+        }
+      ],
+      "Default": "RecordFailState",
+      "Type": "Choice"
+    },
+    "Moderation Result?": {
+      "Choices": [
+        {
+          "Next": "Resizer",
+          "Condition": "{% $states.input.moderationResult = true %}"
+        },
+        {
+          "Next": "RecordFailState",
+          "Condition": "{% $states.input.moderationResult = false %}"
+        }
+      ],
+      "Default": "RecordFailState",
+      "Type": "Choice"
+    },
+    "Moderator": {
+      "Next": "Moderation Result?",
+      "Resource": "${ModeratorFunctionArn}",
+      "Type": "Task"
+    },
+    "Publish": {
+      "End": true,
+      "Arguments": {
+        "FunctionName": "${PublishFunctionArn}",
+        "Payload": {
+          "Input": "{% $states.input %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Type": "Task"
+    },
+    "RecordFailState": {
+      "End": true,
+      "Arguments": {
+        "ExpressionAttributeValues": {
+          ":detail": {
+            "S": "{% $states.input.workflowDetail %}"
+          },
+          ":newStatus": {
+            "S": "REJECTED"
+          }
+        },
+        "Key": {
+          "PK": {
+            "S": "workflow"
+          },
+          "SK": {
+            "S": "{% $states.input.detail.ID %}"
+          }
+        },
+        "TableName": "${DDBTable}",
+        "UpdateExpression": "set objStatus = :newStatus, detail = :detail"
+      },
+      "Resource": "${DDBUpdateItem}",
+      "Type": "Task"
+    },
+    "Resizer": {
+      "Next": "Publish",
+      "Resource": "${ResizerFunctionArn}",
+      "Type": "Task"
+    }
+  }
+}

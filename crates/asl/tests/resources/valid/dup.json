@@ -1,0 +1,23 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "P",
+  "States": {
+    "P": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Success",
+          "States": {
+            "Success": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      ],
+      "Next": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

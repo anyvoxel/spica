@@ -1,0 +1,8 @@
+[package]
+name = "spica"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+spica-asl.workspace = true

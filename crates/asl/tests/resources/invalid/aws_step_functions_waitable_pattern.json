@@ -1,0 +1,74 @@
+{
+  "Comment": "An example of the Amazon States Language using wait states",
+  "StartAt": "SetInitialStatus",
+  "States": {
+    "SetFinalStatus": {
+      "End": true,
+      "Arguments": {
+        "ExpressionAttributeValues": {
+          ":newStatus": {
+            "S": "COMPLETED"
+          },
+          ":newTimestamp": {
+            "S": "{% $states.context.State.EnteredTime %}"
+          }
+        },
+        "Key": {
+          "Id": {
+            "S": "{% $states.input.Id %}"
+          }
+        },
+        "TableName": "${DDBTable}",
+        "UpdateExpression": "SET ProcessStatus = :newStatus, LastUpdated = :newTimestamp"
+      },
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Retry": [
+        {
+          "BackoffRate": 10,
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 20,
+          "MaxAttempts": 5
+        }
+      ],
+      "Type": "Task"
+    },
+    "SetInitialStatus": {
+      "Next": "WaitUntil",
+      "Arguments": {
+        "Item": {
+          "Id": {
+            "S": "{% $states.input.Id %}"
+          },
+          "LastUpdated": {
+            "S": "{% $states.context.State.EnteredTime %}"
+          },
+          "ProcessStatus": {
+            "S": "STARTED"
+          },
+          "StartActionAt": {
+            "S": "{% $states.input.StartTimestamp %}"
+          }
+        },
+        "TableName": "${DDBTable}"
+      },
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Retry": [
+        {
+          "BackoffRate": 10,
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 20,
+          "MaxAttempts": 5
+        }
+      ],
+      "Type": "Task"
+    },
+    "WaitUntil": {
+      "Next": "SetFinalStatus",
+      "Type": "Wait"
+    }
+  }
+}

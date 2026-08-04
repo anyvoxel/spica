@@ -1,0 +1,36 @@
+{
+  "Comment": "An example of the Amazon States Language using a parallel state to execute two branches at the same time.",
+  "StartAt": "Parallel",
+  "States": {
+    "Notify": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Parallel": {
+      "Branches": [
+        {
+          "StartAt": "Isolate",
+          "States": {
+            "Isolate": {
+              "End": true,
+              "Resource": "${IsolatorFunctionArn}",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "Snapshot",
+          "States": {
+            "Snapshot": {
+              "End": true,
+              "Resource": "${SnapshotFunctionArn}",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "Notify",
+      "Type": "Parallel"
+    }
+  }
+}

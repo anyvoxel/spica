@@ -1,0 +1,60 @@
+{
+  "StartAt": "CreateStackSetInstances",
+  "States": {
+    "CreateStackSetInstances": {
+      "End": true,
+      "ItemProcessor": {
+        "StartAt": "CreateUpdateDeleteStackInstances",
+        "States": {
+          "CreateUpdateDeleteStackInstances": {
+            "Next": "VerifyStackInstanceStatus",
+            "Resource": "CreateUpdateDeleteStackInstances.Arn",
+            "Retry": [
+              {
+                "BackoffRate": 1.1,
+                "ErrorEquals": [
+                  "OperationInProgressException",
+                  "ClientError"
+                ],
+                "IntervalSeconds": 120,
+                "MaxAttempts": 30
+              }
+            ],
+            "Type": "Task"
+          },
+          "Done": {
+            "End": true,
+            "Type": "Pass"
+          },
+          "IsStackSetInstanceReady": {
+            "Choices": [
+              {
+                "Next": "VerifyStackInstanceStatus",
+                "Condition": "{% $states.input.stackset_instance_ready = false %}"
+              }
+            ],
+            "Default": "Done",
+            "Type": "Choice"
+          },
+          "VerifyStackInstanceStatus": {
+            "Next": "IsStackSetInstanceReady",
+            "Resource": "VerifyStackInstanceStatus.Arn",
+            "Retry": [
+              {
+                "BackoffRate": 1.1,
+                "ErrorEquals": [
+                  "OperationInProgressException",
+                  "ClientError"
+                ],
+                "IntervalSeconds": 120,
+                "MaxAttempts": 30
+              }
+            ],
+            "Type": "Task"
+          }
+        }
+      },
+      "Type": "Map"
+    }
+  }
+}

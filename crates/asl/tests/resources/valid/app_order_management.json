@@ -1,0 +1,265 @@
+{
+  "Comment": "Handle new order events complete shipping.",
+  "StartAt": "Validate Input",
+  "States": {
+    "Do Fraud Check": {
+      "Choices": [
+        {
+          "Next": "Notify Fraudulent Customer",
+          "Condition": "{% $states.input.status = 'fraudulent' %}"
+        }
+      ],
+      "Default": "Notify New Order",
+      "Type": "Choice"
+    },
+    "Get Customer Status": {
+      "Next": "Do Fraud Check",
+      "Arguments": {
+        "FunctionName": "${LambdaGetCustomerStatus}",
+        "Payload": "{% $states.input.detail.customer %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        },
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5
+        }
+      ],
+      "Type": "Task"
+    },
+    "Initate Packaging and Shipping": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "Next": "Notify Packaging and Shipping Failed"
+        }
+      ],
+      "Next": "Notify Successful Shipping",
+      "Arguments": {
+        "MessageBody": {
+          "order_detail": "{% $states.context.Execution.Input.detail %}",
+          "reservations": "{% $states.input.reservations %}",
+          "token": "{% $states.context.Task.Token %}"
+        },
+        "QueueUrl": "${PackageAndShipQueue}"
+      },
+      "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+      "TimeoutSeconds": 10800,
+      "Type": "Task"
+    },
+    "Notify Fraudulent Customer": {
+      "Next": "Order Shipping Failed",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "error_message": "FraudulentCustomer",
+              "order_event": "{% $states.context.Execution.Input %}",
+              "workflow_id": "{% $states.context.Execution.Id %}"
+            },
+            "DetailType": "OrderShippingFailed",
+            "EventBusName": "${EventBusName}",
+            "Source": "com.orders.shipping"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "Notify Invalid Input": {
+      "Next": "Order Shipping Failed",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "error_message": "InvalidInput",
+              "order_event": "{% $states.context.Execution.Input %}",
+              "workflow_id": "{% $states.context.Execution.Id %}"
+            },
+            "DetailType": "OrderShippingFailed",
+            "EventBusName": "${EventBusName}",
+            "Source": "com.orders.shipping"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Retry": [
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3
+        }
+      ],
+      "Type": "Task"
+    },
+    "Notify New Order": {
+      "Next": "Reserve Products",
+      "Arguments": {
+        "Message": "{% $states.context.Execution.Input %}",
+        "TopicArn": "${SnsNewOrderTopic}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Notify Packaging and Shipping Failed": {
+      "Next": "Order Shipping Failed",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "error_details": "{% $states.input.errors %}",
+              "error_message": "PackagingAndShippingFailed",
+              "order_event": "{% $states.context.Execution.Input %}",
+              "workflow_id": "{% $states.context.Execution.Id %}"
+            },
+            "DetailType": "OrderShippingFailed",
+            "EventBusName": "${EventBusName}",
+            "Source": "com.orders.shipping"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "Notify Products Reserved": {
+      "Next": "Initate Packaging and Shipping",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "order_id": "{% $states.context.Execution.Input.detail.order_id %}",
+              "workflow_id": "{% $states.context.Execution.Id %}"
+            },
+            "DetailType": "OrderShippingProductsReserved",
+            "EventBusName": "${EventBusName}",
+            "Source": "com.orders.shipping"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "Notify Successful Shipping": {
+      "Next": "Order Shipped Successfully",
+      "Arguments": {
+        "Entries": [
+          {
+            "Detail": {
+              "order_event": "{% $states.context.Execution.Input %}",
+              "workflow_id": "{% $states.context.Execution.Id %}"
+            },
+            "DetailType": "ShippingSuccessful",
+            "EventBusName": "${EventBusName}",
+            "Source": "com.orders.shipping"
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Type": "Task"
+    },
+    "Order Shipped Successfully": {
+      "Type": "Succeed"
+    },
+    "Order Shipping Failed": {
+      "Error": "order_shipping_failed",
+      "Type": "Fail"
+    },
+    "Reserve Products": {
+      "ItemProcessor": {
+        "StartAt": "Reserve Product",
+        "States": {
+          "Choice": {
+            "Choices": [
+              {
+                "Next": "Notify Delayed",
+                "Condition": "{% $states.input.reservation_status = 'temporarily-unavailable' %}"
+              }
+            ],
+            "Default": "Reservation Successful",
+            "Type": "Choice"
+          },
+          "Notify Delayed": {
+            "Next": "Wait for availability",
+            "Arguments": {
+              "Entries": [
+                {
+                  "Detail": {
+                    "delay_reason": "Product Temporarily Un-Available",
+                    "order_id": "{% $states.context.Execution.Input.detail.order_id %}",
+                    "product_id": "{% $states.input.product_id %}",
+                    "workflow_id": "{% $states.context.Execution.Id %}"
+                  },
+                  "DetailType": "OrderShippingDelayed",
+                  "EventBusName": "${EventBusName}",
+                  "Source": "com.orders.shipping"
+                }
+              ]
+            },
+            "Resource": "arn:aws:states:::events:putEvents",
+            "Type": "Task"
+          },
+          "Reservation Successful": {
+            "Type": "Succeed"
+          },
+          "Reserve Product": {
+            "Next": "Choice",
+            "Arguments": {
+              "FunctionName": "${LambdaReserveProduct}",
+              "Payload": "{% $states.input %}"
+            },
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "Type": "Task"
+          },
+          "Wait for availability": {
+            "Next": "Reserve Product",
+            "Seconds": 10,
+            "Type": "Wait"
+          }
+        }
+      },
+      "Next": "Notify Products Reserved",
+      "Type": "Map"
+    },
+    "Validate Input": {
+      "Choices": [
+        {
+          "Next": "Notify Invalid Input",
+          "Condition": "{% (false) or (false) or (false) %}"
+        }
+      ],
+      "Default": "Get Customer Status",
+      "Type": "Choice"
+    }
+  }
+}

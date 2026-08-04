@@ -1,0 +1,19 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "Catch": [
+        {
+          "ErrorEquals": [],
+          "Next": "x"
+        }
+      ],
+      "End": true,
+      "Resource": "foo:bar",
+      "Type": "Task"
+    },
+    "x": {
+      "Type": "Fail"
+    }
+  }
+}

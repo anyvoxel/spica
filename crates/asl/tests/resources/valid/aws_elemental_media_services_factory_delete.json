@@ -1,0 +1,85 @@
+{
+  "Comment": "An example of the MediaLive to MediaPackage workflow",
+  "StartAt": "MediaLiveFindChannel",
+  "States": {
+    "Done": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "IsMediaLiveChannelIdle": {
+      "Choices": [
+        {
+          "Next": "MediaLiveDeleteChannel",
+          "Condition": "{% $states.input.medialive.channel.State = 'IDLE' %}"
+        }
+      ],
+      "Default": "WaitForChannelIdleState",
+      "Type": "Choice"
+    },
+    "IsMediaLiveInputDetached": {
+      "Choices": [
+        {
+          "Next": "MediaLiveDeleteInput",
+          "Condition": "{% $states.input.medialive.input.State = 'DETACHED' %}"
+        }
+      ],
+      "Default": "WaitForInputDetachedState",
+      "Type": "Choice"
+    },
+    "MediaLiveDeleteChannel": {
+      "Next": "WaitForInputDetachedState",
+      "Resource": "${medialiveDeleteChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveDeleteInput": {
+      "Next": "Done",
+      "Resource": "${medialiveDeleteInputArn}",
+      "Type": "Task"
+    },
+    "MediaLiveDescribeChannel": {
+      "Next": "IsMediaLiveChannelIdle",
+      "Resource": "${medialiveDescribeChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveDescribeInput": {
+      "Next": "IsMediaLiveInputDetached",
+      "Resource": "${medialiveDescribeInputArn}",
+      "Type": "Task"
+    },
+    "MediaLiveFindChannel": {
+      "Next": "MediaLiveStopChannel",
+      "Resource": "${medialiveFindChannelArn}",
+      "Type": "Task"
+    },
+    "MediaLiveStopChannel": {
+      "Next": "SystemsManagerDeleteParameters",
+      "Resource": "${medialiveStopChannelArn}",
+      "Type": "Task"
+    },
+    "MediaPackageDeleteChannel": {
+      "Next": "WaitForChannelIdleState",
+      "Resource": "${mediapackageDeleteChannelArn}",
+      "Type": "Task"
+    },
+    "MediaPackageDeleteEndpoints": {
+      "Next": "MediaPackageDeleteChannel",
+      "Resource": "${mediapackageDeleteEndpointsArn}",
+      "Type": "Task"
+    },
+    "SystemsManagerDeleteParameters": {
+      "Next": "MediaPackageDeleteEndpoints",
+      "Resource": "${systemsmanagerDeleteParametersArn}",
+      "Type": "Task"
+    },
+    "WaitForChannelIdleState": {
+      "Next": "MediaLiveDescribeChannel",
+      "Seconds": 1,
+      "Type": "Wait"
+    },
+    "WaitForInputDetachedState": {
+      "Next": "MediaLiveDescribeInput",
+      "Seconds": 1,
+      "Type": "Wait"
+    }
+  }
+}

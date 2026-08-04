@@ -1,0 +1,63 @@
+{
+  "StartAt": "Start Athena Query",
+  "States": {
+    "Done": {
+      "Type": "Succeed"
+    },
+    "Get Query Results": {
+      "Next": "Map State",
+      "Arguments": {
+        "QueryExecutionId": "{% $states.input.QueryExecution.QueryExecutionId %}"
+      },
+      "Resource": "arn:aws:states:::athena:getQueryResults",
+      "Type": "Task"
+    },
+    "Has More Results?": {
+      "Choices": [
+        {
+          "Next": "Prepare Next Query Params",
+          "Condition": "{% $exists($states.input.GetQueryResults.NextToken) = true %}"
+        }
+      ],
+      "Default": "Done",
+      "Type": "Choice"
+    },
+    "Map State": {
+      "ItemProcessor": {
+        "StartAt": "DoSomething",
+        "States": {
+          "DoSomething": {
+            "End": true,
+            "Type": "Pass"
+          }
+        }
+      },
+      "MaxConcurrency": 1,
+      "Next": "Has More Results?",
+      "Type": "Map"
+    },
+    "Prepare Next Query Params": {
+      "Next": "Get Query Results",
+      "Type": "Pass",
+      "Output": {
+        "NextToken": "{% $states.input.GetQueryResults.NextToken %}",
+        "QueryExecutionId": "{% $states.input.StartQueryParams.QueryExecutionId %}"
+      }
+    },
+    "Start Athena Query": {
+      "Next": "Get Query Results",
+      "Arguments": {
+        "QueryExecutionContext": {
+          "Database": "serverlessland_database"
+        },
+        "QueryString": "SELECT uri FROM cf_access_logs limit 10",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://sfnathenacdkpythonstack-athenaresultsbucket879938-kofgclbeydzu/results/"
+        }
+      },
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Type": "Task"
+    }
+  },
+  "TimeoutSeconds": 3600
+}

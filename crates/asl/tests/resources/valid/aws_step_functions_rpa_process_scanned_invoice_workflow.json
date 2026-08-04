@@ -1,0 +1,96 @@
+{
+  "Comment": "A state machine that starts a workflow and monitors the workflow until it completes.",
+  "StartAt": "Did Analyze Document Job Complete Successfully?",
+  "States": {
+    "Analyze Document Job Failed": {
+      "Cause": "Textract Job Failed",
+      "Error": "Analyze Document Job returned FAILED",
+      "Type": "Fail"
+    },
+    "Archive Document": {
+      "Next": "Document Processed",
+      "Resource": "${ArchiveDocumentLambdaArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3
+        }
+      ],
+      "Type": "Task"
+    },
+    "Did Analyze Document Job Complete Successfully?": {
+      "Choices": [
+        {
+          "Next": "Save Document Analysis",
+          "Condition": "{% $states.input.status = 'SUCCEEDED' %}"
+        },
+        {
+          "Next": "Analyze Document Job Failed",
+          "Condition": "{% $states.input.status = 'FAILED' %}"
+        }
+      ],
+      "Default": "Analyze Document Job Failed",
+      "Type": "Choice"
+    },
+    "Document Processed": {
+      "Type": "Succeed"
+    },
+    "Is Approved for Payment?": {
+      "Choices": [
+        {
+          "Next": "Archive Document",
+          "Condition": "{% $states.input.payment_info.status = 'Approved for Payment' %}"
+        },
+        {
+          "Next": "Review Document",
+          "Condition": "{% $states.input.payment_info.status = 'Pending Review' %}"
+        }
+      ],
+      "Default": "Review Document",
+      "Type": "Choice"
+    },
+    "Process Document Analysis": {
+      "Next": "Is Approved for Payment?",
+      "Resource": "${ProcessDocumentAnalysisLambdaArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3
+        }
+      ],
+      "Type": "Task"
+    },
+    "Review Document": {
+      "Next": "Document Processed",
+      "Arguments": {
+        "Message": "{% $states.input %}",
+        "TopicArn": "${PendingReviewTopicArn}"
+      },
+      "Resource": "arn:aws:states:::sns:publish",
+      "Type": "Task"
+    },
+    "Save Document Analysis": {
+      "Next": "Process Document Analysis",
+      "Resource": "${SaveDocumentAnalysisLambdaArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}

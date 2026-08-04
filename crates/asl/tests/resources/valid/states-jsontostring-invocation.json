@@ -1,0 +1,13 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Arguments": {
+        "abc": "{% States.JsonToString($.xyz) %}"
+      },
+      "Resource": "foo:bar",
+      "Type": "Task"
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "Comment": "Video",
+  "StartAt": "CreateVocabularyFilter",
+  "States": {
+    "CreateVocabularyFilter": {
+      "Next": "Wait for Creating Filter",
+      "Arguments": {
+        "LanguageCode": "en-US",
+        "VocabularyFilterName": "badWordFilter",
+        "Words": [
+          "mug",
+          "fucking"
+        ]
+      },
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:createVocabularyFilter",
+      "Type": "Task"
+    },
+    "Fail": {
+      "Type": "Fail"
+    },
+    "GetObject": {
+      "Comment": "Get Transcribed json file",
+      "Next": "PutObject",
+      "Arguments": {
+        "Bucket": "bucket-776177632559-us-east-1-transcript-results",
+        "Key": "temp.json"
+      },
+      "Resource": "arn:aws:states:us-east-1:776177632559:aws-sdk:s3:getObject",
+      "Type": "Task"
+    },
+    "GetTranscriptionJobStatus": {
+      "Next": "TranscriptionJobStatus",
+      "Arguments": {
+        "TranscriptionJobName": "{% $states.input.TranscriptionJob.TranscriptionJobName %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+      "Type": "Task"
+    },
+    "PutObject": {
+      "Comment": "extract transcription text in json file",
+      "End": true,
+      "Arguments": {
+        "Body": "{% $states.input.transcription.filecontent.results.transcripts[0].transcript %}",
+        "Bucket": "bucket-776177632559-us-east-1-transcript-results",
+        "Key": "transcript.txt"
+      },
+      "Resource": "arn:aws:states:us-east-1:776177632559:aws-sdk:s3:putObject",
+      "Type": "Task"
+    },
+    "StartTranscriptionJob": {
+      "Comment": "Start a transcribe job on the provided media file",
+      "Next": "Wait for Starting Job",
+      "Arguments": {
+        "LanguageCode": "en-US",
+        "Media": {
+          "MediaFileUri": "{% States.Format('s3://{}/{}', $.detail.bucket.name, $.detail.object.key) %}"
+        },
+        "OutputBucketName": "bucket-776177632559-us-east-1-transcript-results",
+        "OutputKey": "temp.json",
+        "Settings": {
+          "VocabularyFilterMethod": "mask",
+          "VocabularyFilterName": "badWordFilter"
+        },
+        "TranscriptionJobName": "{% $states.context.Execution.Name %}"
+      },
+      "Resource": "arn:aws:states:us-east-1:776177632559:aws-sdk:transcribe:startTranscriptionJob",
+      "Type": "Task"
+    },
+    "TranscriptionJobStatus": {
+      "Choices": [
+        {
+          "Next": "GetObject",
+          "Condition": "{% $states.input.TranscriptionJob.TranscriptionJobStatus = 'COMPLETED' %}"
+        },
+        {
+          "Next": "Fail",
+          "Condition": "{% $states.input.TranscriptionJob.TranscriptionJobStatus = 'FAILED' %}"
+        }
+      ],
+      "Default": "Wait for Starting Job",
+      "Type": "Choice"
+    },
+    "Wait for Creating Filter": {
+      "Next": "StartTranscriptionJob",
+      "Seconds": 20,
+      "Type": "Wait"
+    },
+    "Wait for Starting Job": {
+      "Next": "GetTranscriptionJobStatus",
+      "Seconds": 10,
+      "Type": "Wait"
+    }
+  }
+}

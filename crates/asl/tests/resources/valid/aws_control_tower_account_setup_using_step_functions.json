@@ -1,0 +1,107 @@
+{
+  "StartAt": "Account",
+  "States": {
+    "Account": {
+      "Next": "DescribeRegions",
+      "Resource": "AccountFunction.Arn",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 20,
+      "Type": "Task"
+    },
+    "AllRegions": {
+      "ItemProcessor": {
+        "StartAt": "Regional",
+        "States": {
+          "Regional": {
+            "End": true,
+            "Resource": "RegionalFunction.Arn",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "TimeoutSeconds": 20,
+            "Type": "Task"
+          }
+        }
+      },
+      "MaxConcurrency": 0,
+      "Next": "SSOAssignment",
+      "Type": "Map"
+    },
+    "DescribeRegions": {
+      "Next": "AllRegions",
+      "Arguments": {
+        "AllRegions": false,
+        "Filters": [
+          {
+            "Name": "opt-in-status",
+            "Values": [
+              "opt-in-not-required"
+            ]
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeRegions",
+      "Type": "Task"
+    },
+    "SSOAssignment": {
+      "Next": "ServiceCatalogPortfolio",
+      "Resource": "SSOAssignmentFunction.Arn",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 300,
+      "Type": "Task"
+    },
+    "ServiceCatalogPortfolio": {
+      "End": true,
+      "Resource": "ServiceCatalogPortfolioFunction.Arn",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "TimeoutSeconds": 300,
+      "Type": "Task"
+    }
+  }
+}

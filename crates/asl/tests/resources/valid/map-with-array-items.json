@@ -1,0 +1,23 @@
+{
+  "Comment": "Map state using a literal array Items field",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": [
+        { "orderId": 1 },
+        { "orderId": 2 }
+      ],
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

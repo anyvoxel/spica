@@ -1,0 +1,217 @@
+{
+  "Comment": "A statemachine for running the main loop of tests ",
+  "StartAt": "VerifyInput",
+  "States": {
+    "BuildBatches": {
+      "Next": "RunTests",
+      "Arguments": {
+        "FunctionName": "${FunctionBuildList}",
+        "Payload": {
+          "execution_name": "{% $states.context.Execution.Name %}",
+          "iteration_count": "{% $states.input.iteration_count %}"
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 15
+        }
+      ],
+      "TimeoutSeconds": 905,
+      "Type": "Task"
+    },
+    "GenerateDefaultInput": {
+      "Next": "RecordTestRunStart",
+      "Type": "Pass",
+      "Output": {
+        "iteration_count": 1
+      }
+    },
+    "GetTestRunReport": {
+      "Next": "RecordTestRunComplete",
+      "Arguments": {
+        "FunctionName": "${LambdaGetTestRunReport}",
+        "Payload": {
+          "Input": {
+            "event_run_id": "{% $states.context.Execution.Id %}",
+            "table_name": "${TableTestResults}"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 15
+        }
+      ],
+      "TimeoutSeconds": 305,
+      "Type": "Task"
+    },
+    "RecordTestRunComplete": {
+      "End": true,
+      "Arguments": {
+        "Item": {
+          "EndTime": {
+            "S": "{% $states.context.State.EnteredTime %}"
+          },
+          "IterationCount": {
+            "N": "{% States.Format('{}',$.stateoutput.GetTestRunReport.Payload.summary.test_count) %}"
+          },
+          "StartTime": {
+            "S": "{% $states.context.Execution.StartTime %}"
+          },
+          "Status": {
+            "S": "Complete"
+          },
+          "TestRunId": {
+            "S": "{% $states.context.Execution.Id %}"
+          }
+        },
+        "TableName": "${TableTestRuns}"
+      },
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 15
+        }
+      ],
+      "TimeoutSeconds": 305,
+      "Type": "Task"
+    },
+    "RecordTestRunStart": {
+      "Next": "BuildBatches",
+      "Arguments": {
+        "Item": {
+          "EndTime": {
+            "S": ""
+          },
+          "IterationCount": {
+            "N": "{% States.Format('{}',$.iteration_count) %}"
+          },
+          "StartTime": {
+            "S": "{% $states.context.Execution.StartTime %}"
+          },
+          "Status": {
+            "S": "Started"
+          },
+          "TestRunId": {
+            "S": "{% $states.context.Execution.Id %}"
+          }
+        },
+        "TableName": "${TableTestRuns}"
+      },
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 15
+        }
+      ],
+      "TimeoutSeconds": 305,
+      "Type": "Task"
+    },
+    "RunTests": {
+      "ItemProcessor": {
+        "StartAt": "GetBatchInfo",
+        "States": {
+          "ClearResults": {
+            "End": true,
+            "Type": "Pass"
+          },
+          "GetBatchInfo": {
+            "Next": "RunDistributorStateMachine",
+            "Arguments": {
+              "FunctionName": "${FunctionGetBatcheFromS3}",
+              "Payload": {
+                "batch_id": "{% $states.input.batch_id %}",
+                "s3_bucket": "{% $states.input.s3_bucket %}",
+                "s3_key": "{% $states.input.s3_key %}"
+              }
+            },
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "MaxAttempts": 15
+              }
+            ],
+            "TimeoutSeconds": 305,
+            "Type": "Task"
+          },
+          "RunDistributorStateMachine": {
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "Next": "ClearResults"
+              }
+            ],
+            "Next": "ClearResults",
+            "Arguments": {
+              "Input": {
+                "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID": "{% $states.context.Execution.Id %}",
+                "test-run-id": "{% $states.context.Execution.Id %}",
+                "tests-to-run": "{% $states.input.stateoutputs.GetBatchInfo.Payload.tests-to-run %}"
+              },
+              "Name": "{% States.Format('{}_batch{}',$$.Execution.Name,$['stateoutputs']['GetBatchInfo']['Payload']['batchnumber']) %}",
+              "StateMachineArn": "${StateMachineDistributor}"
+            },
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Retry": [
+              {
+                "BackoffRate": 5,
+                "ErrorEquals": [
+                  "StepFunctions.ExecutionAlreadyExistsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 1
+              },
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 12
+              }
+            ],
+            "Type": "Task"
+          }
+        }
+      },
+      "MaxConcurrency": 0,
+      "Next": "GetTestRunReport",
+      "Type": "Map"
+    },
+    "VerifyInput": {
+      "Choices": [
+        {
+          "Next": "RecordTestRunStart",
+          "Condition": "{% (% $exists($states.input.iteration_count) = true %) and (% $type($states.input.iteration_count) = 'number' %) %}"
+        }
+      ],
+      "Default": "GenerateDefaultInput",
+      "Type": "Choice"
+    }
+  }
+}

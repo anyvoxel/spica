@@ -1,0 +1,151 @@
+{
+  "Comment": "Synchronize two Amazon S3 buckets.",
+  "StartAt": "FindBucketRegions",
+  "States": {
+    "BucketRegionsNotEqualFailure": {
+      "Cause": "The source and destination buckets have different regions. This is currently not supported.",
+      "Error": "BucketRegionsNotEqualError",
+      "Type": "Fail"
+    },
+    "CombineRegionOutputs": {
+      "Next": "ValidateInput",
+      "Resource": "combine_dicts",
+      "TimeoutSeconds": 15,
+      "Type": "Task"
+    },
+    "ConfirmInputValid": {
+      "Choices": [
+        {
+          "Next": "ProcessBuckets",
+          "Condition": "{% $states.input.regionsAreSame = true %}"
+        }
+      ],
+      "Default": "BucketRegionsNotEqualFailure",
+      "Type": "Choice"
+    },
+    "FindBucketRegions": {
+      "Branches": [
+        {
+          "StartAt": "FindRegionForSourceBucket",
+          "States": {
+            "FindRegionForSourceBucket": {
+              "End": true,
+              "Resource": "get_bucket_location",
+              "TimeoutSeconds": 15,
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "FindRegionForDestinationBucket",
+          "States": {
+            "FindRegionForDestinationBucket": {
+              "End": true,
+              "Resource": "get_bucket_location",
+              "TimeoutSeconds": 15,
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "CombineRegionOutputs",
+      "Type": "Parallel"
+    },
+    "ProcessBuckets": {
+      "Branches": [
+        {
+          "StartAt": "InjectSourceBucket",
+          "States": {
+            "CopySourceKeys": {
+              "Next": "EvaluateCopyListToken",
+              "Resource": "copy_keys",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.Unknown",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 0,
+                  "MaxAttempts": 3
+                }
+              ],
+              "TimeoutSeconds": 305,
+              "Type": "Task"
+            },
+            "EvaluateCopyListToken": {
+              "Choices": [
+                {
+                  "Next": "UpdateSourceKeyList",
+                  "Condition": "{% not(% $states.input.listResult.token = '' %) %}"
+                }
+              ],
+              "Default": "FinishCopyBranch",
+              "Type": "Choice"
+            },
+            "FinishCopyBranch": {
+              "End": true,
+              "Type": "Pass"
+            },
+            "InjectSourceBucket": {
+              "Next": "UpdateSourceKeyList",
+              "Type": "Pass"
+            },
+            "UpdateSourceKeyList": {
+              "Next": "CopySourceKeys",
+              "Resource": "list_bucket",
+              "TimeoutSeconds": 65,
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "InjectDestinationBucket",
+          "States": {
+            "DeleteOrphanedKeys": {
+              "Next": "EvaluateDestinationListToken",
+              "Resource": "delete_orphaned_keys",
+              "TimeoutSeconds": 305,
+              "Type": "Task"
+            },
+            "EvaluateDestinationListToken": {
+              "Choices": [
+                {
+                  "Next": "UpdateDestinationKeyList",
+                  "Condition": "{% not(% $states.input.listResult.token = '' %) %}"
+                }
+              ],
+              "Default": "FinishDeleteBranch",
+              "Type": "Choice"
+            },
+            "FinishDeleteBranch": {
+              "End": true,
+              "Type": "Pass"
+            },
+            "InjectDestinationBucket": {
+              "Next": "UpdateDestinationKeyList",
+              "Type": "Pass"
+            },
+            "UpdateDestinationKeyList": {
+              "Next": "DeleteOrphanedKeys",
+              "Resource": "list_bucket",
+              "TimeoutSeconds": 65,
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "Success",
+      "Type": "Parallel"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "ValidateInput": {
+      "Next": "ConfirmInputValid",
+      "Resource": "validate_input",
+      "TimeoutSeconds": 15,
+      "Type": "Task"
+    }
+  },
+  "TimeoutSeconds": 1800
+}

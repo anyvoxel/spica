@@ -1,0 +1,76 @@
+{
+  "Comment": "Scatter Gather State Machine for Amazon Location Service",
+  "StartAt": "Scatter Function",
+  "States": {
+    "Gather Function": {
+      "End": true,
+      "Arguments": {
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "${GatherFunctionArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    },
+    "Process": {
+      "ItemProcessor": {
+        "StartAt": "Process Function",
+        "States": {
+          "Process Function": {
+            "End": true,
+            "Arguments": {
+              "Payload": "{% $states.input %}"
+            },
+            "Resource": "${ProcessFunctionArn}",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "Type": "Task"
+          }
+        }
+      },
+      "MaxConcurrency": 100,
+      "Next": "Gather Function",
+      "Type": "Map"
+    },
+    "Scatter Function": {
+      "Next": "Process",
+      "Arguments": {
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "${ScatterFunctionArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}

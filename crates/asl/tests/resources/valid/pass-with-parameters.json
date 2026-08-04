@@ -1,0 +1,10 @@
+{
+  "StartAt": "p",
+  "States": {
+    "p": {
+      "End": true,
+      "Type": "Pass",
+      "Output": "I'm a parameter!"
+    }
+  }
+}

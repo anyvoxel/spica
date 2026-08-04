@@ -1,0 +1,171 @@
+{
+  "StartAt": "PreparePollerJob",
+  "States": {
+    "PollerJobComplete": {
+      "Comment": "Used for result aggregation",
+      "End": true,
+      "Type": "Pass"
+    },
+    "PreparePollerJob": {
+      "Comment": "Check the level of parallelism, split requests into chunks and invoke lamndas",
+      "Next": "ProcessPollerTasks",
+      "Arguments": {
+        "FunctionName": "${WorkflowPreparePollerJobFunction}",
+        "Payload": "{% $states.input %}"
+      },
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Retry": [
+        {
+          "BackoffRate": 1,
+          "ErrorEquals": [
+            "RetriablePollerError"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        }
+      ],
+      "Type": "Task"
+    },
+    "ProcessPollerTasks": {
+      "ItemProcessor": {
+        "StartAt": "ReportProgress",
+        "States": {
+          "ChooseNextAction": {
+            "Choices": [
+              {
+                "Next": "FetchPayload",
+                "Condition": "{% $states.input.nextState = $states.input.taskStateMap.Started %}"
+              },
+              {
+                "Next": "SendToSQS",
+                "Condition": "{% $states.input.nextState = $states.input.taskStateMap.PayloadSaved %}"
+              },
+              {
+                "Next": "Done",
+                "Condition": "{% $states.input.nextState = $states.input.taskStateMap.Enqueued %}"
+              },
+              {
+                "Next": "Done",
+                "Condition": "{% $states.input.nextState = $states.input.taskStateMap.Failed %}"
+              }
+            ],
+            "Default": "Done",
+            "Type": "Choice"
+          },
+          "Done": {
+            "End": true,
+            "Type": "Pass",
+            "Output": {
+              "jobId": "{% $states.input.task.jobId %}",
+              "payloadLocation": "{% $states.input.payloadLocation %}",
+              "state": "{% $states.input.nextState %}",
+              "taskId": "{% $states.input.task.taskId %}"
+            }
+          },
+          "FetchPayload": {
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "OnFailure"
+              }
+            ],
+            "Next": "OnPayloadSaved",
+            "Arguments": {
+              "FunctionName": "${WorkflowFetchPayloadFunction}",
+              "Payload": "{% $states.input %}"
+            },
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Retry": [
+              {
+                "BackoffRate": 2,
+                "ErrorEquals": [
+                  "RetriablePollerError"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6
+              }
+            ],
+            "Type": "Task"
+          },
+          "OnFailure": {
+            "Next": "ReportProgress",
+            "Type": "Pass",
+            "Output": {
+              "nextState": "{% $states.input.taskStateMap.Failed %}",
+              "payloadLocation": "{% $states.input.payloadLocation %}",
+              "task": "{% $states.input.task %}",
+              "taskStateMap": "{% $states.input.taskStateMap %}"
+            }
+          },
+          "OnPayloadSaved": {
+            "Next": "ReportProgress",
+            "Type": "Pass",
+            "Output": {
+              "nextState": "{% $states.input.taskStateMap.PayloadSaved %}",
+              "payloadLocation": "{% $states.input.payloadLocation %}",
+              "task": "{% $states.input.task %}",
+              "taskStateMap": "{% $states.input.taskStateMap %}"
+            }
+          },
+          "OnSentToSQS": {
+            "Next": "ReportProgress",
+            "Type": "Pass",
+            "Output": {
+              "nextState": "{% $states.input.taskStateMap.Enqueued %}",
+              "payloadLocation": "{% $states.input.payloadLocation %}",
+              "task": "{% $states.input.task %}",
+              "taskStateMap": "{% $states.input.taskStateMap %}"
+            }
+          },
+          "ReportProgress": {
+            "Next": "ChooseNextAction",
+            "Arguments": {
+              "Item": {
+                "JobId": {
+                  "S": "{% $states.input.task.jobId %}"
+                },
+                "State": {
+                  "S": "{% $states.input.nextState %}"
+                },
+                "TaskId": {
+                  "S": "{% $states.input.task.taskId %}"
+                },
+                "TimeToLive": {
+                  "N": "{% $states.input.task.ttl %}"
+                }
+              },
+              "TableName": "${PollerTasksTable}"
+            },
+            "Resource": "${DDBPutItem}",
+            "Type": "Task"
+          },
+          "SendToSQS": {
+            "Next": "OnSentToSQS",
+            "Arguments": {
+              "MessageAttributes": {
+                "jobId": {
+                  "DataType": "String",
+                  "StringValue": "{% $states.input.task.jobId %}"
+                },
+                "taskId": {
+                  "DataType": "String",
+                  "StringValue": "{% $states.input.task.taskId %}"
+                }
+              },
+              "MessageBody": "{% $states.input %}",
+              "QueueUrl": "${ProcessPayloadQueueUrl}"
+            },
+            "Resource": "${SQSPutItem}",
+            "Type": "Task"
+          }
+        }
+      },
+      "MaxConcurrency": 25,
+      "Next": "PollerJobComplete",
+      "Type": "Map"
+    }
+  },
+  "TimeoutSeconds": 150
+}

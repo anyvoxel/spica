@@ -1,0 +1,63 @@
+{
+  "Comment": "An example state machine that plays a game of craps",
+  "StartAt": "Roll",
+  "States": {
+    "EvaluateRoll": {
+      "Next": "Outcome",
+      "Resource": "<INSERT GAME LOGIC LAMBDA ARN HERE>",
+      "Type": "Task"
+    },
+    "Loss": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Outcome": {
+      "Choices": [
+        {
+          "Next": "Win",
+          "Condition": "{% $states.input.results.outcome = 'Win' %}"
+        },
+        {
+          "Next": "Loss",
+          "Condition": "{% $states.input.results.outcome = 'Lose' %}"
+        }
+      ],
+      "Default": "Roll",
+      "Type": "Choice"
+    },
+    "Roll": {
+      "Next": "RollTwoDiceInParallel",
+      "Type": "Pass"
+    },
+    "RollTwoDiceInParallel": {
+      "Branches": [
+        {
+          "StartAt": "Dice1",
+          "States": {
+            "Dice1": {
+              "End": true,
+              "Resource": "<INSERT DICE LAMBDA ARN HERE>",
+              "Type": "Task"
+            }
+          }
+        },
+        {
+          "StartAt": "Dice2",
+          "States": {
+            "Dice2": {
+              "End": true,
+              "Resource": "<INSERT DICE LAMBDA ARN HERE>",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "EvaluateRoll",
+      "Type": "Parallel"
+    },
+    "Win": {
+      "End": true,
+      "Type": "Pass"
+    }
+  }
+}

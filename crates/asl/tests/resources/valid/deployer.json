@@ -1,0 +1,71 @@
+{
+  "Comment": "Deployer Example",
+  "StartAt": "FetchValidateCreateFn",
+  "States": {
+    "CheckHealthy": {
+      "Comment": "Is the new deploy healthy? Should we continue checking?",
+      "Next": "Healthy?",
+      "Resource": "go://localhost/CheckHealthy",
+      "Type": "Task"
+    },
+    "CheckHealthyFn": {
+      "Next": "CheckHealthy",
+      "Type": "Pass"
+    },
+    "CleanUp": {
+      "Comment": "Delete Old Resources",
+      "Next": "Success",
+      "Resource": "go://localhost/CleanUp",
+      "Type": "Task"
+    },
+    "CleanUpFailure": {
+      "Comment": "Delete Old Resources",
+      "Next": "Fail",
+      "Resource": "go://localhost/CleanUpFailure",
+      "Type": "Task"
+    },
+    "CleanUpFailureFn": {
+      "Next": "CleanUpFailure",
+      "Type": "Pass"
+    },
+    "CleanUpFn": {
+      "Next": "CleanUp",
+      "Type": "Pass"
+    },
+    "Fail": {
+      "Type": "Fail"
+    },
+    "FetchValidateCreate": {
+      "Comment": "Fetch, Validate, Create Resources",
+      "Next": "WaitForHealthy",
+      "Resource": "go://localhost/FetchValidateCreate",
+      "Type": "Task"
+    },
+    "FetchValidateCreateFn": {
+      "Next": "FetchValidateCreate",
+      "Type": "Pass"
+    },
+    "Healthy?": {
+      "Choices": [
+        {
+          "Next": "CleanUpFn",
+          "Condition": "{% $states.input.Healthy = true %}"
+        },
+        {
+          "Next": "WaitForHealthy",
+          "Condition": "{% $states.input.CheckAgain = true %}"
+        }
+      ],
+      "Default": "CleanUpFailureFn",
+      "Type": "Choice"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "WaitForHealthy": {
+      "Next": "CheckHealthyFn",
+      "Seconds": 20,
+      "Type": "Wait"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "Comment": "Map state using null for ToleratedFailureCount",
+  "StartAt": "ProcessOrders",
+  "States": {
+    "ProcessOrders": {
+      "Type": "Map",
+      "Items": [1, 2, 3],
+      "ToleratedFailureCount": null,
+      "ItemProcessor": {
+        "StartAt": "ProcessItem",
+        "States": {
+          "ProcessItem": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

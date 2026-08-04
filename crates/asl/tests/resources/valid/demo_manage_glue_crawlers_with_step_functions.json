@@ -1,0 +1,307 @@
+{
+  "StartAt": "Parallel",
+  "States": {
+    "Parallel": {
+      "Branches": [
+        {
+          "StartAt": "Daily User - Years",
+          "States": {
+            "Daily User - Per Year": {
+              "End": true,
+              "ItemProcessor": {
+                "StartAt": "Daily User - Months",
+                "States": {
+                  "Daily User - Months": {
+                    "Next": "Daily User - Per Month",
+                    "Type": "Pass",
+                    "Output": {
+                      "months": [
+                        "01",
+                        "02",
+                        "03",
+                        "04",
+                        "05",
+                        "06",
+                        "07",
+                        "08",
+                        "09",
+                        "10",
+                        "11",
+                        "12"
+                      ],
+                      "year": "{% $states.input.year %}"
+                    }
+                  },
+                  "Daily User - Per Month": {
+                    "End": true,
+                    "ItemProcessor": {
+                      "StartAt": "Daily User - Generate Days",
+                      "States": {
+                        "Daily User - Generate Days": {
+                          "Next": "Daily User - Per Day",
+                          "Type": "Pass",
+                          "Output": {
+                            "days": [
+                              "01",
+                              "02",
+                              "03",
+                              "04",
+                              "05",
+                              "06",
+                              "07",
+                              "08",
+                              "09",
+                              "10",
+                              "11",
+                              "12",
+                              "13",
+                              "14",
+                              "15",
+                              "16",
+                              "17",
+                              "18",
+                              "19",
+                              "20",
+                              "21",
+                              "22",
+                              "23",
+                              "24",
+                              "25",
+                              "26",
+                              "27"
+                            ],
+                            "month": "{% $states.input.month %}",
+                            "year": "{% $states.input.year %}"
+                          }
+                        },
+                        "Daily User - Per Day": {
+                          "End": true,
+                          "ItemProcessor": {
+                            "StartAt": "Daily User - Generate User Data",
+                            "States": {
+                              "Daily User - Create File Per User": {
+                                "End": true,
+                                "ItemProcessor": {
+                                  "StartAt": "Daily User - Create Json File Per User",
+                                  "States": {
+                                    "Daily User - Create Json File Per User": {
+                                      "End": true,
+                                      "Arguments": {
+                                        "Body": "{% $states.input.user %}",
+                                        "Bucket": "${bucket-name}",
+                                        "Key": "{% States.Format('data/daily-user-summaries/year={}/month={}/date={}-{}-{}/{}-{}-{}_{}.json',$.year,$.month,$.year,$.month,$.day,$.year,$.month,$.day,$.user.user) %}"
+                                      },
+                                      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                                      "Retry": [
+                                        {
+                                          "BackoffRate": 1.5,
+                                          "ErrorEquals": [
+                                            "States.ALL"
+                                          ],
+                                          "IntervalSeconds": 1,
+                                          "MaxAttempts": 3
+                                        }
+                                      ],
+                                      "Type": "Task"
+                                    }
+                                  }
+                                },
+                                "Type": "Map"
+                              },
+                              "Daily User - Generate User Data": {
+                                "Next": "Daily User - Create File Per User",
+                                "Type": "Pass"
+                              }
+                            }
+                          },
+                          "Type": "Map"
+                        }
+                      }
+                    },
+                    "MaxConcurrency": 1,
+                    "Type": "Map"
+                  }
+                }
+              },
+              "MaxConcurrency": 1,
+              "Type": "Map"
+            },
+            "Daily User - Years": {
+              "Next": "Daily User - Per Year",
+              "Type": "Pass"
+            }
+          }
+        },
+        {
+          "StartAt": "Locations - Years",
+          "States": {
+            "Locations - Per Year": {
+              "End": true,
+              "ItemProcessor": {
+                "StartAt": "Locations - Months",
+                "States": {
+                  "Locations - Months": {
+                    "Next": "Locations - Per Month",
+                    "Type": "Pass",
+                    "Output": {
+                      "months": [
+                        "01",
+                        "02",
+                        "03",
+                        "04",
+                        "05",
+                        "06",
+                        "07",
+                        "08",
+                        "09",
+                        "10",
+                        "11",
+                        "12"
+                      ],
+                      "year": "{% $states.input.year %}"
+                    }
+                  },
+                  "Locations - Per Month": {
+                    "End": true,
+                    "ItemProcessor": {
+                      "StartAt": "Locations - Generate Days",
+                      "States": {
+                        "Locations - Generate Days": {
+                          "Next": "Locations - Per Day",
+                          "Type": "Pass",
+                          "Output": {
+                            "days": [
+                              "01",
+                              "02",
+                              "03",
+                              "04",
+                              "05",
+                              "06",
+                              "07",
+                              "08",
+                              "09",
+                              "10",
+                              "11",
+                              "12",
+                              "13",
+                              "14",
+                              "15",
+                              "16",
+                              "17",
+                              "18",
+                              "19",
+                              "20",
+                              "21",
+                              "22",
+                              "23",
+                              "24",
+                              "25",
+                              "26",
+                              "27"
+                            ],
+                            "month": "{% $states.input.month %}",
+                            "year": "{% $states.input.year %}"
+                          }
+                        },
+                        "Locations - Per Day": {
+                          "End": true,
+                          "ItemProcessor": {
+                            "StartAt": "Locations - Generate Location Data",
+                            "States": {
+                              "Locations - Create File Per User": {
+                                "End": true,
+                                "ItemProcessor": {
+                                  "StartAt": "Locations - Create Json File Per Location",
+                                  "States": {
+                                    "Locations - Create Json File Per Location": {
+                                      "End": true,
+                                      "Arguments": {
+                                        "Body": "{% $states.input.location %}",
+                                        "Bucket": "${bucket-name}",
+                                        "Key": "{% States.Format('data/daily-location-summaries/year={}/month={}/date={}-{}-{}/{}-{}-{}_{}.json',$.year,$.month,$.year,$.month,$.day,$.year,$.month,$.day,$.location.name) %}"
+                                      },
+                                      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                                      "Retry": [
+                                        {
+                                          "BackoffRate": 1.5,
+                                          "ErrorEquals": [
+                                            "States.ALL"
+                                          ],
+                                          "IntervalSeconds": 1,
+                                          "MaxAttempts": 3
+                                        }
+                                      ],
+                                      "Type": "Task"
+                                    }
+                                  }
+                                },
+                                "Type": "Map"
+                              },
+                              "Locations - Generate Location Data": {
+                                "Next": "Locations - Create File Per User",
+                                "Type": "Pass"
+                              }
+                            }
+                          },
+                          "Type": "Map"
+                        }
+                      }
+                    },
+                    "MaxConcurrency": 1,
+                    "Type": "Map"
+                  }
+                }
+              },
+              "MaxConcurrency": 1,
+              "Type": "Map"
+            },
+            "Locations - Years": {
+              "Next": "Locations - Per Year",
+              "Type": "Pass"
+            }
+          }
+        },
+        {
+          "StartAt": "Locations All Time - Generate Location Data",
+          "States": {
+            "Locations All Time - Create File Per Location": {
+              "End": true,
+              "ItemProcessor": {
+                "StartAt": "Locations All Time - Create Json File Per Location",
+                "States": {
+                  "Locations All Time - Create Json File Per Location": {
+                    "End": true,
+                    "Arguments": {
+                      "Body": "{% $states.input.location %}",
+                      "Bucket": "${bucket-name}",
+                      "Key": "{% States.Format('data/all-time-location-summaries/{}.json',$.location.name) %}"
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                    "Retry": [
+                      {
+                        "BackoffRate": 1.5,
+                        "ErrorEquals": [
+                          "States.ALL"
+                        ],
+                        "IntervalSeconds": 1,
+                        "MaxAttempts": 3
+                      }
+                    ],
+                    "Type": "Task"
+                  }
+                }
+              },
+              "Type": "Map"
+            },
+            "Locations All Time - Generate Location Data": {
+              "Next": "Locations All Time - Create File Per Location",
+              "Type": "Pass"
+            }
+          }
+        }
+      ],
+      "End": true,
+      "Type": "Parallel"
+    }
+  }
+}

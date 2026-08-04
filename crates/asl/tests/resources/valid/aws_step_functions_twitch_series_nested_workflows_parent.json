@@ -1,0 +1,76 @@
+{
+  "Comment": "An example of the Amazon States Language using a parallel state to execute two branches at the same time.",
+  "StartAt": "Parallel",
+  "States": {
+    "Final State": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "Parallel": {
+      "Branches": [
+        {
+          "StartAt": "Failing Child",
+          "States": {
+            "Failing Child": {
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "Next": "Task Failure Fallback"
+                }
+              ],
+              "End": true,
+              "Arguments": {
+                "Input": {
+                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID": "{% $states.context.Execution.Id %}"
+                },
+                "Name": "FailingChild",
+                "StateMachineArn": "${FailingChildWorkflowArn}"
+              },
+              "Resource": "arn:aws:states:::states:startExecution.sync:2",
+              "Retry": [
+                {
+                  "BackoffRate": 2,
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 20,
+                  "MaxAttempts": 2
+                }
+              ],
+              "Type": "Task"
+            },
+            "Task Failure Fallback": {
+              "End": true,
+              "Type": "Pass",
+              "Output": {
+                "ErrorObject": "{% $states.input %}",
+                "Message": "Child workflow failed; retry limit reached. See ErrorObject for additional information."
+              }
+            }
+          }
+        },
+        {
+          "StartAt": "Succeeding Child",
+          "States": {
+            "Succeeding Child": {
+              "End": true,
+              "Arguments": {
+                "Input": {
+                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID": "{% $states.context.Execution.Id %}"
+                },
+                "Name": "SucceedingChild",
+                "StateMachineArn": "${SucceedingChildWorkflowArn}"
+              },
+              "Resource": "arn:aws:states:::states:startExecution.sync:2",
+              "Type": "Task"
+            }
+          }
+        }
+      ],
+      "Next": "Final State",
+      "Type": "Parallel"
+    }
+  }
+}

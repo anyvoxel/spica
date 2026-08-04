@@ -1,0 +1,18 @@
+{
+  "Comment": "Child Step Function that would notify its parent automatically when called with sync option",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Next": "Wait",
+      "Type": "Pass"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "Wait": {
+      "Next": "Success",
+      "Seconds": 20,
+      "Type": "Wait"
+    }
+  }
+}

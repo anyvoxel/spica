@@ -1,0 +1,47 @@
+{
+  "Comment": "A simple task retry",
+  "StartAt": "Call Amazon S3 ListObjectsV2",
+  "States": {
+    "Call Amazon S3 ListObjectsV2": {
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Fail State"
+        }
+      ],
+      "Next": "Succeed State",
+      "Arguments": {
+        "Bucket": "ExampleS3Bucket",
+        "Key": "MyData"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "ErrorA",
+            "ErrorB"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2
+        },
+        {
+          "ErrorEquals": [
+            "ErrorC"
+          ],
+          "IntervalSeconds": 5
+        }
+      ],
+      "TimeoutSeconds": 5,
+      "Type": "Task"
+    },
+    "Fail State": {
+      "Type": "Fail"
+    },
+    "Succeed State": {
+      "Type": "Succeed"
+    }
+  }
+}

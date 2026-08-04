@@ -1,0 +1,21 @@
+{
+  "Comment": "An example of the Amazon States Language with a simple Retry block",
+  "StartAt": "Jittery Function",
+  "States": {
+    "Jittery Function": {
+      "End": true,
+      "Resource": "${JitteryFunctionArn}",
+      "Retry": [
+        {
+          "BackoffRate": 2,
+          "ErrorEquals": [
+            "errorString"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5
+        }
+      ],
+      "Type": "Task"
+    }
+  }
+}

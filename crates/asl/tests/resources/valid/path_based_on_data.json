@@ -1,0 +1,36 @@
+{
+  "Comment": "A Hello World example of the Amazon States Language using Pass states",
+  "StartAt": "Choice State",
+  "States": {
+    "Choice State": {
+      "Choices": [
+        {
+          "Next": "NEXT_STATE_ONE",
+          "Condition": "{% not(% $states.input.type = 'Private' %) %}"
+        },
+        {
+          "Next": "NEXT_STATE_TWO",
+          "Condition": "{% $states.input.value = 0 %}"
+        },
+        {
+          "Next": "NEXT_STATE_TWO",
+          "Condition": "{% (% $states.input.value >= 20 %) and (% $states.input.value < 30 %) %}"
+        }
+      ],
+      "Default": "DEFAULT_STATE",
+      "Type": "Choice"
+    },
+    "DEFAULT_STATE": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "NEXT_STATE_ONE": {
+      "End": true,
+      "Type": "Pass"
+    },
+    "NEXT_STATE_TWO": {
+      "End": true,
+      "Type": "Pass"
+    }
+  }
+}
