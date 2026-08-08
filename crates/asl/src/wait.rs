@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    utils::{parse_int_or_expr, IntOrExpr, JsonataExpr},
     AssignObject,
+    utils::{IntOrExpr, JsonataExpr, parse_int_or_expr},
 };
 
 /// The value of a `Wait` state's `Seconds` field in the JSONata-only subset.
@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for WaitTimestamp {
 /// See:
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/state-wait.html
 /// - https://states-language.net/spec.html#wait-state
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitState {
     /// Optional. A human-readable description of the state.

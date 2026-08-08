@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{utils::JsonataExpr, AssignObject};
+use crate::{AssignObject, utils::JsonataExpr};
 
 /// The value of a `Choice` rule's `Condition` field in the JSONata-only subset.
 ///
@@ -20,7 +20,9 @@ where
 {
     match value {
         serde_json::Value::Bool(b) => Ok(ChoiceCondition::Bool(b)),
-        serde_json::Value::String(s) => JsonataExpr::parse(s, "Condition").map(ChoiceCondition::Expr),
+        serde_json::Value::String(s) => {
+            JsonataExpr::parse(s, "Condition").map(ChoiceCondition::Expr)
+        }
         _ => Err(serde::de::Error::custom(
             "Condition must be either a boolean or a JSONata string",
         )),
@@ -37,7 +39,9 @@ impl<'de> Deserialize<'de> for ChoiceCondition {
     }
 }
 
-fn deserialize_choice_condition_option<'de, D>(deserializer: D) -> Result<Option<ChoiceCondition>, D::Error>
+fn deserialize_choice_condition_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<ChoiceCondition>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -59,7 +63,7 @@ where
 /// See:
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html
 /// - https://states-language.net/spec.html#choice-state
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct ChoiceState {
     /// Optional. A human-readable description of the state.
@@ -130,7 +134,9 @@ mod tests {
     use super::{ChoiceCondition, ChoiceRule};
 
     fn assign(v: serde_json::Value) -> Option<AssignObject> {
-        Some(AssignObject(v.as_object().expect("assign must be object").clone()))
+        Some(AssignObject(
+            v.as_object().expect("assign must be object").clone(),
+        ))
     }
 
     #[test]
@@ -309,10 +315,7 @@ mod tests {
         };
 
         assert_eq!(choice.default.as_deref(), Some("DefaultPath"));
-        assert_eq!(
-            choice.assign,
-            assign(serde_json::json!({ "discount": 0 }))
-        );
+        assert_eq!(choice.assign, assign(serde_json::json!({ "discount": 0 })));
         assert_eq!(choice.choices.len(), 2);
 
         let r0 = &choice.choices[0];
@@ -323,10 +326,7 @@ mod tests {
                 JsonataExpr::new("{% $states.input.category = 'premium' %}").unwrap()
             ))
         );
-        assert_eq!(
-            r0.assign,
-            assign(serde_json::json!({ "discount": 20 }))
-        );
+        assert_eq!(r0.assign, assign(serde_json::json!({ "discount": 20 })));
 
         let r1 = &choice.choices[1];
         assert_eq!(r1.next, "StandardPath");
@@ -336,10 +336,7 @@ mod tests {
                 JsonataExpr::new("{% $states.input.category = 'standard' %}").unwrap()
             ))
         );
-        assert_eq!(
-            r1.assign,
-            assign(serde_json::json!({ "discount": 5 }))
-        );
+        assert_eq!(r1.assign, assign(serde_json::json!({ "discount": 5 })));
 
         // Round-trip.
         let reserialized = serde_json::to_string(&value)?;
@@ -355,7 +352,7 @@ mod tests {
         let expr_rule = ChoiceRule {
             next: "NextState".to_string(),
             condition: Some(ChoiceCondition::Expr(
-                JsonataExpr::new("{% $score > 90 %}").unwrap()
+                JsonataExpr::new("{% $score > 90 %}").unwrap(),
             )),
             assign: None,
             output: None,

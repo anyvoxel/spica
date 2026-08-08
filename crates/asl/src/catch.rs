@@ -43,7 +43,9 @@ mod tests {
     use crate::{AssignObject, Catcher};
 
     fn assign(v: serde_json::Value) -> Option<AssignObject> {
-        Some(AssignObject(v.as_object().expect("assign must be object").clone()))
+        Some(AssignObject(
+            v.as_object().expect("assign must be object").clone(),
+        ))
     }
 
     #[test]

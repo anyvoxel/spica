@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    utils::{parse_int_or_expr, IntOrExpr},
     AssignObject, Catcher, Retrier,
+    utils::{IntOrExpr, parse_int_or_expr},
 };
 
 /// The value of a `Task` state's `TimeoutSeconds` field in the JSONata-only subset.

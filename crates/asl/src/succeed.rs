@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// See:
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/state-succeed.html
 /// - https://states-language.net/spec.html#succeed-state
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SucceedState {
     /// Optional. A human-readable description of the state.
@@ -69,7 +69,10 @@ mod tests {
             panic!("expected Succeed state, got {:?}", value);
         };
 
-        assert_eq!(succeed.output, Some(serde_json::json!("{% $states.input %}")));
+        assert_eq!(
+            succeed.output,
+            Some(serde_json::json!("{% $states.input %}"))
+        );
 
         // Round-trip: the JSONata Output must be preserved.
         let reserialized = serde_json::to_string(&value)?;

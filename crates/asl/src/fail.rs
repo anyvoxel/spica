@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// See:
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/state-fail.html
 /// - https://states-language.net/spec.html#fail-state
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailState {
     /// Optional. A human-readable description of the state.

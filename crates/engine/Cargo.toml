@@ -1,0 +1,25 @@
+[package]
+name = "spica-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+derive_more.workspace = true
+jsonata-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spica-asl.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-stream.workspace = true

@@ -14,6 +14,11 @@ impl JsonataExpr {
         }
     }
 
+    /// The raw expression text, including the surrounding `{% %}` delimiters.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     pub(crate) fn parse<E>(value: String, field_name: &str) -> Result<Self, E>
     where
         E: serde::de::Error,
@@ -103,13 +108,16 @@ impl<'de> Deserialize<'de> for IntOrExpr {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_non_negative_int_or_expr, IntOrExpr, JsonataExpr};
+    use super::{IntOrExpr, JsonataExpr, parse_non_negative_int_or_expr};
 
     #[test]
     fn test_jsonata_expr_deserializes_wrapped_expression() {
         let value = serde_json::from_str::<JsonataExpr>(r#""{% $states.input.delay %}""#)
             .expect("expected JSONata expression to parse");
-        assert_eq!(value, JsonataExpr::new("{% $states.input.delay %}").unwrap());
+        assert_eq!(
+            value,
+            JsonataExpr::new("{% $states.input.delay %}").unwrap()
+        );
     }
 
     #[test]

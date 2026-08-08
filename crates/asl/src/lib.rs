@@ -9,12 +9,12 @@ mod choice;
 mod fail;
 mod item_processor;
 mod map;
-mod utils;
 mod parallel;
 mod pass;
 mod retry;
 mod succeed;
 mod task;
+mod utils;
 mod wait;
 
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ pub use pass::PassState;
 pub use retry::Retrier;
 pub use succeed::SucceedState;
 pub use task::{TaskHeartbeatSeconds, TaskState, TaskTimeoutSeconds};
-pub use utils::JsonataExpr;
+pub use utils::{IntOrExpr, JsonataExpr};
 pub use wait::{WaitSeconds, WaitState, WaitTimestamp};
 
 /// A state machine is defined by the states it contains and the relationships between them.
@@ -109,7 +109,9 @@ mod tests {
     use crate::{AssignObject, StateMachine};
 
     fn assign(v: serde_json::Value) -> Option<AssignObject> {
-        Some(AssignObject(v.as_object().expect("assign must be object").clone()))
+        Some(AssignObject(
+            v.as_object().expect("assign must be object").clone(),
+        ))
     }
 
     #[test]
@@ -273,10 +275,7 @@ mod tests {
         let crate::State::Succeed(ref goodbye) = sm.states["Goodbye"] else {
             panic!("expected Succeed state, got {:?}", sm.states["Goodbye"]);
         };
-        assert_eq!(
-            goodbye.output,
-            Some(serde_json::json!("{% $outer %}"))
-        );
+        assert_eq!(goodbye.output, Some(serde_json::json!("{% $outer %}")));
 
         // Round-trip: the nested Map, item processor, and all JSONata expressions must be
         // preserved.
@@ -372,7 +371,10 @@ mod tests {
             }
         }
 
-        eprintln!("valid round-trip: {parsed} parsed, {} failed", failures.len());
+        eprintln!(
+            "valid round-trip: {parsed} parsed, {} failed",
+            failures.len()
+        );
 
         if !failures.is_empty() {
             let report = failures
@@ -380,7 +382,10 @@ mod tests {
                 .map(|(name, err)| format!("  - {name}: {err}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            panic!("{} valid fixture(s) failed to round-trip:\n{report}", failures.len());
+            panic!(
+                "{} valid fixture(s) failed to round-trip:\n{report}",
+                failures.len()
+            );
         }
 
         assert!(parsed > 0, "expected at least one valid fixture to parse");
@@ -422,8 +427,7 @@ mod tests {
                     if expects_parse {
                         parsed_ok += 1;
                     } else {
-                        misclassified
-                            .push(format!("{name}: expected serde-reject but parsed"));
+                        misclassified.push(format!("{name}: expected serde-reject but parsed"));
                     }
                 }
             }

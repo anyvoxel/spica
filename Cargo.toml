@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/asl", "crates/spica"]
+members = ["crates/asl", "crates/engine", "crates/spica"]
 resolver = "2"
 
 [workspace.package]
@@ -8,8 +8,22 @@ edition = "2024"
 publish = ["mirror"]
 
 [workspace.dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+derive_more = { version = "1", features = ["from", "into"] }
 jsonata-core = "2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_with = "3.21.0"
 spica-asl = { path = "crates/asl" }
+spica-engine = { path = "crates/engine" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["time"] }
+time = { version = "0.3", features = ["parsing", "formatting", "serde-well-known"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = { version = "1", features = ["serde"] }
