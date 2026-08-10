@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    utils::{parse_int_or_expr, IntOrExpr},
     AssignObject, Catcher, Retrier,
+    utils::{IntOrExpr, parse_int_or_expr},
 };
 
 /// The value of a `Task` state's `TimeoutSeconds` field in the JSONata-only subset.
@@ -57,7 +57,7 @@ where
 /// - https://states-language.net/spec.html#task-state
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html
 #[skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct TaskState {
     /// Optional. A human-readable description of the state.

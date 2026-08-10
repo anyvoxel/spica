@@ -81,4 +81,4 @@ This repository is still early-stage at the project level:
 - `spica` is still a placeholder binary
 - repository automation and contributor guidance are intentionally lightweight and focused on the current Rust/Cargo workflow
 
-For contributor workflow details, see `CONTRIBUTING.md`. For Claude Code guidance, see `CLAUDE.md`. For broader AI-agent guidance, see `AGENTS.md`.
+For architecture and design decisions, see `Architecture.md`. For contributor workflow details, see `CONTRIBUTING.md`. For Claude Code guidance, see `CLAUDE.md`. For broader AI-agent guidance, see `AGENTS.md`.

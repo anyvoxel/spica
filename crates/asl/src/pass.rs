@@ -9,7 +9,7 @@ use crate::AssignObject;
 /// See:
 /// - https://docs.aws.amazon.com/step-functions/latest/dg/state-pass.html
 /// - https://states-language.net/spec.html#pass-state
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassState {
     /// Optional. A human-readable description of the state.
@@ -46,7 +46,9 @@ mod tests {
     use crate::{AssignObject, State};
 
     fn assign(v: serde_json::Value) -> Option<AssignObject> {
-        Some(AssignObject(v.as_object().expect("assign must be object").clone()))
+        Some(AssignObject(
+            v.as_object().expect("assign must be object").clone(),
+        ))
     }
 
     #[test]
