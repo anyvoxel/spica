@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    utils::{parse_non_negative_int_or_expr, IntOrExpr, JsonataExpr},
     AssignObject, Catcher, ItemProcessor, Retrier,
+    utils::{IntOrExpr, JsonataExpr, parse_non_negative_int_or_expr},
 };
 
 /// The value of a JSONata `Map` state's `Items` field.
@@ -618,8 +618,10 @@ mod tests {
         assert!(reserialized.contains(
             r#""ToleratedFailurePercentage":"{% $states.input.failureTolerancePercent %}""#
         ));
-        assert!(reserialized
-            .contains(r#""ToleratedFailureCount":"{% $states.input.failureToleranceCount %}""#));
+        assert!(
+            reserialized
+                .contains(r#""ToleratedFailureCount":"{% $states.input.failureToleranceCount %}""#)
+        );
         let reparsed: State = serde_json::from_str(&reserialized)?;
         assert_eq!(value, reparsed);
 
