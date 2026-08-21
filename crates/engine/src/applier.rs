@@ -1,15 +1,15 @@
 //! Event projection, as a per-variant applier table.
 //!
-//! Storage is a pure fold of the [`Event`] stream; the [`Processor`](crate::Processor) rebuilds the
+//! Storage is a pure fold of the [`Event`] stream; the [`StreamProcessor`](crate::StreamProcessor) rebuilds the
 //! execution tree by applying each event. Mirroring the [`CommandHandler`](crate::CommandHandler)
 //! design, projection is split into per-`Event` applier implementations (each in
 //! [`appliers`]), keeping each event's fold rule local and — because some events carry *side
 //! effects* (arming a timer schedules a physical deadline; cancelling one deschedules it) — the
 //! applier context hands each impl a [`ApplierContext`] through which it can both mutate the store
-//! and drive the timer [`Scheduler`](crate::scheduler::SchedulerHandle).
+//! and drive the timer [`Scheduler`](crate::scheduler::Scheduler).
 //!
 //! A storage implementation needs only supply the read/mutate primitives ([`Storage`](crate::Storage));
-//! the applier table is shared and constructed once per Processor.
+//! the applier table is shared and constructed once per StreamProcessor.
 
 mod appliers;
 
@@ -17,13 +17,14 @@ use std::collections::HashMap;
 use std::mem::discriminant;
 
 use crate::event::Event;
+use crate::log::Timestamp;
 
 use appliers::*;
 
 /// Registers one or more [`EventApplier`]s into a `Discriminant<Event>` dispatch map.
 /// Each applier knows which [`Event`] variant it serves via [`EventApplier::event`], which returns
 /// that variant as a `Default` placeholder (used only to read its discriminant — real events are
-/// folded by the Processor). The applier type is therefore the single source of truth for its own
+/// folded by the StreamProcessor). The applier type is therefore the single source of truth for its own
 /// key; there is no hand-written placeholder to keep in sync. `$applier` is captured as a `path` so
 /// it can serve both as a type (`<… as EventApplier>`) and as a `Default`-constructible value
 /// (`<$applier>::default()`).
@@ -45,7 +46,7 @@ macro_rules! event_applier_entry {
 pub trait EventApplier: Send + Sync {
     /// The [`Event`] variant this applier folds, identified by a `Default` placeholder instance
     /// standing in only to read its discriminant — the real event instances are applied by the
-    /// Processor. The [`EventDispatcher`]'s table reads this off the applier to derive its key, so
+    /// StreamProcessor. The [`EventDispatcher`]'s table reads this off the applier to derive its key, so
     /// the applier is the single source of truth for which variant it handles. Takes `&self` (rather
     /// than being a `Self: Sized` associated function) so the trait stays object-safe for the
     /// `Box<dyn EventApplier>` dispatch table.
@@ -58,17 +59,29 @@ pub trait EventApplier: Send + Sync {
     ) -> Result<(), crate::error::ExecutionError>;
 }
 
-/// Context handed to a single `EventApplier::apply` call: mutable access to the store and handles
-/// to the timer scheduler and task service (for `TimerActivated` / `TimerCancelled` scheduling and
-/// `TaskActivated` invocation side effects), plus the envelope identity (`stream_id`, `cause_id`) of
-/// the entry currently being applied. The scheduler/service need these to later re-envelope the
-/// resumption commands they fire; the Processor sets them from the entry it holds before applying.
+/// Context handed to a single `EventApplier::apply` call: mutable access to the store and a handle
+/// to the timer scheduler (for `TimerActivated` / `TimerCancelled` scheduling), plus the envelope
+/// identity `cause_id` and the **`timestamp`** of the entry currently being applied. The scheduler
+/// needs `cause_id` to later re-envelope the resumption command it fires (there is no per-execution
+/// stream — a LogStream is one stream, so stream identity lives on the log, not the context);
+/// `timestamp` is the single deterministic source for the projection's `created_at`/`updated_at`
+/// facts — it is the value frozen in the log record, so every replica replaying the same entries
+/// computes identical times (see `storage::*::created_at`). Appliers must use this value and
+/// **never** call `Timestamp::now()` locally, which would make the fold non-deterministic across
+/// replicas.
+///
+/// M1→M2 note: there is **no** task service on the context. Applying `TaskActivated` used to invoke
+/// the handler in-process as a side effect; now it only makes the task *claimable* — a worker pulls
+/// it via the engine's `TaskApi` (see `crate::task_service`). Task settlements are inbound reports
+/// the engine validates, not side effects of a fold.
 pub struct ApplierContext<'a> {
-    pub storage: &'a mut dyn crate::storage::Storage,
-    pub scheduler: &'a crate::scheduler::SchedulerHandle,
-    pub task_service: &'a crate::task_service::TaskServiceHandle,
-    pub stream_id: crate::id::StreamId,
+    /// Write handle into the projection. A [`StorageTxn`](crate::storage::StorageTxn), **not** the
+    /// raw [`Storage`](crate::storage::Storage): the applier can fold rows but cannot commit (which
+    /// consumes the `Box`) nor move the resume watermark — atomicity is *type-enforced*.
+    pub storage: &'a mut dyn crate::storage::StorageTxn,
+    pub scheduler: &'a dyn crate::scheduler::Scheduler,
     pub cause_id: crate::id::EntryId,
+    pub timestamp: Timestamp,
 }
 
 /// Consume the collector's accumulated entries and route them to the applier table.
@@ -88,6 +101,8 @@ impl EventDispatcher {
             ExecutionCompletedApplier,
             ExecutionTerminatingApplier,
             ExecutionTerminatedApplier,
+            FlowCreatedApplier,
+            FlowVersionCreatedApplier,
             StateActivatingApplier,
             StateActivatedApplier,
             StateCompletingApplier,
@@ -95,13 +110,15 @@ impl EventDispatcher {
             StateTerminatingApplier,
             StateTerminatedApplier,
             TimerActivatedApplier,
-            TimerCompletedApplier,
+            TimerTriggeredApplier,
             TimerCancelledApplier,
             VariablesAssignedApplier,
             StateTransitionedApplier,
             RetryScheduledApplier,
             ParallelBranchSpawnedApplier,
             TaskActivatedApplier,
+            TaskLeasedApplier,
+            TaskLeaseExpiredApplier,
             TaskCompletedApplier,
             TaskFailedApplier,
             TaskCancelledApplier

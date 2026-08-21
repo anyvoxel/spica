@@ -74,8 +74,10 @@ impl CommandHandler for ActivateStateHandler {
             return; // execution not running — a rescheduled activate is a no-op.
         }
         if exec.current_activity.is_some() {
-            // Defensive: a single in-flight activity per execution is the M1 invariant; a second
-            // ActivateState for the same execution would reuse the dispatch table idempotently.
+            // Defensive: `current_activity` is now projection-only, but it still records the
+            // single in-flight state cursor for this execution. A second `ActivateState` for the
+            // same execution would violate the M1 one-active-state invariant even though the cursor
+            // itself is derived rather than domain-carried.
         }
 
         // The owning execution's `state_path`, where this state lives. A `Parallel` handler extends
@@ -93,30 +95,43 @@ impl CommandHandler for ActivateStateHandler {
         }
         state_path.push_back(state);
         let actx = ActivityCtx {
-            execution: *execution,
-            // The top-level run id is this activity's flat anchor (for a top-level activity it is
-            // the owning execution itself; inside a branch it is the branch's root_execution) —
-            // carried so a `Parallel` fan-out can thread the true root to its children.
-            root_execution: exec.root_execution,
+            // Build the same entity-shaped activity value the forthcoming `StateActivating` event
+            // carries, so activation logic reads the canonical domain object even before the storage
+            // projection row exists.
+            activity: crate::ActivityValue {
+                id: *activity,
+                execution: *execution,
+                root_execution: exec.root_execution,
+                parent: crate::id::NodeId::Execution(*execution),
+                state_path: state_path.clone(),
+                status: crate::ActivityStatus::Running,
+                raw_input: input.clone(),
+                input: input.clone(),
+                raw_output: None,
+                activity_state: crate::ActivityState::Leaf,
+                retry_state: crate::RetryState::default(),
+                output: None,
+            },
             execution_state_path,
             exec_input: exec.input.clone(),
             // Fresh entry: no preprocessing has run yet, so raw == processed. `StateActivated` (and
             // the state's own emit) carry/produce the processed view; the raw input stays verbatim.
-            raw_input: input.clone(),
-            input: input.clone(),
-            raw_output: None,
-            scope: exec.scope.clone(),
-            state_path,
-            // A fresh `ActivateState` is always a first (or post-`End`-loop) entry — the activity
-            // row created by `StateActivating` starts at 0 unless a retry has already re-invoked it.
-            retry_count: 0,
+            variables: exec.variables.clone(),
             kind: CtxKind::Activate,
         };
+        // Resolve the machine revision this execution is bound to. First use of a revision in a
+        // fresh StreamProcessor loads it from storage into the cache.
+        let sm = fail_or!(
+            out,
+            Some(*activity),
+            *execution,
+            ctx.machine(exec.flow_version_id).await
+        );
         let state_def = fail_or!(
             out,
             Some(*activity),
             *execution,
-            resolve_state_for(ctx.storage, ctx.sm, *execution, &actx.state_name()).await
+            resolve_state_for(ctx.storage, &sm, *execution, &actx.state_name()).await
         );
         // `StateActivating` (the ing) is emitted unconditionally on entry. The matching ed —
         // `StateActivated` — is not emitted here: it belongs to each `StateHandler::activate`, which

@@ -46,9 +46,11 @@ impl CommandHandler for CompleteExecutionHandler {
             return; // idempotency: already finishing or terminal.
         }
 
+        let mut completing_execution = exec.value();
+        completing_execution.status = crate::ExecutionStatus::Completing;
+        completing_execution.output = Some(output.clone());
         out.emit_event(Event::ExecutionCompleting {
-            id: *id,
-            output: output.clone(),
+            execution: completing_execution,
         });
 
         let children = exec.active_children.clone();
@@ -60,10 +62,17 @@ impl CommandHandler for CompleteExecutionHandler {
             }
         }
         if pending_children == 0 {
-            out.emit_event(Event::ExecutionCompleted {
-                id: *id,
-                output: output.clone(),
-            });
+            let mut completed_execution = exec.value();
+            completed_execution.status = crate::ExecutionStatus::Completed;
+            completed_execution.output = Some(output.clone());
+            // Completion is observable durably: `start` returns the execution id and the caller's
+            // `wait_for_execution` poll surfaces this terminal `ExecutionCompleted` from Storage. No
+            // deferred ack is needed — terminal notification travels through the poll rather than an
+            // `execution → request` ack mapping (see `Engine::wait_for_execution`).
+            let completed_event = Event::ExecutionCompleted {
+                execution: completed_execution,
+            };
+            out.emit_event(completed_event);
             // A child execution (a Parallel branch) relays its settle to its owning node so the
             // owner (a `Parallel` activity) can react once its last branch drains. The top-level
             // run has no parent — `Engine::start` observes its `ExecutionCompleted` directly.

@@ -17,29 +17,75 @@ pub struct CreateExecutionHandler;
 impl CommandHandler for CreateExecutionHandler {
     fn command(&self) -> Command {
         Command::CreateExecution {
+            request_id: crate::id::RequestId::nil(),
             id: crate::id::ExecutionId::nil(),
+            flow_version_id: crate::id::FlowVersionId::nil(),
             input: Default::default(),
         }
     }
 
     async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
-        let Command::CreateExecution { id, input } = cmd else {
+        // `request_id` is the awaiting caller's correlation key — echoed onto `ExecutionCreated` so
+        // the StreamProcessor's request-ack correlator wakes the awaiting `start` operation with the fact
+        // that this execution was durably created (see `Event::ExecutionCreated`). The handler
+        // otherwise ignores it.
+        let Command::CreateExecution {
+            request_id,
+            id,
+            flow_version_id,
+            input,
+        } = cmd
+        else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
             );
         };
+        // Resolve the machine this execution binds to. This is the first use of the version in a
+        // fresh StreamProcessor — it loads the definition (keyed by its never-reused id) from Storage into
+        // the cache. If the version is missing (definition GC'd), the execution cannot run and
+        // fails before any state is entered.
+        let sm = fail_or!(out, None, *id, ctx.machine(*flow_version_id).await);
         out.emit_event(Event::ExecutionCreated {
-            id: *id,
-            // The top-level run is its own root: `root_execution = self`, and it has no parent and
-            // no branch `state_path` (it resolves states against the machine's top-level
-            // `states`). A child Parallel branch would instead set these via `SpawnBranch`.
-            root_execution: *id,
-            parent: None,
-            state_path: None,
-            input: input.clone(),
+            request_id: *request_id,
+            execution: crate::ExecutionValue {
+                id: *id,
+                // The version this run executes against — every nested child execution inherits it.
+                flow_version_id: *flow_version_id,
+                // The top-level run is its own root: `root_execution = self`, and it has no parent and
+                // no branch `state_path` (it resolves states against the machine's top-level
+                // `states`). A child Parallel branch would instead set these via `SpawnBranch`.
+                root_execution: *id,
+                parent: None,
+                state_path: None,
+                status: crate::ExecutionStatus::Running,
+                input: input.clone(),
+                output: None,
+            },
         });
+        // Declare the *birth* acknowledgement for the awaiting `start` caller: the StreamProcessor wakes
+        // it (delivering the applied event) once this `ExecutionCreated` lands on Storage — see
+        // `Engine::start_for_revision`, which returns the execution id at that point, leaving the
+        // terminal settle to `wait_for_execution`. Correlation is by event variant + echoed
+        // `request_id` (see `AckRouter`) — never full-value equality — so the expected event here
+        // need only carry that id, not the full execution value above.
+        out.ack_request(
+            *request_id,
+            Event::ExecutionCreated {
+                request_id: *request_id,
+                execution: crate::ExecutionValue {
+                    id: crate::id::ExecutionId::nil(),
+                    flow_version_id: crate::id::FlowVersionId::nil(),
+                    root_execution: crate::id::ExecutionId::nil(),
+                    parent: None,
+                    state_path: None,
+                    status: crate::ExecutionStatus::Running,
+                    input: Default::default(),
+                    output: None,
+                },
+            },
+        );
 
-        if let Some(secs) = ctx.sm.timeout_seconds
+        if let Some(secs) = sm.timeout_seconds
             && secs > 0
         {
             let timer = out.next_timer();
@@ -64,7 +110,7 @@ impl CommandHandler for CreateExecutionHandler {
             });
         }
 
-        let start = ctx.sm.start_at.clone();
+        let start = sm.start_at.clone();
         let activity = out.next_activity();
         out.emit_command(Command::ActivateState {
             execution: *id,

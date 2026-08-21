@@ -1,8 +1,8 @@
 use serde_json::Value;
 use spica_asl::{PassState, State};
 
-use super::super::emit_transition;
 use super::super::state_handler::StateHandler;
+use super::super::{emit_transition, state_activated_value, state_completed_value};
 use crate::context::build_states;
 use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
@@ -29,9 +29,7 @@ impl StateHandler for PassStateHandler {
         // the complete step in the very next Command. Emit the activation-complete ed first, then
         // the transition command.
         out.emit_event(crate::event::Event::StateActivated {
-            activity,
-            input: actx.input.clone(),
-            plan: None,
+            activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
         out.emit_command(crate::command::Command::CompleteState { activity });
     }
@@ -70,41 +68,41 @@ fn complete_pass(
     state: &PassState,
 ) {
     let states = build_states(
-        &actx.input,
-        Some(&actx.input),
+        &actx.activity.input,
+        Some(&actx.activity.input),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // no Catch `errorOutput` in the success path
         None, // not a Map item — no `context.Map.Item` binding
     );
-    let mut local_scope = actx.scope.clone();
+    let mut local_scope = actx.variables.clone();
 
     if let Some(assign_obj) = &state.assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
-                    out.emit_event(Event::VariablesAssigned {
-                        execution: actx.execution,
-                        assignments: map.clone(),
-                    });
                     for (k, v) in map {
                         local_scope.insert(k, v);
                     }
+                    out.emit_event(Event::VariablesAssigned {
+                        execution: actx.activity.execution,
+                        variables: local_scope.clone(),
+                    });
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     ),
@@ -118,19 +116,18 @@ fn complete_pass(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(o, &states, &local_scope)
         ),
-        None => actx.input.clone(),
+        None => actx.activity.input.clone(),
     };
 
     out.emit_event(Event::StateCompleted {
-        activity,
-        output: output_value.clone(),
+        activity: state_completed_value(actx, output_value.clone()),
     });
     emit_transition(
         out,
-        actx.execution,
+        actx.activity.execution,
         activity,
         &output_value,
         state.next.as_deref(),

@@ -1,50 +1,64 @@
+use std::ops::{Deref, DerefMut};
+
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::id::{NodeId, TaskId};
 use crate::log::Timestamp;
+use crate::task::TaskValue;
 
-/// Lifecycle status of a [`Task`]. Like [`super::TimerStatus`], a task is a leaf side-effect node: it
-/// never initiates its own completion — it is invoked and either completes (`Completed`), fails
-/// (`Failed`), or is cancelled (`Cancelled`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskStatus {
-    Active,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl TaskStatus {
-    pub fn is_active(&self) -> bool {
-        matches!(self, TaskStatus::Active)
-    }
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, TaskStatus::Active)
-    }
-}
-
-/// An in-flight external [`Task`] invoked by a `Task` state (`"Type": "Task"`) — a call to a
-/// connected `Resource` (`TaskState::resource`) with the projected `arguments` as input. Owned by
-/// the invoking [`super::Activity`]; a leaf — never owns children.
+/// The storage projection row of a Task.
 ///
-/// A `Task` is the external-resource analogue of a [`super::Timer`]: it is a side-effect node whose
-/// lifecycle is driven from outside the decision loop. The physical invocation is handled by the
-/// [`TaskService`](crate::task_service::TaskService) (in-process in M2, a real worker in a
-/// distributed deployment); the decision loop only records the logical facts (`TaskActivated` /
-/// `TaskCompleted` / `TaskTerminated`) and resumes the owning state when the task settles.
+/// `TaskValue` is the single source of truth for the task's shared domain state; storage wraps it
+/// so task domain values and storage ownership stay separated the same way `Activity` wraps
+/// `ActivityValue` and `Timer` wraps `TimerValue`. `#[serde(flatten)]` preserves the existing
+/// serialized shape. The row carries the projection-only `created_at`/`updated_at` timing facts (see
+/// [`crate::storage::Execution::created_at`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
-    pub id: TaskId,
-    /// The node that invoked it (its owner — a `NodeId::Activity` in M2). Drained by the owner's
-    /// cascade.
-    pub parent: NodeId,
-    /// The `Resource` URI the task calls (a downstream service / activity identifier).
-    pub resource: String,
-    /// The projected `arguments` passed to the resource as its input payload.
-    pub arguments: Value,
-    pub status: TaskStatus,
-    /// Optional deadline (the state's `TimeoutSeconds`) after which the task is treated as failed
-    /// with `States.Timeout`. `None` if the Task state has no timeout.
-    pub deadline: Option<Timestamp>,
+    /// The canonical task domain value reconstructed from the event stream.
+    #[serde(flatten)]
+    pub value: TaskValue,
+    /// When this row's birth event (`TaskActivated`) landed in the log (see
+    /// [`crate::storage::Activity::created_at`] for the deterministic-source note).
+    pub created_at: Timestamp,
+    /// The latest applied entry's timestamp that touched this row; each mutating applier bumps it.
+    pub updated_at: Timestamp,
+}
+
+impl Task {
+    pub fn value(&self) -> TaskValue {
+        self.value.clone()
+    }
+
+    pub fn from_value(value: TaskValue) -> Self {
+        Self {
+            value,
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        }
+    }
+
+    /// Stamp a fresh row's birth entry moment (creation applier): `created_at == updated_at == at`.
+    pub fn born(&mut self, at: Timestamp) {
+        self.created_at = at;
+        self.updated_at = at;
+    }
+
+    /// Record a row write at `at` (a mutation applier): advances `updated_at`, leaves `created_at`.
+    pub fn touch(&mut self, at: Timestamp) {
+        self.updated_at = at;
+    }
+}
+
+impl Deref for Task {
+    type Target = TaskValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl DerefMut for Task {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "spica-proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The tonic-build/prost-build codegen runs only at build time; the runtime need is the generated
+# tonic service traits + prost messages, so the build deps pull `protoc` and codegen while the normal
+# deps provide the runtime types.
+[build-dependencies]
+prost-build.workspace = true
+tonic-build.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true

@@ -1,8 +1,8 @@
 use serde_json::Value;
 use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State};
 
-use super::super::emit_transition;
 use super::super::state_handler::StateHandler;
+use super::super::{emit_transition, state_activated_value, state_completed_value};
 use crate::context::build_states;
 use crate::error::ExecutionError;
 use crate::eval_env::{EvalEnv, extract_jsonata};
@@ -33,9 +33,7 @@ impl StateHandler for ChoiceStateHandler {
         // therefore routes through the framework's uniform complete step (`CompleteState` →
         // `StateCompleting` → `complete`), like every other M1 state.
         out.emit_event(crate::event::Event::StateActivated {
-            activity,
-            input: actx.input.clone(),
-            plan: None,
+            activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
         out.emit_command(crate::command::Command::CompleteState { activity });
     }
@@ -72,16 +70,16 @@ fn complete_choice(
     actx: &ActivityCtx,
     state: &ChoiceState,
 ) {
-    let scope = actx.scope.clone();
+    let variables = actx.variables.clone();
     // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed/Fail) — however
-    // late an `Assign` is applied, derived values read consistently with the scope already folded.
+    // late an `Assign` is applied, derived values read consistently with the variables already folded.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // no Catch `errorOutput` in the choice path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -94,7 +92,7 @@ fn complete_choice(
                 let inner = fail_or!(
                     out,
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     extract_jsonata(expr.as_str()).ok_or_else(|| {
                         ExecutionError::InvalidDefinition(
                             "Choice Condition must be a {% %} JSONata expression".to_string(),
@@ -104,15 +102,15 @@ fn complete_choice(
                 let value = fail_or!(
                     out,
                     Some(activity),
-                    actx.execution,
-                    env.eval_expr(inner, &states, &scope)
+                    actx.activity.execution,
+                    env.eval_expr(inner, &states, &variables)
                 );
                 match value {
                     Value::Bool(b) => b,
                     _ => {
                         out.terminate(
                             Some(activity),
-                            actx.execution,
+                            actx.activity.execution,
                             ExecutionError::Jsonata {
                                 field: expr.as_str().to_string(),
                                 message: "Condition must evaluate to a boolean".to_string(),
@@ -137,7 +135,7 @@ fn complete_choice(
             None => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::NoChoiceMatched {
                         state: actx.state_name(),
                     },
@@ -151,31 +149,31 @@ fn complete_choice(
     let output_src = rule_output.as_ref().or(state.output.as_ref());
 
     // Projection uses the complete-step `$states` plus any `Assign` effect folded in.
-    let mut local_scope = scope.clone();
+    let mut local_variables = variables.clone();
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            env.eval_json(&assign_value, &states, &local_scope)
+            actx.activity.execution,
+            env.eval_json(&assign_value, &states, &local_variables)
         );
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
-                    out.emit_event(Event::VariablesAssigned {
-                        execution: actx.execution,
-                        assignments: map.clone(),
-                    });
                     for (k, v) in map {
-                        local_scope.insert(k, v);
+                        local_variables.insert(k, v);
                     }
+                    out.emit_event(Event::VariablesAssigned {
+                        execution: actx.activity.execution,
+                        variables: local_variables.clone(),
+                    });
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     ),
@@ -189,10 +187,10 @@ fn complete_choice(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            env.eval_json(o, &states, &local_scope)
+            actx.activity.execution,
+            env.eval_json(o, &states, &local_variables)
         ),
-        None => actx.input.clone(),
+        None => actx.activity.input.clone(),
     };
 
     // The routing + projection is done: emit the state's success ed (`StateCompleting` was already
@@ -200,12 +198,11 @@ fn complete_choice(
     // other synchronous states) and throw the transition. Always a State→State hop (`next` is
     // mandatory for Choice via rule/Default), never a terminal `End`.
     out.emit_event(Event::StateCompleted {
-        activity,
-        output: output_value.clone(),
+        activity: state_completed_value(actx, output_value.clone()),
     });
     emit_transition(
         out,
-        actx.execution,
+        actx.activity.execution,
         activity,
         &output_value,
         Some(&rule_next),

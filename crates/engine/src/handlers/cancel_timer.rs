@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
+use crate::TimerStatus;
 use crate::command::Command;
 use crate::event::Event;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::storage::TimerStatus;
 
 /// Handles `CancelTimer`: marks an armed timer cancelled. Idempotent — a no-op for a timer that
 /// already fired or was already cancelled. After recording the timer's terminal state, notifies
@@ -30,12 +30,20 @@ impl CommandHandler for CancelTimerHandler {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return,
         };
-        if act.status != TimerStatus::Active {
+        if act.value.status != TimerStatus::Active {
             return; // already finished; duplicate cancel is a no-op.
         }
-        out.emit_event(Event::TimerCancelled { timer: *timer });
+        out.emit_event(Event::TimerCancelled {
+            timer: crate::TimerValue {
+                id: act.value.id,
+                parent: act.value.parent,
+                purpose: act.value.purpose,
+                status: crate::TimerStatus::Cancelled,
+                deadline: act.value.deadline,
+            },
+        });
         out.emit_command(Command::ProcessChildCompleted {
-            parent: act.parent,
+            parent: act.value.parent,
             child: crate::id::NodeId::Timer(*timer),
         });
     }

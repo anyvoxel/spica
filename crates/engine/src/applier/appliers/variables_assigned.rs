@@ -15,7 +15,7 @@ impl EventApplier for VariablesAssignedApplier {
     fn event(&self) -> Event {
         Event::VariablesAssigned {
             execution: ExecutionId::nil(),
-            assignments: Default::default(),
+            variables: Default::default(),
         }
     }
 
@@ -26,7 +26,7 @@ impl EventApplier for VariablesAssignedApplier {
     ) -> Result<(), ExecutionError> {
         let Event::VariablesAssigned {
             execution,
-            assignments,
+            variables,
         } = event
         else {
             unreachable!(
@@ -34,9 +34,11 @@ impl EventApplier for VariablesAssignedApplier {
             );
         };
         if let Some(mut exec) = ctx.storage.get_execution(*execution).await? {
-            for (k, v) in assignments {
-                exec.scope.insert(k.clone(), v.clone());
-            }
+            // Variable assignment is a projection concern in the C-lite model: execution lifecycle
+            // events stay focused on identity/status, while the mutable execution variables are folded
+            // here as a full snapshot for later JSONata evaluation and replay.
+            exec.variables = variables.clone();
+            exec.touch(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

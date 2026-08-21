@@ -7,7 +7,7 @@ use crate::event::Event;
 use crate::{ApplierContext, EventApplier};
 
 use crate::id::{NodeId, TaskId};
-use crate::storage::TaskStatus;
+use crate::{TaskStatus, TaskValue};
 
 #[derive(Default)]
 pub(crate) struct TaskFailedApplier;
@@ -15,7 +15,16 @@ pub(crate) struct TaskFailedApplier;
 impl EventApplier for TaskFailedApplier {
     fn event(&self) -> Event {
         Event::TaskFailed {
-            task: TaskId::nil(),
+            task: TaskValue {
+                id: TaskId::nil(),
+                parent: NodeId::Activity(crate::id::ActivityId::nil()),
+                resource: String::new(),
+                arguments: Default::default(),
+                status: TaskStatus::Failed,
+                deadline: None,
+                worker_id: None,
+                lease_until: None,
+            },
             error: ExecutionError::InvalidDefinition(String::new()),
         }
     }
@@ -34,12 +43,13 @@ impl EventApplier for TaskFailedApplier {
         // task row — it drives the state's `TerminateState` (the `TaskFailed` event's real consumer
         // is the terminate path), so the terminal status here only serves the sweep + duplicate
         // guard.
-        if let Some(mut t) = ctx.storage.get_task(*task).await? {
+        if let Some(mut t) = ctx.storage.get_task(task.id).await? {
             let parent = t.parent;
             t.status = TaskStatus::Failed;
+            t.touch(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             ctx.storage
-                .remove_child(parent, NodeId::Task(*task))
+                .remove_child(parent, NodeId::Task(task.id))
                 .await?;
         }
         Ok(())

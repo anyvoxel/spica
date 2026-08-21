@@ -30,7 +30,7 @@ Examples:
 ## Repository structure
 
 - `crates/asl` contains `spica-asl`, the main library crate
-- `crates/spica` contains `spica`, a thin binary crate
+- `crates/cli` contains `spica`, the remote CLI binary crate
 
 Keep new parsing and modeling logic in the library crate unless the change is specifically about CLI behavior.
 

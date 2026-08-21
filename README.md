@@ -5,7 +5,7 @@ Spica is a small Rust workspace centered on `spica-asl`, a library crate that mo
 ## Workspace layout
 
 - `crates/asl` — `spica-asl`, the main library crate
-- `crates/spica` — `spica`, a binary crate that depends on `spica-asl`
+- `crates/cli` — `spica`, the remote CLI binary crate
 
 The library is the primary implementation surface today. It defines typed state-machine models for ASL states such as `Task`, `Choice`, `Map`, `Parallel`, `Pass`, `Wait`, `Fail`, and `Succeed`, along with supporting types like retries, catches, branches, and item processors.
 

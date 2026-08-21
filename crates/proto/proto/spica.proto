@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+// The wire contract for the spica workflow server. A remote client (`spica` CLI or any gRPC client)
+// drives a state machine run through two coarse services:
+//
+//   - Workflow.CreateFlow    persists a definition and returns its system-minted FlowVersionId.
+//   - Execution.StartExecution  binds that FlowVersionId and returns the execution id at birth.
+//   - Execution.GetExecution    returns a point-in-time status snapshot; the client POLLS this until
+//                               the execution settles (COMPLETED / TERMINATED) — there is no
+//                               fire-and-forget/blocking "Wait" RPC.
+//   - Execution.StopExecution   aborts a running execution (issues TerminateExecution{Cancelled}).
+package spica.v1;
+
+// Definition lifecycle: create and version a state machine.
+service Workflow {
+  rpc CreateFlow(CreateFlowRequest) returns (CreateFlowResponse);
+  // Resolve a flow name (+ optional ordinal version) to its concrete FlowVersionId without starting
+  // an execution — a non-blocking projection read, so the id can be captured for later reuse.
+  rpc ResolveFlowVersion(ResolveFlowVersionRequest) returns (ResolveFlowVersionResponse);
+}
+
+// Execution lifecycle: start a run and observe its status by polling.
+service Execution {
+  // Issues an execution immediately and returns its id at birth (non-blocking). Settling is observed
+  // by polling GetExecution. The requested revision is addressed by an explicit FlowVersionId, or by
+  // a flow name + optional ordinal (0 = latest).
+  rpc StartExecution(StartExecutionRequest) returns (StartExecutionResponse);
+  // Point-in-time snapshot of one execution; the client polls until state is terminal.
+  rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+  // Abort a running execution by issuing TerminateExecution{Cancelled}. Non-blocking: appends the
+  // command and returns; the client observes settlement (TERMINATED) by polling GetExecution.
+  rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
+}
+
+message CreateFlowRequest {
+  // The immutable logical flow name ([A-Za-z0-9_], 1..=64). Recreating a name bumps its version.
+  string name = 1;
+  // The ASL state machine definition serialized as JSON (opaque to the wire).
+  bytes definition = 2;
+}
+message CreateFlowResponse {
+  // The system-minted FlowVersionId (ULID string) of the created version — the handle to bind
+  // executions on, and which the CLI threads into StartExecution.
+  string flow_version_id = 1;
+}
+
+message ResolveFlowVersionRequest {
+  // The flow name to resolve (immutable; must already have been created via CreateFlow).
+  string flow_name = 1;
+  // The ordinal version to resolve; 0 means latest (the default). 1..N address a specific version.
+  uint32 version = 2;
+}
+message ResolveFlowVersionResponse {
+  // The concrete FlowVersionId (ULID string) for (flow_name, version).
+  string flow_version_id = 1;
+}
+
+message StartExecutionRequest {
+  // How to address the revision to run. Exactly one is set.
+  oneof target {
+    // A concrete revision already returned by CreateFlow.
+    string flow_version_id = 1;
+    // A flow name, with `version` for the ordinal (0 = latest).
+    string flow_name = 2;
+  }
+  // The ordinal version under `flow_name`; 0 means latest. Ignored for the flow_version_id target.
+  uint32 version = 3;
+  // The execution input serialized as JSON (opaque to the wire).
+  bytes input = 4;
+}
+message StartExecutionResponse {
+  // The ExecutionId (ULID string), issued at birth. The client polls GetExecution to settle.
+  string execution_id = 1;
+}
+
+message GetExecutionRequest {
+  // The ExecutionId returned by StartExecution.
+  string execution_id = 1;
+}
+message GetExecutionResponse {
+  // The execution's lifecycle state (a point-in-time snapshot).
+  ExecutionState state = 1;
+  // Terminal state output (JSON), present once state == COMPLETED.
+  bytes output = 2;
+  // ASL error name, present once state == TERMINATED (e.g. "States.NoChoiceMatched").
+  string error_name = 3;
+  // Error output (JSON), present once state == TERMINATED.
+  bytes error_output = 4;
+}
+
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0;
+  // Still in flight (Running / Completing / Terminating).
+  ACTIVE = 1;
+  // Settled successfully; `output` carries the result.
+  COMPLETED = 2;
+  // Settled abnormally; `error_name` / `error_output` describe the failure.
+  TERMINATED = 3;
+  // No projection exists for the requested id (never created or GC'd).
+  NOT_FOUND = 4;
+}
+
+message StopExecutionRequest {
+  // The ExecutionId (returned by StartExecution) to abort.
+  string execution_id = 1;
+}
+// StopExecution is fire-and-forget (non-blocking): this empty confirmation only means the
+// termination command was accepted, not that the execution has settled — poll GetExecution for that.
+message StopExecutionResponse {
+  // The ExecutionId the termination was issued for, echoed back as confirmation.
+  string execution_id = 1;
+}

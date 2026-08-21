@@ -1,20 +1,14 @@
-//! `StateActivated` event projection: folds the `Event::StateActivated` activation product onto the
-//! activity row.
-//!
-//! `StateActivated` carries the state's *activation product* — state the activate step computed that
-//! must be reconstructible from the event stream alone (see the [`Event::StateActivated`] docs). For
-//! a `Map` state this is the iteration plan (`plan: Some(MapActivityState)`); the applier materializes it
-//! into the activity's `activity_state` (`ActivityState::Map`) so the later replenish rounds (driven by
-//! `child_completed`) can read the items/total/cap. For every non-container state the plan is `None`,
-//! so the fold is a no-op — the activity already carries all it needs.
+//! `StateActivated` event projection: folds the `Event::StateActivated` activity value onto Storage.
 
 use async_trait::async_trait;
 
 use crate::error::ExecutionError;
 use crate::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::{
+    ActivityState, ActivityStatus, ActivityValue, ApplierContext, EventApplier, RetryState,
+};
 
-use crate::id::ActivityId;
+use crate::id::{ActivityId, ExecutionId, NodeId};
 
 #[derive(Default)]
 pub(crate) struct StateActivatedApplier;
@@ -22,9 +16,20 @@ pub(crate) struct StateActivatedApplier;
 impl EventApplier for StateActivatedApplier {
     fn event(&self) -> Event {
         Event::StateActivated {
-            activity: ActivityId::nil(),
-            input: Default::default(),
-            plan: None,
+            activity: ActivityValue {
+                id: ActivityId::nil(),
+                execution: ExecutionId::nil(),
+                root_execution: ExecutionId::nil(),
+                parent: NodeId::Execution(ExecutionId::nil()),
+                state_path: jsonptr::PointerBuf::new(),
+                status: ActivityStatus::Running,
+                raw_input: Default::default(),
+                input: Default::default(),
+                raw_output: None,
+                activity_state: ActivityState::Leaf,
+                retry_state: RetryState::default(),
+                output: None,
+            },
         }
     }
 
@@ -33,32 +38,22 @@ impl EventApplier for StateActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::StateActivated {
-            activity,
-            input,
-            plan,
-        } = event
-        else {
+        let Event::StateActivated { activity } = event else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        let Some(mut act) = ctx.storage.get_activity(*activity).await? else {
+        let Some(act) = ctx.storage.get_activity(activity.id).await? else {
             return Ok(());
         };
-        // Record the state's processed input — the value the activate step preprocessed the raw input
-        // into (or the raw input itself when no preprocessing happened). Inspector/auditor reads it
-        // directly instead of re-running the projection.
-        act.input = input.clone();
-        // Only a Map's activation carries a plan; a `None` plan means there is nothing to fold — the
-        // activity row from `StateActivating` is already complete (`map_progress` stays `None`).
-        // A Map's activation product: materialize the iteration plan into the activity's state
-        // repository so the replenish loop's `child_completed` can read items/total/cap without
-        // re-deriving them. `activity_state` started as `ActivityState::Leaf` (from `StateActivating`).
-        if let Some(plan) = plan {
-            act.activity_state = crate::storage::ActivityState::Map(plan.clone());
-        }
-        ctx.storage.put_activity(act).await?;
+        // Activation mutates only the domain value itself (processed input and, for Map, its
+        // activation product). The independently-maintained `active_children` set is preserved; the
+        // row's `created_at` is carried over (this is an update, not a birth) and `updated_at` is
+        // stamped with this entry's moment.
+        let mut row = crate::storage::Activity::from_value(activity.clone(), act.active_children);
+        row.created_at = act.created_at;
+        row.updated_at = ctx.timestamp;
+        ctx.storage.put_activity(row).await?;
         Ok(())
     }
 }

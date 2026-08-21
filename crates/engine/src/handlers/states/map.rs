@@ -2,9 +2,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{IntOrExpr, MapItems, MapState, State};
 
-use super::super::emit_transition;
-use super::super::eval_string_or_expr;
 use super::super::state_handler::StateHandler;
+use super::super::{
+    emit_transition, eval_string_or_expr, state_activated_value, state_completed_value,
+    state_completing_value, state_terminated_value, state_terminating_value,
+};
 use crate::command::{Command, TerminationReason};
 use crate::context::build_states;
 use crate::error::ExecutionError;
@@ -12,7 +14,7 @@ use crate::eval_env::EvalEnv;
 use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
 use crate::id::{ActivityId, ExecutionId, NodeId};
-use crate::storage::{ExecutionStatus, MapActivityState};
+use crate::{ActivityState, ExecutionStatus, MapActivityState};
 
 /// The `Map` state: iterates an `Items` array, running the `item_processor` sub-state-machine once
 /// per item as a child execution, with bounded concurrency (`MaxConcurrency`, 0 = unlimited). It
@@ -81,10 +83,16 @@ impl StateHandler for MapStateHandler {
         _state: &State,
     ) {
         out.emit_event(Event::StateCompleted {
-            activity,
-            output: actx.input.clone(),
+            activity: state_completed_value(actx, actx.activity.input.clone()),
         });
-        emit_transition(out, actx.execution, activity, &actx.input, None, Some(true));
+        emit_transition(
+            out,
+            actx.activity.execution,
+            activity,
+            &actx.activity.input,
+            None,
+            Some(true),
+        );
     }
 
     /// The per-settle **replenish** hook, resumed by `ProcessChildCompleted`'s Running arm on *every*
@@ -121,7 +129,7 @@ impl StateHandler for MapStateHandler {
         // The iteration plan + item child map live in the `Map` state-specific repository, folded
         // from the `StateActivated` activation product; without it this activity is not (or no
         // longer) a Map's — nothing to drive.
-        let crate::storage::ActivityState::Map(progress) = &act.activity_state else {
+        let ActivityState::Map(progress) = &act.value.activity_state else {
             return;
         };
 
@@ -233,7 +241,7 @@ impl StateHandler for MapStateHandler {
             let index = spawn_count + k;
             out.emit_command(Command::SpawnBranch {
                 parent: owner,
-                root_execution: actx.root_execution,
+                root_execution: actx.activity.root_execution,
                 state_path: Some(pointer.clone()),
                 // `branch_index` carries the *item index* — the `children` key we aggregate
                 // on at convergence (matching the ordering semantics of a `Parallel` branch).
@@ -260,12 +268,12 @@ fn activate_map(
     // `$states.input` and in-scope variables. No `Map.Item` binding here — `Items` is the whole
     // array, not a per-item value.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.retry_count,
+        actx.activity.retry_state.retry_count,
         None,
         None,
     );
@@ -279,8 +287,8 @@ fn activate_map(
             let evaluated = fail_or!(
                 out,
                 Some(activity),
-                actx.execution,
-                eval_string_or_expr(env, expr.as_str(), &states, &actx.scope)
+                actx.activity.execution,
+                eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             match evaluated {
                 Value::Array(arr) => arr,
@@ -288,7 +296,7 @@ fn activate_map(
                     fail_or!(
                         out,
                         Some(activity),
-                        actx.execution,
+                        actx.activity.execution,
                         Err(ExecutionError::InvalidDefinition(format!(
                             "Map '{}' Items expression did not evaluate to an array",
                             actx.state_name()
@@ -298,13 +306,13 @@ fn activate_map(
                 }
             }
         }
-        None => match &actx.input {
+        None => match &actx.activity.input {
             Value::Array(arr) => arr.clone(),
             _ => {
                 fail_or!(
                     out,
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     Err(ExecutionError::InvalidDefinition(format!(
                         "Map '{}' has no Items and its input is not an array",
                         actx.state_name()
@@ -324,7 +332,7 @@ fn activate_map(
             fail_or!(
                 out,
                 Some(activity),
-                actx.execution,
+                actx.activity.execution,
                 Err(ExecutionError::InvalidDefinition(
                     "Map MaxConcurrency must be a non-negative integer".into(),
                 ))
@@ -335,8 +343,8 @@ fn activate_map(
             let evaluated = fail_or!(
                 out,
                 Some(activity),
-                actx.execution,
-                eval_string_or_expr(env, expr.as_str(), &states, &actx.scope)
+                actx.activity.execution,
+                eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             let value = match evaluated {
                 Value::Number(num) => num.as_f64(),
@@ -348,7 +356,7 @@ fn activate_map(
                     fail_or!(
                         out,
                         Some(activity),
-                        actx.execution,
+                        actx.activity.execution,
                         Err(ExecutionError::InvalidDefinition(
                             "Map MaxConcurrency expression must evaluate to a non-negative integer"
                                 .into(),
@@ -378,7 +386,7 @@ fn activate_map(
     for index in 0..initial_batch {
         out.emit_command(Command::SpawnBranch {
             parent: owner,
-            root_execution: actx.root_execution,
+            root_execution: actx.activity.root_execution,
             state_path: Some(pointer.clone()),
             branch_index: index,
             state: start_at.clone(),
@@ -393,16 +401,16 @@ fn activate_map(
     // leader to rebuild the replenish loop. The activity stays `Running` owning its child
     // executions; it completes/replenishes only as they settle (via `child_completed`).
     out.emit_event(Event::StateActivated {
-        activity,
-        // A Map performs no input preprocessing (its `Items`/`MaxConcurrency` are projected as the
-        // plan, not as the state's input), so its processed input is a copy of the raw input.
-        input: actx.input.clone(),
-        plan: Some(MapActivityState {
-            items: items.clone(),
-            total: items.len(),
-            max_concurrency,
-            children: std::collections::HashMap::new(),
-        }),
+        activity: state_activated_value(
+            actx,
+            actx.activity.input.clone(),
+            Some(MapActivityState {
+                items: items.clone(),
+                total: items.len(),
+                max_concurrency,
+                children: std::collections::HashMap::new(),
+            }),
+        ),
     });
 
     // An empty items array spawns no children, so nobody will ever trigger `child_completed` —
@@ -422,7 +430,7 @@ fn activate_map(
 /// `Parallel` branch pointer).
 fn item_pointer(actx: &ActivityCtx) -> jsonptr::PointerBuf {
     // The owning execution's pointer extended by `/states/<map>/item_processor`, where `<map>` is
-    // this state's own name (the leaf of `actx.state_path`). Every item runs the *same* processor, so
+    // this state's own name (the leaf of `actx.activity.state_path`). Every item runs the *same* processor, so
     // the pointer is shared by all of a Map's item children. For a top-level Map the owner's pointer
     // is `None`, so we build `/states/<map>/item_processor` from scratch; otherwise we clone and
     // append. `push_back` applies RFC 6901 escaping.
@@ -444,20 +452,18 @@ fn item_pointer(actx: &ActivityCtx) -> jsonptr::PointerBuf {
 /// `parallel.rs::fail_parallel`; the sweep then stops the still-in-flight sibling items.
 fn fail_map(
     out: &mut Collector,
-    activity: ActivityId,
+    _activity: ActivityId,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
     out.emit_event(Event::StateTerminating {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminating_value(actx, reason.clone()),
     });
     out.emit_event(Event::StateTerminated {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminated_value(actx, reason.clone()),
     });
     out.emit_command(Command::TerminateExecution {
-        id: actx.execution,
+        id: actx.activity.execution,
         reason,
     });
 }
@@ -479,41 +485,41 @@ fn finish_map(
     aggregated: Value,
 ) {
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         Some(&aggregated), // `$states.result` = the ordered per-item outputs
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // success path — no Catch `errorOutput`
         None, // not projecting a Map item — no `context.Map.Item` binding
     );
-    let mut local_scope = actx.scope.clone();
+    let mut local_scope = actx.variables.clone();
 
     if let Some(assign_obj) = &state.assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
-                    out.emit_event(Event::VariablesAssigned {
-                        execution: actx.execution,
-                        assignments: map.clone(),
-                    });
                     for (k, v) in map {
                         local_scope.insert(k, v);
                     }
+                    out.emit_event(Event::VariablesAssigned {
+                        execution: actx.activity.execution,
+                        variables: local_scope.clone(),
+                    });
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     ),
@@ -529,20 +535,21 @@ fn finish_map(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(o, &states, &local_scope)
         ),
         None => aggregated,
     };
 
-    out.emit_event(Event::StateCompleting { activity });
+    out.emit_event(Event::StateCompleting {
+        activity: state_completing_value(actx),
+    });
     out.emit_event(Event::StateCompleted {
-        activity,
-        output: output_value.clone(),
+        activity: state_completed_value(actx, output_value.clone()),
     });
     emit_transition(
         out,
-        actx.execution,
+        actx.activity.execution,
         activity,
         &output_value,
         state.next.as_deref(),

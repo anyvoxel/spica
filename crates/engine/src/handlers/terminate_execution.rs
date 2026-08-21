@@ -44,9 +44,10 @@ impl CommandHandler for TerminateExecutionHandler {
             return;
         }
 
+        let mut terminating_execution = exec.value();
+        terminating_execution.status = crate::ExecutionStatus::Terminating(reason.clone());
         out.emit_event(Event::ExecutionTerminating {
-            id: *id,
-            reason: reason.clone(),
+            execution: terminating_execution,
         });
 
         let children = exec.active_children.clone();
@@ -79,10 +80,16 @@ impl CommandHandler for TerminateExecutionHandler {
             }
         }
         if pending == 0 {
-            out.emit_event(Event::ExecutionTerminated {
-                id: *id,
-                reason: reason.clone(),
-            });
+            let mut terminated_execution = exec.value();
+            terminated_execution.status = crate::ExecutionStatus::Terminated(reason.clone());
+            // Termination is observable durably: `start` returns the execution id and the caller's
+            // `wait_for_execution` poll surfaces this terminal `ExecutionTerminated` from Storage. No
+            // deferred ack is needed — terminal notification travels through the poll rather than an
+            // `execution → request` ack mapping (see `Engine::wait_for_execution`).
+            let terminated_event = Event::ExecutionTerminated {
+                execution: terminated_execution,
+            };
+            out.emit_event(terminated_event);
             // A terminating child execution (a Parallel branch that failed) relays its settle to its
             // owning node — the `Parallel` activity — the same way a successful branch does (see
             // `CompleteExecutionHandler`). Without this the failed branch drains `P`'s `active_children`

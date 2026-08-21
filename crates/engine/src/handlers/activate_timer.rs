@@ -5,8 +5,8 @@ use crate::event::Event;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
 
 /// The side-effect handler that arms a timer: emits only `TimerActivated`, recording the logical
-/// arm (with its **absolute `deadline`**) in the stream. The follow-on `CompleteTimer` is
-/// synthesized later by the [`SchedulerHandle`](crate::scheduler::SchedulerHandle) when the
+/// arm (with its **absolute `deadline`**) in the stream. The follow-on `TriggerTimer` is
+/// synthesized later by the [`Scheduler`](crate::scheduler::Scheduler) when the
 /// deadline passes (driven by the persisted `deadline`, not a fresh relative count) — so the
 /// stream advances while the timer "runs" and an in-line sleep inside this handler can't block the
 /// cascade's serial dispatch (e.g. an external `TerminateExecution` from
@@ -38,10 +38,13 @@ impl CommandHandler for ActivateTimerHandler {
             );
         };
         out.emit_event(Event::TimerActivated {
-            parent: *parent,
-            timer: *timer,
-            purpose: *purpose,
-            deadline: *deadline,
+            timer: crate::TimerValue {
+                id: *timer,
+                parent: *parent,
+                purpose: *purpose,
+                status: crate::TimerStatus::Active,
+                deadline: *deadline,
+            },
         });
     }
 }

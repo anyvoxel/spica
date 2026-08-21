@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-/// The variable scope of a state-machine execution.
+/// The current variables of a state-machine execution.
 ///
 /// Each top-level state's `Assign` mutates this map in place, and the result is visible to
 /// subsequent states. When entering a `Map` iteration or `Parallel` branch (later milestones),
@@ -10,4 +10,4 @@ use serde_json::Value;
 ///
 /// Variable names are stored without the leading `$`; a binding `("outer", v)` is referenced from
 /// JSONata as `$outer`.
-pub type Scope = HashMap<String, Value>;
+pub type Variables = HashMap<String, Value>;

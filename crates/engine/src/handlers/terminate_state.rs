@@ -40,26 +40,27 @@ impl CommandHandler for TerminateStateHandler {
         // was read before the drain batch applied. The projection is idempotent on remove_child
         // (HashSet), so re-emitting the ed as a duplicate is safe AND is what drains the
         // Terminating execution that waited on us.
+        use crate::ActivityStatus as S;
         use crate::command::TerminationReason;
-        use crate::storage::ActivityStatus as S;
-        match act.status {
+        match act.value.status {
             // Running, or Completing, are legitimate pre-failure states: a state can fail either
             // before the complete step opens (Running) or while it is in progress (Completing, since
             // `StateCompleting` is emitted eagerly by `CompleteStateHandler` before the state's
             // `complete` runs). Both must be redirected from success to failure — fall through to the
             // normal terminate path.
             S::Running | S::Completing => {}
-            S::Terminated(reason) => {
+            S::Terminated(ref reason) => {
                 // Re-emit the terminal ed with the recorded reason (ignore the incoming duplicate
                 // reason — it arrived later and is the parent's copy). The projection absorbs the
                 // duplicate; the owned parent then reacts via `ProcessChildCompleted` (activity already
                 // drained from its snapshot) and advances the parent's deferred terminations.
+                let mut activity_value = act.value();
+                activity_value.status = S::Terminated(reason.clone());
                 out.emit_event(crate::event::Event::StateTerminated {
-                    activity: *activity,
-                    reason,
+                    activity: activity_value,
                 });
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent: act.parent,
+                    parent: act.value.parent,
                     child: NodeId::Activity(*activity),
                 });
                 return;
@@ -74,11 +75,21 @@ impl CommandHandler for TerminateStateHandler {
         }
         let _ = TerminationReason::Cancelled; // referenced above
 
+        let mut terminating_activity = act.value();
+        terminating_activity.status = S::Terminating(reason.clone());
         out.emit_event(Event::StateTerminating {
-            activity: *activity,
-            reason: reason.clone(),
+            activity: terminating_activity,
         });
 
+        // M1 sweeps the full materialized child set here. TODO(termination+batching): if this ever
+        // chunks the sweep Zeebe-style (a partition-scanned `(parent, index)` resume with follow-up
+        // batches — to avoid issuing one Command per child at once), correctness depends on a strict
+        // monotonic order over child keys: a child created *after* termination began must sort after
+        // the current `index`, or a per-index skip would miss it. Spica's `NodeId` is ULID-based
+        // (monotone), so ordering holds by construction — but an unordered child container (e.g. a
+        // `HashSet`, as today) cannot drive an index-resume sweep on its own and would need an
+        // explicit ordered key. See Zeebe's ProcessInstanceBatchTerminateStreamProcessor / DbElementInstanceState
+        // ELEMENT_INSTANCE_PARENT_CHILD for the reference shape.
         let children = act.active_children.clone();
         let mut pending = 0usize;
         for child in children {
@@ -105,7 +116,7 @@ impl CommandHandler for TerminateStateHandler {
                 // A `Task` is a leaf side-effect node owned by this activity (a `Task` state's
                 // in-flight call). Sweep it like a timer: `CancelTask` marks it Cancelled and drains
                 // it. The physical call is left running; a later `CompleteTask` is swallowed by the
-                // `CompleteTaskHandler`'s non-Active guard.
+                // `CompleteTaskHandler`'s non-Running guard.
                 NodeId::Task(t) => {
                     out.emit_command(Command::CancelTask { task: t });
                     pending += 1;
@@ -113,12 +124,13 @@ impl CommandHandler for TerminateStateHandler {
             }
         }
         if pending == 0 {
+            let mut terminated_activity = act.value();
+            terminated_activity.status = S::Terminated(reason.clone());
             out.emit_event(Event::StateTerminated {
-                activity: *activity,
-                reason: reason.clone(),
+                activity: terminated_activity,
             });
             out.emit_command(Command::ProcessChildCompleted {
-                parent: act.parent,
+                parent: act.value.parent,
                 child: NodeId::Activity(*activity),
             });
         } else {

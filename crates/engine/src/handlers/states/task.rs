@@ -1,8 +1,8 @@
 use serde_json::Value;
 use spica_asl::{State, TaskState};
 
-use super::super::eval_string_or_expr;
 use super::super::state_handler::StateHandler;
+use super::super::{eval_string_or_expr, state_activated_value};
 use crate::command::Command;
 use crate::context::build_states;
 use crate::eval_env::EvalEnv;
@@ -59,7 +59,7 @@ impl StateHandler for TaskStateHandler {
             s.output.as_ref(),
             s.next.as_deref(),
             s.end,
-            actx.retry_count,
+            actx.activity.retry_state.retry_count,
             None, // success path — no Catch `errorOutput`
         );
     }
@@ -86,12 +86,12 @@ fn activate_task(
     // complete step later projects against). `assign_ctx = None`: the state's own `Assign` has not
     // yet been applied.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.retry_count,
+        actx.activity.retry_state.retry_count,
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -103,10 +103,10 @@ fn activate_task(
         Some(arguments) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            env.eval_json(arguments, &states, &actx.scope)
+            actx.activity.execution,
+            env.eval_json(arguments, &states, &actx.variables)
         ),
-        None => actx.input.clone(),
+        None => actx.activity.input.clone(),
     };
 
     // TODO(M2): the remaining Task field not yet fully acted on is `heartbeat_seconds`
@@ -124,11 +124,7 @@ fn activate_task(
     // throw the invocation as the transition's side effect. The `parent` links the task to the
     // owning activity so a later termination sweeps it.
     out.emit_event(Event::StateActivated {
-        activity,
-        // A Task's processed input is its projected `Arguments` (the call payload); the raw input
-        // from `StateActivating` is on `raw_input`.
-        input: arguments.clone(),
-        plan: None,
+        activity: state_activated_value(actx, arguments.clone(), None),
     });
     out.emit_command(Command::ActivateTask {
         parent: crate::id::NodeId::Activity(activity),
@@ -193,10 +189,10 @@ fn resolve_task_deadline(
         // JSONata `TimeoutSeconds`: evaluate, require a non-negative integer result.
         spica_asl::IntOrExpr::Expr(expr) => {
             // Evaluate the JSONata `TimeoutSeconds`; on eval failure emit the failure and `None`.
-            let value = match eval_string_or_expr(env, expr.as_str(), states, &actx.scope) {
+            let value = match eval_string_or_expr(env, expr.as_str(), states, &actx.variables) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_timeout_definition_failure(out, activity, actx.execution, e);
+                    emit_timeout_definition_failure(out, activity, actx.activity.execution, e);
                     return None;
                 }
             };

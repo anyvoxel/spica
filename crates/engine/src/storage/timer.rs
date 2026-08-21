@@ -1,40 +1,63 @@
+use std::ops::{Deref, DerefMut};
+
 use serde::{Deserialize, Serialize};
 
-use crate::command::TimerPurpose;
-use crate::id::{NodeId, TimerId};
 use crate::log::Timestamp;
+use crate::timer::TimerValue;
 
-/// Lifecycle status of a [`Timer`]. Kept separate from [`super::ExecutionStatus`]/[`super::ActivityStatus`]
-/// because a timer has (in M1) a strictly simpler shape — it never initiates its own completion; it
-/// is *armed* by a state or the execution and either fires (`Completed`) or is cancelled
-/// (`Cancelled`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TimerStatus {
-    Active,
-    Completed,
-    Cancelled,
-}
-
-impl TimerStatus {
-    pub fn is_active(&self) -> bool {
-        matches!(self, TimerStatus::Active)
-    }
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, TimerStatus::Completed | TimerStatus::Cancelled)
-    }
-}
-
-/// A timer armed by an [`super::Execution`] (`ExecutionTimeout`) or an [`super::Activity`] (`WaitResume`).
-/// A leaf — never owns children.
+/// The storage projection row of a Timer.
+///
+/// `TimerValue` is the single source of truth for the timer's shared domain state; storage wraps it
+/// so timer domain values and storage ownership stay separated the same way `Activity` wraps
+/// `ActivityValue`. `#[serde(flatten)]` preserves the existing serialized shape. The row carries the
+/// projection-only `created_at`/`updated_at` timing facts (see [`crate::storage::Execution::created_at`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timer {
-    pub id: TimerId,
-    /// The node that armed it (its owner). Drained by the owner's cascade.
-    pub parent: NodeId,
-    pub purpose: TimerPurpose,
-    pub status: TimerStatus,
-    /// Absolute wall-clock moment the timer fires. Persisting the absolute deadline (not a relative
-    /// duration) keeps the timer row self-contained: a replay can derive "how long is left" from
-    /// `deadline - now` without re-arming based on a stale relative count.
-    pub deadline: Timestamp,
+    /// The canonical timer domain value reconstructed from the event stream.
+    #[serde(flatten)]
+    pub value: TimerValue,
+    /// When this row's birth event (`TimerActivated`) landed in the log (see
+    /// [`crate::storage::Activity::created_at`] for the deterministic-source note).
+    pub created_at: Timestamp,
+    /// The latest applied entry's timestamp that touched this row; each mutating applier bumps it.
+    pub updated_at: Timestamp,
+}
+
+impl Timer {
+    pub fn value(&self) -> TimerValue {
+        self.value.clone()
+    }
+
+    pub fn from_value(value: TimerValue) -> Self {
+        Self {
+            value,
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        }
+    }
+
+    /// Stamp a fresh row's birth entry moment (creation applier): `created_at == updated_at == at`.
+    pub fn born(&mut self, at: Timestamp) {
+        self.created_at = at;
+        self.updated_at = at;
+    }
+
+    /// Record a row write at `at` (a mutation applier): advances `updated_at`, leaves `created_at`.
+    pub fn touch(&mut self, at: Timestamp) {
+        self.updated_at = at;
+    }
+}
+
+impl Deref for Timer {
+    type Target = TimerValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl DerefMut for Timer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }

@@ -4,7 +4,7 @@ use crate::command::Command;
 use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
 use crate::id::{NodeId, NodeKind};
-use crate::storage::{ActivityStatus, ExecutionStatus};
+use crate::{ActivityStatus, ExecutionStatus};
 
 /// Handles `Command::ProcessChildCompleted`: a child reached a terminal state; the owned `parent` now
 /// reacts based on **its own** state.
@@ -31,7 +31,7 @@ use crate::storage::{ActivityStatus, ExecutionStatus};
 /// parent's last child (the `len()==1 && contains` / re-entry snapshot special-cases).
 ///
 /// **Why this is clean:** the child's terminal event is applied *before* this command is
-/// dispatched (the Processor applies an `Event` then dispatches the following `Command` in batch
+/// dispatched (the StreamProcessor applies an `Event` then dispatches the following `Command` in batch
 /// order), so `parent`'s `active_children` is the real post-drain projection — no snapshot
 /// arithmetic needed.
 pub struct ProcessChildCompletedHandler {
@@ -105,13 +105,19 @@ impl ProcessChildCompletedHandler {
                 if !exec.active_children.is_empty() {
                     return; // not drained yet — some other child owns the parent's finish.
                 }
-                match exec.status {
+                match &exec.status {
                     ExecutionStatus::Completing => {
                         let output = exec.output.clone().unwrap_or(Default::default());
-                        out.emit_event(Event::ExecutionCompleted {
-                            id,
-                            output: output.clone(),
-                        });
+                        let mut completed_execution = exec.value();
+                        completed_execution.status = ExecutionStatus::Completed;
+                        completed_execution.output = Some(output.clone());
+                        // The parent execution's finish is observable durably; `start`'s
+                        // `wait_for_execution` poll surfaces it from Storage. No deferred ack — the
+                        // execution (a Parallel branch or its owner) was never awaited via an ack.
+                        let completed_event = Event::ExecutionCompleted {
+                            execution: completed_execution,
+                        };
+                        out.emit_event(completed_event);
                         if let Some(gp) = exec.parent {
                             out.emit_command(Command::ProcessChildCompleted {
                                 parent: gp,
@@ -120,10 +126,14 @@ impl ProcessChildCompletedHandler {
                         }
                     }
                     ExecutionStatus::Terminating(reason) => {
-                        out.emit_event(Event::ExecutionTerminated {
-                            id,
-                            reason: reason.clone(),
-                        });
+                        let mut terminated_execution = exec.value();
+                        terminated_execution.status = ExecutionStatus::Terminated(reason.clone());
+                        // Same as the Completing branch: reachable durably via `wait_for_execution`
+                        // poll; no deferred ack needed.
+                        let terminated_event = Event::ExecutionTerminated {
+                            execution: terminated_execution,
+                        };
+                        out.emit_event(terminated_event);
                         if let Some(gp) = exec.parent {
                             out.emit_command(Command::ProcessChildCompleted {
                                 parent: gp,
@@ -143,7 +153,7 @@ impl ProcessChildCompletedHandler {
                 let Some(act) = ctx.storage.get_activity(id).await.ok().flatten() else {
                     return;
                 };
-                match act.status {
+                match act.value.status {
                     ActivityStatus::Completing => {
                         // The success drain only fires once every owned child has terminated — the
                         // `ing` (`StateCompleting`) awaits them. A still-in-flight child owns this
@@ -157,27 +167,34 @@ impl ProcessChildCompletedHandler {
                         // after projecting convergence), but keeping it aligned with the shared
                         // complete semantics avoids silently changing the result if a future state
                         // defers its success ed to drain.
-                        let output = act.raw_output.clone().unwrap_or_else(|| act.input.clone());
+                        let output = act
+                            .value
+                            .raw_output
+                            .clone()
+                            .unwrap_or_else(|| act.value.input.clone());
+                        let mut activity_value = act.value();
+                        activity_value.status = ActivityStatus::Completed;
+                        activity_value.output = Some(output.clone());
                         out.emit_event(Event::StateCompleted {
-                            activity: id,
-                            output: output.clone(),
+                            activity: activity_value,
                         });
                         out.emit_command(Command::ProcessChildCompleted {
-                            parent: act.parent,
+                            parent: act.value.parent,
                             child: NodeId::Activity(id),
                         });
                     }
-                    ActivityStatus::Terminating(reason) => {
+                    ActivityStatus::Terminating(ref reason) => {
                         // The failure drain likewise only fires once every child has terminated.
                         if !act.active_children.is_empty() {
                             return;
                         }
+                        let mut activity_value = act.value();
+                        activity_value.status = ActivityStatus::Terminated(reason.clone());
                         out.emit_event(Event::StateTerminated {
-                            activity: id,
-                            reason: reason.clone(),
+                            activity: activity_value,
                         });
                         out.emit_command(Command::ProcessChildCompleted {
-                            parent: act.parent,
+                            parent: act.value.parent,
                             child: NodeId::Activity(id),
                         });
                     }
@@ -213,7 +230,7 @@ impl ProcessChildCompletedHandler {
     /// `child` is the node that just settled, threaded through so a `Map` can identify which item it
     /// was.
     ///
-    /// `actx.execution` is the owning execution, whose `root_execution`/`state_path` thread
+    /// `actx.activity.execution` is the owning execution, whose `root_execution`/`state_path` thread
     /// through so a nested `Map`/`Parallel` can fan out deeper children.
     async fn dispatch_child_completed(
         &self,
@@ -225,18 +242,24 @@ impl ProcessChildCompletedHandler {
     ) {
         // The owning execution: an activity is owned by an Execution (top-level or a Parallel-branch
         // child execution). Build the ctx from that execution's row.
-        let execution = match act.parent {
+        let execution = match act.value.parent {
             NodeId::Execution(e) => e,
             _ => return, // internal fault: an activity's owner is always an Execution.
         };
         let Some(exec) = ctx.storage.get_execution(execution).await.ok().flatten() else {
             return; // owning execution gone — nothing to replenish into.
         };
+        // Resolve the machine revision this execution is bound to. First use of a revision in a
+        // fresh StreamProcessor loads it from storage into the cache.
+        let sm = match ctx.machine(exec.flow_version_id).await {
+            Ok(s) => s,
+            Err(_) => return, // definition gone — nothing to decide.
+        };
         let state_def = match super::resolve_state_for(
             ctx.storage,
-            ctx.sm,
+            &sm,
             execution,
-            &crate::handlers::state_name_from_path(act.state_path.as_ptr()),
+            &crate::handlers::state_name_from_path(act.value.state_path.as_ptr()),
         )
         .await
         {
@@ -244,16 +267,13 @@ impl ProcessChildCompletedHandler {
             Err(_) => return, // definition gone — nothing to decide.
         };
         let actx = ActivityCtx {
-            execution,
-            root_execution: exec.root_execution,
+            // `child_completed` runs after the child's terminal event landed, so the activity row is
+            // the latest projection snapshot; convert it to the canonical event-shaped value before
+            // handing it to the container state logic.
+            activity: act.value(),
             execution_state_path: exec.state_path.clone(),
             exec_input: exec.input.clone(),
-            raw_input: act.raw_input.clone(),
-            input: act.input.clone(),
-            raw_output: act.raw_output.clone(),
-            scope: exec.scope.clone(),
-            state_path: act.state_path.clone(),
-            retry_count: act.retry_state.retry_count,
+            variables: exec.variables.clone(),
             kind: CtxKind::Complete,
         };
         match self.state_handlers.get(&std::mem::discriminant(state_def)) {

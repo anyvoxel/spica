@@ -1,5 +1,5 @@
-//! `TaskActivated` event projection: folds the `Event::TaskActivated` into Storage and feeds the
-//! external call to the [`TaskServiceHandle`](crate::task_service::TaskServiceHandle).
+//! `TaskActivated` event projection: folds the `Event::TaskActivated` into Storage, making the task
+//! **available** (`Pending`) for a worker to claim.
 
 use async_trait::async_trait;
 
@@ -8,7 +8,7 @@ use crate::event::Event;
 use crate::{ApplierContext, EventApplier};
 
 use crate::id::{NodeId, TaskId};
-use crate::storage::TaskStatus;
+use crate::{TaskStatus, TaskValue};
 
 #[derive(Default)]
 pub(crate) struct TaskActivatedApplier;
@@ -16,10 +16,16 @@ pub(crate) struct TaskActivatedApplier;
 impl EventApplier for TaskActivatedApplier {
     fn event(&self) -> Event {
         Event::TaskActivated {
-            parent: NodeId::Activity(crate::id::ActivityId::nil()),
-            task: TaskId::nil(),
-            resource: String::new(),
-            arguments: Default::default(),
+            task: TaskValue {
+                id: TaskId::nil(),
+                parent: NodeId::Activity(crate::id::ActivityId::nil()),
+                resource: String::new(),
+                arguments: Default::default(),
+                status: TaskStatus::Pending,
+                deadline: None,
+                worker_id: None,
+                lease_until: None,
+            },
         }
     }
 
@@ -28,41 +34,24 @@ impl EventApplier for TaskActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::TaskActivated {
-            parent,
-            task,
-            resource,
-            arguments,
-        } = event
-        else {
+        let Event::TaskActivated { task } = event else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        // Fold the invocation as a durable fact: an `Active` task row owned by the invoking
-        // activity. `deadline` is `None` in M1 (no `TimeoutSeconds` support yet — a later milestone
-        // arms a deadline-derived timeout).
+        // Fold the invocation as a durable fact: an `Pending` (available) task row owned by the
+        // invoking activity. `deadline` is `None` in M1 (no `TimeoutSeconds` support yet), and
+        // `worker_id`/`lease_until` are `None` until a worker claims it.
+        let mut row = crate::storage::Task::from_value(task.clone());
+        // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
+        row.born(ctx.timestamp);
+        ctx.storage.put_task(row).await?;
         ctx.storage
-            .put_task(crate::storage::Task {
-                id: *task,
-                parent: *parent,
-                resource: resource.clone(),
-                arguments: arguments.clone(),
-                status: TaskStatus::Active,
-                deadline: None,
-            })
+            .add_child(task.parent, NodeId::Task(task.id))
             .await?;
-        ctx.storage.add_child(*parent, NodeId::Task(*task)).await?;
-        // Feed the external call to the task service (the storage fold is pure; this is the side
-        // effect). The service needs the owning entry's stream/cause identity to re-envelope the
-        // `CompleteTask` it fires on settle; the Processor supplies these via the context.
-        ctx.task_service.invoke(
-            *task,
-            resource.clone(),
-            arguments.clone(),
-            ctx.stream_id,
-            ctx.cause_id,
-        );
+        // No handler is invoked here (M1 used to `invoke` as a post-commit side effect). The task is
+        // now *claimable*: a worker pulls it via `TaskApi::activate` and performs the physical call.
+        // Storage is the durable source of truth; the "queue" of `Pending` tasks is derived from it.
         Ok(())
     }
 }

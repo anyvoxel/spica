@@ -6,10 +6,10 @@ use crate::error::ExecutionError;
 use crate::event::Event;
 use crate::{ApplierContext, EventApplier};
 
+use crate::TimerStatus;
 use crate::command::TimerPurpose;
 use crate::id::{ExecutionId, NodeId, TimerId};
 use crate::log::Timestamp;
-use crate::storage::TimerStatus;
 
 /// `TimerActivated` folds the timer row into Storage **and** arms the physical deadline in the
 /// scheduler. The durable stream carries the logical "armed" fact plus its absolute `deadline`;
@@ -21,10 +21,13 @@ pub(crate) struct TimerActivatedApplier;
 impl EventApplier for TimerActivatedApplier {
     fn event(&self) -> Event {
         Event::TimerActivated {
-            parent: NodeId::Execution(ExecutionId::nil()),
-            timer: TimerId::nil(),
-            purpose: TimerPurpose::WaitResume,
-            deadline: Timestamp::from_millis(0),
+            timer: crate::TimerValue {
+                id: TimerId::nil(),
+                parent: NodeId::Execution(ExecutionId::nil()),
+                purpose: TimerPurpose::WaitResume,
+                status: TimerStatus::Active,
+                deadline: Timestamp::from_millis(0),
+            },
         }
     }
 
@@ -33,36 +36,26 @@ impl EventApplier for TimerActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::TimerActivated {
-            parent,
-            timer,
-            purpose,
-            deadline,
-        } = event
-        else {
+        let Event::TimerActivated { timer } = event else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
+        let mut row = crate::storage::Timer::from_value(timer.clone());
+        // Birth: `created_at`/`updated_at` stamped with the `TimerActivated` entry's moment.
+        row.born(ctx.timestamp);
+        ctx.storage.put_timer(row).await?;
         ctx.storage
-            .put_timer(crate::storage::Timer {
-                id: *timer,
-                parent: *parent,
-                purpose: *purpose,
-                status: TimerStatus::Active,
-                deadline: *deadline,
-            })
-            .await?;
-        ctx.storage
-            .add_child(*parent, NodeId::Timer(*timer))
+            .add_child(timer.parent, NodeId::Timer(timer.id))
             .await?;
         // Schedule the physical deadline (the storage fold is pure; this is the side effect).
-        // The scheduler needs the owning entry's stream/cause identity to re-envelope the
-        // `CompleteTimer` it fires on expiry; the Processor supplies these via the context.
+        // The scheduler needs the owning entry's causal identity to re-envelope the `TriggerTimer`
+        // it fires on expiry; the StreamProcessor supplies it via the context. (There is no per-execution
+        // stream — a LogStream is one stream, so stream identity lives on the log, not here.)
         // The wait duration is derived from the persisted absolute `deadline`: already-past
         // fire immediately (saturating to zero).
         ctx.scheduler
-            .schedule(*timer, *deadline, ctx.stream_id, ctx.cause_id);
+            .schedule(timer.id, timer.deadline, ctx.cause_id);
         Ok(())
     }
 }
