@@ -19,6 +19,12 @@ use crate::id::NodeId;
 /// For a `Map`, `branch_index` carries the **item index** and `state`/`input` are the item
 /// processor's `StartAt` and the item's input value — the same command shape, reused verbatim for
 /// map items via the identical `ParallelBranchSpawned`/`parallel_children` mapping.
+///
+/// TODO(command-design): this handler already proves `SpawnBranch` is misnamed and underspecified.
+/// It no longer spawns only a `Parallel` branch, and the command payload does not preserve enough
+/// source context to describe *why* this child execution exists — only how to start it. Rename it
+/// to a container-neutral child-execution spawn command and extend its payload before more fan-out
+/// modes or source-specific behavior are added.
 #[derive(Default)]
 pub struct SpawnBranchHandler;
 
@@ -57,20 +63,28 @@ impl CommandHandler for SpawnBranchHandler {
             NodeId::Activity(a) => *a,
             _ => return, // internal fault: a branch owner must be an Activity.
         };
-        if !ctx
-            .storage
-            .get_activity(owner)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.status.is_running())
-            .unwrap_or(false)
-        {
+        let owner_activity = match ctx.storage.get_activity(owner).await {
+            Ok(Some(a)) => a,
+            _ => return, // owner gone — the fan-out is dropped.
+        };
+        if !owner_activity.status.is_running() {
             return; // owner not running — the fan-out is dropped.
         }
 
+        // The child execution runs against the *same* machine version as its owner: the owning
+        // activity's parent is the owning execution, whose `flow_version_id` names the definition the
+        // whole tree binds to. Resolve it from the owner's execution so the child's later
+        // `ActivateState`/`CompleteState` resolve states against the same shared machine doc.
+        let flow_version_id = match owner_activity.value.parent {
+            NodeId::Execution(e) => match ctx.storage.get_execution(e).await {
+                Ok(Some(ex)) => ex.flow_version_id,
+                _ => return, // owning execution gone — nothing to bind the child to.
+            },
+            _ => return, // internal fault: a branch owner's parent must be an Execution.
+        };
+
         let id = out.next_execution();
-        tracing::debug!(child = ?id, parent = ?parent, "spawning parallel branch as child execution");
+        tracing::debug!(child = ?id, parent = ?parent, "spawning child execution from fan-out command");
 
         // Root the child in the owning tree: `parent` links it to the Parallel activity (whose
         // `active_children` the applier populates, so the Parallel drains only once every branch
@@ -79,11 +93,19 @@ impl CommandHandler for SpawnBranchHandler {
         // states without querying its parent or the root — it already names the branch's `states`
         // table within the single shared machine document.
         out.emit_event(Event::ExecutionCreated {
-            id,
-            root_execution: *root_execution,
-            parent: Some(*parent),
-            state_path: state_path.clone(),
-            input: input.clone(),
+            // A child spawned by fan-out has no client request awaiting its creation — the `nil`
+            // placeholder means this record is never interpreted as a request acknowledgement.
+            request_id: crate::id::RequestId::nil(),
+            execution: crate::ExecutionValue {
+                id,
+                flow_version_id,
+                root_execution: *root_execution,
+                parent: Some(*parent),
+                state_path: state_path.clone(),
+                status: crate::ExecutionStatus::Running,
+                input: input.clone(),
+                output: None,
+            },
         });
         // Record the child under its branch index so the owning `Parallel` can aggregate branch
         // outputs in the declared `Branches` order when it converges.

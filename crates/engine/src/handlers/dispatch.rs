@@ -30,7 +30,7 @@ macro_rules! state_handler_entry {
     ($map:expr) => {};
 }
 
-/// The shared `State` -> `StateHandler` dispatch table, built once per `Processor` and reused by
+/// The shared `State` -> `StateHandler` dispatch table, built once per `StreamProcessor` and reused by
 /// both the `ActivateState` and `CompleteState` command handlers. Routing by
 /// [`Discriminant`](std::mem::Discriminant) mirrors the `Command` table and keeps each state's
 /// activate/complete behavior in one impl.

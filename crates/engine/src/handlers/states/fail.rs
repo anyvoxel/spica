@@ -1,8 +1,10 @@
 use serde_json::{Map, Value};
 use spica_asl::{FailState, State};
 
-use super::super::eval_string_or_expr;
 use super::super::state_handler::StateHandler;
+use super::super::{
+    eval_string_or_expr, state_activated_value, state_terminated_value, state_terminating_value,
+};
 use crate::command::{Command, TerminationReason};
 use crate::context::build_states;
 use crate::error::ExecutionError;
@@ -33,9 +35,7 @@ impl StateHandler for FailStateHandler {
         // `complete`), which is a structural-symmetry trade-off against the failure semantics the
         // framework's `StateCompleting` marker implies.
         out.emit_event(crate::event::Event::StateActivated {
-            activity,
-            input: actx.input.clone(),
-            plan: None,
+            activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
         out.emit_command(crate::command::Command::CompleteState { activity });
     }
@@ -72,12 +72,12 @@ fn complete_fail(
     // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed) — however late an
     // `Assign` is applied, derived values read consistently with the scope already folded.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // no Catch `errorOutput` in the fail path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -88,8 +88,8 @@ fn complete_fail(
         let value = fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            eval_string_or_expr(env, error, &states, &actx.scope)
+            actx.activity.execution,
+            eval_string_or_expr(env, error, &states, &actx.variables)
         );
         if let Some(s) = value.as_str() {
             error_name = s.to_string();
@@ -100,8 +100,8 @@ fn complete_fail(
         let value = fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            eval_string_or_expr(env, cause, &states, &actx.scope)
+            actx.activity.execution,
+            eval_string_or_expr(env, cause, &states, &actx.variables)
         );
         err_out.insert("Cause".to_string(), value);
     }
@@ -117,15 +117,13 @@ fn complete_fail(
     // execution's termination (`ExecutionTerminating` → `ExecutionTerminated`) rather than the
     // `CompleteExecution` Pass would throw.
     out.emit_event(crate::event::Event::StateTerminating {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminating_value(actx, reason.clone()),
     });
     out.emit_event(crate::event::Event::StateTerminated {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminated_value(actx, reason.clone()),
     });
     out.emit_command(Command::TerminateExecution {
-        id: actx.execution,
+        id: actx.activity.execution,
         reason,
     });
 }

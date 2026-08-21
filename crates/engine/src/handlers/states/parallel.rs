@@ -2,8 +2,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{ParallelState, State};
 
-use super::super::emit_transition;
 use super::super::state_handler::StateHandler;
+use super::super::{
+    emit_transition, state_activated_value, state_completed_value, state_completing_value,
+    state_terminated_value, state_terminating_value,
+};
 use crate::command::{Command, TerminationReason};
 use crate::context::build_states;
 use crate::error::ExecutionError;
@@ -11,7 +14,7 @@ use crate::eval_env::EvalEnv;
 use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
 use crate::id::{ActivityId, NodeId};
-use crate::storage::ExecutionStatus;
+use crate::{ActivityState, ExecutionStatus};
 
 /// The `Parallel` state: runs several branch sub-state-machines concurrently, waits for all of them
 /// to reach a terminal state, then transitions — or fails the whole state if any branch fails.
@@ -72,10 +75,16 @@ impl StateHandler for ParallelStateHandler {
         _state: &State,
     ) {
         out.emit_event(Event::StateCompleted {
-            activity,
-            output: actx.input.clone(),
+            activity: state_completed_value(actx, actx.activity.input.clone()),
         });
-        emit_transition(out, actx.execution, activity, &actx.input, None, Some(true));
+        emit_transition(
+            out,
+            actx.activity.execution,
+            activity,
+            &actx.activity.input,
+            None,
+            Some(true),
+        );
     }
 
     /// The **replenish** hook, resumed by `ProcessChildCompleted`'s Running arm once the last branch
@@ -120,7 +129,7 @@ impl StateHandler for ParallelStateHandler {
         // so the aggregated output array matches the declared `Branches` order.
         // A non-`Parallel` repository here is an internal fault (a Parallel always fans out while
         // still `Running`); nothing to aggregate — defer.
-        let crate::storage::ActivityState::Parallel(progress) = &act.activity_state else {
+        let ActivityState::Parallel(progress) = &act.value.activity_state else {
             return;
         };
         let mut entries: Vec<(usize, crate::id::ExecutionId)> =
@@ -138,7 +147,7 @@ impl StateHandler for ParallelStateHandler {
                 fail_parallel(out, activity, actx, reason);
                 return;
             };
-            match child.status {
+            match &child.status {
                 ExecutionStatus::Completed => {
                     outputs.push(child.output.clone().unwrap_or(Value::Null))
                 }
@@ -178,12 +187,12 @@ fn activate_parallel(
     // result until its branches settle) and `assign_ctx = None`. A JSONata `Arguments` expression
     // may reference `$states.input` and in-scope variables.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.retry_count,
+        actx.activity.retry_state.retry_count,
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -194,13 +203,13 @@ fn activate_parallel(
         Some(arguments) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            env.eval_json(arguments, &states, &actx.scope)
+            actx.activity.execution,
+            env.eval_json(arguments, &states, &actx.variables)
         ),
-        None => actx.input.clone(),
+        None => actx.activity.input.clone(),
     };
 
-    // Fan out each branch as a child execution. Each child inherits `actx.root_execution` (the flat
+    // Fan out each branch as a child execution. Each child inherits `actx.activity.root_execution` (the flat
     // query anchor), is rooted under this activity (`NodeId::Activity(activity)` — so the Parallel
     // waits on all of them via `active_children`), and carries a `state_path` locating its
     // branch's `states` table: the owning execution's pointer extended by
@@ -211,7 +220,7 @@ fn activate_parallel(
         let pointer = child_pointer(actx, index);
         out.emit_command(Command::SpawnBranch {
             parent: owner,
-            root_execution: actx.root_execution,
+            root_execution: actx.activity.root_execution,
             state_path: Some(pointer),
             branch_index: index,
             state: branch.start_at.clone(),
@@ -223,11 +232,7 @@ fn activate_parallel(
     // activation-complete ed. No synchronous finish — the activity stays `Running` owning its child
     // executions; it completes only when they all settle (via `child_completed`).
     out.emit_event(Event::StateActivated {
-        activity,
-        // A Parallel's processed input is its projected `Arguments` (the value each branch
-        // received); the raw input from `StateActivating` is on `raw_input`.
-        input: arguments.clone(),
-        plan: None,
+        activity: state_activated_value(actx, arguments.clone(), None),
     });
 }
 
@@ -242,7 +247,7 @@ fn activate_parallel(
 /// `states` when the pointer ends right there. No trailing `/states` token.
 fn child_pointer(actx: &ActivityCtx, index: usize) -> jsonptr::PointerBuf {
     // The owning execution's pointer extended by `/states/<parallel>/branches/<index>`, where
-    // `<parallel>` is this state's own name (the leaf of `actx.state_path`). For a top-level
+    // `<parallel>` is this state's own name (the leaf of `actx.activity.state_path`). For a top-level
     // `Parallel` the owner's pointer is `None`, so we build `/states/<parallel>/branches/ <index>`
     // from scratch; otherwise we clone and append. `push_back` applies RFC 6901 escaping.
     let mut pointer = match &actx.execution_state_path {
@@ -264,20 +269,18 @@ fn child_pointer(actx: &ActivityCtx, index: usize) -> jsonptr::PointerBuf {
 /// `TerminateState` sweep handles its `Execution` children).
 fn fail_parallel(
     out: &mut Collector,
-    activity: ActivityId,
+    _activity: ActivityId,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
     out.emit_event(Event::StateTerminating {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminating_value(actx, reason.clone()),
     });
     out.emit_event(Event::StateTerminated {
-        activity,
-        reason: reason.clone(),
+        activity: state_terminated_value(actx, reason.clone()),
     });
     out.emit_command(Command::TerminateExecution {
-        id: actx.execution,
+        id: actx.activity.execution,
         reason,
     });
 }
@@ -298,41 +301,41 @@ fn finish_parallel(
     aggregated: Value,
 ) {
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         Some(&aggregated), // `$states.result` = the ordered branch outputs
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // success path — no Catch `errorOutput`
         None, // not a Map item — no `context.Map.Item` binding
     );
-    let mut local_scope = actx.scope.clone();
+    let mut local_scope = actx.variables.clone();
 
     if let Some(assign_obj) = &state.assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
-                    out.emit_event(Event::VariablesAssigned {
-                        execution: actx.execution,
-                        assignments: map.clone(),
-                    });
                     for (k, v) in map {
                         local_scope.insert(k, v);
                     }
+                    out.emit_event(Event::VariablesAssigned {
+                        execution: actx.activity.execution,
+                        variables: local_scope.clone(),
+                    });
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     ),
@@ -348,20 +351,21 @@ fn finish_parallel(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(o, &states, &local_scope)
         ),
         None => aggregated,
     };
 
-    out.emit_event(Event::StateCompleting { activity });
+    out.emit_event(Event::StateCompleting {
+        activity: state_completing_value(actx),
+    });
     out.emit_event(Event::StateCompleted {
-        activity,
-        output: output_value.clone(),
+        activity: state_completed_value(actx, output_value.clone()),
     });
     emit_transition(
         out,
-        actx.execution,
+        actx.activity.execution,
         activity,
         &output_value,
         state.next.as_deref(),

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::error::ExecutionError;
 use crate::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::{ActivityState, ApplierContext, EventApplier};
 
 use crate::id::{ActivityId, ExecutionId};
 
@@ -42,18 +42,16 @@ impl EventApplier for ParallelBranchSpawnedApplier {
             // repository, dispatching on the variant already there: an existing `Map` repository
             // collects item children; anything else is a `Parallel` (entered as `Leaf`, upgraded on
             // the first spawn).
-            match &mut act.activity_state {
-                crate::storage::ActivityState::Map(progress) => {
+            match &mut act.value.activity_state {
+                ActivityState::Map(progress) => {
                     progress.children.insert(*index, *execution);
                 }
                 _ => {
-                    let progress = match &mut act.activity_state {
-                        crate::storage::ActivityState::Parallel(progress) => progress,
+                    let progress = match &mut act.value.activity_state {
+                        ActivityState::Parallel(progress) => progress,
                         _ => {
-                            act.activity_state =
-                                crate::storage::ActivityState::Parallel(Default::default());
-                            let crate::storage::ActivityState::Parallel(progress) =
-                                &mut act.activity_state
+                            act.value.activity_state = ActivityState::Parallel(Default::default());
+                            let ActivityState::Parallel(progress) = &mut act.value.activity_state
                             else {
                                 unreachable!()
                             };
@@ -63,6 +61,7 @@ impl EventApplier for ParallelBranchSpawnedApplier {
                     progress.branches.insert(*index, *execution);
                 }
             }
+            act.touch(ctx.timestamp);
             ctx.storage.put_activity(act).await?;
         }
         Ok(())

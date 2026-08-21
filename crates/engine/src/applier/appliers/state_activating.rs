@@ -1,13 +1,15 @@
-//! `StateActivating` event projection: folds the `Event::StateActivating` into Storage.
+//! `StateActivating` event projection: folds the `Event::StateActivating` activity value into Storage.
 
 use async_trait::async_trait;
 
 use crate::error::ExecutionError;
 use crate::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::{
+    ActivityState, ActivityStatus, ActivityValue, ApplierContext, EventApplier, RetryState,
+};
 
 use crate::id::{ActivityId, ExecutionId, NodeId};
-use crate::storage::ActivityStatus;
+use crate::storage::Activity;
 
 #[derive(Default)]
 pub(crate) struct StateActivatingApplier;
@@ -15,10 +17,20 @@ pub(crate) struct StateActivatingApplier;
 impl EventApplier for StateActivatingApplier {
     fn event(&self) -> Event {
         Event::StateActivating {
-            execution: ExecutionId::nil(),
-            activity: ActivityId::nil(),
-            state_path: jsonptr::PointerBuf::new(),
-            input: Default::default(),
+            activity: ActivityValue {
+                id: ActivityId::nil(),
+                execution: ExecutionId::nil(),
+                root_execution: ExecutionId::nil(),
+                parent: NodeId::Execution(ExecutionId::nil()),
+                state_path: jsonptr::PointerBuf::new(),
+                status: ActivityStatus::Running,
+                raw_input: Default::default(),
+                input: Default::default(),
+                raw_output: None,
+                activity_state: ActivityState::Leaf,
+                retry_state: RetryState::default(),
+                output: None,
+            },
         }
     }
 
@@ -27,49 +39,28 @@ impl EventApplier for StateActivatingApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::StateActivating {
-            execution,
-            activity,
-            state_path,
-            input,
-        } = event
-        else {
+        let Event::StateActivating { activity } = event else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        // The leaf state name is derived from the full `state_path` (`/states/<name>` → `<name>`),
-        // so the two never drift apart.
-        let state_name = crate::handlers::state_name_from_path(state_path.as_ptr());
+        // `StateActivating` is the creation moment of the projection row: the event already carries
+        // the canonical domain entity, and storage only adds its projection-only `active_children`
+        // bookkeeping alongside it.
+        let mut row = Activity::from_value(activity.clone(), std::collections::HashSet::new());
+        // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
+        row.born(ctx.timestamp);
+        ctx.storage.put_activity(row).await?;
         ctx.storage
-            .put_activity(crate::storage::Activity {
-                id: *activity,
-                parent: NodeId::Execution(*execution),
-                state_path: state_path.clone(),
-                status: ActivityStatus::Running,
-                // Initially the processed input equals the raw input: preprocessing (e.g. projecting
-                // a Task's `Arguments`) has not run yet — `StateActivated` overwrites `input` once a
-                // state's activate step finishes its input preprocessing.
-                raw_input: input.clone(),
-                input: input.clone(),
-                raw_output: None,
-                // A state enters with no state-specific repository yet. A container state's
-                // `Leaf` is replaced by its `ActivityState::Parallel`/`Map` when its fan-out/plan is
-                // recorded (`ParallelBranchSpawned` / `StateActivated`).
-                activity_state: crate::storage::ActivityState::Leaf,
-                // Retry bookkeeping starts empty: no retry has been scheduled yet, so both the total
-                // count and every per-retrier counter begin at 0.
-                retry_state: crate::storage::RetryState::default(),
-                output: None,
-                active_children: std::collections::HashSet::new(),
-            })
+            .add_child(activity.parent, NodeId::Activity(activity.id))
             .await?;
-        ctx.storage
-            .add_child(NodeId::Execution(*execution), NodeId::Activity(*activity))
-            .await?;
-        if let Some(mut exec) = ctx.storage.get_execution(*execution).await? {
-            exec.current_state = Some(state_name.clone());
-            exec.current_activity = Some(*activity);
+        if let Some(mut exec) = ctx.storage.get_execution(activity.execution).await? {
+            // Track the currently active state only in the projection row. The event-carried
+            // execution value stays focused on durable domain facts, while this storage-only cursor
+            // keeps the single-active-state invariant easy to observe and debug.
+            exec.current_activity = Some(activity.id);
+            // Newest activation also touches the owning execution's update time.
+            exec.touch(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

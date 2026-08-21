@@ -1,9 +1,8 @@
 use serde_json::Value;
 use spica_asl::{IntOrExpr, State, WaitState, WaitTimestamp};
 
-use super::super::complete_activity;
-use super::super::eval_string_or_expr;
 use super::super::state_handler::StateHandler;
+use super::super::{complete_activity, eval_string_or_expr, state_activated_value};
 use crate::command::{Command, TimerPurpose};
 use crate::context::build_states;
 use crate::error::ExecutionError;
@@ -62,7 +61,7 @@ impl StateHandler for WaitStateHandler {
             s.output.as_ref(),
             s.next.as_deref(),
             s.end,
-            actx.retry_count,
+            actx.activity.retry_state.retry_count,
             None, // Wait has no Catch `errorOutput`
         );
     }
@@ -80,12 +79,12 @@ fn activate_wait(
     // applied). A JSONata `Seconds`/`Timestamp` expression may reference `$states.input` and any
     // in-scope variables.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.retry_count,
+        actx.activity.retry_state.retry_count,
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -100,7 +99,7 @@ fn activate_wait(
             if !(0..=MAX_WAIT_SECONDS).contains(n) {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Wait Seconds must be an integer in the range 0..99999999".into(),
                     ),
@@ -111,7 +110,7 @@ fn activate_wait(
             let Some(deadline) = deadline else {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Wait Seconds overflows the absolute deadline".into(),
                     ),
@@ -126,8 +125,8 @@ fn activate_wait(
             let value = fail_or!(
                 out,
                 Some(activity),
-                actx.execution,
-                eval_string_or_expr(env, expr.as_str(), &states, &actx.scope)
+                actx.activity.execution,
+                eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             // The evaluated result must be a JSON number that is an integer in range (ASL: a JSONata
             // `Seconds` expression must evaluate to a non-negative integer, 0..99,999,999). Anything
@@ -151,7 +150,7 @@ fn activate_wait(
             let Some(n) = n else {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Wait Seconds expression must evaluate to an integer".into(),
                     ),
@@ -161,7 +160,7 @@ fn activate_wait(
             if !(0..=MAX_WAIT_SECONDS).contains(&n) {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Wait Seconds expression must evaluate to an integer in the range \
                          0..99999999"
@@ -174,7 +173,7 @@ fn activate_wait(
             let Some(deadline) = deadline else {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Wait Seconds overflows the absolute deadline".into(),
                     ),
@@ -189,7 +188,7 @@ fn activate_wait(
             None => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(format!(
                         "Wait Timestamp is not a valid RFC3339 timestamp: {s}"
                     )),
@@ -203,15 +202,15 @@ fn activate_wait(
             let value = fail_or!(
                 out,
                 Some(activity),
-                actx.execution,
-                eval_string_or_expr(env, expr.as_str(), &states, &actx.scope)
+                actx.activity.execution,
+                eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             let s = match value {
                 Value::String(s) => s,
                 _ => {
                     out.terminate(
                         Some(activity),
-                        actx.execution,
+                        actx.activity.execution,
                         ExecutionError::InvalidDefinition(
                             "Wait Timestamp expression must evaluate to a string".into(),
                         ),
@@ -224,7 +223,7 @@ fn activate_wait(
                 None => {
                     out.terminate(
                         Some(activity),
-                        actx.execution,
+                        actx.activity.execution,
                         ExecutionError::InvalidDefinition(format!(
                             "Wait Timestamp expression must evaluate to a valid RFC3339 \
                              timestamp: {s}"
@@ -250,9 +249,7 @@ fn activate_wait(
     // The activation work (computing the absolute deadline from Seconds/Timestamp) is done: emit the
     // activation-complete ed, then arm the resume timer as the transition's side effect.
     out.emit_event(crate::event::Event::StateActivated {
-        activity,
-        input: actx.input.clone(),
-        plan: None,
+        activity: state_activated_value(actx, actx.activity.input.clone(), None),
     });
     out.emit_command(Command::ActivateTimer {
         parent: crate::id::NodeId::Activity(activity),

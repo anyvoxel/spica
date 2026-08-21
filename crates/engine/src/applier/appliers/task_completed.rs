@@ -7,7 +7,7 @@ use crate::event::Event;
 use crate::{ApplierContext, EventApplier};
 
 use crate::id::{NodeId, TaskId};
-use crate::storage::TaskStatus;
+use crate::{TaskStatus, TaskValue};
 
 #[derive(Default)]
 pub(crate) struct TaskCompletedApplier;
@@ -15,7 +15,16 @@ pub(crate) struct TaskCompletedApplier;
 impl EventApplier for TaskCompletedApplier {
     fn event(&self) -> Event {
         Event::TaskCompleted {
-            task: TaskId::nil(),
+            task: TaskValue {
+                id: TaskId::nil(),
+                parent: NodeId::Activity(crate::id::ActivityId::nil()),
+                resource: String::new(),
+                arguments: Default::default(),
+                status: TaskStatus::Completed,
+                deadline: None,
+                worker_id: None,
+                lease_until: None,
+            },
             output: Default::default(),
         }
     }
@@ -34,18 +43,20 @@ impl EventApplier for TaskCompletedApplier {
         // is folded into the activity's `raw_output`: it is the state's raw result before the
         // complete step's `Output` projection, distinct from the immutable processed input recorded
         // during `StateActivated`.
-        if let Some(mut t) = ctx.storage.get_task(*task).await? {
+        if let Some(mut t) = ctx.storage.get_task(task.id).await? {
             let parent = t.parent;
             t.status = TaskStatus::Completed;
+            t.touch(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             if let NodeId::Activity(activity_id) = parent
                 && let Some(mut act) = ctx.storage.get_activity(activity_id).await?
             {
-                act.raw_output = Some(output.clone());
+                act.value.raw_output = Some(output.clone());
+                act.touch(ctx.timestamp);
                 ctx.storage.put_activity(act).await?;
             }
             ctx.storage
-                .remove_child(parent, NodeId::Task(*task))
+                .remove_child(parent, NodeId::Task(task.id))
                 .await?;
         }
         Ok(())

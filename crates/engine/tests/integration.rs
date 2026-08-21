@@ -1,16 +1,22 @@
 //! Integration tests for the M1 engine: pure-dataflow state machines using `Pass`, `Succeed`,
 //! `Fail`, `Choice`, and `Wait`.
 
+mod common;
+
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
-use spica_engine::{Engine, ExecutionError};
+use spica_engine::ExecutionError;
 
 fn parse_sm(definition: &str) -> StateMachine {
     serde_json::from_str(definition).expect("state machine should parse")
 }
 
+/// One-shot try: create an anonymous flow and run it once, returning the output. This is the explicit
+/// lifecycle the removed `Engine::run` used to sugar (see `tests/common`).
 async fn run(sm: &StateMachine, input: Value) -> Result<Value, ExecutionError> {
-    Engine::start(sm.clone(), input).await.map(|r| r.output)
+    common::create_and_run(common::in_memory_builder(), sm.clone(), input)
+        .await
+        .map(|r| r.output)
 }
 #[tokio::test]
 async fn pass_output_projection() {
@@ -331,24 +337,34 @@ async fn end_to_end_dataflow() {
 }
 
 #[tokio::test]
-async fn task_without_registered_handler_fails() {
+async fn unserved_task_fails_via_timeout_not_definition() {
+    // With no worker for its Resource, a Task is *not* rejected up front — Zeebe semantics: an
+    // unclaimed task simply stays queued/claimable (Pending). If the state sets `TimeoutSeconds`, the
+    // engine's `TaskTimeout` backstop fails it after that window, so the terminal outcome is a
+    // deterministic `TimedOut` — not the M1 `InvalidDefinition` "no worker" guard, which is gone.
     let sm = parse_sm(
         r#"{
           "StartAt": "T",
-          "States": { "T": { "Type": "Task", "Resource": "arn:aws:lambda:::f", "End": true } }
+          "States": {
+            "T": { "Type": "Task", "Resource": "arn:aws:lambda:::f",
+                   "TimeoutSeconds": 1, "End": true }
+          }
         }"#,
     );
     let err = run(&sm, Value::Null)
         .await
-        .expect_err("a Task with no registered handler should fail");
-    assert!(matches!(err, ExecutionError::InvalidDefinition(_)));
+        .expect_err("an unserved Task with TimeoutSeconds should eventually time out");
+    assert!(
+        matches!(err, ExecutionError::TimedOut { .. }),
+        "expected TimedOut, got {err:?}"
+    );
 }
 
 #[tokio::test]
 async fn handler_error_is_recorded_as_failure() {
     // A Pass with a malformed JSONata `Output`: the handler's `decide` errors (eval failure), and
     // the default `handle` records it as a failure (ActivityFailed + FailExecution) into the same
-    // collector — preserving the already-emitted ActivityStarted — rather than the Processor
+    // collector — preserving the already-emitted ActivityStarted — rather than the StreamProcessor
     // synthesizing a fresh failure.
     let sm = parse_sm(
         r#"{ "StartAt": "P", "States": { "P": { "Type": "Pass", "Output": "{% $states.input.. %}", "End": true } } }"#,
@@ -438,7 +454,7 @@ async fn run_task(
         "arn:aws:states:::lambda:invoke".to_string(),
         std::sync::Arc::from(handler),
     );
-    Engine::start_with_task_handlers(sm.clone(), input, handlers)
+    common::create_and_run_with_handlers(common::in_memory_builder(), sm.clone(), input, handlers)
         .await
         .map(|r| r.output)
 }

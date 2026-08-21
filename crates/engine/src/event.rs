@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::command::TerminationReason;
+use crate::activity::ActivityValue;
 use crate::error::ExecutionError;
-use crate::id::{ActivityId, ExecutionId, NodeId, TaskId, TimerId};
+use crate::execution::ExecutionValue;
+use crate::flow::Flow;
+use crate::flow_version::FlowVersion;
+use crate::id::{ActivityId, ExecutionId, RequestId};
 use crate::log::Timestamp;
+use crate::task::TaskValue;
+use crate::timer::TimerValue;
+use crate::variables::Variables;
 
 /// The result of executing a [`Command`](crate::Command). Events are appended to the
-/// [`LogStream`](crate::LogStream) alongside Commands; the [`Processor`](crate::Processor) applies
+/// [`LogStream`](crate::LogStream) alongside Commands; the [`StreamProcessor`](crate::StreamProcessor) applies
 /// each to [`Storage`](crate::Storage) to materialize the execution tree.
 ///
 /// Lifecycle verbs split into **before/after (`ing`/`ed`)** pairs so each phase records both what it
@@ -21,22 +27,56 @@ use crate::log::Timestamp;
 /// Storage is a projection (fold) of the event stream and can be rebuilt by replaying it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
+    /// `FlowCreated` — a **brand-new flow** (a `name` appearing for the first time) was created.
+    /// This is the durable record of a flow aggregate's birth, carrying the authoritative
+    /// [`Flow`](crate::Flow) value (its minted audit `flow_id`, `name`, creation stamp, `Active`
+    /// status, and — since a flow is born with its first version — the initial
+    /// `latest_flow_version_id`). It fires **only** on a new name: creating a *new version* of an
+    /// existing flow is a distinct operation that emits [`FlowVersionCreated`](Event::FlowVersionCreated)
+    /// alone (see the split rationale there).
+    ///
+    /// `CreateFlow` requires the name to **not already exist** (the `Engine` boundary pre-checks
+    /// before appending), so this event and the co-emitted `FlowVersionCreated` together make up one
+    /// atomic creation in a single command batch. `request_id` is the [`RequestId`] the `CreateFlow`
+    /// command carried — the awaiting operation's correlation key. The StreamProcessor routes the create
+    /// ack on `FlowVersionCreated` (which always fires), so this event's `request_id` is carried for
+    /// correlation/symmetry but does not itself resolve the ack.
+    FlowCreated { request_id: RequestId, flow: Flow },
+
+    /// `FlowVersionCreated` — a new immutable version of a flow was created, carrying the full
+    /// [`FlowVersion`](crate::FlowVersion) value. This is the **durable definition record**: it is
+    /// where a definition enters the stream (the projection keeps it in Storage keyed by
+    /// `flow_version_id`), and it is exactly what lets a recovered Engine re-resolve a definition by
+    /// id without the caller re-supplying the machine.
+    ///
+    /// It is emitted for **every** version creation — the `version 1` that accompanies a
+    /// [`FlowCreated`](Event::FlowCreated) birth, and, in a future milestone, the versions published
+    /// by a standalone "add a version to an existing flow" command. Splitting it out from
+    /// `FlowCreated` is precisely what lets that future command emit only this event (and advance the
+    /// owning `Flow.latest_flow_version_id` via its applier) without re-creating the flow aggregate.
+    ///
+    /// `request_id` echoes the originating command's [`RequestId`]; the StreamProcessor completes the
+    /// awaiting `create_flow` ack on this event and routes back `flow_version.flow_version_id`.
+    FlowVersionCreated {
+        request_id: RequestId,
+        flow_version: FlowVersion,
+    },
+
     /// Result of `Command::CreateExecution` (a top-level run) or `Command::SpawnBranch` (a child
     /// Parallel branch) — the execution's single creation record. For a child execution `parent`
     /// links it into the owning tree and `state_path` locates its branch `states` table within
     /// the shared machine document (see [`crate::storage::Execution::state_path`]);
     /// `root_execution` is always the top-level run's id (the flat query anchor), carried verbatim
     /// through every nesting level.
+    ///
+    /// `request_id` is the echoing correlate for a **top-level** `CreateExecution`: it carries the
+    /// command's `request_id` back so the awaiting `start` operation is acknowledged by request id
+    /// (the same model as `FlowCreated`) once the execution is durably created. A child execution
+    /// spawned by a fan-out (`SpawnBranch`) has no client request awaiting it, so it carries the
+    /// `nil` placeholder — that variant is never a request acknowledgement.
     ExecutionCreated {
-        id: ExecutionId,
-        /// The id of the top-level run this execution belongs to (self for the top-level run).
-        root_execution: ExecutionId,
-        /// `Some(owner)` for a child execution (M3 Parallel branch); `None` for the top-level run.
-        parent: Option<NodeId>,
-        /// JSON Pointer to this run's branch `states` table within the shared machine; `None` for
-        /// the top-level run.
-        state_path: Option<jsonptr::PointerBuf>,
-        input: Value,
+        request_id: RequestId,
+        execution: ExecutionValue,
     },
 
     /// Result of `Command::SpawnBranch` — a `Parallel` activity fanned out one branch as a child
@@ -51,99 +91,66 @@ pub enum Event {
         execution: ExecutionId,
     },
 
-    /// Success path began on the execution (records the computed output).
-    ExecutionCompleting { id: ExecutionId, output: Value },
-    /// Execution succeeded after any owned children drained (records `output`, the result).
-    ExecutionCompleted { id: ExecutionId, output: Value },
+    /// Success path began on the execution. Carries the same execution entity with
+    /// `status = Completing` and its decided success `output` fixed.
+    ExecutionCompleting { execution: ExecutionValue },
+    /// Execution succeeded after any owned children drained. Carries the same execution entity with
+    /// `status = Completed`.
+    ExecutionCompleted { execution: ExecutionValue },
 
-    /// Termination began on the execution (records the reason).
-    ExecutionTerminating {
-        id: ExecutionId,
-        reason: TerminationReason,
-    },
-    /// Execution terminated after any owned children drained (records the terminal reason).
-    ExecutionTerminated {
-        id: ExecutionId,
-        reason: TerminationReason,
-    },
+    /// Termination began on the execution. Carries the same execution entity with its final
+    /// termination reason already embedded in `status = Terminating(reason)`.
+    ExecutionTerminating { execution: ExecutionValue },
+    /// Execution terminated after any owned children drained. Carries the same execution entity with
+    /// `status = Terminated(reason)`.
+    ExecutionTerminated { execution: ExecutionValue },
 
-    /// Result of `Command::ActivateState` — the state was entered with `input`.
+    /// Result of `Command::ActivateState` — the state was entered and the lifecycle stream records
+    /// the full event-carried [`ActivityValue`](crate::ActivityValue) for that moment.
     ///
-    /// `state_path` is a JSON Pointer (RFC 6901) locating this state's definition within the shared
-    /// [`StateMachine`](spica_asl::StateMachine) document, e.g. `/states/P2` for a top-level state or
-    /// `/states/P1/branches/0/states/P2` for a state inside a Parallel branch. It is the **complete,
-    /// self-contained pointer to the state** (the owning execution's `state_path` names the
-    /// enclosing `states` table; `state_path` extends it by the state's name). The leaf state name is
-    /// **derived** as the pointer's last token, so it is not redundantly carried here. The event is
-    /// carried so a follower / recovered leader can record exactly where the activity lives without
-    /// re-deriving it from the machine + parent chain.
-    StateActivating {
-        execution: ExecutionId,
-        activity: ActivityId,
-        /// JSON Pointer to this state's definition in the machine document.
-        state_path: jsonptr::PointerBuf,
-        input: Value,
-    },
+    /// The value is the Activity's domain entity shape, intentionally excluding projection-only
+    /// bookkeeping such as `active_children`. A follower / recovered leader can therefore rebuild the
+    /// same activity domain state from the event stream alone, while storage remains free to keep its
+    /// own fold-only metadata alongside it.
+    StateActivating { activity: ActivityValue },
     /// The state finished activating — emitted by the `StateHandler::activate` **only after** it has
     /// processed the state's input. It is the ed of `StateActivating` and precedes the state's own
     /// follow-up: a `CompleteState`/`TerminateState` sequence or an armed side-effect (e.g. a Wait
     /// resume timer). Full per-entry chain: `StateActivating → StateActivated → …`.
     ///
-    /// Carries the state's **activation product** — state that the activate step computed and that a
-    /// follower / recovered leader must be able to rebuild from the event stream alone (it is not
-    /// re-derivable from the static machine definition). For a `Map` state this is the iteration
-    /// plan it projected from `Items`/`MaxConcurrency` (a JSONata `Items` expression is evaluated at
-    /// activate time against a scope that later replenish rounds can't re-derive, so it must travel
-    /// here). For every non-container state the plan is `None` — its activation consumed no state that
-    /// isn't already on the `Activity` row.
-    ///
-    /// `input` is the state's **processed input** — the result of its activation-time input
-    /// preprocessing (e.g. projecting a `Task`'s/`Parallel`'s `Arguments`) applied to the raw input
-    /// carried on `StateActivating`. A state that consumes its raw input verbatim carries a copy of it
-    /// (never `None`). Folded onto the activity's `input` so the processed view is inspectable without
-    /// re-running the projection.
-    StateActivated {
-        activity: ActivityId,
-        /// The state's processed input (raw input after activation-time preprocessing).
-        input: Value,
-        /// The activation product: the `Map` iteration plan, or `None` for non-container states.
-        plan: Option<crate::storage::MapActivityState>,
-    },
+    /// Carries the same entity-shaped [`ActivityValue`](crate::ActivityValue), now updated to
+    /// reflect the activation result (for example, a Task/Parallel processed input or a Map activity
+    /// whose `activity_state` now contains its iteration plan).
+    StateActivated { activity: ActivityValue },
 
-    /// The state began its success finish (the complete step started; children, if any, may still
-    /// be draining).
-    StateCompleting { activity: ActivityId },
-    /// The state finished successfully, producing `output` (the next state's input, or the
-    /// execution output if terminal).
-    StateCompleted { activity: ActivityId, output: Value },
+    /// The state began its success finish (the complete step started; children, if any, may still be
+    /// draining). Carries the same Activity entity with `status = Completing`.
+    StateCompleting { activity: ActivityValue },
+    /// The state finished successfully. Carries the same Activity entity with its terminal `output`
+    /// fixed and `status = Completed`.
+    StateCompleted { activity: ActivityValue },
 
-    /// The state began terminating with `reason` (children may still be draining).
-    StateTerminating {
-        activity: ActivityId,
-        reason: TerminationReason,
-    },
-    /// The state terminated after its owner/children drained; reason flows from the cascade.
-    StateTerminated {
-        activity: ActivityId,
-        reason: TerminationReason,
-    },
+    /// The state began terminating. Carries the same Activity entity with the final termination reason
+    /// already embedded in `status = Terminating(reason)`.
+    StateTerminating { activity: ActivityValue },
+    /// The state terminated after its owner/children drained. Carries the same Activity entity with
+    /// `status = Terminated(reason)`.
+    StateTerminated { activity: ActivityValue },
 
-    /// A timer was armed for `purpose` (records the absolute `deadline` and the owning `parent`).
-    TimerActivated {
-        parent: NodeId,
-        timer: TimerId,
-        purpose: crate::command::TimerPurpose,
-        deadline: Timestamp,
-    },
-    /// A timer's deadline passed.
-    TimerCompleted { timer: TimerId },
-    /// A timer was cancelled before firing.
-    TimerCancelled { timer: TimerId },
+    /// A timer was armed and the lifecycle stream records the full event-carried
+    /// [`TimerValue`](crate::TimerValue) for that moment.
+    TimerActivated { timer: TimerValue },
+    /// A timer's deadline passed. Carries the same timer entity with `status = Completed`.
+    TimerTriggered { timer: TimerValue },
+    /// A timer was cancelled before firing. Carries the same timer entity with
+    /// `status = Cancelled`.
+    TimerCancelled { timer: TimerValue },
 
-    /// Variables assigned by an Activity's `Assign`. Applied as a delta to the Execution's scope.
+    /// Variables assigned by an Activity's `Assign`. Carries the full post-assign variable snapshot
+    /// for the owning execution projection so replay does not need to re-merge per-key diffs.
     VariablesAssigned {
         execution: ExecutionId,
-        assignments: serde_json::Map<String, Value>,
+        variables: Variables,
     },
 
     /// The state finished successfully and routed to its successor — `next` is the resolved
@@ -163,28 +170,35 @@ pub enum Event {
     },
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────
-    /// A `Task` state invoked its `Resource` — the logical equivalent of arming a timer: the
-    /// physical invocation is delegated to the [`TaskService`](crate::task_service::TaskService),
-    /// which drives the external call and routes the outcome back as `Command::CompleteTask`. The
-    /// single creation record (a task never owns children, so it has no deferred ing/ed — mirroring
-    /// `TimerActivated`). `parent` is the invoking `NodeId::Activity`; `resource` is the URI the
-    /// service dispatches on; `arguments` are the projected call payload.
-    TaskActivated {
-        parent: NodeId,
-        task: TaskId,
-        resource: String,
-        arguments: Value,
+    /// A `Task` state invoked its `Resource` and the lifecycle stream records the full event-carried
+    /// [`TaskValue`](crate::TaskValue) for that moment, with `status = Active` (available for a
+    /// worker to claim).
+    ///
+    /// Like `TimerActivated`, this is the durable single creation record for a leaf side effect: the
+    /// task owns no children. Applying it makes the task **claimable** (a worker pulls it via
+    /// [`TaskApi::activate`](crate::TaskApi::activate)); the physical call is performed by the
+    /// worker, never the engine.
+    TaskActivated { task: TaskValue },
+    /// A worker claimed the task (`AssignTask`): `status = Activated`, `worker_id` and `lease_until`
+    /// recorded. From here only the leasing worker's `CompleteTask`/`FailTask` may settle it; the
+    /// worker/lease fields are the durable record a restarted engine needs to keep honoring the
+    /// claim.
+    TaskLeased { task: TaskValue },
+    /// The claimed task's lease elapsed before a settle (`ReleaseTaskLease`): `status` returns to
+    /// `Pending` and `worker_id`/`lease_until` are cleared, so the task is re-claimable by any worker
+    /// (or the same one, if it stalled then recovered — Zeebe's activation-timeout re-queue).
+    TaskLeaseExpired { task: TaskValue },
+    /// The task settled successfully. Carries the same task entity with `status = Completed`; the
+    /// concrete returned payload is kept separately as `output` because it feeds the owning activity's
+    /// `raw_output` rather than becoming part of the task entity itself.
+    TaskCompleted { task: TaskValue, output: Value },
+    /// The task's registered handler failed. Carries the same task entity with `status = Failed`;
+    /// `error` still travels alongside it because the failure drives the owning state's
+    /// `Retry`/`Catch`/terminate decision rather than being stored on the task row.
+    TaskFailed {
+        task: TaskValue,
+        error: ExecutionError,
     },
-    /// The task settled successfully: `output` becomes the state's result (the input to the
-    /// successor's `Assign`/`Output` projection via `$states.result`).
-    TaskCompleted { task: TaskId, output: Value },
-    /// The task's registered handler failed: `error` drives the owning state to a
-    /// `TerminateState{reason: Failed{error}}` (unless a `Retry`/`Catch` intercepts it in the
-    /// complete-task decision). Kept as a distinct variant from `TaskCompleted`
-    /// (rather than folding the `Result` into one event) so the projection can mark the task
-    /// `Failed` and the state's termination path is explicit — mirroring how `State-Terminated`
-    /// carries a `TerminationReason`.
-    TaskFailed { task: TaskId, error: ExecutionError },
     /// A `Retry` was scheduled for `activity`: the matching retrier at `retrier_index` consumed its
     /// next attempt (`retrier_attempt`), the activity's overall retry count became `retry_count`, and
     /// `scheduled_at` records when this retry decision was made. The concrete **when** of the retry
@@ -199,6 +213,6 @@ pub enum Event {
         scheduled_at: Timestamp,
     },
     /// The task was cancelled before settling (e.g. the owning activity/execution was terminated
-    /// while the call was in flight) — the sweep counterpart of `TaskCompleted`/`TaskFailed`.
-    TaskCancelled { task: TaskId },
+    /// while the call was in flight). Carries the same task entity with `status = Cancelled`.
+    TaskCancelled { task: TaskValue },
 }

@@ -5,12 +5,13 @@ use spica_asl::State;
 
 use super::dispatch::build_state_handlers;
 use super::resolve_state_for;
+use super::state_completing_value;
 use super::state_handler::StateHandler;
+use crate::ActivityStatus;
 use crate::command::Command;
 use crate::error::ExecutionError;
 use crate::handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
 use crate::id::NodeId;
-use crate::storage::ActivityStatus;
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching [`StateHandler::complete`], which emits the projection
@@ -42,7 +43,7 @@ impl CompleteStateHandler {
             .await
             .ok()
             .flatten()
-            .map(|a| a.parent);
+            .map(|a| a.value.parent);
         if let Some(parent) = parent {
             out.emit_command(crate::command::Command::ProcessChildCompleted {
                 parent,
@@ -88,16 +89,20 @@ impl CommandHandler for CompleteStateHandler {
             }
         };
 
-        if act.status != ActivityStatus::Running {
-            match act.status {
+        if act.value.status != ActivityStatus::Running {
+            match act.value.status {
                 // Race fix: a cancel already won on this activity. The drain that would have been
                 // emitted by the cancel side may have been missed because the ordering interleaved
                 // (e.g. timer-fired + cancel together). Emit the deferred termination ed so the
                 // parent finishes, reusing the reason embedded in the terminating status itself.
-                ActivityStatus::Terminating(reason) => {
+                ActivityStatus::Terminating(ref reason) => {
+                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
+                    // preserving every previously-folded domain field while only flipping the status
+                    // from `Terminating(reason)` to `Terminated(reason)`.
+                    let mut activity_value = act.value();
+                    activity_value.status = ActivityStatus::Terminated(reason.clone());
                     out.emit_event(crate::event::Event::StateTerminated {
-                        activity: *activity,
-                        reason,
+                        activity: activity_value,
                     });
                 }
                 _ => return,
@@ -112,7 +117,7 @@ impl CommandHandler for CompleteStateHandler {
             return;
         }
 
-        let execution = match &act.parent {
+        let execution = match &act.value.parent {
             NodeId::Execution(e) => *e,
             NodeId::Activity(_) => {
                 out.terminate(
@@ -139,28 +144,27 @@ impl CommandHandler for CompleteStateHandler {
         }
 
         let actx = ActivityCtx {
-            execution,
-            root_execution: exec.root_execution,
+            // Rehydrate the same entity-shaped activity value lifecycle events carry, so the
+            // complete step observes the canonical domain payload rather than the projection-only row.
+            activity: act.value(),
             execution_state_path: exec.state_path.clone(),
             exec_input: exec.input.clone(),
-            // The activity's raw (verbatim entry) and processed inputs, read off the activity row —
-            // `StateActivated` folded the processed value there during activate.
-            raw_input: act.raw_input.clone(),
-            input: act.input.clone(),
-            raw_output: act.raw_output.clone(),
-            scope: exec.scope.clone(),
-            state_path: act.state_path.clone(),
-            // The activity's accumulated retry count (bumped by `RetryScheduled`) so the complete
-            // step's `$states.context.State.RetryCount` reflects how many times the task was
-            // retried before succeeding/catching.
-            retry_count: act.retry_state.retry_count,
+            variables: exec.variables.clone(),
             kind: CtxKind::Complete,
         };
+        // Resolve the machine revision this execution is bound to. First use of a revision in a
+        // fresh StreamProcessor loads it from storage into the cache.
+        let sm = fail_or!(
+            out,
+            Some(*activity),
+            execution,
+            ctx.machine(exec.flow_version_id).await
+        );
         let state_def = fail_or!(
             out,
             Some(*activity),
             execution,
-            resolve_state_for(ctx.storage, ctx.sm, execution, &actx.state_name()).await
+            resolve_state_for(ctx.storage, &sm, execution, &actx.state_name()).await
         );
 
         // `StateCompleting` (the ing) is emitted by the framework on entering the success-finish
@@ -169,7 +173,7 @@ impl CommandHandler for CompleteStateHandler {
         // projected `Assign`/`Output`, and routes via `emit_transition` (`StateTransitioned` +
         // command). This keeps the ing uniform across states regardless of their output handling.
         out.emit_event(crate::event::Event::StateCompleting {
-            activity: *activity,
+            activity: state_completing_value(&actx),
         });
 
         match self.state_handlers.get(&std::mem::discriminant(state_def)) {

@@ -61,7 +61,7 @@ pub use wait::{WaitSeconds, WaitState, WaitTimestamp};
 /// Once this validator exists and callers submit through it, replace the engine's runtime
 /// defenses (e.g. the `Seconds ⇄ Timestamp` checks in `crates/engine/src/handlers/states/wait.rs`)
 /// with the assumption that a definition is well-formed at activation.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct StateMachine {
     /// Required. A string that must exactly match (case sensitive) the name of one of the

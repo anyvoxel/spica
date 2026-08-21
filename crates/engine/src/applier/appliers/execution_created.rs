@@ -7,8 +7,7 @@ use crate::event::Event;
 use crate::{ApplierContext, EventApplier};
 
 use crate::id::{ExecutionId, NodeId};
-use crate::scope::Scope;
-use crate::storage::ExecutionStatus;
+use crate::{ExecutionStatus, ExecutionValue};
 
 #[derive(Default)]
 pub(crate) struct ExecutionCreatedApplier;
@@ -16,11 +15,17 @@ pub(crate) struct ExecutionCreatedApplier;
 impl EventApplier for ExecutionCreatedApplier {
     fn event(&self) -> Event {
         Event::ExecutionCreated {
-            id: ExecutionId::nil(),
-            root_execution: ExecutionId::nil(),
-            parent: None,
-            state_path: None,
-            input: Default::default(),
+            request_id: crate::id::RequestId::nil(),
+            execution: ExecutionValue {
+                id: ExecutionId::nil(),
+                flow_version_id: crate::id::FlowVersionId::nil(),
+                root_execution: ExecutionId::nil(),
+                parent: None,
+                state_path: None,
+                status: ExecutionStatus::Running,
+                input: Default::default(),
+                output: None,
+            },
         }
     }
 
@@ -29,43 +34,26 @@ impl EventApplier for ExecutionCreatedApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::ExecutionCreated {
-            id,
-            root_execution,
-            parent,
-            state_path,
-            input,
-        } = event
-        else {
+        let Event::ExecutionCreated { execution, .. } = event else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        ctx.storage
-            .put_execution(crate::storage::Execution {
-                id: *id,
-                // A child execution inherits the top-level run's id (never its own) so the whole
-                // tree shares one flat query anchor. The top-level run's `CreateExecution` sets
-                // `root_execution = itself`.
-                root_execution: *root_execution,
-                parent: *parent,
-                state_path: state_path.clone(),
-                status: ExecutionStatus::Running,
-                current_state: None,
-                current_activity: None,
-                scope: Scope::new(),
-                input: input.clone(),
-                output: None,
-                active_children: std::collections::HashSet::new(),
-            })
-            .await?;
+        let mut exec = crate::storage::Execution::from_value(
+            execution.clone(),
+            std::collections::HashSet::new(),
+        );
+        // Birth: the row's `created_at`/`updated_at` are stamped with the `ExecutionCreated` entry's
+        // moment (deterministic across replicas — see `ApplierContext::timestamp`).
+        exec.born(ctx.timestamp);
+        ctx.storage.put_execution(exec).await?;
         // A child execution (a Parallel branch) is added to its owner's `active_children` so the
         // owner drains (Completing/Terminating) waits on it via the shared cascade, and the
         // `ProcessChildCompleted` drain notices it as in-flight. The top-level run (`parent: None`)
         // is owned by nothing and adds nothing.
-        if let Some(parent) = parent {
+        if let Some(parent) = execution.parent {
             ctx.storage
-                .add_child(*parent, NodeId::Execution(*id))
+                .add_child(parent, NodeId::Execution(execution.id))
                 .await?;
         }
         Ok(())

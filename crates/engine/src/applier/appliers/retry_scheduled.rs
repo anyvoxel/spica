@@ -7,8 +7,8 @@ use crate::event::Event;
 use crate::log::Timestamp;
 use crate::{ApplierContext, EventApplier};
 
+use crate::activity::RetrierAttemptState;
 use crate::id::ActivityId;
-use crate::storage::RetrierAttemptState;
 
 /// `RetryScheduled` updates the owning activity's retry bookkeeping so the re-invoked task's
 /// `$states.context.State.RetryCount` and each retrier's independent attempt budget are durable and
@@ -51,16 +51,17 @@ impl EventApplier for RetryScheduledApplier {
             // matched retrier's own attempt counter, and when that retry decision was taken. Fold them
             // verbatim so replay rebuilds the exact same retry state without re-running the matching
             // logic.
-            act.retry_state.retry_count = *retry_count;
-            if act.retry_state.retrier_attempts.len() <= *retrier_index {
+            act.value.retry_state.retry_count = *retry_count;
+            if act.value.retry_state.retrier_attempts.len() <= *retrier_index {
                 act.retry_state
                     .retrier_attempts
                     .resize(*retrier_index + 1, RetrierAttemptState::default());
             }
-            act.retry_state.retrier_attempts[*retrier_index] = RetrierAttemptState {
+            act.value.retry_state.retrier_attempts[*retrier_index] = RetrierAttemptState {
                 attempt_count: *retrier_attempt,
                 last_retry_at: Some(*scheduled_at),
             };
+            act.touch(ctx.timestamp);
             ctx.storage.put_activity(act).await?;
         }
         Ok(())

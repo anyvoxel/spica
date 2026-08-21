@@ -7,7 +7,7 @@ use jsonata_core::value::JValue;
 use serde_json::Value;
 
 use crate::error::ExecutionError;
-use crate::scope::Scope;
+use crate::variables::Variables;
 
 /// The JSONata evaluation environment for a single execution.
 ///
@@ -27,22 +27,22 @@ impl EvalEnv {
     }
 
     /// Evaluates a JSONata `expr` (the inner text, without the `{% %}` delimiters) against the
-    /// given `$states` object and variable `scope`.
+    /// given `$states` object and current `variables`.
     ///
-    /// `$states` and every variable in `scope` are bound by their bare name (so `$states.input`
+    /// `$states` and every variable in `variables` are bound by their bare name (so `$states.input`
     /// and `$outer` resolve). The JSONata input data (`.` / `$`) is set to `$states.input`.
     pub fn eval_expr(
         &mut self,
         expr: &str,
         states: &Value,
-        scope: &Scope,
+        variables: &Variables,
     ) -> Result<Value, ExecutionError> {
         let ast = self.ast_for(expr)?;
         let data = JValue::from(states.get("input").unwrap_or(&Value::Null).clone());
 
         let mut ctx = Context::new();
         ctx.bind("states".to_string(), JValue::from(states.clone()));
-        for (name, value) in scope {
+        for (name, value) in variables {
             ctx.bind(name.clone(), JValue::from(value.clone()));
         }
 
@@ -64,24 +64,24 @@ impl EvalEnv {
         &mut self,
         value: &Value,
         states: &Value,
-        scope: &Scope,
+        variables: &Variables,
     ) -> Result<Value, ExecutionError> {
         match value {
             Value::String(s) => match extract_jsonata(s) {
-                Some(inner) => self.eval_expr(inner, states, scope),
+                Some(inner) => self.eval_expr(inner, states, variables),
                 None => Ok(value.clone()),
             },
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (key, val) in map {
-                    out.insert(key.clone(), self.eval_json(val, states, scope)?);
+                    out.insert(key.clone(), self.eval_json(val, states, variables)?);
                 }
                 Ok(Value::Object(out))
             }
             Value::Array(arr) => {
                 let mut out = Vec::with_capacity(arr.len());
                 for val in arr {
-                    out.push(self.eval_json(val, states, scope)?);
+                    out.push(self.eval_json(val, states, variables)?);
                 }
                 Ok(Value::Array(out))
             }
@@ -167,7 +167,7 @@ mod tests {
         let mut env = env();
         let value = serde_json::json!("hello");
         let out = env
-            .eval_json(&value, &states(Value::Null), &Scope::new())
+            .eval_json(&value, &states(Value::Null), &Variables::new())
             .unwrap();
         assert_eq!(out, serde_json::json!("hello"));
     }
@@ -177,7 +177,7 @@ mod tests {
         let mut env = env();
         let value = serde_json::json!("{% $states.input.total %}");
         let st = states(serde_json::json!({ "total": 42 }));
-        let out = env.eval_json(&value, &st, &Scope::new()).unwrap();
+        let out = env.eval_json(&value, &st, &Variables::new()).unwrap();
         // jsonata-core numbers are f64, so 42 round-trips as 42.0.
         assert_eq!(out, serde_json::json!(42.0));
     }
@@ -190,7 +190,7 @@ mod tests {
             "items": ["{% $states.input.name %}", "literal"]
         });
         let st = states(serde_json::json!({ "total": 7, "name": "widget" }));
-        let out = env.eval_json(&value, &st, &Scope::new()).unwrap();
+        let out = env.eval_json(&value, &st, &Variables::new()).unwrap();
         assert_eq!(
             out,
             serde_json::json!({
@@ -206,7 +206,7 @@ mod tests {
         // A JSONata expression that constructs an object.
         let value = serde_json::json!("{% { 'a': $states.input.x, 'b': 2 } %}");
         let st = states(serde_json::json!({ "x": 9 }));
-        let out = env.eval_json(&value, &st, &Scope::new()).unwrap();
+        let out = env.eval_json(&value, &st, &Variables::new()).unwrap();
         assert_eq!(out, serde_json::json!({ "a": 9.0, "b": 2.0 }));
     }
 
@@ -216,17 +216,17 @@ mod tests {
         // Referencing a missing field yields JSONata Undefined, which maps to null.
         let value = serde_json::json!("{% $states.input.missing %}");
         let st = states(serde_json::json!({}));
-        let out = env.eval_json(&value, &st, &Scope::new()).unwrap();
+        let out = env.eval_json(&value, &st, &Variables::new()).unwrap();
         assert_eq!(out, Value::Null);
     }
 
     #[test]
     fn eval_expr_binds_user_variables() {
         let mut env = env();
-        let mut scope = Scope::new();
-        scope.insert("greeting".to_string(), serde_json::json!("hi"));
+        let mut variables = Variables::new();
+        variables.insert("greeting".to_string(), serde_json::json!("hi"));
         let out = env
-            .eval_expr("$greeting", &states(Value::Null), &scope)
+            .eval_expr("$greeting", &states(Value::Null), &variables)
             .unwrap();
         assert_eq!(out, serde_json::json!("hi"));
     }
@@ -236,7 +236,7 @@ mod tests {
         let mut env = env();
         // A syntactically invalid expression.
         let err = env
-            .eval_expr("$states.input..", &states(Value::Null), &Scope::new())
+            .eval_expr("$states.input..", &states(Value::Null), &Variables::new())
             .unwrap_err();
         assert!(matches!(err, ExecutionError::Jsonata { .. }));
     }

@@ -1,7 +1,7 @@
 use spica_asl::{State, SucceedState};
 
-use super::super::emit_transition;
 use super::super::state_handler::StateHandler;
+use super::super::{emit_transition, state_activated_value, state_completed_value};
 use crate::eval_env::EvalEnv;
 use crate::handler::{ActivityCtx, Collector};
 use crate::id::ActivityId;
@@ -24,9 +24,7 @@ impl StateHandler for SucceedStateHandler {
         // No side effect: a Succeed state's success is resolved in the complete step. Emit the
         // activation-complete ed, then hand off to the complete step via `CompleteState`.
         out.emit_event(crate::event::Event::StateActivated {
-            activity,
-            input: actx.input.clone(),
-            plan: None,
+            activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
         out.emit_command(crate::command::Command::CompleteState { activity });
     }
@@ -62,12 +60,12 @@ fn complete_succeed(
     state: &SucceedState,
 ) {
     let states = crate::context::build_states(
-        &actx.input,
-        Some(&actx.input),
+        &actx.activity.input,
+        Some(&actx.activity.input),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
-        actx.retry_count,
+        Some(&actx.activity.input),
+        actx.activity.retry_state.retry_count,
         None, // no Catch `errorOutput` in the succeed path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -75,14 +73,20 @@ fn complete_succeed(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
-            env.eval_json(o, &states, &actx.scope)
+            actx.activity.execution,
+            env.eval_json(o, &states, &actx.variables)
         ),
-        None => actx.input.clone(),
+        None => actx.activity.input.clone(),
     };
     out.emit_event(crate::event::Event::StateCompleted {
-        activity,
-        output: output.clone(),
+        activity: state_completed_value(actx, output.clone()),
     });
-    emit_transition(out, actx.execution, activity, &output, None, Some(true));
+    emit_transition(
+        out,
+        actx.activity.execution,
+        activity,
+        &output,
+        None,
+        Some(true),
+    );
 }

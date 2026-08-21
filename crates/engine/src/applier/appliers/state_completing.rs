@@ -1,13 +1,14 @@
-//! `StateCompleting` event projection: folds the `Event::StateCompleting` into Storage.
+//! `StateCompleting` event projection: folds the `Event::StateCompleting` activity value into Storage.
 
 use async_trait::async_trait;
 
 use crate::error::ExecutionError;
 use crate::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::{
+    ActivityState, ActivityStatus, ActivityValue, ApplierContext, EventApplier, RetryState,
+};
 
-use crate::id::ActivityId;
-use crate::storage::ActivityStatus;
+use crate::id::{ActivityId, ExecutionId, NodeId};
 
 #[derive(Default)]
 pub(crate) struct StateCompletingApplier;
@@ -15,7 +16,20 @@ pub(crate) struct StateCompletingApplier;
 impl EventApplier for StateCompletingApplier {
     fn event(&self) -> Event {
         Event::StateCompleting {
-            activity: ActivityId::nil(),
+            activity: ActivityValue {
+                id: ActivityId::nil(),
+                execution: ExecutionId::nil(),
+                root_execution: ExecutionId::nil(),
+                parent: NodeId::Execution(ExecutionId::nil()),
+                state_path: jsonptr::PointerBuf::new(),
+                status: ActivityStatus::Completing,
+                raw_input: Default::default(),
+                input: Default::default(),
+                raw_output: None,
+                activity_state: ActivityState::Leaf,
+                retry_state: RetryState::default(),
+                output: None,
+            },
         }
     }
 
@@ -29,9 +43,13 @@ impl EventApplier for StateCompletingApplier {
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        if let Some(mut act) = ctx.storage.get_activity(*activity).await? {
-            act.status = ActivityStatus::Completing;
-            ctx.storage.put_activity(act).await?;
+        if let Some(act) = ctx.storage.get_activity(activity.id).await? {
+            // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
+            let mut row =
+                crate::storage::Activity::from_value(activity.clone(), act.active_children);
+            row.created_at = act.created_at;
+            row.updated_at = ctx.timestamp;
+            ctx.storage.put_activity(row).await?;
         }
         Ok(())
     }

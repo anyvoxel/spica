@@ -2,7 +2,7 @@
 
 This repository is a Rust workspace with two crates:
 - `crates/asl` (`spica-asl`) is the main library crate
-- `crates/spica` (`spica`) is a thin binary crate and is currently a placeholder
+- `crates/cli` (`spica`) is a thin binary crate and is currently a placeholder
 
 Prefer putting real logic in `spica-asl` unless a task is specifically about the executable.
 

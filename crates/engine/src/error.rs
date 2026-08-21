@@ -4,9 +4,9 @@ use thiserror::Error;
 
 /// A failure produced while executing a state machine.
 ///
-/// The `Ok` branch of [`crate::Engine::start`] is reserved for successful executions; every
-/// failure — a `Fail` state, an unhandled runtime error, a timeout, a cancel, or a structural
-/// problem with the definition — is reported via this type.
+/// The `Ok` branch of execution (via `Engine::wait_for_execution`) is reserved for successful
+/// executions; every failure — a `Fail` state, an unhandled runtime error, a timeout, a cancel, or
+/// a structural problem with the definition — is reported via this type.
 ///
 /// The [`error_name`](Self::error_name) and [`error_output`](Self::error_output) accessors expose
 /// the ASL reserved error name and error-output object so that a later milestone's `Retry`/`Catch`
@@ -55,6 +55,18 @@ pub enum ExecutionError {
     /// are engine-internal faults (not ASL-catchable).
     #[error("log protocol error: {0}")]
     Log(String),
+
+    /// A client command was **rejected** — the engine refused to apply it (see [`Reject`]) and
+    /// surfaced the reason to the awaiting caller. This is the *command-layer* outcome of a
+    /// well-formed command whose preconditions failed (e.g. a malformed `CreateFlow` definition, or
+    /// a duplicate name), distinct from a runtime *execution* failure (which reaches the caller via
+    /// `ExecutionError` on a terminated execution). `kind` is the machine-readable
+    /// [`RejectionType`]; `reason` the human-readable explanation.
+    #[error("command rejected ({kind}): {reason}")]
+    Rejected {
+        kind: crate::RejectionType,
+        reason: String,
+    },
 }
 
 impl ExecutionError {
@@ -73,6 +85,10 @@ impl ExecutionError {
             ExecutionError::TimedOut { .. } => "States.Timeout",
             ExecutionError::Cancelled { .. } => "States.Cancelled",
             ExecutionError::Log(_) => "States.Runtime",
+            // A command rejection is a command-layer refusal — it never becomes a runtime
+            // TerminationReason, so `error_name` cannot meaningfully be attributed to one; the
+            // generic structural name keeps the match exhaustive.
+            ExecutionError::Rejected { .. } => "States.Runtime",
         }
     }
 
@@ -97,7 +113,17 @@ impl ExecutionError {
             ExecutionError::StateNotFound(_)
             | ExecutionError::NoTerminal
             | ExecutionError::InvalidDefinition(_)
-            | ExecutionError::Log(_) => None,
+            | ExecutionError::Log(_)
+            | ExecutionError::Rejected { .. } => None,
         }
+    }
+}
+
+impl From<spica_logstream::LogError> for ExecutionError {
+    /// Map a payload-agnostic log fault onto the engine's log-protocol error. The message is
+    /// preserved so the surfaced text is unchanged whether the fault came from the in-memory or the
+    /// RocksDB log; the engine never needs to branch on the finer `LogError` taxonomy today.
+    fn from(e: spica_logstream::LogError) -> Self {
+        ExecutionError::Log(e.to_string())
     }
 }

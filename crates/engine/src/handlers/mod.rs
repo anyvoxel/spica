@@ -17,35 +17,43 @@ macro_rules! fail_or {
 mod activate_state;
 mod activate_task;
 mod activate_timer;
+mod assign_task;
 mod cancel_task;
 mod cancel_timer;
 mod complete_execution;
 mod complete_state;
 mod complete_task;
-mod complete_timer;
 mod create_execution;
+mod create_flow;
 mod dispatch;
+mod fail_task;
 mod process_child_completed;
+mod release_task_lease;
 mod spawn_branch;
 mod state_handler;
 mod states;
 mod terminate_execution;
 mod terminate_state;
+mod trigger_timer;
 
 pub use activate_state::ActivateStateHandler;
 pub use activate_task::ActivateTaskHandler;
 pub use activate_timer::ActivateTimerHandler;
+pub use assign_task::{AssignTaskHandler, PullTasksHandler};
 pub use cancel_task::CancelTaskHandler;
 pub use cancel_timer::CancelTimerHandler;
 pub use complete_execution::CompleteExecutionHandler;
 pub use complete_state::CompleteStateHandler;
 pub use complete_task::CompleteTaskHandler;
-pub use complete_timer::CompleteTimerHandler;
 pub use create_execution::CreateExecutionHandler;
+pub use create_flow::CreateFlowHandler;
+pub use fail_task::FailTaskHandler;
 pub use process_child_completed::ProcessChildCompletedHandler;
+pub use release_task_lease::ReleaseTaskLeaseHandler;
 pub use spawn_branch::SpawnBranchHandler;
 pub use terminate_execution::TerminateExecutionHandler;
 pub use terminate_state::TerminateStateHandler;
+pub use trigger_timer::TriggerTimerHandler;
 
 use std::collections::HashMap;
 
@@ -57,8 +65,9 @@ use crate::context::build_states;
 use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
 use crate::event::Event;
-use crate::handler::{ActivityCtx, Collector};
+use crate::handler::{ActivityCtx, Collector, HandlerContext};
 use crate::id::ActivityId;
+use crate::{ActivityState, ActivityStatus, ActivityValue, MapActivityState};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -218,15 +227,58 @@ pub(super) async fn load_execution(
     storage.get_execution(execution).await
 }
 
+/// Cancel every active timer child of `activity`. Used by the task **settlement** handlers
+/// (`CompleteTask`, `FailTask`) to sweep the task's parented timers — the `TaskLease` armed on
+/// assign, and the optional `TaskTimeout` — before the activity completes. Mirrors the M1 terminate
+/// sweep's timer arm, but for a *settling* (still `Running`) activity: leaving a live timer child
+/// would trip the activity-completion guard's "still has children" refusal, stalling the state.
+/// Idempotent: a timer already fired or cancelled is not an active child and is simply skipped.
+///
+/// Emits the `TimerCancelled` **events** directly (rather than `CancelTimer` commands) so they land
+/// in the same batch **before** the caller's `CompleteState` — a `CancelTimer` command would only
+/// produce `TimerCancelled` as a *later* log entry, after which `CompleteState` had already read the
+/// activity with its child still attached. The applier deschedules the deadline and detaches the
+/// child, which is all the settle path needs (`ProcessChildCompleted` omitted: the activity itself is
+/// about to complete via `CompleteState`).
+pub(super) async fn cancel_activity_timers(
+    ctx: &HandlerContext<'_>,
+    out: &mut Collector,
+    activity: ActivityId,
+) {
+    let Some(act) = ctx.storage.get_activity(activity).await.ok().flatten() else {
+        return; // activity already gone — nothing to sweep.
+    };
+    for child in act.active_children {
+        let crate::id::NodeId::Timer(timer) = child else {
+            continue; // only timer children matter here (M1 task activities own none other).
+        };
+        let Some(t) = ctx.storage.get_timer(timer).await.ok().flatten() else {
+            continue;
+        };
+        if t.value.status != crate::TimerStatus::Active {
+            continue; // already terminal — a fired/cancelled timer is no longer a live child.
+        }
+        out.emit_event(crate::event::Event::TimerCancelled {
+            timer: crate::TimerValue {
+                id: t.value.id,
+                parent: t.value.parent,
+                purpose: t.value.purpose,
+                status: crate::TimerStatus::Cancelled,
+                deadline: t.value.deadline,
+            },
+        });
+    }
+}
+
 /// Evaluates a string that may be a literal or a `{% ... %}` JSONata expression.
 pub(super) fn eval_string_or_expr(
     env: &mut EvalEnv,
     s: &str,
     states: &Value,
-    scope: &crate::scope::Scope,
+    variables: &crate::variables::Variables,
 ) -> Result<Value, ExecutionError> {
     match crate::eval_env::extract_jsonata(s) {
-        Some(inner) => env.eval_expr(inner, states, scope),
+        Some(inner) => env.eval_expr(inner, states, variables),
         None => Ok(Value::String(s.to_string())),
     }
 }
@@ -247,19 +299,105 @@ pub(crate) fn state_name_from_path(path: &jsonptr::Pointer) -> String {
 
 /// Emits the [`crate::Event::StateActivating`] event for the activity being entered.
 ///
-/// The event carries `state_path`, the complete JSON Pointer to this state's definition — the owning
-/// execution's `state_path` (the enclosing `states` table) extended by the state's own name; a
-/// top-level execution's path starts at the machine's top-level `states` table. The leaf state name
-/// is *derivable* as the pointer's last token, so only the full path is carried.
-pub(super) fn state_activating(actx: &ActivityCtx, activity: ActivityId) -> Event {
+/// The event carries the full entity-shaped [`ActivityValue`], not only ids/fields for the current
+/// step, so a follower can rebuild the same domain activity object from the stream alone.
+pub(super) fn state_activating(actx: &ActivityCtx, _activity: ActivityId) -> Event {
     Event::StateActivating {
-        execution: actx.execution,
-        activity,
-        state_path: actx.state_path.clone(),
-        // The entry event carries the **raw** input — whatever was handed to the state on entry —
-        // since preprocessing (which produces `StateActivated.input`) has not run yet.
-        input: actx.raw_input.clone(),
+        activity: actx.activity.clone(),
     }
+}
+
+/// Build a new [`ActivityValue`] from the current context, replacing only the fields the lifecycle
+/// step just changed. This keeps every lifecycle emitter updating the same entity payload shape.
+pub(super) fn activity_value_with(
+    actx: &ActivityCtx,
+    status: Option<ActivityStatus>,
+    input: Option<Value>,
+    activity_state: Option<ActivityState>,
+    raw_output: Option<Option<Value>>,
+    output: Option<Option<Value>>,
+) -> ActivityValue {
+    ActivityValue {
+        id: actx.activity.id,
+        execution: actx.activity.execution,
+        root_execution: actx.activity.root_execution,
+        parent: actx.activity.parent,
+        state_path: actx.activity.state_path.clone(),
+        status: status.unwrap_or_else(|| actx.activity.status.clone()),
+        raw_input: actx.activity.raw_input.clone(),
+        input: input.unwrap_or_else(|| actx.activity.input.clone()),
+        raw_output: raw_output.unwrap_or_else(|| actx.activity.raw_output.clone()),
+        activity_state: activity_state.unwrap_or_else(|| actx.activity.activity_state.clone()),
+        retry_state: actx.activity.retry_state.clone(),
+        output: output.unwrap_or_else(|| actx.activity.output.clone()),
+    }
+}
+
+/// Build the `StateActivated` payload by applying the activate step's processed input and optional
+/// `Map` activation plan onto the current activity value.
+pub(super) fn state_activated_value(
+    actx: &ActivityCtx,
+    input: Value,
+    plan: Option<MapActivityState>,
+) -> ActivityValue {
+    let activity_state = plan.map(ActivityState::Map);
+    activity_value_with(actx, None, Some(input), activity_state, None, None)
+}
+
+/// Build the `StateCompleted` payload by fixing the final projected output on the activity value.
+pub(super) fn state_completed_value(actx: &ActivityCtx, output: Value) -> ActivityValue {
+    activity_value_with(
+        actx,
+        Some(ActivityStatus::Completed),
+        None,
+        None,
+        None,
+        Some(Some(output)),
+    )
+}
+
+/// Build the `StateTerminating` payload by embedding the final termination reason into the activity
+/// status.
+pub(super) fn state_terminating_value(
+    actx: &ActivityCtx,
+    reason: crate::command::TerminationReason,
+) -> ActivityValue {
+    activity_value_with(
+        actx,
+        Some(ActivityStatus::Terminating(reason)),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Build the `StateTerminated` payload by embedding the terminal termination reason into the activity
+/// status.
+pub(super) fn state_terminated_value(
+    actx: &ActivityCtx,
+    reason: crate::command::TerminationReason,
+) -> ActivityValue {
+    activity_value_with(
+        actx,
+        Some(ActivityStatus::Terminated(reason)),
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Build the `StateCompleting` payload by flipping only the lifecycle status.
+pub(super) fn state_completing_value(actx: &ActivityCtx) -> ActivityValue {
+    activity_value_with(
+        actx,
+        Some(ActivityStatus::Completing),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Records the successful state finish's routing — emitting the `StateTransitioned` marker that
@@ -313,7 +451,7 @@ pub(super) fn emit_transition(
 /// finish emits the ing uniformly regardless of its own output handling.
 ///
 /// This runs only from the `complete` step (see [`state_handler::StateHandler::complete`]) — never
-/// from `activate`. Reads scope mutation from `Assign` into the local scope used for the output
+/// from `activate`. Reads variable mutation from `Assign` into the local variables used for the output
 /// projection, then drains via a `ProcessChildCompleted` notice to its parent (once drained).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete_activity(
@@ -332,45 +470,49 @@ pub(super) fn complete_activity(
     // actually ran on, while `$states.result` is the raw result produced before any complete-step
     // `Output` projection. For states that produce no distinct raw result, the result defaults to the
     // processed input so the shared success semantics stay unchanged.
-    let raw_result = actx.raw_output.as_ref().unwrap_or(&actx.input);
+    let raw_result = actx
+        .activity
+        .raw_output
+        .as_ref()
+        .unwrap_or(&actx.activity.input);
     // Activate-phase Assign was already applied (mutating scope); the output projection runs with
     // that updated scope so it can reference the Just-assigned variables.
     let states = build_states(
-        &actx.input,
+        &actx.activity.input,
         Some(raw_result),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.input),
+        Some(&actx.activity.input),
         retry_count,
         error_output,
         None, // not a Map item — no `context.Map.Item` binding
     );
-    let mut local_scope = actx.scope.clone();
+    let mut local_scope = actx.variables.clone();
 
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
-                    out.emit_event(Event::VariablesAssigned {
-                        execution: actx.execution,
-                        assignments: map.clone(),
-                    });
                     for (k, v) in map {
                         local_scope.insert(k, v);
                     }
+                    out.emit_event(Event::VariablesAssigned {
+                        execution: actx.activity.execution,
+                        variables: local_scope.clone(),
+                    });
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.execution,
+                    actx.activity.execution,
                     ExecutionError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     ),
@@ -384,16 +526,22 @@ pub(super) fn complete_activity(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.execution,
+            actx.activity.execution,
             env.eval_json(o, &states, &local_scope)
         ),
         None => raw_result.clone(),
     };
 
     out.emit_event(Event::StateCompleted {
-        activity,
-        output: output_value.clone(),
+        activity: state_completed_value(actx, output_value.clone()),
     });
 
-    emit_transition(out, actx.execution, activity, &output_value, next, end);
+    emit_transition(
+        out,
+        actx.activity.execution,
+        activity,
+        &output_value,
+        next,
+        end,
+    );
 }

@@ -1,0 +1,18 @@
+# Workspace-wide cargo defaults.
+#
+# `[profile.*]` here is a fall-back: an explicit `[profile]` in a crate's
+# Cargo.toml overrides it, and CLI `--profile`/`--config` wins over both.
+# Keep this file minimal so the size-saving default is opt-out, not enforced.
+
+[build]
+# Bound the parallel rustc count so a dev machine under memory pressure
+# (this one OOM-killed a from-source build) doesn't get killed mid-build.
+jobs = 4
+
+[profile.dev]
+# Drop full (debug = 2) DWARF for the workspace crates down to line tables
+# only: backtraces still resolve function names/lines, but target/ shrinks
+# meaningfully (the `deps/` and `build/` artifacts of local crates carry the
+# biggest per-crate debug overhead). Set `debug = 2` locally (or a crate-level
+# `[profile.dev]`) when full variable inspection is needed.
+debug = "line-tables-only"

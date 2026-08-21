@@ -8,8 +8,8 @@
 //! - [`Command`]s and [`Event`](crate::Event)s are appended to a durable, ordered
 //!   [`LogStream`]; each entry is causally linked (`cause_id`) to the Command that produced it,
 //!   and the Events + subsequent Commands produced by one Command are appended atomically.
-//! - A [`Processor`] reads entries in order: [`Command`]s are dispatched to [`CommandHandler`]s
-//!   (e.g. [`StateProcessor`](crate::handlers)s), which produce more entries;
+//! - A [`StreamProcessor`] reads entries in order: [`Command`]s are dispatched to [`CommandHandler`]s
+//!   (e.g. [`StateStreamProcessor`](crate::handlers)s), which produce more entries;
 //!   [`Event`](crate::Event)s are applied to [`Storage`] to materialize
 //!   [`Execution`]/[`Activity`] state.
 //! - [`Storage`] is a projection (fold) of the [`Event`](crate::Event) stream — any worker can
@@ -40,7 +40,7 @@
 //!   recovery path for `Command::ProcessChildCompleted` over container (Map/Parallel) states;
 //!   `$states.context.StateMachine` stats.
 //!
-//! The CCES seams (LogStream/Storage/Processor/CommandHandler) are the foundation a distributed
+//! The CCES seams (LogStream/Storage/StreamProcessor/CommandHandler) are the foundation a distributed
 //! deployment implements.
 //!
 //! ## Known limitation
@@ -48,42 +48,61 @@
 //! `jsonata-core` represents all JSON numbers as `f64`, so an integer assigned or output via
 //! JSONata (e.g. `5`) round-trips as `5.0`. Comparisons inside JSONata are unaffected.
 
+mod activity;
 mod applier;
 mod command;
 mod context;
 mod engine;
+mod entry;
 mod error;
 mod eval_env;
 mod event;
+mod execution;
+mod flow;
+mod flow_version;
 mod handler;
 mod handlers;
 mod id;
+mod job_api;
 mod log;
-mod processor;
+mod reject;
 mod result;
 mod scheduler;
-mod scope;
 mod storage;
+mod stream_processor;
+mod task;
 mod task_service;
+mod timer;
+mod variables;
 
+pub use activity::{
+    ActivityState, ActivityStatus, ActivityValue, MapActivityState, ParallelActivityState,
+    RetrierAttemptState, RetryState,
+};
 pub use applier::{ApplierContext, EventApplier, EventDispatcher};
 pub use command::{Command, TerminationReason, TimerPurpose};
-pub use engine::Engine;
+pub use engine::{Engine, EngineBuilder};
 pub use error::ExecutionError;
 pub use event::Event;
+pub use execution::{ExecutionStatus, ExecutionValue};
+pub use flow::{Flow, FlowStatus};
+pub use flow_version::FlowVersion;
 pub use handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
-pub use id::{ActivityId, EntryId, ExecutionId, IdSource, NodeId, StreamId, TaskId, TimerId};
-pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, Timestamp};
-pub use processor::Processor;
-pub use result::ExecutionResult;
-pub use scheduler::SchedulerHandle;
-pub use scope::Scope;
-pub use storage::{
-    Activity, ActivityState, ActivityStatus, Execution, ExecutionStatus, InMemoryStorage,
-    MapActivityState, ParallelActivityState, RetrierAttemptState, RetryState, Storage, Task,
-    TaskStatus, Timer, TimerStatus,
+pub use id::{
+    ActivityId, EntryId, ExecutionId, FlowId, FlowName, FlowVersionId, NodeId, RequestId, StreamId,
+    TaskId, TimerId,
 };
-pub use task_service::{TaskHandler, TaskServiceHandle};
+pub use job_api::{ActivatedTask, TaskApi};
+pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
+pub use reject::{Reject, RejectionType};
+pub use result::{ExecutionResult, ExecutionStatusSnapshot};
+pub use scheduler::{Scheduler, TimerSink};
+pub use storage::{Activity, Execution, Storage, StorageTxn, Task, Timer};
+pub use stream_processor::StreamProcessor;
+pub use task::{TaskStatus, TaskValue};
+pub use task_service::{TaskHandler, TaskService};
+pub use timer::{TimerStatus, TimerValue};
+pub use variables::Variables;
 
 // Re-export the ASL state types the public API references (so callers need only depend on
 // `spica-engine`).

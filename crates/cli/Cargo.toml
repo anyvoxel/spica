@@ -1,0 +1,16 @@
+[package]
+name = "spica"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# spica is a PURE-REMOTE client: the engine it drives lives in `spica-server`, reached over gRPC
+# (CreateFlow → StartExecution → poll GetExecution). No engine/backend code runs in this binary, so
+# it depends only on the wire contract + transport, not spica-engine.
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+spica-proto.workspace = true
+tokio.workspace = true
+tonic.workspace = true

@@ -22,6 +22,14 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # `spica-proto` compiles its protobuf definitions at build time (tonic-build/prost-build in
+      # `crates/proto/build.rs`), which requires a `protoc` binary on PATH. Without it, the
+      # `cargo clippy`/`cargo test` steps fail while building `spica-proto`.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Check formatting
         run: cargo fmt --all --check
 

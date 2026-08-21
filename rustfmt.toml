@@ -1,0 +1,18 @@
+# rustfmt.toml — stable-only options (no `unstable_features`).
+# The repo has no rustfmt.toml today and is formatted by rustfmt defaults, so
+# this pins project intent (edition, line endings, field-init style) WITHOUT
+# repainting the whole tree and keeps `cargo fmt --check` green.
+
+# Parse with 2024 rules (let-else / let-chains); matches the workspace edition.
+edition = "2024"
+
+# Force LF so no mixed CRLF appears across editors/OS (whole-file diffs).
+newline_style = "Unix"
+
+# Explicit pins of rustfmt defaults — document intent, produce no formatting change.
+max_width = 100
+use_small_heuristics = "Default"
+
+# `Foo { field }` not `Foo { field: field }`; already the norm in this codebase,
+# so this is effectively a no-op today (guards the style going forward).
+use_field_init_shorthand = true
