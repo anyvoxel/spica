@@ -114,6 +114,19 @@ pub enum Event {
     /// `status = Terminated(reason)`.
     ThreadTerminated { thread: Thread },
 
+    /// Durable confirmation that a [`Command::ProcessChildCompleted`] was handled even though the
+    /// addressed `owner` had nothing to project in response — most commonly a `Parallel` whose
+    /// sibling branches are still in flight, or an already-terminal owner absorbing a duplicate.
+    /// Every dispatched command must leave a causally-tied follow-up (the CCES watermark rule); this
+    /// is that follow-up for the no-op case. It changes no state because the no-op projection changed
+    /// none — it exists so the stream records receipt and advances the watermark. Carries the
+    /// `owner` it was addressed to and the `child` that settled, so the record is traceable to the
+    /// specific command instance.
+    ProcessChildCompletedHandled {
+        owner: ObjectReference,
+        child: ObjectReference,
+    },
+
     /// Result of `Command::ActivateState` — the state was entered and the lifecycle stream records
     /// the full event-carried [`Activity`](crate::Activity) for that moment.
     ///
@@ -178,7 +191,6 @@ pub enum Event {
     StateTransitioned {
         activity: ObjectReference,
         next: String,
-        output: Value,
     },
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────

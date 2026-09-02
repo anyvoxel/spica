@@ -135,7 +135,7 @@ impl CommandHandler for FailTaskHandler {
                     task: task_value,
                     error: error.clone(),
                 });
-                // Sweep the failed attempt's `TaskLease`/`TaskTimeout` children (a settled task
+                // Sweep the failed attempt's `DeliveryLease`/`TaskTimeout` children (a settled task
                 // leaves no live child behind). No retry timer is armed — `next_available_at` is the
                 // gate, and the re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
                 super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
@@ -152,7 +152,7 @@ impl CommandHandler for FailTaskHandler {
             task: task_value,
             error: error.clone(),
         });
-        // Sweep the activity's task timers (the `TaskLease` armed on assign, and any `TaskTimeout`)
+        // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // so a settled task leaves no live child behind; a terminal fail is then free to
         // terminate/drain the activity (which would sweep them anyway — this just makes the settle
         // self-contained and avoids a stale child blocking a later complete).

@@ -16,7 +16,7 @@ use crate::types::event::Event;
 /// when the whole branch/item finishes. This is the flat (non-recursive) fan-out: the thread is
 /// stored as one row with a `state_path` into the shared machine, never copying branch state.
 ///
-/// For a `Map`, `branch_index` carries the **item index** and `state`/`input` are the item
+/// For a `Map`, `index` carries the **item index** and `start_at`/`input` are the item
 /// processor's `StartAt` and the item's input value — the same command shape, reused verbatim for
 /// map items via the identical `index`→`children` mapping.
 ///
@@ -32,22 +32,22 @@ pub struct SpawnThreadHandler;
 impl CommandHandler for SpawnThreadHandler {
     fn command(&self) -> Command {
         Command::SpawnThread {
-            parent: crate::types::meta::ObjectReference::nil(),
+            owner: crate::types::meta::ObjectReference::nil(),
             execution: crate::types::meta::ObjectReference::nil(),
             state_path: None,
-            branch_index: 0,
-            state: String::new(),
+            index: 0,
+            start_at: String::new(),
             input: Default::default(),
         }
     }
 
     async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
         let Command::SpawnThread {
-            parent,
+            owner,
             execution,
             state_path,
-            branch_index,
-            state,
+            index,
+            start_at,
             input,
         } = cmd
         else {
@@ -56,14 +56,13 @@ impl CommandHandler for SpawnThreadHandler {
             );
         };
 
-        // The `parent` Parallel activity must still be running (it may have since been terminated —
+        // The `owner` Parallel activity must still be running (it may have since been terminated —
         // e.g. a sibling branch failed and drained the Parallel). If it is gone or no longer
         // accepting children, the fan-out is a no-op: the child simply never spawns.
-        if parent.kind != crate::types::meta::ObjectKind::Activity {
+        if owner.kind != crate::types::meta::ObjectKind::Activity {
             return; // internal fault: a branch owner must be an Activity.
         }
-        let owner = parent.clone();
-        let owner_activity = match ctx.storage.get_activity(&owner).await {
+        let owner_activity = match ctx.storage.get_activity(owner).await {
             Ok(Some(a)) => a,
             _ => return, // owner gone — the fan-out is dropped.
         };
@@ -101,14 +100,20 @@ impl CommandHandler for SpawnThreadHandler {
         // before the `ThreadCreated` applier builds the entity.
         let id = out.next_execution();
         let uid: ulid::Ulid = id.into();
+        // Name the thread as a child of its owning execution (the #3/#11/#13 convention, applied to
+        // threads): the generated name's plain base is the owning execution's name, inherited
+        // verbatim through every nesting level — so a branch thread still names its root run — and
+        // its suffix is a random tail via `PlainName::to_generated`, decoupled from the thread's own
+        // `uid`. Not the opaque `child-<uid>` placeholder. Minted once and reused for the reference
+        // and the serialized `meta.name`, so the storage row key (`thread.reference()`) matches the
+        // sibling `ActivateState` owner.
+        let thread_name = execution.name.base().to_generated();
         let reference = crate::types::meta::ObjectReference::new(
             crate::types::meta::ObjectKind::Thread,
-            // The generated `child-<uid>` name is statically in the valid charset, so it cannot fail.
-            crate::types::meta::ObjectName::generated_with_suffix("child", &uid.to_string())
-                .expect("thread object name is always valid"),
+            thread_name.clone(),
             uid,
         );
-        tracing::debug!(child = ?reference, parent = ?parent, "spawning child thread from fan-out command");
+        tracing::debug!(child = ?reference, owner = ?owner, "spawning child thread from fan-out command");
 
         // Root the child in the owning tree: `parent` links it to the Parallel activity (whose
         // `active_children` the applier populates, so the Parallel drains only once every branch
@@ -128,18 +133,19 @@ impl CommandHandler for SpawnThreadHandler {
                 // The thread records its own ordinal (branch/item index in declaration order); the
                 // container's ordered fan-out map is projected from this by the `ThreadCreated`
                 // applier, so the value lives here on the entity as its identity.
-                index: *branch_index,
+                index: *index,
                 status: crate::ThreadStatus::Running,
                 input: input.clone(),
                 output: None,
                 // Birth: `created_at == now` (fan-out moment). The owner is the SpawnThread command's
                 // `parent` Parallel/Map activity, converted to the reference form stored in meta.
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::born_named(
                     crate::types::meta::ObjectKind::Thread,
+                    thread_name,
                     uid,
                     Timestamp::now(),
                 )
-                .with_owner(parent.clone()),
+                .with_owner(owner.clone()),
             },
         });
         // Enter the branch at its `StartAt` state. The child's path = the thread's branch/item
@@ -149,7 +155,7 @@ impl CommandHandler for SpawnThreadHandler {
         let mut enter_path = state_path
             .clone()
             .expect("a spawned thread always receives its state_path from the container");
-        enter_path.push_back(state.as_str());
+        enter_path.push_back(start_at.as_str());
         out.emit_command(Command::ActivateState {
             execution: root_execution,
             owner: reference,

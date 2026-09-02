@@ -19,7 +19,6 @@ impl EventApplier for StateTransitionedApplier {
         Event::StateTransitioned {
             activity: ObjectReference::nil(),
             next: String::new(),
-            output: Default::default(),
         }
     }
 

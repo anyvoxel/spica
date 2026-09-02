@@ -79,7 +79,7 @@ impl CommandHandler for CompleteThreadHandler {
             // parallel/map converges once its last branch/item drains.
             if let Some(owner) = thread_row.value.meta.owner.clone() {
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent: owner,
+                    owner,
                     child: thread_ref.clone(),
                 });
             }

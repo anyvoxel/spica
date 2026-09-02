@@ -27,7 +27,7 @@ impl CommandHandler for ActivateTaskHandler {
     fn command(&self) -> Command {
         Command::ActivateTask {
             execution: crate::types::meta::ObjectReference::nil(),
-            parent: crate::types::meta::ObjectReference::nil(),
+            owner: crate::types::meta::ObjectReference::nil(),
             task: crate::types::meta::ObjectReference::nil(),
             resource: String::new(),
             arguments: Default::default(),
@@ -38,7 +38,7 @@ impl CommandHandler for ActivateTaskHandler {
     async fn handle(&self, cmd: &Command, _ctx: &mut HandlerContext<'_>, out: &mut Collector) {
         let Command::ActivateTask {
             execution,
-            parent,
+            owner,
             task,
             resource,
             arguments,
@@ -72,7 +72,7 @@ impl CommandHandler for ActivateTaskHandler {
                     task.uid,
                     crate::log::Timestamp::now(),
                 )
-                .with_owner(parent.clone()),
+                .with_owner(owner.clone()),
             },
         });
     }

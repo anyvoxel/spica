@@ -60,7 +60,7 @@ impl CommandHandler for TerminateStateHandler {
                     activity: activity_value,
                 });
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent: act
+                    owner: act
                         .value
                         .meta
                         .owner
@@ -149,7 +149,7 @@ impl CommandHandler for TerminateStateHandler {
                 activity: terminated_activity,
             });
             out.emit_command(Command::ProcessChildCompleted {
-                parent: act
+                owner: act
                     .value
                     .meta
                     .owner

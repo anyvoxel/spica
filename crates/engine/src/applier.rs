@@ -103,6 +103,7 @@ impl EventDispatcher {
             ExecutionTerminatedApplier,
             FlowCreatedApplier,
             FlowVersionCreatedApplier,
+            ProcessChildCompletedHandledApplier,
             StateActivatingApplier,
             StateActivatedApplier,
             StateCompletingApplier,

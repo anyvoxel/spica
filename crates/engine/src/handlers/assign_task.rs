@@ -15,7 +15,7 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 ///
 /// Runs in the StreamProcessor's serialized, lock-holding command arm, so discovery and leasing are
 /// decided against the same projection snapshot the fold writes. It discovers up to `max_tasks`
-/// `Pending` tasks of `resource`, leases each to `worker_id` (arming its `TaskLease` timer), and
+/// `Pending` tasks of `resource`, leases each to `worker_id` (arming its `DeliveryLease` timer), and
 /// returns the granted set to the awaiting `poll_tasks` via the acknowledgment channel
 /// (`AckOutcome::Granted`). All claimed tasks ride **one** batched `TasksClaimed` event (they share
 /// this single causal batch), with per-task lease timers.
@@ -54,7 +54,7 @@ impl CommandHandler for ClaimTasksHandler {
             );
         };
         // Lease horizon: `now + lease_seconds`, persisted as the absolute deadline so the paired
-        // `TaskLease` timer (and a restarted engine) reconstruct the same window; a `None` on
+        // `DeliveryLease` timer (and a restarted engine) reconstruct the same window; a `None` on
         // overflow means we grant an empty set (a defensively-clamped `now` lease would fire
         // immediately — absurd for a pull).
         let Some(lease_until) = Timestamp::now().checked_add(Duration::from_secs(*lease_seconds))
@@ -94,7 +94,7 @@ impl CommandHandler for ClaimTasksHandler {
             if activity_id.kind != ObjectKind::Activity {
                 continue; // a task without an activity owner is an internal fault; skip it.
             }
-            // Resolve the owning execution — the `TaskLease` timer belongs to it (its `execution`
+            // Resolve the owning execution — the `DeliveryLease` timer belongs to it (its `execution`
             // field and, eventually, its name-prefix). Carry it when the activity is present; when the
             // owner row is absent (raw-seam dispatch) fall back to nil rather than skipping a claimable
             // task.
@@ -127,7 +127,7 @@ impl CommandHandler for ClaimTasksHandler {
     }
 }
 
-/// Mark `task_value` claimed (leased to `worker_id` until `lease_until`) and arm its `TaskLease`
+/// Mark `task_value` claimed (leased to `worker_id` until `lease_until`) and arm its `DeliveryLease`
 /// expiry timer under the owning `activity_id` (belonging to `execution`). The `ClaimTasks` handler
 /// uses it so every claim leases + arms identically — the timer, on firing, re-queues the task so a
 /// stalled / crashed worker does not hold it forever. The timer is minted inline so the arm lands in
@@ -155,7 +155,7 @@ fn emit_lease(
         out,
         execution,
         activity_id,
-        TimerPurpose::TaskLease,
+        TimerPurpose::DeliveryLease,
         lease_until,
     );
     task_value

@@ -151,6 +151,13 @@ impl Collector {
         self.entries
     }
 
+    /// Whether the collector has produced no entries. Handlers use this to guarantee a dispatched
+    /// command always leaves a causally-tied follow-up, emitting a confirmation when it would
+    /// otherwise be silent (`ProcessChildCompleted`'s no-op receipt).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Declare an acknowledgement to be executed once `event` has been applied to Storage, waking
     /// the awaiting `request_id` with `event`. Side effects are deferred rather than executed at
     /// dispatch: the StreamProcessor — which alone knows when an Entry is durably appended *and* applied

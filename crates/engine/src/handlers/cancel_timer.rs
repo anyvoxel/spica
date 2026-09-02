@@ -51,7 +51,7 @@ impl CommandHandler for CancelTimerHandler {
             },
         });
         out.emit_command(Command::ProcessChildCompleted {
-            parent: act
+            owner: act
                 .value
                 .meta
                 .owner

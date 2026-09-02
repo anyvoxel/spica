@@ -323,6 +323,7 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::TaskCancelled { .. } => "TaskCancelled",
         Event::VariablesAssigned { .. } => "VariablesAssigned",
         Event::StateTransitioned { .. } => "StateTransitioned",
+        Event::ProcessChildCompletedHandled { .. } => "ProcessChildCompletedHandled",
     }
 }
 
@@ -2159,18 +2160,18 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
         assert_eq!(*status, TaskStatus::Running);
         assert_eq!(worker.as_deref(), Some("w2"));
     }
-    // Each grant arms its TaskLease expiry timer (emitted inline with the lease).
+    // Each grant arms its DeliveryLease expiry timer (emitted inline with the lease).
     let timers = entries
         .iter()
         .filter(|e| {
             matches!(
                 &e.payload,
                 EntryPayload::Event(Event::TimerActivated { timer })
-                    if timer.purpose == TimerPurpose::TaskLease
+                    if timer.purpose == TimerPurpose::DeliveryLease
             )
         })
         .count();
-    assert_eq!(timers, 2, "each granted task arms a TaskLease timer");
+    assert_eq!(timers, 2, "each granted task arms a DeliveryLease timer");
 }
 
 #[tokio::test]

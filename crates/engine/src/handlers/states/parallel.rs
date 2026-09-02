@@ -234,11 +234,11 @@ fn activate_parallel(
     for (index, branch) in state.branches.iter().enumerate() {
         let pointer = child_pointer(actx, index);
         out.emit_command(Command::SpawnThread {
-            parent: owner.clone(),
+            owner: owner.clone(),
             execution: actx.activity.execution.clone(),
             state_path: Some(pointer),
-            branch_index: index,
-            state: branch.start_at.clone(),
+            index,
+            start_at: branch.start_at.clone(),
             input: arguments.clone(),
         });
     }
@@ -247,7 +247,11 @@ fn activate_parallel(
     // activation-complete ed. No synchronous finish — the activity stays `Running` owning its child
     // executions; it completes only when they all settle (via `child_completed`).
     out.emit_event(Event::StateActivated {
-        activity: state_activated_value(actx, arguments.clone(), None),
+        activity: state_activated_value(
+            actx,
+            arguments.clone(),
+            Some(ActivityState::Parallel(Default::default())),
+        ),
     });
 }
 
