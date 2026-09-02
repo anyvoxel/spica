@@ -107,7 +107,7 @@ impl CommandHandler for TerminateThreadHandler {
             // once its last branch/item drains (mirrors the `Execution` completion relay).
             if let Some(owner) = thread_row.value.meta.owner.clone() {
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent: owner,
+                    owner,
                     child: thread_ref.clone(),
                 });
             }

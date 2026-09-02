@@ -264,6 +264,72 @@ async fn task_name_derives_from_execution_name_base() {
 }
 
 #[tokio::test]
+async fn thread_name_derives_from_execution_name_base() {
+    // finding #7: a `Parallel`/`Map` fan-out Thread's generated name uses its owning execution's name
+    // (the plain base) as base, mirroring #3/#11/#13 — not the old `child-<uid>` placeholder. Read the
+    // real durable log and check a `ThreadCreated` event's thread name.
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    let exec_name = ObjectName::plain("run_threadnaming").expect("a plain execution name is valid");
+    // A `Parallel` fans each branch out as a child Thread, so this run emerges a `ThreadCreated`.
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "P",
+          "States": {
+            "P": { "Type": "Parallel", "End": true, "Branches": [
+              { "StartAt": "A", "States": { "A": { "Type": "Pass", "End": true } } },
+              { "StartAt": "B", "States": { "B": { "Type": "Pass", "End": true } } }
+            ] }
+          }
+        }"#,
+    );
+    let flow_version = engine
+        .create_flow(
+            FlowName::new("run_threadnaming_flow").expect("anon flow name is valid"),
+            &serde_json::to_string(&sm).expect("sm serializes"),
+        )
+        .await
+        .expect("flow created");
+    let execution_id = engine
+        .start_for_revision(exec_name.clone(), flow_version, Value::Null)
+        .await
+        .expect("execution starts");
+    let _result = engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("run succeeds");
+
+    let entries = log.lock().await.entries();
+    let thread = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::ThreadCreated { thread }) => Some(thread.meta.name.clone()),
+            _ => None,
+        })
+        .expect("a ThreadCreated event was emitted for the Parallel branch");
+    assert_eq!(
+        thread.base().as_str(),
+        exec_name.as_str(),
+        "thread name base must be the owning execution's name (finding #7), not 'child'"
+    );
+    assert!(
+        thread
+            .as_str()
+            .starts_with(&format!("{}-", exec_name.as_str())),
+        "thread name {} must be <execution>-<suffix>",
+        thread
+    );
+}
+
+#[tokio::test]
 async fn idle_poll_writes_no_durable_entry() {
     // finding #12: an idle poll (nothing claimable on `resource`) is a pure idempotent read that must
     // not write a durable `ClaimTasks` entry — the worker's ~10ms busy poll would otherwise flood the

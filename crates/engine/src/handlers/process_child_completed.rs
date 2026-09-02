@@ -60,19 +60,19 @@ impl Default for ProcessChildCompletedHandler {
 impl CommandHandler for ProcessChildCompletedHandler {
     fn command(&self) -> Command {
         Command::ProcessChildCompleted {
-            parent: ObjectReference::nil(),
+            owner: ObjectReference::nil(),
             child: ObjectReference::nil(),
         }
     }
 
     async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
-        let Command::ProcessChildCompleted { parent, child } = cmd else {
+        let Command::ProcessChildCompleted { owner, child } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
             );
         };
-        tracing::debug!(parent = ?parent, child = ?child, "child finalized");
-        self.react(ctx, out, parent.clone(), child.clone()).await;
+        tracing::debug!(owner = ?owner, child = ?child, "child finalized");
+        self.react(ctx, out, owner.clone(), child.clone()).await;
     }
 }
 
@@ -126,7 +126,7 @@ impl ProcessChildCompletedHandler {
                         out.emit_event(completed_event);
                         if let Some(owner) = exec.value.meta.owner.clone() {
                             out.emit_command(Command::ProcessChildCompleted {
-                                parent: owner,
+                                owner,
                                 child: parent.clone(),
                             });
                         }
@@ -143,7 +143,7 @@ impl ProcessChildCompletedHandler {
                         out.emit_event(terminated_event);
                         if let Some(owner) = exec.value.meta.owner.clone() {
                             out.emit_command(Command::ProcessChildCompleted {
-                                parent: owner,
+                                owner,
                                 child: parent.clone(),
                             });
                         }
@@ -180,7 +180,7 @@ impl ProcessChildCompletedHandler {
                         out.emit_event(completed_event);
                         if let Some(owner) = thread.value.meta.owner.clone() {
                             out.emit_command(Command::ProcessChildCompleted {
-                                parent: owner,
+                                owner,
                                 child: parent.clone(),
                             });
                         }
@@ -195,7 +195,7 @@ impl ProcessChildCompletedHandler {
                         out.emit_event(terminated_event);
                         if let Some(owner) = thread.value.meta.owner.clone() {
                             out.emit_command(Command::ProcessChildCompleted {
-                                parent: owner,
+                                owner,
                                 child: parent.clone(),
                             });
                         }
@@ -233,7 +233,7 @@ impl ProcessChildCompletedHandler {
                             activity: activity_value,
                         });
                         out.emit_command(Command::ProcessChildCompleted {
-                            parent: act
+                            owner: act
                                 .value
                                 .meta
                                 .owner
@@ -253,7 +253,7 @@ impl ProcessChildCompletedHandler {
                             activity: activity_value,
                         });
                         out.emit_command(Command::ProcessChildCompleted {
-                            parent: act
+                            owner: act
                                 .value
                                 .meta
                                 .owner
@@ -270,8 +270,14 @@ impl ProcessChildCompletedHandler {
                     // whose branches were all fanned out up front, the hook itself guards on the
                     // children having fully drained before it converges.
                     ActivityStatus::Running => {
-                        self.dispatch_child_completed(ctx, out, parent, &act, child)
-                            .await;
+                        self.dispatch_child_completed(
+                            ctx,
+                            out,
+                            parent.clone(),
+                            &act,
+                            child.clone(),
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -279,6 +285,17 @@ impl ProcessChildCompletedHandler {
             // A Flow / FlowVersion / Timer / Task parent owns no children in this path:
             // `ProcessChildCompleted` is never issued to one, so anything else is a silent no-op.
             _ => {}
+        }
+        // Guard the CCES watermark rule: every dispatched command must leave a causally-tied
+        // follow-up, even when the parent's reaction produced nothing to project (a `Parallel`
+        // whose sibling branches are still in flight, a parent already terminal, a duplicate).
+        // The confirmation event carries no state — the no-op changed none — so it is a pure
+        // durable receipt the stream (and the watermark) records without inventing projection.
+        if out.is_empty() {
+            out.emit_event(Event::ProcessChildCompletedHandled {
+                owner: parent,
+                child,
+            });
         }
     }
 

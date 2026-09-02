@@ -69,7 +69,7 @@ use crate::types::context::build_states;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, ObjectReference};
-use crate::{Activity, ActivityState, ActivityStatus, MapActivityState};
+use crate::{Activity, ActivityState, ActivityStatus};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -285,7 +285,7 @@ pub(super) fn emit_scope_termination(
 }
 
 /// Cancel every active timer child of `activity`. Used by the task **settlement** handlers
-/// (`CompleteTask`, `FailTask`) to sweep the task's parented timers — the `TaskLease` armed on
+/// (`CompleteTask`, `FailTask`) to sweep the task's parented timers — the `DeliveryLease` armed on
 /// assign, and the optional `TaskTimeout` — before the activity completes. Mirrors the M1 terminate
 /// sweep's timer arm, but for a *settling* (still `Running`) activity: leaving a live timer child
 /// would trip the activity-completion guard's "still has children" refusal, stalling the state.
@@ -412,9 +412,8 @@ pub(super) fn activity_value_with(
 pub(super) fn state_activated_value(
     actx: &ActivityCtx,
     input: Value,
-    plan: Option<MapActivityState>,
+    activity_state: Option<ActivityState>,
 ) -> Activity {
-    let activity_state = plan.map(ActivityState::Map);
     activity_value_with(actx, None, Some(input), activity_state, None, None)
 }
 
@@ -534,7 +533,6 @@ pub(super) fn emit_transition(
         out.emit_event(crate::types::event::Event::StateTransitioned {
             activity,
             next: next.to_string(),
-            output: output.clone(),
         });
         // The successor lives as a sibling of the completing state in the same enclosing `states`
         // table — that table is the completing activity's `state_path` minus its own leaf.

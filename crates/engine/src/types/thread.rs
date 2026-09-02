@@ -54,8 +54,8 @@ impl ThreadStatus {
 /// each one an item, but they share this single entity shape. It is a **distinct type from
 /// [`Execution`](crate::types::execution::Execution)**: an `Execution` is always a top-level run a
 /// client started (plain user name, no `state_path`, no owner); a `Thread` is always an internal
-/// fan-out sub-run (generated `child-<uid>` name, always-a-`state_path`, always owned by its container
-/// activity). The role is declared by the type, so no consumer has to infer it from fields.
+/// fan-out sub-run (generated `{execution-name}-{suffix}` name, always-a-`state_path`, always owned by
+/// its container activity). The role is declared by the type, so no consumer has to infer it from fields.
 ///
 /// It carries only durable identity/lifecycle facts; runtime conveniences (variable scope, in-flight
 /// children) live on the storage projection `crate::storage::ThreadRecord`, mirroring
@@ -63,7 +63,8 @@ impl ThreadStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     /// Object identity + shared metadata. **`meta.uid` IS the thread's never-reused identity ulid**
-    /// (there is no separate bare id); `meta.name` is a generated `child-<uid>` placeholder. Unlike a
+    /// (there is no separate bare id); `meta.name` is a generated `{execution-name}-{suffix}` name
+    /// (see `SpawnThread`'s minting rule). Unlike a
     /// top-level `Execution` (which has no owner), `meta.owner` is **always** the container
     /// `Parallel`/`Map` activity that fanned this thread out — the drain cascade and the container's
     /// `active_children` rely on that owning edge.

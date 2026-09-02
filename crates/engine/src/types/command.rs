@@ -129,16 +129,16 @@ pub enum Command {
     /// tree, inheriting the top-level run's id as its flat query anchor, and pointing its
     /// `state_path` at the branch's `states` table within the shared machine) followed by an
     /// `ActivateState` entering the branch's `StartAt` state. The child runs as a self-contained
-    /// sub-state-machine; its terminal hop cascades back to `parent` via `ProcessChildCompleted`.
+    /// sub-state-machine; its terminal hop cascades back to `owner` via `ProcessChildCompleted`.
     ///
-    /// `parent` is the `Parallel` activity that owns the branch, `execution` the top-level run
+    /// `owner` is the `Parallel` activity that owns the branch, `execution` the top-level run
     /// (carried verbatim through every nesting level), `state_path` the resolved JSON Pointer to
     /// this branch's `states` table (computed by the fan-out from the owning execution's pointer +
     /// the `Parallel` state name + branch index), and `state` the branch's `StartAt` to enter first.
     ///
     /// TODO(command-design): `SpawnThread` is reused by both `Parallel` branches and `Map` items
     /// (the rename from `SpawnBranch` resolved the naming concern — it now matches the `Thread`
-    /// entity it creates), but its payload is still too thin: `branch_index/state/input/state_path`
+    /// entity it creates), but its payload is still too thin: `index/start_at/input/state_path`
     /// is just enough to enter the child, not enough to preserve the higher-level source semantics
     /// (container kind, whether the index is a branch or item index, and any future fan-out
     /// metadata). Redesign this command as a more general child-thread spawn command before adding
@@ -146,18 +146,23 @@ pub enum Command {
     SpawnThread {
         /// The owning node — the `Parallel`/`Map` activity's reference (kind `Activity`) whose
         /// `active_children` must drain before the container can finish.
-        parent: ObjectReference,
+        owner: ObjectReference,
         /// The reference of the top-level run this branch belongs to (the child inherits it as
         /// its `execution` anchor, carried verbatim through every nesting level).
         execution: ObjectReference,
         /// Resolved JSON Pointer to this branch's `states` table within the shared machine.
         state_path: Option<jsonptr::PointerBuf>,
-        /// This branch's index within the parent `Parallel`'s `Branches` array. Carried so the
-        /// created child execution can be recorded under this index (for ordered output
-        /// aggregation when the `Parallel` converges).
-        branch_index: usize,
-        /// The state name entered first within the branch (the branch's `StartAt`).
-        state: String,
+        /// This child's ordinal within its container's fan-out source — the `Branches` array index
+        /// for a `Parallel`, or the `Items` array index for a `Map`. Carried so the created child
+        /// (`Thread.index`) is recorded under this index for ordered output aggregation when the
+        /// container converges. `SpawnThread` is shared by both, hence the container-neutral name.
+        index: usize,
+        /// The **entry-point state name** the child enters first — the branch's `StartAt` for a
+        /// `Parallel`, the item-processor's `StartAt` for a `Map`. Distinct from `state_path` (which
+        /// names only the sub-machine's `states` table): it is the one carrier of *where within that
+        /// table* the child starts, needed to build the sibling `ActivateState`'s path and
+        /// unrecoverable from `state_path` alone without re-resolving the definition.
+        start_at: String,
         /// The input the branch receives (the `Parallel` state's projected `Arguments`, or the
         /// state's input by default).
         input: Value,
@@ -279,7 +284,7 @@ pub enum Command {
     /// Invoke an external `Task` — the Task-state analogue of inline timer arming. The
     /// side-effect handler emits only `Event::TaskActivated`, which makes the task **available**
     /// (`Pending`) for a worker to claim; the physical call is performed by the worker (see
-    /// `spica-client`'s `worker` module), not by the engine. `parent` is the invoking activity's
+    /// `spica-client`'s `worker` module), not by the engine. `owner` is the invoking activity's
     /// reference (kind `Activity`); `resource` is the URI workers claim on (the job type); `arguments` are
     /// the projected call payload — **frozen once here** (Zeebe job payload) and reused verbatim on
     /// every retry of the same task entity, never re-projected.
@@ -293,7 +298,7 @@ pub enum Command {
     /// `Task::execution` and the task's `{execution.name}-{suffix}` generated name (finding #13).
     ActivateTask {
         execution: ObjectReference,
-        parent: ObjectReference,
+        owner: ObjectReference,
         task: ObjectReference,
         resource: String,
         arguments: Value,
@@ -304,7 +309,7 @@ pub enum Command {
     /// `ActivateJobs`). The engine's `poll_tasks` API writes this **only when a read-first gate found
     /// claimable work** — an idle poll is a pure query and never reaches the log. Dispatch leases each
     /// discovered task to `worker_id` for `lease_seconds`, emitting one batched `TasksClaimed` (+ a
-    /// per-task `TaskLease` timer), and returns the granted set to the awaiting caller via the
+    /// per-task `DeliveryLease` timer), and returns the granted set to the awaiting caller via the
     /// acknowledgment channel (`AckOutcome::Granted`). Allocation stays in the StreamProcessor's
     /// serialized, lock-holding dispatch, so the grant is decided where the projection is read.
     /// `request_id` correlates the caller's `poll_tasks` with the returned task list (the
@@ -352,18 +357,18 @@ pub enum Command {
     CancelTask { task: ObjectReference },
 
     // ── Coordination (cross-entity relay) ────────────────────────────────────
-    /// A child reached a terminal state; notify `parent` so *it* can decide what to do next.
+    /// A child reached a terminal state; notify `owner` so *it* can decide what to do next.
     ///
-    /// The child never knows whether its settle drains the parent (was it the last child?) nor
-    /// whether the parent should replenish a work slot (Map/Parallel concurrency) — those are the
-    /// parent's own decisions. This command hands that decision to [`ProcessChildCompletedHandler`]
+    /// The child never knows whether its settle drains the owner (was it the last child?) nor
+    /// whether the owner should replenish a work slot (Map/Parallel concurrency) — those are the
+    /// owner's own decisions. This command hands that decision to [`ProcessChildCompletedHandler`]
     /// (crate::handlers::ProcessChildCompletedHandler), which runs on the *next* dispatch round after the
-    /// child's terminal event was applied, so it sees `parent`'s real post-drain `active_children`.
+    /// child's terminal event was applied, so it sees `owner`'s real post-drain `active_children`.
     ///
-    /// `parent` is carried in the command (rather than re-derived from storage) because by the time
-    /// this command is dispatched, the child may have been removed from `parent`'s snapshot or,
+    /// `owner` is carried in the command (rather than re-derived from storage) because by the time
+    /// this command is dispatched, the child may have been removed from `owner`'s snapshot or,
     /// in the re-entry path, swept from the tree entirely — the child's own terminal path reads the
-    /// parent link before that. `child` is retained for logging / debugging and for the M2/M3
+    /// owner link before that. `child` is retained for logging / debugging and for the M2/M3
     /// Map/Parallel replenish logic.
     ///
     /// TODO(recovery + design): this command's handling is unfinished for the container states and
@@ -385,13 +390,19 @@ pub enum Command {
     ///   unreachable default is only valid while there are no container states (M1/M2), and must be
     ///   replaced (by the idempotent confirmation path above) before Map/Parallel + recovery coexist.
     ProcessChildCompleted {
-        parent: ObjectReference,
+        owner: ObjectReference,
         child: ObjectReference,
     },
 }
 
-/// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s split
-/// (resume vs. timeout) and is a placeholder for later per-state `TimeoutSeconds` (M2).
+/// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s dispatch and is a
+/// placeholder for later per-state `TimeoutSeconds` (M2).
+///
+/// The first three variants are **state-machine semantic** timers: they arise from the ASL
+/// definition (`Seconds`/`TimeoutSeconds`) and drive a state transition when they fire. The last
+/// (`DeliveryLease`) is an **infra/delivery** guard, not workflow-defined — it shares the durable
+/// timer path only because a claimed-but-unsettled task must be re-queued after a restart, and its
+/// firing is engine-internal coordination rather than a state-machine behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimerPurpose {
     /// The state-machine `TimeoutSeconds` deadline; its firing terminates the execution `TimedOut`.
@@ -401,8 +412,9 @@ pub enum TimerPurpose {
     /// A Task state's `TimeoutSeconds` deadline; its firing fails the in-flight task with
     /// `States.Timeout` (routed back into the owning state's `Retry`/`Catch` policy).
     TaskTimeout,
-    /// A claimed Task's lease (Zeebe activation timeout); its firing re-queues the task (`Pending`)
-    /// so a stalled / crashed worker does not hold it forever.
-    TaskLease,
+    /// The engine's **delivery lease** on a claimed Task (Zeebe activation timeout); its firing
+    /// re-queues the task (`Pending`) so a stalled / crashed worker does not hold it forever. An
+    /// infra/delivery timer, unlike the state-machine semantic timers above.
+    DeliveryLease,
     // M2: StateTimeout
 }

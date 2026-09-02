@@ -5,7 +5,7 @@ use crate::handler::{Collector, CommandHandler, HandlerContext};
 use crate::types::command::Command;
 use crate::types::event::Event;
 
-/// Handles `ReleaseTaskLease`: a claimed task's `TaskLease` deadline elapsed without a settlement
+/// Handles `ReleaseTaskLease`: a claimed task's `DeliveryLease` deadline elapsed without a settlement
 /// (Zeebe activation timeout / worker unavailability), so the task is re-queued for another worker.
 ///
 /// Idempotent: a no-op unless the task is still `Running` — a task that already settled (or was

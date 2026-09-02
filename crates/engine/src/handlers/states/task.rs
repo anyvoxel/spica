@@ -151,7 +151,7 @@ fn activate_task(
     });
     out.emit_command(Command::ActivateTask {
         execution: actx.activity.execution.clone(),
-        parent: activity.clone(),
+        owner: activity.clone(),
         task: task_ref,
         resource: state.resource.clone(),
         arguments,

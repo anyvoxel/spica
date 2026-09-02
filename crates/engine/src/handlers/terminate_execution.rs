@@ -135,7 +135,7 @@ impl CommandHandler for TerminateExecutionHandler {
             // tree wedges. The top-level run (`parent: None`) has no owner and relays nothing.
             if let Some(owner) = exec.value.meta.owner.clone() {
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent: owner,
+                    owner,
                     child: exec_ref.clone(),
                 });
             }

@@ -117,7 +117,7 @@ impl CommandHandler for TriggerTimerHandler {
                     }),
                 });
             }
-            TimerPurpose::TaskLease => {
+            TimerPurpose::DeliveryLease => {
                 // A claimed task's lease (Zeebe activation timeout) elapsed without a settle: re-queue
                 // it (`Pending`) so a stalled / crashed worker does not hold it forever. Parented on
                 // the owning activity like `TaskTimeout`; find the in-flight task child and release it

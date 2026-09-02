@@ -842,6 +842,13 @@ pub(crate) fn log_event(event: &Event) {
         Event::StateTransitioned { activity, next, .. } => {
             info!(activity = %activity, next = %next, "state routed to next");
         }
+        Event::ProcessChildCompletedHandled { owner, child } => {
+            debug!(
+                owner = %owner,
+                child = %child,
+                "process child completed handled (no projection to make)"
+            );
+        }
     }
 }
 

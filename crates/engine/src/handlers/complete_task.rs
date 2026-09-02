@@ -134,7 +134,7 @@ impl CommandHandler for CompleteTaskHandler {
         // contract that lets the awaiting `TaskApi::complete` report that this settlement was applied.
         out.ack_request(*request_id, completed.clone());
         out.emit_event(completed);
-        // Sweep the activity's task timers (the `TaskLease` armed on assign, and any `TaskTimeout`)
+        // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // before `CompleteState`: the M1 activity-completion guard refuses to finish an activity that
         // still has live children, and a settled task must leave none behind. Fired-since timers are
         // no longer active children and are simply absent.

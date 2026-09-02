@@ -255,13 +255,13 @@ impl StateHandler for MapStateHandler {
         for k in 0..to_spawn {
             let index = spawn_count + k;
             out.emit_command(Command::SpawnThread {
-                parent: owner.clone(),
+                owner: owner.clone(),
                 execution: actx.activity.execution.clone(),
                 state_path: Some(pointer.clone()),
-                // `branch_index` carries the *item index* — the `children` key we aggregate
-                // on at convergence (matching the ordering semantics of a `Parallel` branch).
-                branch_index: index,
-                state: start_at.clone(),
+                // `index` is the item's ordinal — the `children` key we aggregate on at
+                // convergence (matching the ordering semantics of a `Parallel` branch).
+                index,
+                start_at: start_at.clone(),
                 // Base scope: the per-item input is the item itself (ASL default). `ItemSelector`
                 // projection is a deferred TODO.
                 input: progress.items.get(index).cloned().unwrap_or(Value::Null),
@@ -425,11 +425,11 @@ fn activate_map(
         .unwrap_or_default();
     for index in 0..initial_batch {
         out.emit_command(Command::SpawnThread {
-            parent: owner.clone(),
+            owner: owner.clone(),
             execution: actx.activity.execution.clone(),
             state_path: Some(pointer.clone()),
-            branch_index: index,
-            state: start_at.clone(),
+            index,
+            start_at: start_at.clone(),
             input: items.get(index).cloned().unwrap_or(Value::Null),
         });
     }
@@ -444,12 +444,12 @@ fn activate_map(
         activity: state_activated_value(
             actx,
             actx.activity.input.clone(),
-            Some(MapActivityState {
+            Some(ActivityState::Map(MapActivityState {
                 items: items.clone(),
                 total: items.len(),
                 max_concurrency,
                 children: std::collections::HashMap::new(),
-            }),
+            })),
         ),
     });
 

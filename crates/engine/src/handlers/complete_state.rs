@@ -35,9 +35,9 @@ impl CompleteStateHandler {
         out: &mut Collector,
         activity: crate::types::meta::ObjectReference,
     ) {
-        // A synchronous state that owns no children drains its parent Execution as soon as its own
-        // terminal lands; notify the parent so its own handler walks the drain.
-        let parent = ctx
+        // A synchronous state that owns no children drains its owner Execution as soon as its own
+        // terminal lands; notify the owner so its own handler walks the drain.
+        let owner = ctx
             .storage
             .get_activity(&activity)
             .await
@@ -50,9 +50,9 @@ impl CompleteStateHandler {
                     .clone()
                     .expect("an owned activity has an owner")
             });
-        if let Some(parent) = parent {
+        if let Some(owner) = owner {
             out.emit_command(crate::types::command::Command::ProcessChildCompleted {
-                parent,
+                owner,
                 child: activity,
             });
         }
