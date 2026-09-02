@@ -3,33 +3,34 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
 use crate::log::Timestamp;
-use crate::task::TaskValue;
+use crate::types::task::Task;
 
-/// The storage projection row of a Task.
+/// The storage projection row of a TaskRecord.
 ///
-/// `TaskValue` is the single source of truth for the task's shared domain state; storage wraps it
-/// so task domain values and storage ownership stay separated the same way `Activity` wraps
-/// `ActivityValue` and `Timer` wraps `TimerValue`. `#[serde(flatten)]` preserves the existing
-/// serialized shape. The row carries the projection-only `created_at`/`updated_at` timing facts (see
-/// [`crate::storage::Execution::created_at`]).
+/// `Task` is the single source of truth for the task's shared domain state; storage wraps it
+/// so task domain values and storage ownership stay separated the same way `ActivityRecord` wraps
+/// `Activity` and `TimerRecord` wraps `Timer`. The value is deliberately **not** `#[serde(flatten)]`:
+/// `Task` now carries its own `created_at`/`updated_at` (stamped at event construction), which would
+/// collide at the same JSON level with this row's entry-timestamp `created_at`/`updated_at` below.
+/// Nesting under `value` keeps the two timestamp concepts in separate namespaces (see
+/// [`crate::storage::ExecutionRecord::created_at`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Task {
+pub struct TaskRecord {
     /// The canonical task domain value reconstructed from the event stream.
-    #[serde(flatten)]
-    pub value: TaskValue,
+    pub value: Task,
     /// When this row's birth event (`TaskActivated`) landed in the log (see
-    /// [`crate::storage::Activity::created_at`] for the deterministic-source note).
+    /// [`crate::storage::ActivityRecord::created_at`] for the deterministic-source note).
     pub created_at: Timestamp,
     /// The latest applied entry's timestamp that touched this row; each mutating applier bumps it.
     pub updated_at: Timestamp,
 }
 
-impl Task {
-    pub fn value(&self) -> TaskValue {
+impl TaskRecord {
+    pub fn value(&self) -> Task {
         self.value.clone()
     }
 
-    pub fn from_value(value: TaskValue) -> Self {
+    pub fn from_value(value: Task) -> Self {
         Self {
             value,
             created_at: Timestamp::from_millis(0),
@@ -49,15 +50,15 @@ impl Task {
     }
 }
 
-impl Deref for Task {
-    type Target = TaskValue;
+impl Deref for TaskRecord {
+    type Target = Task;
 
     fn deref(&self) -> &Self::Target {
         &self.value
     }
 }
 
-impl DerefMut for Task {
+impl DerefMut for TaskRecord {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }

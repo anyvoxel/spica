@@ -3,24 +3,31 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ExecutionValue;
-use crate::id::{ActivityId, NodeId};
+use crate::Execution;
 use crate::log::Timestamp;
-use crate::variables::Variables;
+use crate::types::id::ActivityId;
+use crate::types::meta::ObjectReference;
+use crate::types::variables::Variables;
 
 /// The storage projection row of an execution.
 ///
-/// `ExecutionValue` is the canonical execution domain entity reconstructed from the stream. Storage
+/// `Execution` is the canonical execution domain entity reconstructed from the stream. Storage
 /// wraps it so projection-only bookkeeping — currently `variables`, `active_children`,
 /// `current_activity`, and the `created_at`/`updated_at` timing facts — stays separated from the
 /// entity value that lifecycle events carry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Execution {
+pub struct ExecutionRecord {
     /// The canonical execution domain value reconstructed from the event stream.
-    #[serde(flatten)]
-    pub value: ExecutionValue,
+    ///
+    /// Deliberately **not** `#[serde(flatten)]`: `Execution` now carries its domain timing facts
+    /// inside an `ObjectMeta` (`meta.created_at`/`updated_at`, stamped at event construction), which
+    /// would collide at the same JSON level with this row's entry-timestamp `created_at`/
+    /// `updated_at` below. Nesting the value under `value` keeps the two timestamp concepts in
+    /// separate namespaces. (`Activity`/`Timer`/`Task` now carry the same two fields, so their rows
+    /// nest under `value` too.)
+    pub value: Execution,
     /// The execution's current variable scope. `Assign` mutates this projection state through
-    /// `VariablesAssigned`; it stays off the event-carried `ExecutionValue` so execution lifecycle
+    /// `VariablesAssigned`; it stays off the event-carried `Execution` so execution lifecycle
     /// events do not repeatedly serialize a mutable scope snapshot.
     pub variables: Variables,
     /// The activity currently in flight for this execution. This is a projection convenience used
@@ -29,7 +36,7 @@ pub struct Execution {
     pub current_activity: Option<ActivityId>,
     /// Owned nodes still in flight (active activities / timers / child executions). Completing or
     /// terminating waits for this projection-only set to drain before the terminal `ed` is emitted.
-    pub active_children: HashSet<NodeId>,
+    pub active_children: HashSet<ObjectReference>,
     /// When this row's birth event (the `ExecutionCreated`) landed in the log. Projection-derived
     /// from the applied entry's [`timestamp`](crate::ApplierContext) — never a local
     /// `Timestamp::now()` at apply time — so every replica replaying the same entries computes the
@@ -40,12 +47,12 @@ pub struct Execution {
     pub updated_at: Timestamp,
 }
 
-impl Execution {
-    pub fn value(&self) -> ExecutionValue {
+impl ExecutionRecord {
+    pub fn value(&self) -> Execution {
         self.value.clone()
     }
 
-    pub fn from_value(value: ExecutionValue, active_children: HashSet<NodeId>) -> Self {
+    pub fn from_value(value: Execution, active_children: HashSet<ObjectReference>) -> Self {
         Self {
             value,
             variables: Variables::new(),
@@ -74,15 +81,15 @@ impl Execution {
     }
 }
 
-impl Deref for Execution {
-    type Target = ExecutionValue;
+impl Deref for ExecutionRecord {
+    type Target = Execution;
 
     fn deref(&self) -> &Self::Target {
         &self.value
     }
 }
 
-impl DerefMut for Execution {
+impl DerefMut for ExecutionRecord {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }

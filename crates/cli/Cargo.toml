@@ -5,12 +5,11 @@ edition.workspace = true
 publish.workspace = true
 
 # spica is a PURE-REMOTE client: the engine it drives lives in `spica-server`, reached over gRPC
-# (CreateFlow → StartExecution → poll GetExecution). No engine/backend code runs in this binary, so
-# it depends only on the wire contract + transport, not spica-engine.
+# (CreateFlow → StartExecution → poll GetExecution) — via the `spica-client` transport face, not by
+# depending on the engine or on the wire contract/transport directly. See `src/main.rs`.
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-spica-proto.workspace = true
+spica-client.workspace = true
 tokio.workspace = true
-tonic.workspace = true

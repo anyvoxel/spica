@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 
-use crate::command::Command;
-use crate::event::Event;
+use crate::RejectionType;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::id::NodeId;
+use crate::log::Timestamp;
+use crate::types::command::Command;
+use crate::types::event::Event;
+use crate::types::id::RequestId;
+use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
 
 /// Handles `TerminateExecution`: begins the abnormal finish of a running execution with `reason`.
 /// Emits `ExecutionTerminating`, sweeps owned children (`CancelTimer` for timers,
@@ -16,36 +19,77 @@ pub struct TerminateExecutionHandler;
 impl CommandHandler for TerminateExecutionHandler {
     fn command(&self) -> Command {
         Command::TerminateExecution {
-            id: crate::id::ExecutionId::nil(),
-            reason: crate::command::TerminationReason::Cancelled,
+            name: ObjectName::plain("default").expect("static placeholder name is valid"),
+            uid: None,
+            reason: crate::types::command::TerminationReason::Cancelled,
         }
     }
 
     async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
-        let Command::TerminateExecution { id, reason } = cmd else {
+        let Command::TerminateExecution { name, uid, reason } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
             );
         };
-        let exec = match super::load_execution(ctx.storage, *id).await {
+        // Storage keys executions by name, so a name-only probe (the uid, when present, doubles as the
+        // incarnation guard below) resolves the row regardless of incarnation.
+        let probe =
+            ObjectReference::new(ObjectKind::Execution, name.clone(), uid.unwrap_or_default());
+        let exec = match super::load_execution(ctx.storage, &probe).await {
             Ok(Some(e)) => e,
-            Ok(None) => return, // already gone; nothing to terminate.
-            Err(_) => return,
-        };
-        if !exec.status.is_running() {
-            // Idempotency: if already Completing, convert the in-flight success into a
-            // termination? No — the draining pipeline for a Completing execution has already
-            // decided the outcome; a later Terminate is swallowed as a no-op.
-            if exec.status.is_terminal() {
+            Ok(None) => {
+                // Target execution is gone. Refuse with a durable `Reject` — every command must yield
+                // a followup entry (an event sequence or a Reject), never a silent no-op return.
+                out.reject(
+                    RequestId::nil(),
+                    RejectionType::NotFound,
+                    format!("terminate_execution: execution {name} not found"),
+                );
                 return;
             }
-            // Completing/Terminating: already winding down; the eventual ed wins over this
-            // later Terminate. Swallow.
+            // An infrastructure (storage) fault is not a command-level refusal — the fold errors out
+            // rather than recording a misleading Reject.
+            Err(_) => return,
+        };
+        let exec_ref = exec.reference();
+
+        // Optional incarnation guard: with a caller-supplied `uid`, only that exact incarnation may be
+        // terminated. A mismatch means the name now points at a different execution than the caller
+        // started — refuse with a `StateConflict` Reject rather than terminating the wrong run.
+        if let Some(want) = uid
+            && want != &exec_ref.uid
+        {
+            out.reject(
+                RequestId::nil(),
+                RejectionType::StateConflict,
+                format!(
+                    "terminate_execution: execution {name} is incarnation {}, not {want}",
+                    exec_ref.uid
+                ),
+            );
+            return;
+        }
+
+        if !exec.status.is_running() {
+            // Not running (already terminal, or Completing/Terminating): the draining pipeline has
+            // already decided this execution's outcome — its eventual event wins. Refuse with a
+            // durable Reject (the command still gets its followup entry) rather than swallowing.
+            out.reject(
+                RequestId::nil(),
+                RejectionType::InvalidState,
+                format!(
+                    "terminate_execution: execution {name} is {:?}, not running",
+                    exec.status
+                ),
+            );
             return;
         }
 
         let mut terminating_execution = exec.value();
         terminating_execution.status = crate::ExecutionStatus::Terminating(reason.clone());
+        // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
+        // carries forward.
+        terminating_execution.meta.touch(Timestamp::now());
         out.emit_event(Event::ExecutionTerminating {
             execution: terminating_execution,
         });
@@ -53,35 +97,29 @@ impl CommandHandler for TerminateExecutionHandler {
         let children = exec.active_children.clone();
         let mut pending = 0usize;
         for child in children {
-            match child {
-                NodeId::Timer(t) => {
-                    out.emit_command(Command::CancelTimer { timer: t });
+            match child.kind {
+                ObjectKind::Timer => {
+                    out.emit_command(Command::CancelTimer { timer: child });
                     pending += 1;
                 }
-                NodeId::Activity(a) => {
+                ObjectKind::Activity => {
                     out.emit_command(Command::TerminateState {
-                        activity: a,
+                        activity: child,
                         reason: reason.clone(),
                     });
                     pending += 1;
                 }
-                // A Parallel-branch child *execution* is owned by a Parallel activity, not by an
-                // Execution directly — its branches are rooted under the *activity*. So an
-                // execution's own children are its activities (above), and a nested Parallel's
-                // branch executions live under those activities, reached transitively through the
-                // TerminateState sweep. Nothing to do at the Execution level; the `TerminateState`
-                // sweep of each activity terminates any deeper Parallel-branch executions.
-                NodeId::Execution(_) => {}
-                // A `Task` (an in-flight external call) is owned by an Activity, not directly by
-                // the Execution — terminating the execution terminates each activity (above), whose
-                // own sweep cancels its tasks. A direct Execution->Task link never exists in M1/M2,
-                // so there is nothing to sweep here.
-                NodeId::Task(_) => {}
+                // A Parallel-branch child *execution*, a fan-out `Thread`, and a `Task` are all owned
+                // by a container *Activity*, never directly by an Execution — so they are reached
+                // transitively through the `TerminateState` sweep above, and there is nothing to
+                // sweep at this level. (An Execution directly owns only its activities and timers.)
+                _ => {}
             }
         }
         if pending == 0 {
             let mut terminated_execution = exec.value();
             terminated_execution.status = crate::ExecutionStatus::Terminated(reason.clone());
+            terminated_execution.meta.touch(Timestamp::now());
             // Termination is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionTerminated` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an
@@ -95,15 +133,15 @@ impl CommandHandler for TerminateExecutionHandler {
             // `CompleteExecutionHandler`). Without this the failed branch drains `P`'s `active_children`
             // but nobody triggers `P`'s `child_completed`, so a failed Parallel never converges and the
             // tree wedges. The top-level run (`parent: None`) has no owner and relays nothing.
-            if let Some(parent) = exec.parent {
+            if let Some(owner) = exec.value.meta.owner.clone() {
                 out.emit_command(Command::ProcessChildCompleted {
-                    parent,
-                    child: NodeId::Execution(*id),
+                    parent: owner,
+                    child: exec_ref.clone(),
                 });
             }
         } else {
             tracing::debug!(
-                execution = %id,
+                execution = %exec_ref,
                 pending,
                 "execution terminating deferred: waiting on owned children"
             );

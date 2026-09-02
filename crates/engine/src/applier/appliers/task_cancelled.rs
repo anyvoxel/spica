@@ -2,12 +2,11 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
 use crate::{ApplierContext, EventApplier};
 
-use crate::id::{NodeId, TaskId};
-use crate::{TaskStatus, TaskValue};
+use crate::{RetryState, Task, TaskStatus};
 
 #[derive(Default)]
 pub(crate) struct TaskCancelledApplier;
@@ -15,15 +14,22 @@ pub(crate) struct TaskCancelledApplier;
 impl EventApplier for TaskCancelledApplier {
     fn event(&self) -> Event {
         Event::TaskCancelled {
-            task: TaskValue {
-                id: TaskId::nil(),
-                parent: NodeId::Activity(crate::id::ActivityId::nil()),
+            task: Task {
+                execution: crate::types::meta::ObjectReference::nil(),
                 resource: String::new(),
                 arguments: Default::default(),
                 status: TaskStatus::Cancelled,
                 deadline: None,
                 worker_id: None,
                 lease_until: None,
+                retry_plan: vec![],
+                retry_state: RetryState::default(),
+                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                    crate::types::meta::ObjectKind::Task,
+                    ulid::Ulid::nil(),
+                    crate::log::Timestamp::from_millis(0),
+                    crate::log::Timestamp::from_millis(0),
+                ),
             },
         }
     }
@@ -41,14 +47,18 @@ impl EventApplier for TaskCancelledApplier {
         // Mark the task Cancelled and drain it from its owning activity. The physical call is left
         // running; a later `CompleteTask` for this task is swallowed by the `CompleteTaskHandler`'s
         // non-`Running` guard.
-        if let Some(mut t) = ctx.storage.get_task(task.id).await? {
-            let parent = t.parent;
+        if let Some(mut t) = ctx.storage.get_task(&task.reference()).await? {
+            let parent = t
+                .meta
+                .owner
+                .clone()
+                .expect("an owned task always has an owner");
             t.status = TaskStatus::Cancelled;
+            // Sync the domain value's transition stamp from the event (see task_completed.rs).
+            t.value.meta.touch(task.meta.updated_at);
             t.touch(ctx.timestamp);
             ctx.storage.put_task(t).await?;
-            ctx.storage
-                .remove_child(parent, NodeId::Task(task.id))
-                .await?;
+            ctx.storage.remove_child(parent, task.reference()).await?;
         }
         Ok(())
     }

@@ -6,8 +6,8 @@ use jsonata_core::parser;
 use jsonata_core::value::JValue;
 use serde_json::Value;
 
-use crate::error::ExecutionError;
-use crate::variables::Variables;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::variables::Variables;
 
 /// The JSONata evaluation environment for a single execution.
 ///
@@ -47,12 +47,12 @@ impl EvalEnv {
         }
 
         let mut evaluator = Evaluator::with_context(ctx);
-        let result = evaluator
-            .evaluate(ast, &data)
-            .map_err(|e| ExecutionError::Jsonata {
+        let result = evaluator.evaluate(ast, &data).map_err(|e| {
+            ExecutionError::Runtime(RuntimeError::Jsonata {
                 field: expr.to_string(),
                 message: e.to_string(),
-            })?;
+            })
+        })?;
 
         Ok(Value::from(&result))
     }
@@ -92,9 +92,11 @@ impl EvalEnv {
     /// Returns the parsed AST for `expr`, parsing and caching it on first use.
     fn ast_for(&mut self, expr: &str) -> Result<&AstNode, ExecutionError> {
         if !self.ast_cache.contains_key(expr) {
-            let parsed = parser::parse(expr).map_err(|e| ExecutionError::Jsonata {
-                field: expr.to_string(),
-                message: e.to_string(),
+            let parsed = parser::parse(expr).map_err(|e| {
+                ExecutionError::Runtime(RuntimeError::Jsonata {
+                    field: expr.to_string(),
+                    message: e.to_string(),
+                })
             })?;
             self.ast_cache.insert(expr.to_string(), parsed);
         }
@@ -238,6 +240,9 @@ mod tests {
         let err = env
             .eval_expr("$states.input..", &states(Value::Null), &Variables::new())
             .unwrap_err();
-        assert!(matches!(err, ExecutionError::Jsonata { .. }));
+        assert!(matches!(
+            err,
+            ExecutionError::Runtime(RuntimeError::Jsonata { .. })
+        ));
     }
 }

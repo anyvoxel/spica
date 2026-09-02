@@ -3,7 +3,9 @@
 //! This crate is the **generic** low-level CCES seam: the append-only [`LogStream`] of [`Entry`]s,
 //! along with its in-memory ([`InMemoryLogStream`]) and RocksDB-backed ([`RocksLogStream`])
 //! implementations, plus the envelope types they share ([`Entry`], [`Timestamp`]) and the position
-//! ids ([`EntryId`], [`StreamId`]).
+//! ids ([`EntryId`], [`StreamId`]). The wall-clock [`Timestamp`] itself is re-exported from
+//! [`spica_machinery`] — the workspace's shared leaf kernel — so the log-agnostic primitive doesn't
+//! live in a single consumer crate.
 //!
 //! It is deliberately **agnostic to the entry payload**: [`Entry<P>`](Entry) and
 //! [`LogStream<P>`](LogStream) are generic over `P`, which the embedding engine fills with its own
@@ -18,7 +20,6 @@ mod id;
 mod logstream;
 mod memory;
 mod rocks;
-mod timestamp;
 
 /// A single record's envelope + payload ([`crate::entry`]).
 pub use self::entry::Entry;
@@ -31,5 +32,6 @@ pub use self::logstream::LogStream;
 pub use self::memory::InMemoryLogStream;
 /// A durable RocksDB-backed [`LogStream`].
 pub use self::rocks::RocksLogStream;
-/// A wall-clock timestamp (via [`crate::timestamp`]).
-pub use self::timestamp::Timestamp;
+/// A wall-clock timestamp, hosted in the shared kernel [`spica_machinery`] and re-exported here so
+/// log-envelope users keep a single import path.
+pub use spica_machinery::Timestamp;

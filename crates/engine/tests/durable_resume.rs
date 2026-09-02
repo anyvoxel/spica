@@ -11,11 +11,10 @@ mod common;
 use std::path::Path;
 
 use serde_json::Value;
-use spica_engine::{EngineBuilder, EntryId, EntryPayload, FlowName, LogStream};
+use spica_engine::{EngineBuilder, EntryId, EntryPayload, FlowName, LogStream, ObjectName};
 use spica_logstream::RocksLogStream;
 use spica_scheduler::InMemoryScheduler;
 use spica_storage::RocksStorage;
-use spica_task_service::InMemoryTaskService;
 
 /// A single-terminal-state machine — one execution routes A → Succeed, settling deterministically.
 const SM: &str = r#"{ "StartAt": "A", "States": { "A": { "Type": "Succeed" } } }"#;
@@ -53,7 +52,6 @@ async fn run_one_execution(log_path: &Path, storage_path: &Path) {
     let storage = RocksStorage::open(storage_path).expect("open storage");
     let engine = EngineBuilder::with_backends(Box::new(log), Box::new(storage))
         .with_scheduler(InMemoryScheduler::spawn())
-        .with_task_service(InMemoryTaskService::spawn(std::collections::HashMap::new()))
         .start()
         .await
         .expect("engine boots");
@@ -61,16 +59,21 @@ async fn run_one_execution(log_path: &Path, storage_path: &Path) {
     // across restarts: every execution exercises the identical state machine path.
     let flow_name =
         FlowName::new(&format!("anon_{}", ulid::Ulid::new())).expect("ULID-suffixed name is valid");
-    let flow_version_id = engine
+    let flow_version = engine
         .create_flow(flow_name, SM)
         .await
         .expect("create flow");
     let execution_id = engine
-        .start_for_revision(flow_version_id, Value::Null)
+        .start_for_revision(
+            ObjectName::generated_with_suffix("resume", &ulid::Ulid::new().to_string())
+                .expect("ULID-suffixed generated name is valid"),
+            flow_version,
+            Value::Null,
+        )
         .await
         .expect("start execution");
     engine
-        .wait_for_execution(execution_id)
+        .wait_for_execution(&execution_id)
         .await
         .expect("execution completes");
     engine.stop().await; // controlled shutdown: drains the loop, drops the Rocks handles.

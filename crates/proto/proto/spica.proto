@@ -3,33 +3,46 @@ syntax = "proto3";
 // The wire contract for the spica workflow server. A remote client (`spica` CLI or any gRPC client)
 // drives a state machine run through two coarse services:
 //
-//   - Workflow.CreateFlow    persists a definition and returns its system-minted FlowVersionId.
-//   - Execution.StartExecution  binds that FlowVersionId and returns the execution id at birth.
+//   - Workflow.CreateFlow    persists a definition and returns its created version's ObjectReference.
+//   - Execution.StartExecution  binds that reference and returns the execution id at birth.
 //   - Execution.GetExecution    returns a point-in-time status snapshot; the client POLLS this until
 //                               the execution settles (COMPLETED / TERMINATED) — there is no
 //                               fire-and-forget/blocking "Wait" RPC.
 //   - Execution.StopExecution   aborts a running execution (issues TerminateExecution{Cancelled}).
+//   - Task.PollTasks            claims available tasks for a worker (Zeebe ActivateJobs);
+//                               Task.CompleteTask / Task.FailTask settle a claim — the
+//                               out-of-process TaskApi a worker reaches over the network.
 package spica.v1;
 
 // Definition lifecycle: create and version a state machine.
 service Workflow {
   rpc CreateFlow(CreateFlowRequest) returns (CreateFlowResponse);
-  // Resolve a flow name (+ optional ordinal version) to its concrete FlowVersionId without starting
-  // an execution — a non-blocking projection read, so the id can be captured for later reuse.
+  // Resolve a flow name (+ optional ordinal version) to its concrete version ObjectReference without
+  // starting an execution — a non-blocking projection read, so the reference can be captured for
+  // later reuse.
   rpc ResolveFlowVersion(ResolveFlowVersionRequest) returns (ResolveFlowVersionResponse);
 }
 
 // Execution lifecycle: start a run and observe its status by polling.
 service Execution {
   // Issues an execution immediately and returns its id at birth (non-blocking). Settling is observed
-  // by polling GetExecution. The requested revision is addressed by an explicit FlowVersionId, or by
-  // a flow name + optional ordinal (0 = latest).
+  // by polling GetExecution. The requested revision is addressed by an explicit version reference, or
+  // by a flow name + optional ordinal (0 = latest).
   rpc StartExecution(StartExecutionRequest) returns (StartExecutionResponse);
   // Point-in-time snapshot of one execution; the client polls until state is terminal.
   rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
   // Abort a running execution by issuing TerminateExecution{Cancelled}. Non-blocking: appends the
   // command and returns; the client observes settlement (TERMINATED) by polling GetExecution.
   rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
+}
+
+message ObjectReference {
+  // The referenced object's kind (e.g. "flow" or "flowversion").
+  string kind = 1;
+  // The referenced object's name — for a flow version, its generated `{flow_name}-{version}` name.
+  string name = 2;
+  // The referenced object's never-reused incarnation id (ULID string).
+  string uid = 3;
 }
 
 message CreateFlowRequest {
@@ -39,9 +52,9 @@ message CreateFlowRequest {
   bytes definition = 2;
 }
 message CreateFlowResponse {
-  // The system-minted FlowVersionId (ULID string) of the created version — the handle to bind
+  // The created version's ObjectReference (its `{name}-{version}` name + uid) — the handle to bind
   // executions on, and which the CLI threads into StartExecution.
-  string flow_version_id = 1;
+  ObjectReference flow_version = 1;
 }
 
 message ResolveFlowVersionRequest {
@@ -51,31 +64,39 @@ message ResolveFlowVersionRequest {
   uint32 version = 2;
 }
 message ResolveFlowVersionResponse {
-  // The concrete FlowVersionId (ULID string) for (flow_name, version).
-  string flow_version_id = 1;
+  // The concrete ObjectReference for (flow_name, version).
+  ObjectReference flow_version = 1;
 }
 
 message StartExecutionRequest {
   // How to address the revision to run. Exactly one is set.
   oneof target {
     // A concrete revision already returned by CreateFlow.
-    string flow_version_id = 1;
+    ObjectReference flow_version = 1;
     // A flow name, with `version` for the ordinal (0 = latest).
     string flow_name = 2;
   }
-  // The ordinal version under `flow_name`; 0 means latest. Ignored for the flow_version_id target.
+  // The ordinal version under `flow_name`; 0 means latest. Ignored for the flow_version target.
   uint32 version = 3;
   // The execution input serialized as JSON (opaque to the wire).
   bytes input = 4;
+  // The execution's user-supplied name (required, validated server-side via `ObjectName::user`; the
+  // reserved `-` separator is rejected). Empty or invalid names are refused by the server.
+  string name = 5;
 }
 message StartExecutionResponse {
-  // The ExecutionId (ULID string), issued at birth. The client polls GetExecution to settle.
+  // The ExecutionId (ULID string), issued at birth — usable with StopExecution's optional `uid`
+  // incarnation guard.
   string execution_id = 1;
+  // The execution's user-supplied name — the per-scope-unique handle subsequent GetExecution /
+  // StopExecution calls resolve by.
+  string name = 2;
 }
 
 message GetExecutionRequest {
-  // The ExecutionId returned by StartExecution.
-  string execution_id = 1;
+  // The execution's user-supplied name (as passed to StartExecution) — the per-scope-unique key the
+  // projection is indexed by.
+  string name = 1;
 }
 message GetExecutionResponse {
   // The execution's lifecycle state (a point-in-time snapshot).
@@ -101,12 +122,99 @@ enum ExecutionState {
 }
 
 message StopExecutionRequest {
-  // The ExecutionId (returned by StartExecution) to abort.
-  string execution_id = 1;
+  // The execution's user-supplied name (required; charset `[A-Za-z0-9_]`, no `-`) — the
+  // per-scope-unique key the termination resolves by.
+  string name = 1;
+  // Optional incarnation guard: only abort the named execution whose uid equals this; empty skip.
+  string uid = 2;
 }
 // StopExecution is fire-and-forget (non-blocking): this empty confirmation only means the
 // termination command was accepted, not that the execution has settled — poll GetExecution for that.
 message StopExecutionResponse {
-  // The ExecutionId the termination was issued for, echoed back as confirmation.
-  string execution_id = 1;
+  // The execution name the termination was issued for, echoed back as confirmation.
+  string name = 1;
 }
+
+// Task lifecycle: the out-of-process worker's inbound claim/settle API — the wire realization of the
+// in-process `TaskApi` (Zeebe's ActivateJobs / CompleteJob / FailJob). A worker polls available work
+// by resource, executes its handler, then settles each claim with a complete (success) or fail
+// (error). The server validates every call against the log (single-writer), exactly as the in-process
+// engine-side trait does.
+service Task {
+  // Pull up to `max_tasks` available (`Pending`) tasks of `resource`, leasing each to `worker_id` for
+  // `lease_seconds`. Non-blocking discovery (a point-in-time claim): returns whatever is claimable
+  // now — possibly empty — and the client polls its own cadence, mirroring GetExecution.
+  rpc PollTasks(PollTasksRequest) returns (PollTasksResponse);
+  // Report a task completed with `output`. Fire-and-forget: the empty confirmation only means the
+  // settlement command was accepted; any subsequent validation failure is observed on the next poll.
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  // Report a task failed with `error`. Fire-and-forget, mirroring CompleteTask.
+  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+}
+
+message PollTasksRequest {
+  // The worker's self-assigned identity; every claim/settle it makes must carry this for the engine
+  // to validate lease ownership.
+  string worker_id = 1;
+  // The Task's `Resource` URI to pull work for.
+  string resource = 2;
+  // Upper bound on tasks to claim in this poll.
+  uint32 max_tasks = 3;
+  // Lease length (seconds) each claimed task is granted before the engine re-queues it.
+  uint64 lease_seconds = 4;
+}
+message PollTasksResponse {
+  // The tasks claimed this round (possibly empty when no work of `resource` is pending).
+  repeated ActivatedTask tasks = 1;
+}
+
+// One claimed task handed to a worker — the durable facts (executable by the handler without
+// re-reading the engine) it needs: which `resource` to call and with what projected `arguments`.
+message ActivatedTask {
+  // The task's canonical name (ObjectName) — the handle to bind CompleteTask/FailTask on.
+  string task_name = 1;
+  // The Resource URI the worker dispatched under.
+  string resource = 2;
+  // The projected arguments serialized as JSON (opaque to the wire).
+  bytes arguments = 3;
+}
+
+message CompleteTaskRequest {
+  // The leasing worker's identity (must match the claim's `worker_id`).
+  string worker_id = 1;
+  // The claimed task to settle (its canonical ObjectName, as returned by PollTasks).
+  string task_name = 2;
+  // The task's output serialized as JSON (opaque to the wire).
+  bytes output = 3;
+  // The completion's request/response correlation key (Zeebe's requestId): a worker-minted ULID string
+  // the server echoes back on the outcome. CompleteTask is not fire-and-forget — it returns the actual
+  // settlement result (accepted, or refused with a gRPC error) once the engine has processed the report.
+  string request_id = 4;
+}
+// CompleteTask is a request/response settlement: the response returns only after the engine has
+// applied (or refused) the completion, so the worker learns the outcome here rather than on its next
+// poll. (The empty confirmation is simply the success case; a refused settlement is a non-OK status.)
+message CompleteTaskResponse {}
+
+// The failure a worker reports for a task — the ASL error name plus the error-output object (bound
+// to `$states.errorOutput` by a Catch). Carried structured (not as a serialized engine error) so the
+// worker contract stays engine-free: the worker reports the error *semantics*, and the server maps
+// them onto the engine's internal representation.
+message TaskFailure {
+  // The ASL error name (e.g. "States.TaskFailed" or a user-defined name), matched by Retry/Catch
+  // `ErrorEquals`.
+  string error_name = 1;
+  // The error-output object serialized as JSON; empty when the worker has none.
+  bytes output = 2;
+}
+
+message FailTaskRequest {
+  // The leasing worker's identity (must match the claim's `worker_id`).
+  string worker_id = 1;
+  // The claimed task to fail (its canonical ObjectName).
+  string task_name = 2;
+  // The failure the worker reports (ASL error name + error-output object).
+  TaskFailure error = 3;
+}
+// Fire-and-forget, mirroring CompleteTaskResponse.
+message FailTaskResponse {}

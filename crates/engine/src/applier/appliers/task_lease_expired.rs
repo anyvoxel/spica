@@ -3,12 +3,11 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
 use crate::{ApplierContext, EventApplier};
 
-use crate::id::{NodeId, TaskId};
-use crate::{TaskStatus, TaskValue};
+use crate::{RetryState, Task, TaskStatus};
 
 #[derive(Default)]
 pub(crate) struct TaskLeaseExpiredApplier;
@@ -16,15 +15,22 @@ pub(crate) struct TaskLeaseExpiredApplier;
 impl EventApplier for TaskLeaseExpiredApplier {
     fn event(&self) -> Event {
         Event::TaskLeaseExpired {
-            task: TaskValue {
-                id: TaskId::nil(),
-                parent: NodeId::Activity(crate::id::ActivityId::nil()),
+            task: Task {
+                execution: crate::types::meta::ObjectReference::nil(),
                 resource: String::new(),
                 arguments: Default::default(),
                 status: TaskStatus::Pending,
                 deadline: None,
                 worker_id: None,
                 lease_until: None,
+                retry_plan: vec![],
+                retry_state: RetryState::default(),
+                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                    crate::types::meta::ObjectKind::Task,
+                    ulid::Ulid::nil(),
+                    crate::log::Timestamp::from_millis(0),
+                    crate::log::Timestamp::from_millis(0),
+                ),
             },
         }
     }
@@ -43,10 +49,12 @@ impl EventApplier for TaskLeaseExpiredApplier {
         // activation-timeout re-queue). The physical handler may still be running from the old
         // lease — that's the at-least-once contract; its late settle is rejected because the task is
         // no longer `Running` to it.
-        if let Some(mut t) = ctx.storage.get_task(task.id).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.reference()).await? {
             t.status = TaskStatus::Pending;
             t.worker_id = None;
             t.lease_until = None;
+            // Sync the domain value's transition stamp from the event (see task_completed.rs).
+            t.value.meta.touch(task.meta.updated_at);
             t.touch(ctx.timestamp);
             ctx.storage.put_task(t).await?;
         }

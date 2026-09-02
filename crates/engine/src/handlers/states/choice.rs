@@ -3,12 +3,12 @@ use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State};
 
 use super::super::state_handler::StateHandler;
 use super::super::{emit_transition, state_activated_value, state_completed_value};
-use crate::context::build_states;
-use crate::error::ExecutionError;
 use crate::eval_env::{EvalEnv, extract_jsonata};
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector};
-use crate::id::ActivityId;
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 
 pub struct ChoiceStateHandler;
 
@@ -22,7 +22,7 @@ impl StateHandler for ChoiceStateHandler {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
@@ -32,17 +32,22 @@ impl StateHandler for ChoiceStateHandler {
         // mirroring how the other synchronous states defer their projection to `complete`. Choice
         // therefore routes through the framework's uniform complete step (`CompleteState` →
         // `StateCompleting` → `complete`), like every other M1 state.
-        out.emit_event(crate::event::Event::StateActivated {
+        out.emit_event(crate::types::event::Event::StateActivated {
             activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
-        out.emit_command(crate::command::Command::CompleteState { activity });
+        out.emit_command(crate::types::command::Command::CompleteState {
+            activity,
+            // A Choice's raw result is its processed input (no distinct raw output); the chosen
+            // branch is resolved in the complete step's routing.
+            output: actx.activity.input.clone(),
+        });
     }
 
     fn complete(
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -66,7 +71,7 @@ impl StateHandler for ChoiceStateHandler {
 fn complete_choice(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ChoiceState,
 ) {
@@ -79,7 +84,7 @@ fn complete_choice(
         &actx.state_name(),
         &actx.exec_input,
         Some(&actx.activity.input),
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None, // no Catch `errorOutput` in the choice path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -92,17 +97,25 @@ fn complete_choice(
                 let inner = fail_or!(
                     out,
                     Some(activity),
-                    actx.activity.execution,
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
                     extract_jsonata(expr.as_str()).ok_or_else(|| {
-                        ExecutionError::InvalidDefinition(
+                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "Choice Condition must be a {% %} JSONata expression".to_string(),
-                        )
+                        ))
                     })
                 );
                 let value = fail_or!(
                     out,
                     Some(activity),
-                    actx.activity.execution,
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
                     env.eval_expr(inner, &states, &variables)
                 );
                 match value {
@@ -110,11 +123,15 @@ fn complete_choice(
                     _ => {
                         out.terminate(
                             Some(activity),
-                            actx.activity.execution,
-                            ExecutionError::Jsonata {
+                            actx.activity
+                                .meta
+                                .owner
+                                .clone()
+                                .expect("an owned activity has an owner"),
+                            ExecutionError::Runtime(RuntimeError::Jsonata {
                                 field: expr.as_str().to_string(),
                                 message: "Condition must evaluate to a boolean".to_string(),
-                            },
+                            }),
                         );
                         return;
                     }
@@ -135,10 +152,14 @@ fn complete_choice(
             None => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::NoChoiceMatched {
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
                         state: actx.state_name(),
-                    },
+                    }),
                 );
                 return;
             }
@@ -155,7 +176,11 @@ fn complete_choice(
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(&assign_value, &states, &local_variables)
         );
         match evaluated {
@@ -165,7 +190,12 @@ fn complete_choice(
                         local_variables.insert(k, v);
                     }
                     out.emit_event(Event::VariablesAssigned {
-                        execution: actx.activity.execution,
+                        scope: actx
+                            .activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
                         variables: local_variables.clone(),
                     });
                 }
@@ -173,10 +203,14 @@ fn complete_choice(
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -187,7 +221,11 @@ fn complete_choice(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_variables)
         ),
         None => actx.activity.input.clone(),
@@ -202,8 +240,14 @@ fn complete_choice(
     });
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output_value,
         Some(&rule_next),
         None,

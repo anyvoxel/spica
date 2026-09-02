@@ -1,5 +1,5 @@
 //! `spica executions <verb>` (alias `exec`) — running and observing executions: start (non-blocking,
-//! prints the id at birth), stop (issue an abort), get (one snapshot), wait (poll to settlement).
+//! prints the name at birth), stop (issue an abort), get (one snapshot), wait (poll to settlement).
 //! The args and handlers live together here; output/validation helpers come from `crate::util`.
 
 use std::path::PathBuf;
@@ -7,18 +7,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use spica_proto::v1::{
-    ExecutionState, GetExecutionRequest, StartExecutionRequest, StopExecutionRequest,
-    execution_client::ExecutionClient, start_execution_request::Target,
-};
-use tonic::transport::Channel;
+use spica_client::{Client, ExecutionState, ObjectReference, StartExecution, Target};
 
 use crate::util::{print_json, printable_error, read_input, state_label, validate_flow_name};
 
 /// `executions` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum ExecutionsCmd {
-    /// Start an execution; prints its id at birth (non-blocking).
+    /// Start an execution; prints its name at birth (non-blocking).
     Start(ExecutionsStartArgs),
     /// Abort a running execution; non-blocking — settle is confirmed via `executions wait`.
     Stop(ExecutionsStopArgs),
@@ -33,111 +29,105 @@ pub(crate) enum ExecutionsCmd {
     clap::ArgGroup::new("target")
         .required(true)
         .multiple(false)
-        .args(["flow_version_id", "name"])
+        .args(["flow_version", "name"])
 ))]
 pub(crate) struct ExecutionsStartArgs {
-    /// Address a concrete revision by its FlowVersionId (returned by `flows create`).
+    /// Address a concrete revision by its ObjectReference (`kind/name/uid`, as printed by
+    /// `flows create`).
     #[arg(long)]
-    pub(crate) flow_version_id: Option<String>,
+    pub(crate) flow_version: Option<String>,
     /// Address a revision by flow name; use --version for the ordinal (0 = latest).
     #[arg(long)]
     pub(crate) name: Option<String>,
-    /// The ordinal version under --name; 0 = latest. Ignored with --flow-version-id.
+    /// The ordinal version under --name; 0 = latest. Ignored with --flow-version.
     #[arg(long, default_value_t = 0)]
     pub(crate) version: u32,
+    /// The execution's user-supplied name (required; charset `[A-Za-z0-9_]`, no `-`).
+    #[arg(long)]
+    pub(crate) execution_name: String,
     /// Path to the execution input (JSON); defaults to null if omitted.
     pub(crate) input: Option<PathBuf>,
 }
 
 #[derive(Args)]
 pub(crate) struct ExecutionsStopArgs {
-    /// The ExecutionId returned by `executions start` (the run to abort).
-    #[arg(value_name = "EXECUTION_ID")]
-    pub(crate) execution_id: String,
+    /// The execution's user-supplied name (required) — the per-scope-unique run to abort.
+    #[arg(long)]
+    pub(crate) execution_name: String,
+    /// Optional incarnation guard: only abort the named execution whose uid equals this.
+    #[arg(long)]
+    pub(crate) execution_uid: Option<String>,
 }
 
 #[derive(Args)]
 pub(crate) struct ExecutionsGetArgs {
-    /// The ExecutionId returned by `executions start`.
-    #[arg(value_name = "EXECUTION_ID")]
-    pub(crate) execution_id: String,
+    /// The execution's user-supplied name (required) — the per-scope-unique run to snapshot.
+    #[arg(long)]
+    pub(crate) execution_name: String,
 }
 
 #[derive(Args)]
 pub(crate) struct ExecutionsWaitArgs {
-    /// The ExecutionId returned by `executions start`.
-    #[arg(value_name = "EXECUTION_ID")]
-    pub(crate) execution_id: String,
+    /// The execution's user-supplied name (required) — the run to poll to settlement.
+    #[arg(long)]
+    pub(crate) execution_name: String,
     /// Poll interval in ms between GetExecution calls while the run is in flight.
     #[arg(long, default_value_t = 100)]
     pub(crate) poll_ms: u64,
 }
 
-/// Start an execution (addressed by explicit revision or name+version) and print its id at birth.
-pub(crate) async fn start(
-    execution: &mut ExecutionClient<Channel>,
-    args: &ExecutionsStartArgs,
-) -> Result<()> {
+/// Start an execution (addressed by explicit revision or name+version) and print its name at birth.
+pub(crate) async fn start(client: &Client, args: &ExecutionsStartArgs) -> Result<()> {
     // Exactly one of the group's fields is present (clap's ArgGroup enforces it).
-    let target_builder = match (&args.flow_version_id, &args.name) {
-        (Some(fvid), None) => Target::FlowVersionId(fvid.clone()),
+    let target = match (&args.flow_version, &args.name) {
+        (Some(fv), None) => Target::ByVersion(
+            fv.parse::<ObjectReference>().map_err(|e| {
+                anyhow::anyhow!("malformed --flow-version (expected kind/name/uid, as printed by `flows create`): {e}")
+            })?,
+        ),
         (None, Some(name)) => {
             validate_flow_name(name)?;
-            Target::FlowName(name.clone())
+            Target::ByName {
+                name: name.clone(),
+                version: args.version,
+            }
         }
         // Unreachable: the group requires exactly one of the two.
-        _ => unreachable!("clap ArgGroup requires exactly one of --flow-version-id / --name"),
+        _ => unreachable!("clap ArgGroup requires exactly one of --flow-version / --name"),
     };
     let input = read_input(&args.input)?;
-    let resp = execution
-        .start_execution(StartExecutionRequest {
-            target: Some(target_builder),
-            version: args.version,
+    let name = client
+        .start_execution(StartExecution {
+            target,
             input,
+            name: args.execution_name.clone(),
         })
         .await
-        .context("StartExecution")?
-        .into_inner();
-    println!("{}", resp.execution_id);
+        .context("StartExecution")?;
+    println!("{name}");
     Ok(())
 }
 
-/// Issue an abort for an execution (non-blocking). Prints the echoed id, then points the user at
-/// `executions wait` to confirm the run actually settles as TERMINATED.
-pub(crate) async fn stop(
-    execution: &mut ExecutionClient<Channel>,
-    args: &ExecutionsStopArgs,
-) -> Result<()> {
-    let resp = execution
-        .stop_execution(StopExecutionRequest {
-            execution_id: args.execution_id.clone(),
-        })
+/// Issue an abort for an execution by `name` (optionally guarded by `uid`) — non-blocking. Prints the
+/// echoed name, then points the user at `executions wait` to confirm the run actually settles as
+/// TERMINATED.
+pub(crate) async fn stop(client: &Client, args: &ExecutionsStopArgs) -> Result<()> {
+    let name = client
+        .stop_execution(&args.execution_name, args.execution_uid.as_deref())
         .await
-        .context("StopExecution")?
-        .into_inner();
-    println!(
-        "termination requested for {}; confirm with 'spica executions wait {}'",
-        resp.execution_id, resp.execution_id
-    );
+        .context("StopExecution")?;
+    println!("termination requested for execution {name}");
     Ok(())
 }
 
 /// Read a single point-in-time status snapshot and print its state (+ output/error if settled).
-pub(crate) async fn get(
-    execution: &mut ExecutionClient<Channel>,
-    pretty: bool,
-    args: &ExecutionsGetArgs,
-) -> Result<()> {
-    let snap = execution
-        .get_execution(GetExecutionRequest {
-            execution_id: args.execution_id.clone(),
-        })
+pub(crate) async fn get(client: &Client, pretty: bool, args: &ExecutionsGetArgs) -> Result<()> {
+    let snap = client
+        .get_execution(&args.execution_name)
         .await
-        .context("GetExecution")?
-        .into_inner();
-    let state = ExecutionState::try_from(snap.state).unwrap_or(ExecutionState::Unspecified);
-    println!("state: {}", state_label(state));
-    match state {
+        .context("GetExecution")?;
+    println!("state: {}", state_label(snap.state));
+    match snap.state {
         ExecutionState::Completed => {
             let output: serde_json::Value =
                 serde_json::from_slice(&snap.output).context("parsing completed output")?;
@@ -156,41 +146,34 @@ pub(crate) async fn get(
 }
 
 /// Poll an execution until it settles: print output (exit 0) or surface the failure (exit 1).
-pub(crate) async fn wait(
-    execution: &mut ExecutionClient<Channel>,
-    pretty: bool,
-    args: &ExecutionsWaitArgs,
-) -> Result<()> {
+pub(crate) async fn wait(client: &Client, pretty: bool, args: &ExecutionsWaitArgs) -> Result<()> {
     loop {
-        let snap = execution
-            .get_execution(GetExecutionRequest {
-                execution_id: args.execution_id.clone(),
-            })
+        let snap = client
+            .get_execution(&args.execution_name)
             .await
-            .context("GetExecution")?
-            .into_inner();
-        match ExecutionState::try_from(snap.state) {
-            Ok(ExecutionState::Completed) => {
+            .context("GetExecution")?;
+        match snap.state {
+            ExecutionState::Completed => {
                 let output: serde_json::Value =
                     serde_json::from_slice(&snap.output).context("parsing completed output")?;
                 print_json(&output, pretty);
                 return Ok(());
             }
-            Ok(ExecutionState::Terminated) => {
+            ExecutionState::Terminated => {
                 bail!(
                     "execution terminated: {} {}",
                     snap.error_name,
                     printable_error(&snap.error_output)
                 );
             }
-            Ok(ExecutionState::NotFound) => {
+            ExecutionState::NotFound => {
                 bail!(
                     "execution {}: no projection (never created or GC'd)",
-                    args.execution_id
+                    args.execution_name
                 );
             }
-            // ACTIVE (or UNSPECIFIED) — still in flight; poll again after the interval.
-            _ => tokio::time::sleep(Duration::from_millis(args.poll_ms)).await,
+            // Still in flight; poll again after the interval.
+            ExecutionState::Active => tokio::time::sleep(Duration::from_millis(args.poll_ms)).await,
         }
     }
 }

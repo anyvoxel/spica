@@ -31,22 +31,22 @@
 //!
 //! | kind | key | value |
 //! |---|---|---|
-//! | `execution` | `/<t>/<ns>/execution/<exec_id>` | Execution row |
-//! | `activity` | `/<t>/<ns>/activity/<act_id>` | Activity row |
-//! | `timer` | `/<t>/<ns>/timer/<timer_id>` | Timer row |
-//! | `task` | `/<t>/<ns>/task/<task_id>` | Task row |
+//! | `execution` | `/<t>/<ns>/execution/<name>` | Execution row (name is the primary key) |
+//! | `thread` | `/<t>/<ns>/thread/<name>` | Thread row (name is the primary key) |
+//! | `activity` | `/<t>/<ns>/activity/<name>` | Activity row (name is the primary key) |
+//! | `timer` | `/<t>/<ns>/timer/<name>` | Timer row (name is the primary key) |
+//! | `task` | `/<t>/<ns>/task/<name>` | Task row (name is the primary key) |
 //! | `flow` | `/<t>/<ns>/flow/<flow_name>` | Flow row (name is the primary key) |
-//! | `flowversion` | `/<t>/<ns>/flowversion/<fvid>` | FlowVersion row |
-//! | `_index` | `/<t>/<ns>/_index/flowversion/<flow_id>/<ver-8hex>` | → `FlowVersionId` |
+//! | `flowversion` | `/<t>/<ns>/flowversion/<flow_name>-<ver>` | FlowVersion row |
 //! | `_global` | `/<t>/<ns>/_global/last_processed_position` | resume watermark (`i64`) |
 //!
-//! The version index tail is fixed-width **lowercase hex** (`{:08x}`) so that, within one
-//! `flow_id`, a range scan yields versions in ascending ordinal order (lexicographic order of a
-//! zero-padded hex string equals numeric order).
+//! A flow version's key embeds its own `ObjectName` `{flow_name}-{version}` (a plain **decimal**
+//! ordinal, no reserved `_index` table). Decimal is human-readable but does **not** order
+//! lexicographically (`order-10` sorts before `order-2`), so a range scan over the
+//! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
+//! by the `version` field, never by key order.
 
-use spica_engine::{
-    ActivityId, ExecutionError, ExecutionId, FlowId, FlowName, FlowVersionId, TaskId, TimerId,
-};
+use spica_engine::{ExecutionError, FlowName, ObjectName, ObjectReference, RuntimeError};
 
 /// The two fixed scope segments of every key (tenant + namespace).
 ///
@@ -61,6 +61,9 @@ pub struct Scope {
 
 impl Scope {
     /// Construct a scope, validating both segments against the key rules.
+    // Returns the engine façade when a segment is invalid. `ExecutionError` is 128B (it embeds the
+    // per-concern `RuntimeError`/`InfraError`/`Reject`), so the `result_large_err` size lint is allowed.
+    #[allow(clippy::result_large_err)]
     pub fn new(tenant: &str, namespace: &str) -> Result<Self, ExecutionError> {
         validate_segment("tenant", tenant)?;
         validate_segment("namespace", namespace)?;
@@ -97,6 +100,8 @@ impl Scope {
 }
 
 /// Validate a single scope segment: non-empty, ≤64 chars, lowercase `[a-z0-9_-]`, no `/`.
+// Returns the engine façade (`InvalidDefinition`); `ExecutionError` is 128B — allow the size lint.
+#[allow(clippy::result_large_err)]
 fn validate_segment(kind: &str, raw: &str) -> Result<(), ExecutionError> {
     let bytes = raw.as_bytes();
     let valid = !raw.is_empty()
@@ -105,8 +110,10 @@ fn validate_segment(kind: &str, raw: &str) -> Result<(), ExecutionError> {
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-');
     if !valid {
-        return Err(ExecutionError::InvalidDefinition(format!(
-            "invalid {kind} {raw:?}: must be 1..=64 chars of [a-z0-9_-] and never contain '/'"
+        return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+            format!(
+                "invalid {kind} {raw:?}: must be 1..=64 chars of [a-z0-9_-] and never contain '/'"
+            ),
         )));
     }
     Ok(())
@@ -117,6 +124,7 @@ fn validate_segment(kind: &str, raw: &str) -> Result<(), ExecutionError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Execution,
+    Thread,
     Activity,
     Timer,
     Task,
@@ -130,6 +138,7 @@ impl Kind {
     pub fn segment(self) -> &'static str {
         match self {
             Kind::Execution => "execution",
+            Kind::Thread => "thread",
             Kind::Activity => "activity",
             Kind::Timer => "timer",
             Kind::Task => "task",
@@ -165,24 +174,37 @@ impl KeyBuilder {
         ])
     }
 
-    /// Execution row: `/<t>/<ns>/execution/<exec_id>`.
-    pub fn execution(&self, id: ExecutionId) -> Vec<u8> {
-        self.row(Kind::Execution, &id.0.to_string())
+    /// Execution row: `/<t>/<ns>/execution/<name>` — keyed by the reference's **addressing `name`**
+    /// (a user name, or a system `obj-<uid>` for children), which is now the execution's unique
+    /// primary key; the `uid` is a secondary attribute, not the storage key. A name is a safe single
+    /// segment (both the user and generated charsets ban `/`).
+    pub fn execution(&self, reference: &ObjectReference) -> Vec<u8> {
+        self.row(Kind::Execution, &reference.name.as_str())
     }
 
-    /// Activity row: `/<t>/<ns>/activity/<act_id>`.
-    pub fn activity(&self, id: ActivityId) -> Vec<u8> {
-        self.row(Kind::Activity, &id.0.to_string())
+    /// Thread row: `/<t>/<ns>/thread/<name>` — keyed by the reference's addressing `name` (a generated
+    /// `obj-<uid>` for fan-out sub-runs), exactly like the execution row, so every node kind shares one
+    /// uniform, human-debuggable key scheme.
+    pub fn thread(&self, reference: &ObjectReference) -> Vec<u8> {
+        self.row(Kind::Thread, &reference.name.as_str())
     }
 
-    /// Timer row: `/<t>/<ns>/timer/<timer_id>`.
-    pub fn timer(&self, id: TimerId) -> Vec<u8> {
-        self.row(Kind::Timer, &id.0.to_string())
+    /// Activity row: `/<t>/<ns>/activity/<name>`. The activity's generated `obj-<uid>` name is its
+    /// primary key (aligned with executions/flows/timers).
+    pub fn activity(&self, reference: &ObjectReference) -> Vec<u8> {
+        self.row(Kind::Activity, &reference.name.as_str())
     }
 
-    /// Task row: `/<t>/<ns>/task/<task_id>`.
-    pub fn task(&self, id: TaskId) -> Vec<u8> {
-        self.row(Kind::Task, &id.0.to_string())
+    /// Timer row: `/<t>/<ns>/timer/<name>`. The timer's generated `obj-<uid>` name is its primary key
+    /// (aligned with executions/flows), even though the uid happens to be a bijective source for it.
+    pub fn timer(&self, reference: &ObjectReference) -> Vec<u8> {
+        self.row(Kind::Timer, &reference.name.as_str())
+    }
+
+    /// Task row: `/<t>/<ns>/task/<name>`. The task's generated `obj-<uid>` name is its primary key
+    /// (aligned with executions/flows/timers).
+    pub fn task(&self, reference: &ObjectReference) -> Vec<u8> {
+        self.row(Kind::Task, &reference.name.as_str())
     }
 
     /// The task-row keys prefix `/<t>/<ns>/task/` — the range start for a forward scan over **all**
@@ -205,22 +227,23 @@ impl KeyBuilder {
         self.row(Kind::Flow, name.as_str())
     }
 
-    /// FlowVersion row: `/<t>/<ns>/flowversion/<fvid>`.
-    pub fn flow_version(&self, id: FlowVersionId) -> Vec<u8> {
-        self.row(Kind::FlowVersion, &id.0.to_string())
+    /// FlowVersion row: `/<t>/<ns>/flowversion/<flow_name>-<ver>`. The identifier segment is
+    /// the version's own `ObjectName` (`{flow_name}-{version}`, see
+    /// [`FlowVersion::version_name`](spica_engine::FlowVersion::version_name)) — a generated name
+    /// whose only `/`-forbidden char would be `/` (banned), so it is a safe single segment.
+    pub fn flow_version(&self, name: &ObjectName) -> Vec<u8> {
+        self.row(Kind::FlowVersion, &name.as_str())
     }
 
-    /// The version lookup key under the reserved `_index` namespace:
-    /// `/<t>/<ns>/_index/flowversion/<flow_id>/<ver-8hex>` → value is the `FlowVersionId`. The
-    /// fixed-width lowercase-hex version keeps a range scan over the flow's prefix in ordinal order.
-    pub fn flow_version_index(&self, flow_id: FlowId, version: u32) -> Vec<u8> {
+    /// The range-start for enumerating every version of `flow_name` in ordinal order:
+    /// `/<t>/<ns>/flowversion/{flow_name}-`. The trailing `-` (the generated-name separator) binds
+    /// the scan to exactly this flow's versions — no other name shares the `{flow_name}-` prefix.
+    pub fn flow_version_prefix(&self, flow_name: &FlowName) -> Vec<u8> {
         join(&[
             self.scope.tenant(),
             self.scope.namespace(),
-            "_index",
             Kind::FlowVersion.segment(),
-            &flow_id.0.to_string(),
-            &format!("{version:08x}"),
+            &format!("{flow_name}-"),
         ])
     }
 
@@ -250,37 +273,79 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spica_engine::ObjectKind;
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
         Scope::new(tenant, ns).unwrap()
     }
 
+    /// An execution reference for the given uid (`obj-<uid>` generated name), matching
+    /// `Execution::reference()` so the uid/key round-trips.
+    fn exec_ref(uid: Ulid) -> ObjectReference {
+        ObjectReference::new(
+            ObjectKind::Execution,
+            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            uid,
+        )
+    }
+
+    /// An activity reference for the given uid (`obj-<uid>` generated name), matching
+    /// `Activity::reference()` so the uid/key round-trips.
+    fn act_ref(uid: Ulid) -> ObjectReference {
+        ObjectReference::new(
+            ObjectKind::Activity,
+            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            uid,
+        )
+    }
+
+    /// A task reference for the given uid (`obj-<uid>` generated name), matching
+    /// `Task::reference()` so the uid/key round-trips.
+    fn task_ref(uid: Ulid) -> ObjectReference {
+        ObjectReference::new(
+            ObjectKind::Task,
+            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            uid,
+        )
+    }
+
+    /// A timer reference for the given uid (`obj-<uid>` generated name), matching
+    /// `Timer::reference()` so the uid/key round-trips.
+    fn timer_ref(uid: Ulid) -> ObjectReference {
+        ObjectReference::new(
+            ObjectKind::Timer,
+            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            uid,
+        )
+    }
+
     #[test]
     fn entity_row_keys_match_the_spec() {
         let kb = KeyBuilder::new(scope("acme", "prod"));
-        let exec = ExecutionId::from(Ulid::new());
-        let act = ActivityId::from(Ulid::new());
-        let tim = TimerId::from(Ulid::new());
-        let task = TaskId::from(Ulid::new());
-        let fvid = FlowVersionId::from(Ulid::new());
+        let exec = exec_ref(Ulid::new());
+        let act = act_ref(Ulid::new());
+        let tim = timer_ref(Ulid::new());
+        let task = task_ref(Ulid::new());
+        let vname = ObjectName::generated_with_suffix("order", "00000001").unwrap();
         let name = FlowName::new("order").unwrap();
 
-        let exec_key = String::from_utf8(kb.execution(exec)).unwrap();
+        let exec_key = String::from_utf8(kb.execution(&exec)).unwrap();
         assert!(exec_key.starts_with("/acme/prod/execution/"));
-        assert!(exec_key.ends_with(&exec.0.to_string()));
+        // Keyed by the addressing name (`obj-<uid>` here), not the bare uid.
+        assert!(exec_key.ends_with(exec.name.as_str().as_str()));
         assert!(
-            String::from_utf8(kb.activity(act))
+            String::from_utf8(kb.activity(&act))
                 .unwrap()
                 .starts_with("/acme/prod/activity/")
         );
         assert!(
-            String::from_utf8(kb.timer(tim))
+            String::from_utf8(kb.timer(&tim))
                 .unwrap()
                 .starts_with("/acme/prod/timer/")
         );
         assert!(
-            String::from_utf8(kb.task(task))
+            String::from_utf8(kb.task(&task))
                 .unwrap()
                 .starts_with("/acme/prod/task/")
         );
@@ -289,7 +354,7 @@ mod tests {
             "/acme/prod/flow/order"
         );
         assert!(
-            String::from_utf8(kb.flow_version(fvid))
+            String::from_utf8(kb.flow_version(&vname))
                 .unwrap()
                 .starts_with("/acme/prod/flowversion/")
         );
@@ -299,34 +364,46 @@ mod tests {
     fn different_kinds_never_share_a_key() {
         let kb = KeyBuilder::new(scope("acme", "prod"));
         let id = Ulid::new();
-        let exec = String::from_utf8(kb.execution(ExecutionId::from(id))).unwrap();
+        let exec = String::from_utf8(kb.execution(&exec_ref(id))).unwrap();
         // Same raw ULID under different kinds must not collide.
-        let act = String::from_utf8(kb.activity(ActivityId::from(id))).unwrap();
-        let fv = String::from_utf8(kb.flow_version(FlowVersionId::from(id))).unwrap();
+        let act = String::from_utf8(kb.activity(&act_ref(id))).unwrap();
+        let fv = String::from_utf8(
+            kb.flow_version(&ObjectName::generated_with_suffix("order", "00000001").unwrap()),
+        )
+        .unwrap();
         assert_ne!(exec, act);
         assert_ne!(exec, fv);
     }
 
     #[test]
-    fn version_index_is_fixed_width_ordered() {
+    fn version_name_is_decimal_and_prefix_bound() {
+        use spica_engine::FlowVersion;
         let kb = KeyBuilder::new(scope("acme", "prod"));
-        let flow = FlowId::from(Ulid::new());
-        let v1 = kb.flow_version_index(flow, 1);
-        let v2 = kb.flow_version_index(flow, 2);
-        let v10 = kb.flow_version_index(flow, 10);
-        // Zero-padded lowercase hex: lexicographic order == numeric order.
-        assert!(v1 < v2 && v2 < v10);
+        let flow = FlowName::new("order").unwrap();
+        // Names follow `{flow}-{decimal}`, human-readable rather than a hex/zero-padded code.
+        let v1 = kb.flow_version(&FlowVersion::version_name(&flow, 1));
+        let v2 = kb.flow_version(&FlowVersion::version_name(&flow, 2));
+        let v10 = kb.flow_version(&FlowVersion::version_name(&flow, 10));
+        assert!(String::from_utf8(v1.clone()).unwrap().ends_with("/order-1"));
+        assert!(String::from_utf8(v2.clone()).unwrap().ends_with("/order-2"));
         assert!(
-            String::from_utf8(v1.clone())
+            String::from_utf8(v10.clone())
                 .unwrap()
-                .ends_with("/00000001")
+                .ends_with("/order-10")
         );
-        assert!(String::from_utf8(v10).unwrap().ends_with("/0000000a"));
+        // Decimal breaks name ordering ("order-10" sorts before "order-2"): a prefix scan must order
+        // by the `version` field, never by key order.
+        assert!(v10 < v2);
         // Two flows never share a version key even with identical version ordinals.
-        let other = FlowId::from(Ulid::new());
+        let other = FlowName::new("checkout").unwrap();
         assert_ne!(
-            kb.flow_version_index(flow, 1),
-            kb.flow_version_index(other, 1)
+            kb.flow_version(&FlowVersion::version_name(&flow, 1)),
+            kb.flow_version(&FlowVersion::version_name(&other, 1))
+        );
+        // The prefix scan start covers exactly one flow's versions; the trailing `-` binds it.
+        assert_eq!(
+            String::from_utf8(kb.flow_version_prefix(&flow)).unwrap(),
+            "/acme/prod/flowversion/order-"
         );
     }
 
@@ -342,10 +419,10 @@ mod tests {
         // The Phase-A default scope is valid and emits the two-segment prefix.
         assert_eq!(
             String::from_utf8(
-                KeyBuilder::new(Scope::default_scope()).execution(ExecutionId::from(Ulid::nil()))
+                KeyBuilder::new(Scope::default_scope()).execution(&exec_ref(Ulid::nil()))
             )
             .unwrap(),
-            "/_/default/execution/00000000000000000000000000"
+            "/_/default/execution/child-00000000000000000000000000"
         );
     }
 }

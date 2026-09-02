@@ -1,12 +1,11 @@
 use async_trait::async_trait;
-use spica_asl::State;
 
 use crate::TimerStatus;
-use crate::command::{Command, TerminationReason, TimerPurpose};
-use crate::error::ExecutionError;
-use crate::event::Event;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::id::NodeId;
+use crate::types::command::{Command, TerminationReason, TimerPurpose};
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::ObjectKind;
 
 /// Handles `TriggerTimer`: a timer's deadline elapsed. Idempotent (a no-op if the timer is gone or
 /// already terminal). Dispatches by `purpose`: `WaitResume` fires the owning state;
@@ -18,7 +17,7 @@ pub struct TriggerTimerHandler;
 impl CommandHandler for TriggerTimerHandler {
     fn command(&self) -> Command {
         Command::TriggerTimer {
-            timer: crate::id::TimerId::nil(),
+            timer: crate::types::meta::ObjectReference::nil(),
         }
     }
 
@@ -29,7 +28,7 @@ impl CommandHandler for TriggerTimerHandler {
             );
         };
 
-        let act = match ctx.storage.get_timer(*timer).await {
+        let act = match ctx.storage.get_timer(timer).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return, // timer never armed; nothing to do.
         };
@@ -38,100 +37,45 @@ impl CommandHandler for TriggerTimerHandler {
         }
 
         out.emit_event(Event::TimerTriggered {
-            timer: crate::TimerValue {
-                id: act.id,
-                parent: act.parent,
+            timer: crate::Timer {
+                execution: act.value.execution.clone(),
                 purpose: act.purpose,
                 status: crate::TimerStatus::Completed,
                 deadline: act.deadline,
+                // Carry the timer's full meta (name/uid/created_at/owner) forward. A timer may be
+                // custom-named (`{execution.name}-{suffix}`); reconstructing it via
+                // `placeholder_with_times` would re-derive `obj-<uid>` and break the child-edge
+                // removal (the child was added under its real name). Stamp the fire moment as
+                // `updated_at`.
+                meta: {
+                    let mut m = act.value.meta.clone();
+                    m.touch(crate::log::Timestamp::now());
+                    m
+                },
             },
         });
 
         match act.value.purpose {
             TimerPurpose::WaitResume => {
                 // Resume the owning state: the activity's `CompleteState` runs its `complete`.
-                let activity_id = match act.value.parent {
-                    NodeId::Activity(a) => a,
-                    _ => return, // a Wait timer without an activity owner is an internal fault.
+                let activity_id = act
+                    .value
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("a live timer is always owned");
+                if activity_id.kind != ObjectKind::Activity {
+                    return; // a Wait timer without an activity owner is an internal fault.
+                }
+                // A Wait's raw result is its processed input (no distinct raw output). Load it so the
+                // `CompleteState` command carries the raw result, keeping the command self-describing.
+                let raw_result = match ctx.storage.get_activity(&activity_id).await {
+                    Ok(Some(act)) => act.value().input,
+                    _ => serde_json::Value::Null, // owner gone — the handler will no-op.
                 };
                 out.emit_command(Command::CompleteState {
                     activity: activity_id,
-                });
-            }
-            TimerPurpose::TaskRetryDelay => {
-                // A Task state's `Retry` backoff elapsed: re-invoke the owning task. The activity
-                // must still be `Running` (it may have since been terminated/cancelled, in which
-                // case the re-invocation is a no-op guard), and its owner must be an Execution.
-                let activity_id = match act.value.parent {
-                    NodeId::Activity(a) => a,
-                    _ => return,
-                };
-                let activity = match ctx.storage.get_activity(activity_id).await {
-                    Ok(Some(a)) => a,
-                    _ => return, // activity gone — a retry no longer applies.
-                };
-                if activity.value.status != crate::ActivityStatus::Running {
-                    return; // activity no longer running — drop the retry.
-                }
-                let execution_id = match activity.value.parent {
-                    NodeId::Execution(e) => e,
-                    _ => return, // internal fault: activity not owned by an execution.
-                };
-                let exec = match ctx.storage.get_execution(execution_id).await {
-                    Ok(Some(e)) => e,
-                    _ => return,
-                };
-                // Resolve the owning Task definition — a Parallel-branch child execution resolves
-                // its Task within its branch's `states` (via its `state_path`), so a retry timer
-                // re-invokes against the right per-branch definition. Load the bound machine revision
-                // (cached by the StreamProcessor) before resolving the state.
-                let sm = match ctx.machine(exec.flow_version_id).await {
-                    Ok(s) => s,
-                    Err(_) => return, // definition gone — nothing to re-invoke.
-                };
-                let state_def = match super::resolve_state_for(
-                    ctx.storage,
-                    &sm,
-                    execution_id,
-                    &crate::handlers::state_name_from_path(activity.value.state_path.as_ptr()),
-                )
-                .await
-                {
-                    Ok(s) => s,
-                    Err(_) => return, // definition gone — nothing to re-invoke.
-                };
-                let State::Task(task_state) = state_def else {
-                    return; // a retry timer under a non-Task activity is an internal fault.
-                };
-                // Re-invoke with the fresh projectable `arguments` (deterministic — same payload a
-                // fresh `activate` would build), bound to `$states.context.State.RetryCount` so a
-                // backoff formula in `Arguments` can react to the attempt.
-                let state_name =
-                    crate::handlers::state_name_from_path(activity.value.state_path.as_ptr());
-                let states = crate::context::build_states(
-                    &activity.value.input,
-                    None,
-                    &state_name,
-                    &exec.input,
-                    None,
-                    activity.value.retry_state.retry_count,
-                    None,
-                    None, // not a Map item — no `context.Map.Item` binding
-                );
-                let arguments = match &task_state.arguments {
-                    Some(arguments) => match ctx.env.eval_json(arguments, &states, &exec.variables)
-                    {
-                        Ok(v) => v,
-                        Err(_) => return, // arguments no longer evaluable — drop the retry.
-                    },
-                    None => activity.value.input.clone(),
-                };
-                let task = out.next_task();
-                out.emit_command(Command::ActivateTask {
-                    parent: NodeId::Activity(activity_id),
-                    task,
-                    resource: task_state.resource.clone(),
-                    arguments,
+                    output: raw_result,
                 });
             }
             TimerPurpose::TaskTimeout => {
@@ -141,21 +85,21 @@ impl CommandHandler for TriggerTimerHandler {
                 // parented on the owning activity (like `WaitResume`), so its deadline is enforced
                 // by the scheduler and swept when the activity terminates; we discover the in-flight
                 // task by asking the activity for its active child task.
-                let activity_id = match act.value.parent {
-                    NodeId::Activity(a) => a,
-                    _ => return,
-                };
+                let activity_id = act
+                    .value
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("a live timer is always owned");
+                if activity_id.kind != ObjectKind::Activity {
+                    return;
+                }
                 let in_flight = ctx
                     .storage
-                    .get_children(NodeId::Activity(activity_id))
+                    .get_children(activity_id)
                     .await
                     .ok()
-                    .and_then(|cs| {
-                        cs.into_iter().find_map(|c| match c {
-                            NodeId::Task(t) => Some(t),
-                            _ => None,
-                        })
-                    });
+                    .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
                 let Some(task) = in_flight else {
                     return; // no in-flight task — the timeout no longer applies.
                 };
@@ -165,12 +109,12 @@ impl CommandHandler for TriggerTimerHandler {
                 out.emit_command(Command::FailTask {
                     task,
                     worker_id: String::new(),
-                    error: ExecutionError::TimedOut {
+                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
                         message: format!(
                             "task ran past its TimeoutSeconds deadline ({})",
                             act.value.deadline.as_millis()
                         ),
-                    },
+                    }),
                 });
             }
             TimerPurpose::TaskLease => {
@@ -178,21 +122,21 @@ impl CommandHandler for TriggerTimerHandler {
                 // it (`Pending`) so a stalled / crashed worker does not hold it forever. Parented on
                 // the owning activity like `TaskTimeout`; find the in-flight task child and release it
                 // (no-op if it already settled — `ReleaseTaskLeaseHandler` validates status).
-                let activity_id = match act.value.parent {
-                    NodeId::Activity(a) => a,
-                    _ => return,
-                };
+                let activity_id = act
+                    .value
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("a live timer is always owned");
+                if activity_id.kind != ObjectKind::Activity {
+                    return;
+                }
                 let in_flight = ctx
                     .storage
-                    .get_children(NodeId::Activity(activity_id))
+                    .get_children(activity_id)
                     .await
                     .ok()
-                    .and_then(|cs| {
-                        cs.into_iter().find_map(|c| match c {
-                            NodeId::Task(t) => Some(t),
-                            _ => None,
-                        })
-                    });
+                    .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
                 let Some(task) = in_flight else {
                     return; // no in-flight task — the lease no longer applies.
                 };
@@ -200,23 +144,25 @@ impl CommandHandler for TriggerTimerHandler {
             }
             TimerPurpose::ExecutionTimeout => {
                 // The execution ran past its `TimeoutSeconds` deadline. Drive it to a `TimedOut`
-                // termination; any in-flight children drain via the cascade started by
-                // `TerminateExecution`.
-                let execution_id = match act.value.parent {
-                    NodeId::Execution(e) => e,
-                    _ => return,
+                // termination; any in-flight children drain via the cascade started by the
+                // terminate command. The timer's owner is the *scope* — a top-level `Execution` (via
+                // `TerminateExecution`) or a `Parallel`-branch / `Map`-item `Thread` (via
+                // `TerminateThread`, which the name-addressed form would miss).
+                let owner = act
+                    .value
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("a live timer is always owned");
+                let reason = TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                        message: format!(
+                            "execution ran past its TimeoutSeconds deadline ({})",
+                            act.value.deadline.as_millis()
+                        ),
+                    }),
                 };
-                out.emit_command(Command::TerminateExecution {
-                    id: execution_id,
-                    reason: TerminationReason::Failed {
-                        error: ExecutionError::TimedOut {
-                            message: format!(
-                                "execution ran past its TimeoutSeconds deadline ({})",
-                                act.value.deadline.as_millis()
-                            ),
-                        },
-                    },
-                });
+                super::emit_scope_termination(out, &owner, reason);
             }
         }
     }

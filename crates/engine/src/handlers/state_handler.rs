@@ -3,7 +3,7 @@ use spica_asl::State;
 
 use crate::eval_env::EvalEnv;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::id::ActivityId;
+use crate::types::meta::ObjectReference;
 
 /// Handles one [`State`] variant across the two moments of its lifecycle. Concrete variants
 /// (`PassStateHandler`, `WaitStateHandler`, …) are registered in
@@ -41,7 +41,7 @@ pub trait StateHandler: Send + Sync {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     );
@@ -52,7 +52,7 @@ pub trait StateHandler: Send + Sync {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     );
@@ -75,10 +75,10 @@ pub trait StateHandler: Send + Sync {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,
-        child: crate::id::NodeId,
+        child: ObjectReference,
     ) {
         let _ = (ctx, out, activity, actx, state, child); // default: leaf states do nothing.
     }

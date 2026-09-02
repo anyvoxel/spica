@@ -5,19 +5,18 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::StateMachine;
 
-use crate::activity::ActivityValue;
-use crate::command::{Command, TerminationReason};
-use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
-use crate::event::Event;
-use crate::id::{
-    ActivityId, EntryId, ExecutionId, FlowVersionId, RequestId, StreamId, TaskId, TimerId,
-};
-use crate::job_api::ActivatedTask;
 use crate::log::{Entry, EntryPayload, Timestamp};
-use crate::reject::{Reject, RejectionType};
 use crate::storage::Storage;
-use crate::variables::Variables;
+use crate::task_api::ActivatedTask;
+use crate::types::activity::Activity;
+use crate::types::command::{Command, TerminationReason};
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::id::{ActivityId, EntryId, ExecutionId, RequestId, StreamId, TimerId};
+use crate::types::meta::ObjectReference;
+use crate::types::reject::{Reject, RejectionType};
+use crate::types::variables::Variables;
 
 /// Collects the [`Entry`]s a handler emits while handling one Command, enveloping each with the
 /// call's `cause_id` / `stream_id` / `timestamp` and a placeholder `entry_id` (the log assigns the
@@ -84,8 +83,9 @@ impl Collector {
         ActivityId::new()
     }
 
-    /// Allocate a fresh [`TimerId`] (for a [`Command::ActivateTimer`]). Timers are ULIDs minted in
-    /// place — no shared counter needed, since the log carries the causal/`entry_id` ordering.
+    /// Allocate a fresh [`TimerId`] (for a timer armed inline via `emit_timer`). Timers are ULIDs
+    /// minted in place — no shared counter needed, since the log carries the causal/`entry_id`
+    /// ordering.
     pub fn next_timer(&mut self) -> TimerId {
         TimerId::new()
     }
@@ -97,10 +97,12 @@ impl Collector {
         ExecutionId::new()
     }
 
-    /// Allocate a fresh [`TaskId`] (for a [`Command::ActivateTask`]). Tasks are ULIDs minted in
-    /// place — no shared counter needed, since the log carries the causal/`entry_id` ordering.
-    pub fn next_task(&mut self) -> TaskId {
-        TaskId::new()
+    /// Allocate a fresh task uid ([`ulid::Ulid`], for a [`Command::ActivateTask`]). The task's
+    /// internal `uid` is a ULID minted in place (no shared counter — the log carries the causal
+    /// `entry_id` ordering). The worker addresses a task by its **canonical name**, not this uid
+    /// (see `task_api::ActivatedTask`), so the uid never leaves the engine over the worker protocol.
+    pub fn next_task(&mut self) -> ulid::Ulid {
+        ulid::Ulid::new()
     }
 
     /// Emit a definitive failure: `TerminateState` (if the failing context is a state) plus
@@ -111,8 +113,8 @@ impl Collector {
     /// StateTerminated, plus descendant cleanup) rather than marking the activity in place.
     pub fn terminate(
         &mut self,
-        activity: Option<ActivityId>,
-        execution: ExecutionId,
+        activity: Option<ObjectReference>,
+        execution: ObjectReference,
         error: ExecutionError,
     ) {
         let reason = TerminationReason::Failed { error };
@@ -123,13 +125,15 @@ impl Collector {
             });
         }
         self.emit_command(Command::TerminateExecution {
-            id: execution,
+            // Internal sites know the exact incarnation, so the uid is set as a matching guard.
+            name: execution.name.clone(),
+            uid: Some(execution.uid),
             reason,
         });
     }
 
     /// Convenience for `terminate` at a site where the execution itself failed (no state context).
-    pub fn fail_execution(&mut self, execution: ExecutionId, error: ExecutionError) {
+    pub fn fail_execution(&mut self, execution: ObjectReference, error: ExecutionError) {
         self.terminate(None, execution, error);
     }
 
@@ -160,8 +164,8 @@ impl Collector {
     }
 
     /// Declare an acknowledgement that delivers a **granted task set** to the awaiting `request_id` —
-    /// the response channel of a `PullTasks` (`TaskApi::activate`). Unlike `CompleteRequest`, there is
-    /// no single event to correlate: the granted list is decided by the `PullTasksHandler` at discovery,
+    /// the response channel of a `poll_tasks` (`TaskApi::poll_tasks`). Unlike `CompleteRequest`, there is
+    /// no single event to correlate: the granted list is decided by the `ClaimTasksHandler` at discovery,
     /// and delivered once the producing command's events are applied (`AckOutcome::Granted`). The
     /// collector's own `cause_id` (the producing command's entry) is carried so the StreamProcessor can
     /// fire it when any of that command's events is applied.
@@ -217,33 +221,33 @@ pub struct HandlerContext<'a> {
     /// The StreamProcessor's per-version machine cache. Handlers resolve the machine an execution is
     /// bound to through [`Self::machine`], never from a single in-memory `sm` — so a recovered
     /// Engine re-resolves definitions by id from storage instead of re-supplying them.
-    pub definitions: &'a mut HashMap<FlowVersionId, Arc<StateMachine>>,
+    pub definitions: &'a mut HashMap<ObjectReference, Arc<StateMachine>>,
 }
 
 impl HandlerContext<'_> {
-    /// Resolve — and cache — the state machine version `flow_version_id` binds to, loading it lazily
-    /// from `Storage` on first use. Executions reference only the (never-reused) `flow_version_id`;
-    /// the machine content is fetched here and cached per id in the StreamProcessor, so the same definition
-    /// is loaded at most once per id and a recovered Engine can re-resolve it without the caller
+    /// Resolve — and cache — the state machine version `flow_version` references, loading it lazily
+    /// from `Storage` on first use. Executions bind only to a (never-reused) version reference;
+    /// the machine content is fetched here and cached per reference in the StreamProcessor, so the same definition
+    /// is loaded at most once per version and a recovered Engine can re-resolve it without the caller
     /// re-supplying the machine.
     ///
     /// Returns [`ExecutionError::InvalidDefinition`] if the version no longer exists in storage
     /// (e.g. its definition was GC'd).
     pub async fn machine(
         &mut self,
-        flow_version_id: FlowVersionId,
+        flow_version: &ObjectReference,
     ) -> Result<Arc<StateMachine>, ExecutionError> {
-        if let Some(m) = self.definitions.get(&flow_version_id) {
+        if let Some(m) = self.definitions.get(flow_version) {
             return Ok(m.clone());
         }
         let ver = self
             .storage
-            .get_flow_version(flow_version_id)
+            .get_flow_version(flow_version)
             .await?
             .ok_or_else(|| {
-                ExecutionError::InvalidDefinition(format!(
-                    "flow version {flow_version_id} not found in storage"
-                ))
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "flow version {flow_version} not found in storage"
+                )))
             })?;
         // The stored form is the raw ASL string; parse it into the model here, then cache. The
         // definition is always parseable (validated at the create boundary and re-checked by the
@@ -251,13 +255,29 @@ impl HandlerContext<'_> {
         // than propagating a serde error.
         let machine = Arc::new(
             serde_json::from_str::<StateMachine>(&ver.definition).map_err(|e| {
-                ExecutionError::InvalidDefinition(format!(
-                    "stored flow definition for {flow_version_id} is not parseable: {e}"
-                ))
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "stored flow definition for {flow_version} is not parseable: {e}"
+                )))
             })?,
         );
-        self.definitions.insert(flow_version_id, machine.clone());
+        self.definitions
+            .insert(flow_version.clone(), machine.clone());
         Ok(machine)
+    }
+
+    /// Resolve — and cache — the state machine a [`ScopeRecord`] binds to, then return it. For a
+    /// top-level `Execution` the version is carried on the scope; for a fan-out `Thread` it is
+    /// derived from the thread's root `execution` (the whole tree shares one definition — see
+    /// [`crate::storage::resolve_scope_flow_version`]). Kept on the context so the resolve
+    /// (which may read `Storage` for the thread case) stays one call at every machine-using site.
+    pub async fn machine_for_scope(
+        &mut self,
+        scope: &crate::storage::ScopeRecord,
+    ) -> Result<Arc<StateMachine>, ExecutionError> {
+        // The immutable borrow of `storage` for resolving the version ends before the mutable
+        // `machine` call below, so there is no aliasing of `self`.
+        let flow_version = crate::storage::resolve_scope_flow_version(self.storage, scope).await?;
+        self.machine(&flow_version).await
     }
 }
 
@@ -274,7 +294,7 @@ pub struct ActivityCtx {
     /// The event-carried activity entity value for the lifecycle moment currently being handled.
     /// Handlers read the canonical domain fields from here so their behavior follows the same value
     /// model the event stream carries, rather than depending on projection-only storage details.
-    pub activity: ActivityValue,
+    pub activity: Activity,
     /// The owning execution's `state_path` — the path to the enclosing `states` table this activity
     /// resolves against. A `Parallel` handler extends it by `/states/<parallel>/branches/<idx>` to
     /// build each child execution's path. `None` for a top-level execution (states resolve at the
@@ -322,8 +342,8 @@ pub enum CtxKind {
 /// handling cohesive in its handler, not split across a generic default or the StreamProcessor.
 ///
 /// Handlers are pure decision-makers: they read `ctx` (definition + current state) and emit to
-/// `out`; they perform no I/O — side effects are themselves Commands (e.g. [`Command::ActivateTimer`])
-/// dispatched to dedicated side-effect handlers.
+/// `out`; they perform no I/O — side effects are themselves Commands dispatched to dedicated
+/// side-effect handlers.
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
     /// The [`Command`] variant this handler serves, identified by a `Default` placeholder instance
@@ -364,7 +384,7 @@ pub enum AckSideEffect {
         request_id: RequestId,
         event: Box<Event>,
     },
-    /// Acknowledge a `PullTasks` request by delivering the granted task set (`AckOutcome::Granted`)
+    /// Acknowledge a `ClaimTasks` request by delivering the granted task set (`AckOutcome::Granted`)
     /// once any of the producing command's events is applied — no single event to correlate, so the
     /// list (already decided by the handler at discovery) is carried directly, keyed to the command's
     /// `cause_id`.

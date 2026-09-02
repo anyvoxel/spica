@@ -1526,9 +1526,8 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
- "spica-proto",
+ "spica-client",
  "tokio",
- "tonic",
 ]
 
 [[package]]
@@ -1539,6 +1538,20 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+]
+
+[[package]]
+name = "spica-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "spica-proto",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]
@@ -1554,10 +1567,11 @@ dependencies = [
  "serde",
  "serde_json",
  "spica-asl",
+ "spica-client",
  "spica-logstream",
+ "spica-machinery",
  "spica-scheduler",
  "spica-storage",
- "spica-task-service",
  "thiserror",
  "time",
  "tokio",
@@ -1577,10 +1591,21 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "spica-machinery",
  "thiserror",
- "time",
  "tokio",
  "tokio-stream",
+ "ulid",
+]
+
+[[package]]
+name = "spica-machinery"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
  "ulid",
 ]
 
@@ -1615,13 +1640,15 @@ dependencies = [
  "clap",
  "serde_json",
  "spica-asl",
+ "spica-client",
  "spica-engine",
  "spica-logstream",
  "spica-proto",
  "spica-scheduler",
  "spica-storage",
- "spica-task-service",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1638,19 +1665,6 @@ dependencies = [
  "serde_json",
  "spica-engine",
  "tokio",
- "ulid",
-]
-
-[[package]]
-name = "spica-task-service"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "spica-engine",
- "tokio",
- "tokio-util",
- "tracing",
  "ulid",
 ]
 

@@ -2,13 +2,9 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
-use crate::{
-    ActivityState, ActivityStatus, ActivityValue, ApplierContext, EventApplier, RetryState,
-};
-
-use crate::id::{ActivityId, ExecutionId, NodeId};
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
+use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
 
 #[derive(Default)]
 pub(crate) struct StateTerminatingApplier;
@@ -16,19 +12,23 @@ pub(crate) struct StateTerminatingApplier;
 impl EventApplier for StateTerminatingApplier {
     fn event(&self) -> Event {
         Event::StateTerminating {
-            activity: ActivityValue {
-                id: ActivityId::nil(),
-                execution: ExecutionId::nil(),
-                root_execution: ExecutionId::nil(),
-                parent: NodeId::Execution(ExecutionId::nil()),
+            activity: Activity {
+                execution: crate::types::meta::ObjectReference::nil(),
                 state_path: jsonptr::PointerBuf::new(),
-                status: ActivityStatus::Terminating(crate::command::TerminationReason::Cancelled),
+                status: ActivityStatus::Terminating(
+                    crate::types::command::TerminationReason::Cancelled,
+                ),
                 raw_input: Default::default(),
                 input: Default::default(),
                 raw_output: None,
                 activity_state: ActivityState::Leaf,
                 retry_state: RetryState::default(),
                 output: None,
+                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                    crate::types::meta::ObjectKind::Activity,
+                    crate::types::id::ActivityId::nil().into(),
+                    crate::log::Timestamp::from_millis(0),
+                ),
             },
         }
     }
@@ -43,10 +43,10 @@ impl EventApplier for StateTerminatingApplier {
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        if let Some(act) = ctx.storage.get_activity(activity.id).await? {
+        if let Some(act) = ctx.storage.get_activity(&activity.reference()).await? {
             // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
             let mut row =
-                crate::storage::Activity::from_value(activity.clone(), act.active_children);
+                crate::storage::ActivityRecord::from_value(activity.clone(), act.active_children);
             row.created_at = act.created_at;
             row.updated_at = ctx.timestamp;
             ctx.storage.put_activity(row).await?;

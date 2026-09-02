@@ -17,7 +17,6 @@ spica-logstream.workspace = true
 spica-proto.workspace = true
 spica-scheduler.workspace = true
 spica-storage.workspace = true
-spica-task-service.workspace = true
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread"] }
 tonic.workspace = true
 tracing.workspace = true
@@ -26,5 +25,8 @@ ulid.workspace = true
 
 [dev-dependencies]
 spica-asl.workspace = true
+spica-client.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
 ulid.workspace = true

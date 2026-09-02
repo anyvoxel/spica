@@ -7,14 +7,14 @@ use super::super::{
     emit_transition, eval_string_or_expr, state_activated_value, state_completed_value,
     state_completing_value, state_terminated_value, state_terminating_value,
 };
-use crate::command::{Command, TerminationReason};
-use crate::context::build_states;
-use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::id::{ActivityId, ExecutionId, NodeId};
-use crate::{ActivityState, ExecutionStatus, MapActivityState};
+use crate::types::command::{Command, TerminationReason};
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::{ActivityState, MapActivityState};
 
 /// The `Map` state: iterates an `Items` array, running the `item_processor` sub-state-machine once
 /// per item as a child execution, with bounded concurrency (`MaxConcurrency`, 0 = unlimited). It
@@ -23,9 +23,9 @@ use crate::{ActivityState, ExecutionStatus, MapActivityState};
 /// fails the whole state on the first item failure (the `ToleratedFailureCount`/`Percentage`
 /// leeway is a deferred TODO; the current behavior equals the ASL default of tolerating 0 failures).
 ///
-/// Each item runs through the exact same `SpawnBranch` fan-out a `Parallel` branch uses (see
-/// [`crate::handlers::spawn_branch::SpawnBranchHandler`]): a child execution rooted under this
-/// activity and carrying a [`state_path`](crate::storage::Execution) of
+/// Each item runs through the exact same `SpawnThread` fan-out a `Parallel` branch uses (see
+/// [`crate::handlers::spawn_thread::SpawnThreadHandler`]): a child execution rooted under this
+/// activity and carrying a [`state_path`](crate::storage::ExecutionRecord) of
 /// `/states/<map>/item_processor` (locating the processor's `states` table in the single shared
 /// machine document). The Map activity stays `Running` owning those children; it replenishes via
 /// `child_completed` on every settle and completes only once the last item lands.
@@ -58,7 +58,7 @@ impl StateHandler for MapStateHandler {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -78,7 +78,7 @@ impl StateHandler for MapStateHandler {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
@@ -87,8 +87,14 @@ impl StateHandler for MapStateHandler {
         });
         emit_transition(
             out,
-            actx.activity.execution,
+            actx.activity.execution.clone(),
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             activity,
+            actx.state_path(),
             &actx.activity.input,
             None,
             Some(true),
@@ -110,10 +116,10 @@ impl StateHandler for MapStateHandler {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,
-        child: NodeId,
+        child: ObjectReference,
     ) {
         let State::Map(s) = state else {
             unreachable!(
@@ -123,7 +129,7 @@ impl StateHandler for MapStateHandler {
         let Some(actx) = actx else {
             return; // owning execution gone — nothing to converge.
         };
-        let Some(act) = ctx.storage.get_activity(activity).await.ok().flatten() else {
+        let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
         };
         // The iteration plan + item child map live in the `Map` state-specific repository, folded
@@ -133,17 +139,24 @@ impl StateHandler for MapStateHandler {
             return;
         };
 
-        // Identify this settled item by its child execution id. The settle drained one child from
-        // `active_children`, and the `children` map (index -> child) records who that was.
-        let NodeId::Execution(child_exec) = child else {
-            return; // a Map's children are always child executions.
+        // Identify this settled item by its child id. The settle drained one child from
+        // `active_children`, and the `children` map (index -> child) records who that was. A Map
+        // item runs as a `Thread` (post-split), so its settle arrives as a `Thread` reference.
+        let child_ref = match child.kind {
+            ObjectKind::Execution | ObjectKind::Thread => child.clone(),
+            _ => return, // a Map's children are always threads (or legacy executions).
         };
-        let Some(child_exec) = progress.children.values().find(|e| **e == child_exec) else {
+        let Some(child_exec) = progress.children.values().find(|e| **e == child_ref) else {
             return; // settled node isn't one of our items — not ours to react to.
         };
-        // A child that vanished without settling counts as a failure (mirrors `parallel.rs`).
-        let this_successful = match ctx.storage.get_execution(*child_exec).await.ok().flatten() {
-            Some(child) => child.status == ExecutionStatus::Completed,
+        // A child that vanished without settling counts as a failure (mirrors `parallel.rs`). A
+        // thread resolves from thread storage, so read through the scope abstraction.
+        let this_successful = match crate::storage::load_scope_ref(ctx.storage, child_exec)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(child) => child.is_terminal() && child.termination_reason().is_none(),
             None => false,
         };
 
@@ -159,11 +172,11 @@ impl StateHandler for MapStateHandler {
         if !this_successful {
             tracing::warn!(activity = %activity, child = %child_exec, "map item child failed");
             let reason = TerminationReason::Failed {
-                error: ExecutionError::StateFailed {
+                error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: actx.state_name(),
                     error: "Map item failed".into(),
-                    output: Value::Null,
-                },
+                    output: Box::new(Value::Null),
+                }),
             };
             fail_map(out, activity, actx, reason);
             return;
@@ -179,13 +192,13 @@ impl StateHandler for MapStateHandler {
         let spawn_count = progress.children.len();
         let mut completed_now = 0usize;
         for exec in progress.children.values() {
-            let is_done = ctx
-                .storage
-                .get_execution(*exec)
+            // Resolve through the scope abstraction: it is a `Completed` item iff terminal and not
+            // terminated (a `Terminated`/`Terminating` item failed and fails the Map separately).
+            let is_done = crate::storage::load_scope_ref(ctx.storage, exec)
                 .await
                 .ok()
                 .flatten()
-                .map(|c| c.status == ExecutionStatus::Completed)
+                .map(|c| c.is_terminal() && c.termination_reason().is_none())
                 .unwrap_or(false);
             if is_done {
                 completed_now += 1;
@@ -196,18 +209,20 @@ impl StateHandler for MapStateHandler {
         if completed_now == progress.total {
             // Aggregate the per-item outputs in item-index order (mirroring a `Parallel`'s
             // branch-order aggregation). Every child is `Completed` by now.
-            let mut entries: Vec<(usize, ExecutionId)> =
-                progress.children.iter().map(|(i, e)| (*i, *e)).collect();
+            let mut entries: Vec<(usize, crate::types::meta::ObjectReference)> = progress
+                .children
+                .iter()
+                .map(|(i, e)| (*i, e.clone()))
+                .collect();
             entries.sort_by_key(|(i, _)| *i);
             let mut outputs = Vec::with_capacity(entries.len());
             for (_index, child_exec) in entries {
-                let output = ctx
-                    .storage
-                    .get_execution(child_exec)
+                // A Map item's output lives on its `Thread` — resolve through the scope abstraction.
+                let output = crate::storage::load_scope_ref(ctx.storage, &child_exec)
                     .await
                     .ok()
                     .flatten()
-                    .and_then(|c| c.output.clone())
+                    .and_then(|c| c.output().cloned())
                     .unwrap_or(Value::Null);
                 outputs.push(output);
             }
@@ -230,7 +245,7 @@ impl StateHandler for MapStateHandler {
             tracing::debug!(activity = %activity, "map replenish: no free slot");
             return;
         }
-        let owner = NodeId::Activity(activity);
+        let owner = activity.clone();
         let pointer = item_pointer(actx);
         let start_at = s
             .item_processor
@@ -239,9 +254,9 @@ impl StateHandler for MapStateHandler {
             .unwrap_or_default();
         for k in 0..to_spawn {
             let index = spawn_count + k;
-            out.emit_command(Command::SpawnBranch {
-                parent: owner,
-                root_execution: actx.activity.root_execution,
+            out.emit_command(Command::SpawnThread {
+                parent: owner.clone(),
+                execution: actx.activity.execution.clone(),
                 state_path: Some(pointer.clone()),
                 // `branch_index` carries the *item index* — the `children` key we aggregate
                 // on at convergence (matching the ordering semantics of a `Parallel` branch).
@@ -259,7 +274,7 @@ impl StateHandler for MapStateHandler {
 fn activate_map(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &MapState,
 ) {
@@ -273,7 +288,7 @@ fn activate_map(
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None,
         None,
     );
@@ -287,7 +302,11 @@ fn activate_map(
             let evaluated = fail_or!(
                 out,
                 Some(activity),
-                actx.activity.execution,
+                actx.activity
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("an owned activity has an owner"),
                 eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             match evaluated {
@@ -296,10 +315,16 @@ fn activate_map(
                     fail_or!(
                         out,
                         Some(activity),
-                        actx.activity.execution,
-                        Err(ExecutionError::InvalidDefinition(format!(
-                            "Map '{}' Items expression did not evaluate to an array",
-                            actx.state_name()
+                        actx.activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
+                        Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                            format!(
+                                "Map '{}' Items expression did not evaluate to an array",
+                                actx.state_name()
+                            )
                         )))
                     );
                     return;
@@ -312,10 +337,16 @@ fn activate_map(
                 fail_or!(
                     out,
                     Some(activity),
-                    actx.activity.execution,
-                    Err(ExecutionError::InvalidDefinition(format!(
-                        "Map '{}' has no Items and its input is not an array",
-                        actx.state_name()
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                        format!(
+                            "Map '{}' has no Items and its input is not an array",
+                            actx.state_name()
+                        )
                     )))
                 );
                 return;
@@ -325,48 +356,57 @@ fn activate_map(
 
     // Resolve `MaxConcurrency` (default 0 = unlimited). A literal is a non-negative integer; a
     // JSONata string must evaluate to one.
-    let max_concurrency: usize = match &state.max_concurrency {
-        None => 0,
-        Some(IntOrExpr::Int(n)) if *n >= 0 => *n as usize,
-        Some(IntOrExpr::Int(_)) => {
-            fail_or!(
-                out,
-                Some(activity),
-                actx.activity.execution,
-                Err(ExecutionError::InvalidDefinition(
-                    "Map MaxConcurrency must be a non-negative integer".into(),
-                ))
-            );
-            return;
-        }
-        Some(IntOrExpr::Expr(expr)) => {
-            let evaluated = fail_or!(
-                out,
-                Some(activity),
-                actx.activity.execution,
-                eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
-            );
-            let value = match evaluated {
-                Value::Number(num) => num.as_f64(),
-                _ => None,
-            };
-            match value {
-                Some(f) if f.fract() == 0.0 && f.is_finite() && f >= 0.0 => f as usize,
-                _ => {
-                    fail_or!(
+    let max_concurrency: usize =
+        match &state.max_concurrency {
+            None => 0,
+            Some(IntOrExpr::Int(n)) if *n >= 0 => *n as usize,
+            Some(IntOrExpr::Int(_)) => {
+                fail_or!(
+                    out,
+                    Some(activity),
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                        "Map MaxConcurrency must be a non-negative integer".into(),
+                    )))
+                );
+                return;
+            }
+            Some(IntOrExpr::Expr(expr)) => {
+                let evaluated = fail_or!(
+                    out,
+                    Some(activity),
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
+                );
+                let value = match evaluated {
+                    Value::Number(num) => num.as_f64(),
+                    _ => None,
+                };
+                match value {
+                    Some(f) if f.fract() == 0.0 && f.is_finite() && f >= 0.0 => f as usize,
+                    _ => {
+                        fail_or!(
                         out,
                         Some(activity),
-                        actx.activity.execution,
-                        Err(ExecutionError::InvalidDefinition(
+                        actx.activity.meta.owner.clone().expect("an owned activity has an owner"),
+                        Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "Map MaxConcurrency expression must evaluate to a non-negative integer"
                                 .into(),
-                        ))
+                        )))
                     );
-                    return;
+                        return;
+                    }
                 }
             }
-        }
-    };
+        };
 
     // Fan out the first batch. With a nonzero cap that is `min(total, max)` items; with the default
     // 0 (unlimited) cap it is every item — mirroring `activate_parallel`'s up-front fan-out for the
@@ -376,7 +416,7 @@ fn activate_map(
     } else {
         max_concurrency.min(items.len())
     };
-    let owner = NodeId::Activity(activity);
+    let owner = activity.clone();
     let pointer = item_pointer(actx);
     let start_at = state
         .item_processor
@@ -384,9 +424,9 @@ fn activate_map(
         .map(|p| p.start_at.clone())
         .unwrap_or_default();
     for index in 0..initial_batch {
-        out.emit_command(Command::SpawnBranch {
-            parent: owner,
-            root_execution: actx.activity.root_execution,
+        out.emit_command(Command::SpawnThread {
+            parent: owner.clone(),
+            execution: actx.activity.execution.clone(),
             state_path: Some(pointer.clone()),
             branch_index: index,
             state: start_at.clone(),
@@ -452,7 +492,7 @@ fn item_pointer(actx: &ActivityCtx) -> jsonptr::PointerBuf {
 /// `parallel.rs::fail_parallel`; the sweep then stops the still-in-flight sibling items.
 fn fail_map(
     out: &mut Collector,
-    _activity: ActivityId,
+    _activity: ObjectReference,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
@@ -462,10 +502,15 @@ fn fail_map(
     out.emit_event(Event::StateTerminated {
         activity: state_terminated_value(actx, reason.clone()),
     });
-    out.emit_command(Command::TerminateExecution {
-        id: actx.activity.execution,
+    super::super::emit_scope_termination(
+        out,
+        actx.activity
+            .meta
+            .owner
+            .as_ref()
+            .expect("an owned activity has an owner"),
         reason,
-    });
+    );
 }
 
 /// The `Map`'s success finish: with all items converged, project the state result — `$states.result`
@@ -479,7 +524,7 @@ fn fail_map(
 fn finish_map(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &MapState,
     aggregated: Value,
@@ -490,7 +535,7 @@ fn finish_map(
         &actx.state_name(),
         &actx.exec_input,
         Some(&actx.activity.input),
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None, // success path — no Catch `errorOutput`
         None, // not projecting a Map item — no `context.Map.Item` binding
     );
@@ -501,7 +546,11 @@ fn finish_map(
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -511,7 +560,12 @@ fn finish_map(
                         local_scope.insert(k, v);
                     }
                     out.emit_event(Event::VariablesAssigned {
-                        execution: actx.activity.execution,
+                        scope: actx
+                            .activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
                     });
                 }
@@ -519,10 +573,14 @@ fn finish_map(
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -535,7 +593,11 @@ fn finish_map(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_scope)
         ),
         None => aggregated,
@@ -549,8 +611,14 @@ fn finish_map(
     });
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output_value,
         state.next.as_deref(),
         state.end,

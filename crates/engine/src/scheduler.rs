@@ -2,8 +2,8 @@
 //!
 //! Arming a timer (`TimerActivated`) is recorded in the stream as a durable fact. The actual
 //! *physical* timing is a side effect driven by that fact, not by the command dispatcher: instead
-//! of the StreamProcessor special-casing `ActivateTimer` (which previously forced an in-dispatch
-//! `sleep`/spawn), the run loop feeds `TimerActivated`/`TimerCancelled` events into the
+//! instead of the StreamProcessor sleeping on an arming command in-dispatch (which would block the
+//! serial loop), the run loop feeds `TimerActivated`/`TimerCancelled` events into the
 //! [`Scheduler`] contract. The scheduler owns a single long-lived `DelayQueue` and, on expiry,
 //! hands the resumption command back to the engine through its injected [`TimerSink`] (see below).
 //!
@@ -28,8 +28,9 @@
 
 use std::sync::Arc;
 
-use crate::id::{EntryId, TimerId};
 use crate::log::Timestamp;
+use crate::types::id::EntryId;
+use crate::types::meta::ObjectReference;
 
 /// The engine's controlled write entry for a fired timer, injected into the [`Scheduler`] at boot.
 ///
@@ -44,7 +45,7 @@ pub trait TimerSink: Send + Sync {
     /// A timer's deadline elapsed: append the `TriggerTimer` that resumes the `Wait` state, causally
     /// linked to the `TimerActivated` entry identified by `cause_id`. Implementations (the engine)
     /// validate the write and append it; the log assigns the entry's position and its own stream id.
-    async fn trigger(&self, timer: TimerId, cause_id: EntryId);
+    async fn trigger(&self, timer: &ObjectReference, cause_id: EntryId);
 }
 
 /// Contract for the engine's timer side-effect service.
@@ -69,8 +70,8 @@ pub trait Scheduler: Send + Sync {
     /// `TimerActivated` entry identified by `cause_id`. There is no stream to route to — a log is
     /// one stream, so the fired `TriggerTimer` is handed to the attached sink (via
     /// [`TimerSink::trigger`]) and the log stamps its own stream id when it is appended.
-    fn schedule(&self, timer: TimerId, deadline: Timestamp, cause_id: EntryId);
+    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp, cause_id: EntryId);
 
     /// Cancel a previously-armed `timer` (a `TimerCancelled` event was applied).
-    fn cancel(&self, timer: TimerId);
+    fn cancel(&self, timer: &ObjectReference);
 }
