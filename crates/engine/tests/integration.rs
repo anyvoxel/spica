@@ -3,9 +3,44 @@
 
 mod common;
 
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
-use spica_engine::ExecutionError;
+use spica_client::worker::{TaskFailure, TaskService};
+use spica_engine::{
+    Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, ExecutionError, FlowName,
+    InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId,
+};
+use spica_logstream::LogError;
+use spica_scheduler::InMemoryScheduler;
+use spica_storage::InMemoryStorage;
+use tokio::sync::Mutex;
+
+/// A `LogStream` wrapper carrying its own `Arc` handle, so the test can read the durable log back
+/// after the run — the same idiom `dump_events` uses to inspect the real log facts (order, payloads).
+struct RetainedLog(Arc<Mutex<InMemoryLogStream<EntryPayload>>>);
+
+#[async_trait]
+impl LogStream<EntryPayload> for RetainedLog {
+    fn stream_id(&self) -> StreamId {
+        self.0.try_lock().unwrap().stream_id()
+    }
+    async fn append(&self, entries: Vec<Entry>) -> Result<EntryId, LogError> {
+        self.0.lock().await.append(entries).await
+    }
+    async fn read(&self, entry_id: EntryId) -> Result<Option<Entry>, LogError> {
+        self.0.lock().await.read(entry_id).await
+    }
+    fn stream_read(
+        &self,
+        from: EntryId,
+    ) -> Pin<Box<dyn tokio_stream::Stream<Item = Entry> + Send + 'static>> {
+        self.0.try_lock().unwrap().stream_read(from)
+    }
+}
 
 fn parse_sm(definition: &str) -> StateMachine {
     serde_json::from_str(definition).expect("state machine should parse")
@@ -18,6 +53,245 @@ async fn run(sm: &StateMachine, input: Value) -> Result<Value, ExecutionError> {
         .await
         .map(|r| r.output)
 }
+#[tokio::test]
+async fn activity_name_derives_from_execution_name_base() {
+    // finding #3: the generated activity name uses the owning execution's name (its plain base) as
+    // the base, so every activity names its run — a branch activity still names its root run —
+    // instead of the opaque `child-<ulid>` placeholder. Observe the real, durable log (same shared
+    // wrapper idiom as `dump_events`) rather than any reconstructed view.
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    // A fixed plain execution name (4..=64 alnum/underscore, no hyphen) — the test's own storage is
+    // fresh, so no cross-test collision. The activity's generated name must derive from this base.
+    let exec_name = ObjectName::plain("run_naming").expect("a plain execution name is valid");
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "Project",
+          "States": { "Project": { "Type": "Pass", "End": true } }
+        }"#,
+    );
+    let flow_version = engine
+        .create_flow(
+            FlowName::new("run_naming_flow").expect("anon flow name is valid"),
+            &serde_json::to_string(&sm).expect("sm serializes"),
+        )
+        .await
+        .expect("flow created");
+    let execution_id = engine
+        .start_for_revision(exec_name.clone(), flow_version, Value::Null)
+        .await
+        .expect("execution starts");
+    let _result = engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("run succeeds");
+
+    let entries = log.lock().await.entries();
+    let activating = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::StateActivating { activity }) => {
+                Some(activity.meta.name.clone())
+            }
+            _ => None,
+        })
+        .expect("a StateActivating event was emitted for the Pass state");
+    // `base()` is the hyphen-free body of a generated name (`<base>-<suffix>`), so for the activity
+    // name it is exactly the owning execution's name — the finding's whole point: the name carries
+    // its run, and the single-hyphen suffix is the activity's own uid.
+    assert_eq!(
+        activating.base().as_str(),
+        exec_name.as_str(),
+        "activity name base must be the owning execution's name (finding #3), not 'child'"
+    );
+    assert!(
+        activating
+            .as_str()
+            .starts_with(&format!("{}-", exec_name.as_str())),
+        "activity name {} must be <execution>-<activity-uid>",
+        activating
+    );
+}
+
+#[tokio::test]
+async fn timer_name_derives_from_execution_name_base() {
+    // finding #11: a Wait-resume timer's generated name uses the owning execution's name (its plain
+    // base) as base, mirroring #3 — so a timer is locatable at the run level rather than the opaque
+    // `child-<ulid>` placeholder. Read the real durable log (same RetainedLog idiom).
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    let exec_name = ObjectName::plain("run_waitnaming").expect("a plain execution name is valid");
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "W",
+          "States": {
+            "W": { "Type": "Wait", "Seconds": 0, "Next": "P" },
+            "P": { "Type": "Pass", "End": true }
+          }
+        }"#,
+    );
+    let flow_version = engine
+        .create_flow(
+            FlowName::new("run_waitnaming_flow").expect("anon flow name is valid"),
+            &serde_json::to_string(&sm).expect("sm serializes"),
+        )
+        .await
+        .expect("flow created");
+    let execution_id = engine
+        .start_for_revision(exec_name.clone(), flow_version, Value::Null)
+        .await
+        .expect("execution starts");
+    let _result = engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("run succeeds");
+
+    let entries = log.lock().await.entries();
+    let timer = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::TimerActivated { timer }) => Some(timer.meta.name.clone()),
+            _ => None,
+        })
+        .expect("a wait-resume TimerActivated event was emitted");
+    assert_eq!(
+        timer.base().as_str(),
+        exec_name.as_str(),
+        "timer name base must be the owning execution's name (finding #11), not 'child'"
+    );
+    assert!(
+        timer
+            .as_str()
+            .starts_with(&format!("{}-", exec_name.as_str())),
+        "timer name {} must be <execution>-<suffix>",
+        timer
+    );
+}
+
+#[tokio::test]
+async fn task_name_derives_from_execution_name_base() {
+    // finding #13: a Task's generated name uses its owning execution's name (the plain base) as base,
+    // mirroring #3/#11 — not the old `child-<uid>` placeholder. Read the real durable log and check
+    // the `TaskActivated` event's task name.
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    let exec_name = ObjectName::plain("run_tasknaming").expect("a plain execution name is valid");
+
+    // Boot the in-process worker (same role split as `common::create_and_run_with_handlers`) so the
+    // Task's physical call completes and the run can terminate; cancel it before the engine drops.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker = {
+        let api = Arc::new(common::EngineTaskApi::new(engine.task_api()));
+        let cancel = cancel.clone();
+        let mut handlers = std::collections::HashMap::new();
+        handlers.insert(
+            "arn:aws:states:::lambda:invoke".to_string(),
+            Arc::new(EchoHandler) as std::sync::Arc<dyn spica_client::worker::TaskHandler>,
+        );
+        let service = spica_client::worker::InMemoryTaskService::spawn(handlers);
+        tokio::spawn(async move { service.run(api, cancel).await })
+    };
+
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "T",
+          "States": {
+            "T": { "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke", "End": true }
+          }
+        }"#,
+    );
+    let flow_version = engine
+        .create_flow(
+            FlowName::new("run_tasknaming_flow").expect("anon flow name is valid"),
+            &serde_json::to_string(&sm).expect("sm serializes"),
+        )
+        .await
+        .expect("flow created");
+    let execution_id = engine
+        .start_for_revision(exec_name.clone(), flow_version, Value::Null)
+        .await
+        .expect("execution starts");
+    let _result = engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("run succeeds");
+    cancel.cancel();
+    let _ = worker.await;
+
+    let entries = log.lock().await.entries();
+    let task = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::TaskActivated { task }) => Some(task.meta.name.clone()),
+            _ => None,
+        })
+        .expect("a TaskActivated event was emitted for the Task state");
+    assert_eq!(
+        task.base().as_str(),
+        exec_name.as_str(),
+        "task name base must be the owning execution's name (finding #13), not 'child'"
+    );
+    assert!(
+        task.as_str()
+            .starts_with(&format!("{}-", exec_name.as_str())),
+        "task name {} must be <execution>-<suffix>",
+        task
+    );
+}
+
+#[tokio::test]
+async fn idle_poll_writes_no_durable_entry() {
+    // finding #12: an idle poll (nothing claimable on `resource`) is a pure idempotent read that must
+    // not write a durable `ClaimTasks` entry — the worker's ~10ms busy poll would otherwise flood the
+    // causal chain with no-op commands. The read-first gate short-circuits to an empty grant.
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    let before = log.lock().await.entries().len();
+    let granted = engine
+        .task_api()
+        .poll_tasks("w-idle", "arn:aws:states:::lambda:invoke", 10, 60)
+        .await
+        .expect("idle poll returns without error");
+    assert!(granted.is_empty(), "no claimable task on an idle resource");
+    assert_eq!(
+        log.lock().await.entries().len(),
+        before,
+        "an idle poll must not append any durable entry"
+    );
+}
+
 #[tokio::test]
 async fn pass_output_projection() {
     let sm = parse_sm(
@@ -134,7 +408,10 @@ async fn choice_no_match_without_default_errors() {
     let err = run(&sm, Value::Null)
         .await
         .expect_err("should fail with no match");
-    assert!(matches!(err, ExecutionError::NoChoiceMatched { .. }));
+    assert!(matches!(
+        err,
+        ExecutionError::Runtime(RuntimeError::NoChoiceMatched { .. })
+    ));
     assert_eq!(err.error_name(), "States.NoChoiceMatched");
 }
 
@@ -152,14 +429,14 @@ async fn fail_state_terminates_with_error_output() {
         .await
         .expect_err("Fail should produce an error");
     match err {
-        ExecutionError::StateFailed {
+        ExecutionError::Runtime(RuntimeError::StateFailed {
             ref error,
             ref output,
             ..
-        } => {
+        }) => {
             assert_eq!(error, "ErrorA");
             assert_eq!(
-                output,
+                output.as_ref(),
                 &json!({ "Error": "ErrorA", "Cause": "Invalid response." })
             );
         }
@@ -263,7 +540,10 @@ async fn wait_seconds_jsonata_non_integer_fails() {
         .await
         .expect_err("non-integer JSONata Seconds should fail");
     assert!(
-        matches!(err, ExecutionError::InvalidDefinition(_)),
+        matches!(
+            err,
+            ExecutionError::Runtime(RuntimeError::InvalidDefinition(_))
+        ),
         "expected InvalidDefinition, got {err:?}"
     );
 }
@@ -285,7 +565,10 @@ async fn wait_timestamp_jsonata_invalid_rfc3339_fails() {
         .await
         .expect_err("invalid JSONata Timestamp should fail");
     assert!(
-        matches!(err, ExecutionError::InvalidDefinition(_)),
+        matches!(
+            err,
+            ExecutionError::Runtime(RuntimeError::InvalidDefinition(_))
+        ),
         "expected InvalidDefinition, got {err:?}"
     );
 }
@@ -355,7 +638,7 @@ async fn unserved_task_fails_via_timeout_not_definition() {
         .await
         .expect_err("an unserved Task with TimeoutSeconds should eventually time out");
     assert!(
-        matches!(err, ExecutionError::TimedOut { .. }),
+        matches!(err, ExecutionError::Runtime(RuntimeError::TimedOut { .. })),
         "expected TimedOut, got {err:?}"
     );
 }
@@ -373,8 +656,94 @@ async fn handler_error_is_recorded_as_failure() {
         .await
         .expect_err("malformed JSONata should fail the execution");
     assert!(
-        matches!(err, ExecutionError::Jsonata { .. }),
+        matches!(err, ExecutionError::Runtime(RuntimeError::Jsonata { .. })),
         "expected Jsonata error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn activate_state_carries_self_locating_state_path() {
+    // finding #2: `Command::ActivateState` must carry the state's full `state_path` (top-level
+    // `/states/<name>`, or `/states/.../branches/<idx>/<name>` inside a container), so the command is
+    // self-locating rather than asking the handler to infer the enclosing `states` table from the
+    // owning thread's stored path. Run a flow that hops through a top-level state, a Parallel whose
+    // first branch itself transitions sequentially, and a second single-state branch, then assert
+    // every emitted ActivateState carries exactly the resolved path (branch order is nondeterministic,
+    // so compare as a sorted list).
+    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
+    let engine = EngineBuilder::with_backends(
+        Box::new(RetainedLog(Arc::clone(&log))),
+        Box::new(InMemoryStorage::new()),
+    )
+    .with_scheduler(InMemoryScheduler::spawn())
+    .start()
+    .await
+    .expect("engine starts");
+
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "Start",
+          "States": {
+            "Start": { "Type": "Pass", "Next": "P" },
+            "P": {
+              "Type": "Parallel",
+              "Next": "Done",
+              "Branches": [
+                { "StartAt": "A0",
+                  "States": { "A0": { "Type": "Pass", "Next": "A1" }, "A1": { "Type": "Succeed" } } },
+                { "StartAt": "B0", "States": { "B0": { "Type": "Succeed" } } }
+              ]
+            },
+            "Done": { "Type": "Pass", "End": true }
+          }
+        }"#,
+    );
+    let flow_version = engine
+        .create_flow(
+            FlowName::new("state_path_flow").expect("anon flow name is valid"),
+            &serde_json::to_string(&sm).expect("sm serializes"),
+        )
+        .await
+        .expect("flow created");
+    let execution_id = engine
+        .start_for_revision(
+            ObjectName::plain("run_state_path").expect("plain name is valid"),
+            flow_version,
+            Value::Null,
+        )
+        .await
+        .expect("execution starts");
+    engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("run succeeds");
+
+    let entries = log.lock().await.entries();
+    let mut paths: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Command(Command::ActivateState { state_path, .. }) => {
+                Some(state_path.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    paths.sort();
+    let mut expected: Vec<String> = [
+        "/states/Start",
+        "/states/P",
+        "/states/P/branches/0/A0",
+        "/states/P/branches/0/A1",
+        "/states/P/branches/1/B0",
+        "/states/Done",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    expected.sort();
+    assert_eq!(
+        paths, expected,
+        "ActivateState must carry the exact resolved state_path (finding #2)"
     );
 }
 
@@ -423,22 +792,21 @@ async fn fixture_choice_with_boolean_condition() {
 struct EchoHandler;
 
 #[async_trait::async_trait]
-impl spica_engine::TaskHandler for EchoHandler {
-    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, ExecutionError> {
+impl spica_client::worker::TaskHandler for EchoHandler {
+    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, TaskFailure> {
         Ok(arguments.clone())
     }
 }
 
-/// A `TaskHandler` that always fails with a fixed `ExecutionError`.
+/// A `TaskHandler` that always fails with a fixed error name.
 #[derive(Default)]
 struct FailingHandler;
 
 #[async_trait::async_trait]
-impl spica_engine::TaskHandler for FailingHandler {
-    async fn run(&self, _resource: &str, _arguments: &Value) -> Result<Value, ExecutionError> {
-        Err(ExecutionError::StateFailed {
-            state: "T".to_string(),
-            error: "TaskBoom".to_string(),
+impl spica_client::worker::TaskHandler for FailingHandler {
+    async fn run(&self, _resource: &str, _arguments: &Value) -> Result<Value, TaskFailure> {
+        Err(TaskFailure {
+            error_name: "TaskBoom".to_string(),
             output: json!({ "Error": "TaskBoom" }),
         })
     }
@@ -447,7 +815,7 @@ impl spica_engine::TaskHandler for FailingHandler {
 async fn run_task(
     sm: &StateMachine,
     input: Value,
-    handler: Box<dyn spica_engine::TaskHandler>,
+    handler: Box<dyn spica_client::worker::TaskHandler>,
 ) -> Result<Value, ExecutionError> {
     let mut handlers = std::collections::HashMap::new();
     handlers.insert(
@@ -507,6 +875,36 @@ async fn task_assigns_result_and_routes_to_next() {
 }
 
 #[tokio::test]
+async fn task_complete_state_carries_worker_payload_as_raw_result() {
+    // The `CompleteState` command carries the state's raw result (its `raw_output` / `$states.result`).
+    // For a Task that is the worker's payload — here the echoed arguments `{ "worker": "payload" }`,
+    // which differs from the null input — so the final output must be that payload, proving the raw
+    // result flowed from the completion command rather than from the state's input (finding #5).
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "T",
+          "States": {
+            "T": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Arguments": { "worker": "payload" },
+              "Output": "{% $states.result %}",
+              "End": true
+            }
+          }
+        }"#,
+    );
+    let output = run_task(&sm, Value::Null, Box::new(EchoHandler))
+        .await
+        .expect("task should succeed");
+    assert_eq!(
+        output,
+        json!({ "worker": "payload" }),
+        "the raw result is the worker payload, not the input"
+    );
+}
+
+#[tokio::test]
 async fn task_failure_terminates_execution() {
     // A Task whose handler fails terminates the execution with the failure, propagating up through
     // the terminate cascade.
@@ -522,7 +920,9 @@ async fn task_failure_terminates_execution() {
         .await
         .expect_err("a failing task should terminate the execution");
     match err {
-        ExecutionError::StateFailed { error, .. } => assert_eq!(error, "TaskBoom"),
+        ExecutionError::Runtime(RuntimeError::StateFailed { error, .. }) => {
+            assert_eq!(error, "TaskBoom")
+        }
         other => panic!("expected StateFailed, got {other:?}"),
     }
 }
@@ -535,15 +935,14 @@ struct FailThenSucceed {
 }
 
 #[async_trait::async_trait]
-impl spica_engine::TaskHandler for FailThenSucceed {
-    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, ExecutionError> {
+impl spica_client::worker::TaskHandler for FailThenSucceed {
+    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, TaskFailure> {
         // The handler runs on a spawned task; use interior mutability to count calls.
         static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n < self.failures {
-            Err(ExecutionError::StateFailed {
-                state: "T".to_string(),
-                error: "TaskBoom".to_string(),
+            Err(TaskFailure {
+                error_name: "TaskBoom".to_string(),
                 output: json!({ "Error": "TaskBoom" }),
             })
         } else {
@@ -554,8 +953,9 @@ impl spica_engine::TaskHandler for FailThenSucceed {
 
 #[tokio::test]
 async fn task_retry_succeeds_after_retries() {
-    // A Task that fails twice then succeeds: its `Retry` (MaxAttempts 3) re-invokes it until it
-    // eventually succeeds, and the execution completes normally.
+    // A Task that fails twice then succeeds: its `Retry` (MaxAttempts 3) re-queues the *same* task
+    // entity (pending, gated by `next_available_at`) until the worker eventually succeeds, and the
+    // execution completes normally.
     let sm = parse_sm(
         r#"{
           "StartAt": "T",
@@ -585,11 +985,11 @@ async fn task_retry_succeeds_after_retries() {
 
 #[derive(Default)]
 struct SequencedHandler {
-    outcomes: std::sync::Mutex<std::collections::VecDeque<Result<Value, ExecutionError>>>,
+    outcomes: std::sync::Mutex<std::collections::VecDeque<Result<Value, TaskFailure>>>,
 }
 
 impl SequencedHandler {
-    fn new(outcomes: Vec<Result<Value, ExecutionError>>) -> Self {
+    fn new(outcomes: Vec<Result<Value, TaskFailure>>) -> Self {
         Self {
             outcomes: std::sync::Mutex::new(std::collections::VecDeque::from(outcomes)),
         }
@@ -597,8 +997,8 @@ impl SequencedHandler {
 }
 
 #[async_trait::async_trait]
-impl spica_engine::TaskHandler for SequencedHandler {
-    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, ExecutionError> {
+impl spica_client::worker::TaskHandler for SequencedHandler {
+    async fn run(&self, _resource: &str, arguments: &Value) -> Result<Value, TaskFailure> {
         self.outcomes
             .lock()
             .expect("sequence mutex should not be poisoned")
@@ -610,9 +1010,9 @@ impl spica_engine::TaskHandler for SequencedHandler {
 #[tokio::test]
 async fn task_multiple_retriers_keep_independent_attempt_counts() {
     // Two retriers with independent budgets: the first handles `ErrorA` once, the second handles
-    // `ErrorB` twice. With only an activity-wide retry counter, the second retrier would inherit the
-    // first retrier's history and exhaust early; the structured retry state keeps each retrier's own
-    // attempt ladder separate, so the task reaches its eventual success.
+    // `ErrorB` twice. The attempt ladders are carried independently on the task's
+    // `retrier_attempts` (one entry per retrier), so the second retrier never inherits the first
+    // retrier's history and the task reaches its eventual success.
     let sm = parse_sm(
         r#"{
           "StartAt": "T",
@@ -634,19 +1034,16 @@ async fn task_multiple_retriers_keep_independent_attempt_counts() {
         &sm,
         json!({ "v": 9 }),
         Box::new(SequencedHandler::new(vec![
-            Err(ExecutionError::StateFailed {
-                state: "T".to_string(),
-                error: "ErrorA".to_string(),
+            Err(TaskFailure {
+                error_name: "ErrorA".to_string(),
                 output: json!({ "Error": "ErrorA" }),
             }),
-            Err(ExecutionError::StateFailed {
-                state: "T".to_string(),
-                error: "ErrorB".to_string(),
+            Err(TaskFailure {
+                error_name: "ErrorB".to_string(),
                 output: json!({ "Error": "ErrorB" }),
             }),
-            Err(ExecutionError::StateFailed {
-                state: "T".to_string(),
-                error: "ErrorB".to_string(),
+            Err(TaskFailure {
+                error_name: "ErrorB".to_string(),
                 output: json!({ "Error": "ErrorB" }),
             }),
             Ok(json!({ "v": 9 })),
@@ -706,7 +1103,9 @@ async fn task_retry_exhausted_no_catch_terminates() {
         .await
         .expect_err("no catch should terminate");
     match err {
-        ExecutionError::StateFailed { error, .. } => assert_eq!(error, "TaskBoom"),
+        ExecutionError::Runtime(RuntimeError::StateFailed { error, .. }) => {
+            assert_eq!(error, "TaskBoom")
+        }
         other => panic!("expected StateFailed, got {other:?}"),
     }
 }
@@ -741,8 +1140,8 @@ async fn task_timeout_with_catch() {
 struct SleepHandler;
 
 #[async_trait::async_trait]
-impl spica_engine::TaskHandler for SleepHandler {
-    async fn run(&self, _resource: &str, _arguments: &Value) -> Result<Value, ExecutionError> {
+impl spica_client::worker::TaskHandler for SleepHandler {
+    async fn run(&self, _resource: &str, _arguments: &Value) -> Result<Value, TaskFailure> {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         Ok(Value::Null)
     }
@@ -821,7 +1220,9 @@ async fn parallel_branch_failure_terminates_execution() {
         .await
         .expect_err("a failing branch should terminate the parallel");
     match err {
-        ExecutionError::StateFailed { error, .. } => assert_eq!(error, "BranchBoom"),
+        ExecutionError::Runtime(RuntimeError::StateFailed { error, .. }) => {
+            assert_eq!(error, "BranchBoom")
+        }
         other => panic!("expected StateFailed, got {other:?}"),
     }
 }
@@ -859,6 +1260,38 @@ async fn parallel_routes_next_after_convergence() {
         .await
         .expect("parallel should route to next after convergence");
     assert_eq!(output, json!({ "branches_count": 2.0 }));
+}
+
+#[tokio::test]
+async fn parallel_branch_assign_reads_parent_and_owns_scope() {
+    // A branch reads a parent-scope variable (`$g`, assigned at the execution scope) and assigns its
+    // own thread-scoped variable, then reads both back within the branch. Exercises finding #6
+    // end-to-end: the branch `Assign` must land on the branch `Thread` (not be silently dropped by
+    // the old execution-only applier) and the thread must inherit the enclosing execution's
+    // variables. A correct result proves both — either failure would error/terminate instead.
+    let sm = parse_sm(
+        r#"{
+          "StartAt": "SetG",
+          "States": {
+            "SetG": { "Type": "Pass", "Assign": { "g": "hi" }, "Next": "Par" },
+            "Par": {
+              "Type": "Parallel",
+              "End": true,
+              "Branches": [
+                { "StartAt": "UseG",
+                  "States": {
+                    "UseG": { "Type": "Pass", "Assign": { "x": 1 }, "Next": "OutG" },
+                    "OutG": { "Type": "Pass", "Output": "{% $g & '-' & $x %}", "End": true }
+                  } }
+              ]
+            }
+          }
+        }"#,
+    );
+    let output = run(&sm, Value::Null)
+        .await
+        .expect("parallel branch assign should succeed");
+    assert_eq!(output, json!(["hi-1"]));
 }
 
 // ── Map state (M3) ───────────────────────────────────────────────────────────
@@ -1006,7 +1439,7 @@ async fn map_item_failure_fails_map() {
         .await
         .expect_err("a failing item should fail the map");
     match err {
-        ExecutionError::StateFailed { error, .. } => {
+        ExecutionError::Runtime(RuntimeError::StateFailed { error, .. }) => {
             assert_eq!(
                 error, "Map item failed",
                 "the map surfaces its own item-failure error (child detail is deferred)"

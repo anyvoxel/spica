@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
 use crate::{ApplierContext, EventApplier};
 
-use crate::id::ActivityId;
+use crate::types::meta::ObjectReference;
 
 /// `StateTransitioned` is a pure "routing resolved" marker; the hop (`ActivateState` /
 /// `CompleteExecution`) is carried by the following `Command`, so there is nothing to fold. No-op,
@@ -17,7 +17,7 @@ pub(crate) struct StateTransitionedApplier;
 impl EventApplier for StateTransitionedApplier {
     fn event(&self) -> Event {
         Event::StateTransitioned {
-            activity: ActivityId::nil(),
+            activity: ObjectReference::nil(),
             next: String::new(),
             output: Default::default(),
         }

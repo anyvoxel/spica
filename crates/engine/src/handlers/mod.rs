@@ -16,43 +16,45 @@ macro_rules! fail_or {
 
 mod activate_state;
 mod activate_task;
-mod activate_timer;
 mod assign_task;
 mod cancel_task;
 mod cancel_timer;
 mod complete_execution;
 mod complete_state;
 mod complete_task;
+mod complete_thread;
 mod create_execution;
 mod create_flow;
 mod dispatch;
 mod fail_task;
 mod process_child_completed;
 mod release_task_lease;
-mod spawn_branch;
+mod spawn_thread;
 mod state_handler;
 mod states;
 mod terminate_execution;
 mod terminate_state;
+mod terminate_thread;
 mod trigger_timer;
 
 pub use activate_state::ActivateStateHandler;
 pub use activate_task::ActivateTaskHandler;
-pub use activate_timer::ActivateTimerHandler;
-pub use assign_task::{AssignTaskHandler, PullTasksHandler};
+pub use assign_task::ClaimTasksHandler;
 pub use cancel_task::CancelTaskHandler;
 pub use cancel_timer::CancelTimerHandler;
 pub use complete_execution::CompleteExecutionHandler;
 pub use complete_state::CompleteStateHandler;
 pub use complete_task::CompleteTaskHandler;
+pub use complete_thread::CompleteThreadHandler;
 pub use create_execution::CreateExecutionHandler;
 pub use create_flow::CreateFlowHandler;
 pub use fail_task::FailTaskHandler;
 pub use process_child_completed::ProcessChildCompletedHandler;
 pub use release_task_lease::ReleaseTaskLeaseHandler;
-pub use spawn_branch::SpawnBranchHandler;
+pub use spawn_thread::SpawnThreadHandler;
 pub use terminate_execution::TerminateExecutionHandler;
 pub use terminate_state::TerminateStateHandler;
+pub use terminate_thread::TerminateThreadHandler;
 pub use trigger_timer::TriggerTimerHandler;
 
 use std::collections::HashMap;
@@ -60,14 +62,14 @@ use std::collections::HashMap;
 use serde_json::Value;
 use spica_asl::{AssignObject, StateMachine};
 
-use crate::command::Command;
-use crate::context::build_states;
-use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::id::ActivityId;
-use crate::{ActivityState, ActivityStatus, ActivityValue, MapActivityState};
+use crate::types::command::{Command, TerminationReason};
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::{Activity, ActivityState, ActivityStatus, MapActivityState};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -78,7 +80,7 @@ pub(super) fn resolve_state<'a>(
 ) -> Result<&'a spica_asl::State, ExecutionError> {
     sm.states
         .get(state_name)
-        .ok_or_else(|| ExecutionError::StateNotFound(state_name.to_string()))
+        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string())))
 }
 
 /// Resolve a `states` table (a `HashMap<String, State>`) within the shared machine document by a
@@ -113,18 +115,22 @@ fn resolve_states_map<'a>(
         }
         // Each descent begins with the `states` opener naming a container state.
         if tokens[i].decoded().as_ref() != "states" {
-            return Err(ExecutionError::InvalidDefinition(format!(
-                "state_path malformed: expected 'states', got '{}'",
-                tokens[i].decoded()
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                format!(
+                    "state_path malformed: expected 'states', got '{}'",
+                    tokens[i].decoded()
+                ),
             )));
         }
         let name = tokens.get(i + 1).ok_or_else(|| {
-            ExecutionError::StateNotFound("state_path truncated at state name".into())
+            ExecutionError::Runtime(RuntimeError::StateNotFound(
+                "state_path truncated at state name".into(),
+            ))
         })?;
         let name = name.decoded();
-        let state = states
-            .get(name.as_ref())
-            .ok_or_else(|| ExecutionError::StateNotFound(name.as_ref().to_string()))?;
+        let state = states.get(name.as_ref()).ok_or_else(|| {
+            ExecutionError::Runtime(RuntimeError::StateNotFound(name.as_ref().to_string()))
+        })?;
         i += 2; // consumed "states" + <name>
         match state {
             // A `Parallel` descent names a branch: `branches/<idx>`, which yields that branch's
@@ -133,24 +139,28 @@ fn resolve_states_map<'a>(
                 // `Cow<str> == &str` compares the decoded token against the literal without building
                 // a borrowed reference to a temporary.
                 if !tokens.get(i).is_some_and(|t| t.decoded() == "branches") {
-                    return Err(ExecutionError::InvalidDefinition(
+                    return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "state_path malformed: expected 'branches'".into(),
-                    ));
+                    )));
                 }
                 let idx: usize = tokens
                     .get(i + 1)
                     .ok_or_else(|| {
-                        ExecutionError::StateNotFound("state_path truncated at branch index".into())
+                        ExecutionError::Runtime(RuntimeError::StateNotFound(
+                            "state_path truncated at branch index".into(),
+                        ))
                     })?
                     .decoded()
                     .parse()
                     .map_err(|_| {
-                        ExecutionError::InvalidDefinition(
+                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "state_path branch index is not an integer".into(),
-                        )
+                        ))
                     })?;
                 let branch = p.branches.get(idx).ok_or_else(|| {
-                    ExecutionError::StateNotFound(format!("branch index {idx} of state {name}"))
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "branch index {idx} of state {name}"
+                    )))
                 })?;
                 i += 2; // consumed "branches" + <idx>
                 states = &branch.states;
@@ -163,14 +173,14 @@ fn resolve_states_map<'a>(
                     .get(i)
                     .is_some_and(|t| t.decoded() == "item_processor")
                 {
-                    return Err(ExecutionError::InvalidDefinition(
+                    return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "state_path malformed: expected 'item_processor'".into(),
-                    ));
+                    )));
                 }
                 let processor = m.item_processor.as_ref().ok_or_else(|| {
-                    ExecutionError::InvalidDefinition(format!(
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                         "Map state '{name}' has no item_processor"
-                    ))
+                    )))
                 })?;
                 i += 1; // consumed "item_processor"
                 states = &processor.states;
@@ -178,8 +188,8 @@ fn resolve_states_map<'a>(
             // Any other state type cannot be descended into — the pointer must always name a child
             // of a container state.
             _ => {
-                return Err(ExecutionError::InvalidDefinition(format!(
-                    "state_path step '{name}' is not a Parallel or Map state"
+                return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    format!("state_path step '{name}' is not a Parallel or Map state"),
                 )));
             }
         }
@@ -188,43 +198,90 @@ fn resolve_states_map<'a>(
     }
 }
 
-/// Resolve a state definition for the execution owning the current activity, honoring a child
-/// execution's `state_path`: a Parallel-branch child resolves its state within the shared
-/// machine at the pointer location (one flat lookup, no parent/root query); a top-level execution
-/// falls back to the machine's top-level `states`. Asynchronous because it reads the owning
-/// execution's row to discover the pointer.
+/// Resolve a state definition for the scope owning the current activity, honoring a scope's
+/// `state_path`: a `Thread` (Parallel-branch / Map-item child) resolves its state within the shared
+/// machine at the pointer location (one flat lookup, no parent/root query); a top-level `Execution`
+/// falls back to the machine's top-level `states`. The `scope` is a loaded [`ScopeRecord`], so the
+/// caller (which already resolved the owning scope) passes it — no second storage read.
 pub(super) async fn resolve_state_for<'a>(
-    storage: &dyn crate::storage::Storage,
     sm: &'a StateMachine,
-    execution: crate::id::ExecutionId,
+    scope: &crate::storage::ScopeRecord,
     state_name: &str,
 ) -> Result<&'a spica_asl::State, ExecutionError> {
-    let Some(exec) = storage.get_execution(execution).await.ok().flatten() else {
-        return Err(ExecutionError::StateNotFound(format!(
-            "execution {execution}"
-        )));
-    };
-    match &exec.state_path {
-        // Child Parallel-branch execution: resolve within its branch's `states` table.
+    match scope.state_path() {
+        // Thread: resolve within its branch/item_processor's `states` table.
         Some(pointer) => {
             let states = resolve_states_map(sm, pointer.as_ptr())?;
-            states
-                .get(state_name)
-                .ok_or_else(|| ExecutionError::StateNotFound(state_name.to_string()))
+            states.get(state_name).ok_or_else(|| {
+                ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string()))
+            })
         }
         // Top-level execution: the machine's top-level `states`.
         None => resolve_state(sm, state_name),
     }
 }
 
-/// Loads the owning [`crate::storage::Execution`] for a state-ish command. Returns `Ok(None)` when
+/// Resolve a state definition by its full `state_path` (a JSON Pointer from the machine root to the
+/// state: `/states/<name>` for a top-level state, or `/states/.../branches/<idx>/<name>` for a branch /
+/// item). The carried path makes `Command::ActivateState` self-locating — the lookup no longer infers
+/// the enclosing `states` table from the owning scope's stored `state_path`. A top-level path is
+/// exactly `/states/<leaf>` (two tokens) and maps to the machine root; any deeper path's parent is a
+/// container's `states` table, resolved via `resolve_states_map`.
+pub(crate) fn resolve_state_from_path<'a>(
+    sm: &'a StateMachine,
+    state_path: &jsonptr::Pointer,
+) -> Result<&'a spica_asl::State, ExecutionError> {
+    let leaf = state_name_from_path(state_path);
+    if state_path.tokens().count() == 2 {
+        // `/states/<leaf>` — a top-level state, resolved against the machine's top-level `states`.
+        return resolve_state(sm, &leaf);
+    }
+    let mut parent = state_path.to_owned();
+    parent.pop_back();
+    let states = resolve_states_map(sm, parent.as_ptr())?;
+    states
+        .get(&leaf)
+        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(leaf)))
+}
+
+/// Loads the owning [`crate::storage::ExecutionRecord`] for a state-ish command. Returns `Ok(None)` when
 /// the owning node is gone (already terminal) — the caller treats that as an idempotent no-op rather
 /// than a failure.
 pub(super) async fn load_execution(
     storage: &dyn crate::storage::Storage,
-    execution: crate::id::ExecutionId,
-) -> Result<Option<crate::storage::Execution>, ExecutionError> {
+    execution: &ObjectReference,
+) -> Result<Option<crate::storage::ExecutionRecord>, ExecutionError> {
     storage.get_execution(execution).await
+}
+
+/// Direct a terminal failure (or abort) at the scope that owns the given activity: a top-level run is
+/// an `Execution` (name+uid-addressed `TerminateExecution`), while a `Parallel` branch / `Map` item
+/// is owned by a `Thread`, which lives in **thread** storage and is only reachable via the
+/// reference-addressed `TerminateThread`. Centralizing this branch keeps every terminal-fail site
+/// (state `Fail`, parallel/map converge-fail, task fail, timer abort) from re-discovering that the
+/// two store kinds address differently — a bare `TerminateExecution` silently misses a Thread and
+/// leaves the branch Running, wedging its container.
+pub(super) fn emit_scope_termination(
+    out: &mut Collector,
+    scope: &ObjectReference,
+    reason: TerminationReason,
+) {
+    match scope.kind {
+        ObjectKind::Execution => out.emit_command(Command::TerminateExecution {
+            name: scope.name.clone(),
+            uid: Some(scope.uid),
+            reason,
+        }),
+        ObjectKind::Thread => out.emit_command(Command::TerminateThread {
+            thread: scope.clone(),
+            reason,
+        }),
+        _ => {
+            // An activity is always owned by a scope; terminating into any other owner is an
+            // internal fault with nowhere to route — nothing to emit, the failure is dropped.
+            tracing::error!(owner = %scope, "terminal fail on a non-scope owner; cannot terminate");
+        }
+    }
 }
 
 /// Cancel every active timer child of `activity`. Used by the task **settlement** handlers
@@ -243,28 +300,36 @@ pub(super) async fn load_execution(
 pub(super) async fn cancel_activity_timers(
     ctx: &HandlerContext<'_>,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
 ) {
-    let Some(act) = ctx.storage.get_activity(activity).await.ok().flatten() else {
+    let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
         return; // activity already gone — nothing to sweep.
     };
     for child in act.active_children {
-        let crate::id::NodeId::Timer(timer) = child else {
+        if child.kind != ObjectKind::Timer {
             continue; // only timer children matter here (M1 task activities own none other).
-        };
-        let Some(t) = ctx.storage.get_timer(timer).await.ok().flatten() else {
+        }
+        let Some(t) = ctx.storage.get_timer(&child).await.ok().flatten() else {
             continue;
         };
         if t.value.status != crate::TimerStatus::Active {
             continue; // already terminal — a fired/cancelled timer is no longer a live child.
         }
-        out.emit_event(crate::event::Event::TimerCancelled {
-            timer: crate::TimerValue {
-                id: t.value.id,
-                parent: t.value.parent,
+        out.emit_event(crate::types::event::Event::TimerCancelled {
+            timer: crate::Timer {
+                execution: t.value.execution.clone(),
                 purpose: t.value.purpose,
                 status: crate::TimerStatus::Cancelled,
                 deadline: t.value.deadline,
+                // Carry the timer's full meta (name/uid/created_at/owner) forward. A timer may be
+                // custom-named (`{execution.name}-{suffix}`); reconstructing it via
+                // `placeholder_with_times` would re-derive `obj-<uid>` and break the child-edge
+                // removal. Stamp the cancel moment as `updated_at`.
+                meta: {
+                    let mut m = t.value.meta.clone();
+                    m.touch(crate::log::Timestamp::now());
+                    m
+                },
             },
         });
     }
@@ -275,7 +340,7 @@ pub(super) fn eval_string_or_expr(
     env: &mut EvalEnv,
     s: &str,
     states: &Value,
-    variables: &crate::variables::Variables,
+    variables: &crate::types::variables::Variables,
 ) -> Result<Value, ExecutionError> {
     match crate::eval_env::extract_jsonata(s) {
         Some(inner) => env.eval_expr(inner, states, variables),
@@ -284,7 +349,7 @@ pub(super) fn eval_string_or_expr(
 }
 
 /// The leaf name of the state a JSON Pointer locates — the pointer's final (decoded) token. For the
-/// `state_path` carried on an [`Activity`](crate::storage::Activity)/`ActivityCtx`, this is the state's
+/// `state_path` carried on an [`Activity`](crate::storage::ActivityRecord)/`ActivityCtx`, this is the state's
 /// name in its enclosing `states` table. Returns the empty string for an empty (document-root) path —
 /// a shape that should never reach a state handler, but kept total. `jsonptr`'s [`decoded`] API only
 /// yields a `Cow` tied to a transient token borrow, so we resolve the leaf to an owned `String` here —
@@ -299,15 +364,21 @@ pub(crate) fn state_name_from_path(path: &jsonptr::Pointer) -> String {
 
 /// Emits the [`crate::Event::StateActivating`] event for the activity being entered.
 ///
-/// The event carries the full entity-shaped [`ActivityValue`], not only ids/fields for the current
-/// step, so a follower can rebuild the same domain activity object from the stream alone.
-pub(super) fn state_activating(actx: &ActivityCtx, _activity: ActivityId) -> Event {
-    Event::StateActivating {
-        activity: actx.activity.clone(),
-    }
+/// The event carries the full entity-shaped [`Activity`], not only ids/fields for the current
+/// step, so a follower can rebuild the same domain activity object from the stream alone. It does
+/// **not** carry the processed `input`: at the entering (`ing`) moment the state has only received
+/// its **raw** input (kept in `raw_input`), and the state's own activate — which emits
+/// `StateActivated` — computes and carries the processed view. So `input` is pinned to `Null` here
+/// and the meaningful value moves with `StateActivated`.
+pub(super) fn state_activating(actx: &ActivityCtx, _activity: ObjectReference) -> Event {
+    let mut activity = actx.activity.clone();
+    // The processed input isn't determined until the state finishes activating (`StateActivated`);
+    // never carry/trust it on the entering event — the raw input (in `raw_input`) is all that's real.
+    activity.input = Value::Null;
+    Event::StateActivating { activity }
 }
 
-/// Build a new [`ActivityValue`] from the current context, replacing only the fields the lifecycle
+/// Build a new [`Activity`] from the current context, replacing only the fields the lifecycle
 /// step just changed. This keeps every lifecycle emitter updating the same entity payload shape.
 pub(super) fn activity_value_with(
     actx: &ActivityCtx,
@@ -316,12 +387,15 @@ pub(super) fn activity_value_with(
     activity_state: Option<ActivityState>,
     raw_output: Option<Option<Value>>,
     output: Option<Option<Value>>,
-) -> ActivityValue {
-    ActivityValue {
-        id: actx.activity.id,
-        execution: actx.activity.execution,
-        root_execution: actx.activity.root_execution,
-        parent: actx.activity.parent,
+) -> Activity {
+    // Carry the activity's `meta` forward (its `created_at` = birth moment and `uid`) and
+    // re-stamp `updated_at` to the transition moment — the meta-level equivalent of the old
+    // `created_at` forward + `updated_at` re-stamp.
+    let mut meta = actx.activity.meta.clone();
+    meta.touch(crate::log::Timestamp::now());
+    Activity {
+        meta,
+        execution: actx.activity.execution.clone(),
         state_path: actx.activity.state_path.clone(),
         status: status.unwrap_or_else(|| actx.activity.status.clone()),
         raw_input: actx.activity.raw_input.clone(),
@@ -339,19 +413,21 @@ pub(super) fn state_activated_value(
     actx: &ActivityCtx,
     input: Value,
     plan: Option<MapActivityState>,
-) -> ActivityValue {
+) -> Activity {
     let activity_state = plan.map(ActivityState::Map);
     activity_value_with(actx, None, Some(input), activity_state, None, None)
 }
 
 /// Build the `StateCompleted` payload by fixing the final projected output on the activity value.
-pub(super) fn state_completed_value(actx: &ActivityCtx, output: Value) -> ActivityValue {
+/// The projected `output` travels on this event; `raw_output` (the pre-`Output` raw result) is
+/// written alongside it so the complete step carries both views and never drops one to `null`.
+pub(super) fn state_completed_value(actx: &ActivityCtx, output: Value) -> Activity {
     activity_value_with(
         actx,
         Some(ActivityStatus::Completed),
         None,
         None,
-        None,
+        Some(Some(state_raw_result(actx))),
         Some(Some(output)),
     )
 }
@@ -360,8 +436,8 @@ pub(super) fn state_completed_value(actx: &ActivityCtx, output: Value) -> Activi
 /// status.
 pub(super) fn state_terminating_value(
     actx: &ActivityCtx,
-    reason: crate::command::TerminationReason,
-) -> ActivityValue {
+    reason: crate::types::command::TerminationReason,
+) -> Activity {
     activity_value_with(
         actx,
         Some(ActivityStatus::Terminating(reason)),
@@ -376,8 +452,8 @@ pub(super) fn state_terminating_value(
 /// status.
 pub(super) fn state_terminated_value(
     actx: &ActivityCtx,
-    reason: crate::command::TerminationReason,
-) -> ActivityValue {
+    reason: crate::types::command::TerminationReason,
+) -> Activity {
     activity_value_with(
         actx,
         Some(ActivityStatus::Terminated(reason)),
@@ -388,14 +464,30 @@ pub(super) fn state_terminated_value(
     )
 }
 
-/// Build the `StateCompleting` payload by flipping only the lifecycle status.
-pub(super) fn state_completing_value(actx: &ActivityCtx) -> ActivityValue {
+/// The raw result a state produced before any complete-step `Output` projection — the canonical
+/// `$states.result`. For a state whose raw result *is* a distinct value (a Task's worker payload,
+/// kept in `raw_output`) that value wins; for a synchronous state with no distinct raw result it
+/// defaults to the processed input. This is exactly the derivation `complete_activity` uses, hoisted
+/// so the complete-step *events* (not the computation) can carry the same value.
+pub(crate) fn state_raw_result(actx: &ActivityCtx) -> Value {
+    actx.activity
+        .raw_output
+        .clone()
+        .unwrap_or_else(|| actx.activity.input.clone())
+}
+
+/// Build the `StateCompleting` payload by flipping only the lifecycle status. Unlike the input side
+/// (`StateActivating` pins `input` to `Null` because the *processed* view isn't determined until
+/// `StateActivated`), `raw_output` is already known here — the raw result is derivable purely from
+/// the activity (`raw_output` else `input`) with no completion-time computation — so the entering
+/// event carries it rather than the logging-information hole the design review flagged.
+pub(super) fn state_completing_value(actx: &ActivityCtx) -> Activity {
     activity_value_with(
         actx,
         Some(ActivityStatus::Completing),
         None,
         None,
-        None,
+        Some(Some(state_raw_result(actx))),
         None,
     )
 }
@@ -408,38 +500,94 @@ pub(super) fn state_completing_value(actx: &ActivityCtx) -> ActivityValue {
 /// stream ahead of the command that carries it (`Command::ActivateState` allocates the successor's
 /// activity id internally, so the marker can only name the state, not the new activity). On
 /// `NoTerminal` the failure is recorded via `out`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_transition(
     out: &mut Collector,
-    execution: crate::id::ExecutionId,
-    activity: ActivityId,
+    execution: ObjectReference,
+    owner: ObjectReference,
+    activity: ObjectReference,
+    activity_state_path: &jsonptr::PointerBuf,
     output: &Value,
     next: Option<&str>,
     end: Option<bool>,
 ) {
     if end == Some(true) {
         // Terminal hop: no next state to route to, so there's no `StateTransitioned` marker — just
-        // fold the top-level output and complete the execution.
-        out.emit_command(Command::CompleteExecution {
-            id: execution,
-            output: output.clone(),
-        });
+        // fold the output and complete the *scope*. The scope kind decides the verb: a **branch's**
+        // terminal state completes its fan-out `Thread` (`CompleteThread`, converged by the owning
+        // container Activity), while a **top-level** state completes the `Execution`
+        // (`CompleteExecution`). Both are scoped, so they take the `owner`, not the top-level anchor.
+        if owner.kind == ObjectKind::Thread {
+            out.emit_command(Command::CompleteThread {
+                thread: owner,
+                output: output.clone(),
+            });
+        } else {
+            out.emit_command(Command::CompleteExecution {
+                execution: owner,
+                output: output.clone(),
+            });
+        }
     } else if let Some(next) = next {
-        // Allocate the successor id before `emit_command` to avoid a double mutable borrow of `out`.
-        let next_activity = out.next_activity();
-        out.emit_event(crate::event::Event::StateTransitioned {
+        // The successor's activity id is allocated inside the `ActivateState` handler (see its
+        // doc); this marker names only the target state, so nothing is minted here.
+        out.emit_event(crate::types::event::Event::StateTransitioned {
             activity,
             next: next.to_string(),
             output: output.clone(),
         });
+        // The successor lives as a sibling of the completing state in the same enclosing `states`
+        // table — that table is the completing activity's `state_path` minus its own leaf.
+        let mut next_path = activity_state_path.clone();
+        next_path.pop_back();
+        next_path.push_back(next);
         out.emit_command(Command::ActivateState {
             execution,
-            activity: next_activity,
-            state: next.to_string(),
+            owner,
+            state_path: next_path,
             input: output.clone(),
         });
     } else {
-        out.terminate(Some(activity), execution, ExecutionError::NoTerminal);
+        out.terminate(
+            Some(activity),
+            execution,
+            ExecutionError::Runtime(RuntimeError::NoTerminal),
+        );
     }
+}
+
+/// Mint and arm a timer inline: allocate its uid (`out.next_timer()`) and derive a generated name
+/// (`{execution.name}-{8-char-suffix}`) from the owning execution, then emit `Event::TimerActivated`
+/// — the fact that both folds the timer row and arms the physical deadline (see
+/// `TimerActivatedApplier`). Inlined rather than a `Command` so the arm lands in the same causal
+/// batch as the state decision that triggers it (create_execution already does this for its
+/// ExecutionTimeout). The name is decoupled from the timer's `uid` and must be carried forward by
+/// later timer events (`TimerTriggered`/`TimerCancelled` preserve the row's meta instead of
+/// re-deriving it).
+pub(super) fn emit_timer(
+    out: &mut Collector,
+    execution: ObjectReference,
+    owner: ObjectReference,
+    purpose: crate::types::command::TimerPurpose,
+    deadline: crate::log::Timestamp,
+) {
+    let timer_uid: ulid::Ulid = out.next_timer().into();
+    let timer_name = execution.name.base().to_generated();
+    out.emit_event(Event::TimerActivated {
+        timer: crate::Timer {
+            execution,
+            purpose,
+            status: crate::TimerStatus::Active,
+            deadline,
+            meta: crate::types::meta::ObjectMeta::born_named(
+                ObjectKind::Timer,
+                timer_name,
+                timer_uid,
+                crate::log::Timestamp::now(),
+            )
+            .with_owner(owner),
+        },
+    });
 }
 
 /// Shared tail of a successful state completion (Wait resume; Pass/Succeed/Choice now carry their
@@ -457,7 +605,7 @@ pub(super) fn emit_transition(
 pub(super) fn complete_activity(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     assign: Option<&AssignObject>,
     output: Option<&Value>,
@@ -494,7 +642,11 @@ pub(super) fn complete_activity(
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -504,7 +656,12 @@ pub(super) fn complete_activity(
                         local_scope.insert(k, v);
                     }
                     out.emit_event(Event::VariablesAssigned {
-                        execution: actx.activity.execution,
+                        scope: actx
+                            .activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
                     });
                 }
@@ -512,10 +669,14 @@ pub(super) fn complete_activity(
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -526,7 +687,11 @@ pub(super) fn complete_activity(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_scope)
         ),
         None => raw_result.clone(),
@@ -538,8 +703,14 @@ pub(super) fn complete_activity(
 
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output_value,
         next,
         end,

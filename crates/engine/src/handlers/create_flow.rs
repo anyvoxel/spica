@@ -3,25 +3,25 @@
 use async_trait::async_trait;
 
 use crate::RejectionType;
-use crate::command::Command;
-use crate::event::Event;
-use crate::flow::Flow;
-use crate::flow::FlowStatus;
-use crate::flow_version::FlowVersion;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::id::{FlowName, FlowVersionId, RequestId};
 use crate::log::Timestamp;
+use crate::types::command::Command;
+use crate::types::event::Event;
+use crate::types::flow::Flow;
+use crate::types::flow::FlowStatus;
+use crate::types::flow_version::FlowVersion;
+use crate::types::id::{FlowName, RequestId};
 
 /// Handles the creation of a new flow **definition** (a new [`FlowName`] with its first immutable
 /// version).
 ///
 /// This is the CCES analogue of Zeebe's Deployment processing: the single place a full definition
-/// enters the system for a **new** name. The handler assigns every identity — minting a fresh audit
-/// [`FlowId`](crate::id::FlowId), a [`FlowVersionId`] (the identity executions bind to), and the
-/// first `version` ordinal (`1`) — then emits both [`Event::FlowCreated`] (the flow aggregate's
-/// birth) and [`Event::FlowVersionCreated`] (this first version) in one atomic command batch. From
-/// then on, executions reference only a `flow_version_id` and the machine is resolved from Storage
-/// by id, never carried in a command again.
+/// enters the system for a **new** name. The handler assigns the durable identity — minting a fresh
+/// version reference (its `{flow_name}-{version}` object name plus a never-reused `uid`, the
+/// identity executions bind to, at the first `version` ordinal (`1`)) — then emits both
+/// [`Event::FlowCreated`] (the flow aggregate's birth) and [`Event::FlowVersionCreated`]
+/// (this first version) in one atomic command batch. From then on, executions reference only a
+/// version reference and the machine is resolved from Storage by it, never carried in a command again.
 ///
 /// `CreateFlow` is **only** for a new name: the [`Engine::create_flow`](crate::Engine::create_flow)
 /// boundary pre-checks (and rejects) an existing name before appending, and the handler re-checks
@@ -95,28 +95,36 @@ impl CommandHandler for CreateFlowHandler {
             return;
         }
 
-        // Assign every durable identity (the handler is the sole identity-assigner): the flow's audit
-        // `flow_id` and this version's `flow_version_id` are minted fresh; a new flow's first version
-        // is always ordinal 1. `created_at` is stamped now and carried on both rows.
-        let flow_id = crate::id::FlowId::new();
-        let flow_version_id = FlowVersionId::new();
+        // Assign the durable identity (the handler is the sole identity-assigner): both the flow and
+        // this first version mint a never-reused `uid`. Every object carries an independent uid —
+        // the name is the addressing key, the uid the sameness/incarnation key (k8s-style). A new
+        // flow's first version is always ordinal 1 (its object name `{flow_name}-1`); the flow's
+        // `meta.uid` is a distinct fresh ulid from the version's. `created_at` is stamped now and
+        // carried on both rows.
+        let flow_uid = ulid::Ulid::new();
+        let flow_version = FlowVersion::version_name(name, 1);
+        let flow_version_uid = ulid::Ulid::new();
         let created_at = Timestamp::now();
-        tracing::info!(name = %name, %flow_id, %flow_version_id, "flow with first version created");
+        tracing::info!(name = %name, uid = %flow_uid, version = %flow_version, "flow with first version created");
 
         // Emit the flow's birth and its first version in one atomic batch (same cause/stream). The
         // StreamProcessor routes the caller's ack on `FlowVersionCreated` (see `Event::FlowVersionCreated`).
         out.emit_event(Event::FlowCreated {
             request_id: *request_id,
             flow: Flow {
-                flow_id,
-                name: name.clone(),
-                created_at,
-                // A flow is born at `created_at`; its update time starts there too (later versions
-                // advance `updated_at` via the version applier).
-                updated_at: created_at,
+                // The flow carries its real, user-supplied name (the primary key) plus a fresh
+                // `meta.uid` — every object has an independent incarnation id.
+                meta: crate::types::meta::ObjectMeta::born_named(
+                    crate::types::meta::ObjectKind::Flow,
+                    crate::types::meta::ObjectName::plain(name.as_str())
+                        .expect("a valid FlowName is a valid user object name"),
+                    flow_uid,
+                    created_at,
+                ),
                 status: FlowStatus::Active,
-                // A flow is born with its first version; the version applier reconciles this pointer.
-                latest_flow_version_id: flow_version_id,
+                // A flow is born with its first version (ordinal 1); the version applier advances
+                // this counter on later publishes.
+                latest_version: 1,
             },
         });
         // The CreateFlow caller awaits the request echoed on `FlowVersionCreated` (this version's
@@ -125,12 +133,22 @@ impl CommandHandler for CreateFlowHandler {
         let version_event = Event::FlowVersionCreated {
             request_id: *request_id,
             flow_version: FlowVersion {
-                flow_version_id,
-                flow_id,
-                name: name.clone(),
+                // A flow version is owned by its flow: the meta carries an owner reference to the
+                // owning `Flow` (same scope, inherited) bundling the flow's own name and uid.
+                meta: crate::types::meta::ObjectMeta::born_named(
+                    crate::types::meta::ObjectKind::FlowVersion,
+                    flow_version,
+                    flow_version_uid,
+                    created_at,
+                )
+                .with_owner(crate::types::meta::OwnerReference::new(
+                    crate::types::meta::ObjectKind::Flow,
+                    crate::types::meta::ObjectName::plain(name.as_str())
+                        .expect("a valid FlowName is a valid user object name"),
+                    flow_uid,
+                )),
                 version: 1,
                 definition: definition.clone(),
-                created_at,
             },
         };
         out.ack_request(*request_id, version_event.clone());

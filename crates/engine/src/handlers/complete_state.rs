@@ -8,10 +8,10 @@ use super::resolve_state_for;
 use super::state_completing_value;
 use super::state_handler::StateHandler;
 use crate::ActivityStatus;
-use crate::command::Command;
-use crate::error::ExecutionError;
 use crate::handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
-use crate::id::NodeId;
+use crate::types::command::Command;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::meta::ObjectKind;
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching [`StateHandler::complete`], which emits the projection
@@ -33,21 +33,27 @@ impl CompleteStateHandler {
         &self,
         ctx: &HandlerContext<'_>,
         out: &mut Collector,
-        activity: crate::id::ActivityId,
+        activity: crate::types::meta::ObjectReference,
     ) {
         // A synchronous state that owns no children drains its parent Execution as soon as its own
         // terminal lands; notify the parent so its own handler walks the drain.
         let parent = ctx
             .storage
-            .get_activity(activity)
+            .get_activity(&activity)
             .await
             .ok()
             .flatten()
-            .map(|a| a.value.parent);
+            .map(|a| {
+                a.value
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("an owned activity has an owner")
+            });
         if let Some(parent) = parent {
-            out.emit_command(crate::command::Command::ProcessChildCompleted {
+            out.emit_command(crate::types::command::Command::ProcessChildCompleted {
                 parent,
-                child: NodeId::Activity(activity),
+                child: activity,
             });
         }
     }
@@ -63,28 +69,39 @@ impl Default for CompleteStateHandler {
 impl CommandHandler for CompleteStateHandler {
     fn command(&self) -> Command {
         Command::CompleteState {
-            activity: crate::id::ActivityId::nil(),
+            activity: crate::types::meta::ObjectReference::nil(),
+            output: serde_json::Value::Null,
         }
     }
 
     async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
-        let Command::CompleteState { activity } = cmd else {
+        let Command::CompleteState {
+            activity,
+            output: raw_result,
+        } = cmd
+        else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
             );
         };
-        let act = match ctx.storage.get_activity(*activity).await {
+        let act = match ctx.storage.get_activity(activity).await {
             Ok(Some(a)) => a,
             Ok(None) => {
                 out.terminate(
-                    Some(*activity),
-                    crate::id::ExecutionId::nil(),
-                    ExecutionError::StateNotFound(format!("activity {activity}")),
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "activity {activity}"
+                    ))),
                 );
                 return;
             }
             Err(e) => {
-                out.terminate(Some(*activity), crate::id::ExecutionId::nil(), e);
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    e,
+                );
                 return;
             }
         };
@@ -101,13 +118,13 @@ impl CommandHandler for CompleteStateHandler {
                     // from `Terminating(reason)` to `Terminated(reason)`.
                     let mut activity_value = act.value();
                     activity_value.status = ActivityStatus::Terminated(reason.clone());
-                    out.emit_event(crate::event::Event::StateTerminated {
+                    out.emit_event(crate::types::event::Event::StateTerminated {
                         activity: activity_value,
                     });
                 }
                 _ => return,
             }
-            self.cascade_parent_after_terminal(ctx, out, *activity)
+            self.cascade_parent_after_terminal(ctx, out, activity.clone())
                 .await;
             return;
         }
@@ -117,54 +134,73 @@ impl CommandHandler for CompleteStateHandler {
             return;
         }
 
-        let execution = match &act.value.parent {
-            NodeId::Execution(e) => *e,
-            NodeId::Activity(_) => {
+        let parent = act
+            .value
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner");
+        // The activity's owner is its *scope* — the top-level `Execution` or a fan-out `Thread`.
+        // Resolve which, then drive the complete step against that scope's machine/state/context.
+        let scope_ref = match parent.kind {
+            ObjectKind::Execution | ObjectKind::Thread => parent.clone(),
+            ObjectKind::Activity => {
                 out.terminate(
-                    Some(*activity),
-                    crate::id::ExecutionId::nil(),
-                    ExecutionError::InvalidDefinition(
-                        "activity parent must be an Execution in M1".into(),
-                    ),
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                        "activity parent must be a scope (Execution or Thread)".into(),
+                    )),
                 );
                 return;
             }
-            NodeId::Timer(_) => unreachable!(),
-            // M1 activities are only ever owned by an Execution. A task (M2) is a leaf with no
-            // activity parent, so this too is unreachable in M1.
-            NodeId::Task(_) => unreachable!("activity parent cannot be a Task in M1"),
+            ObjectKind::Timer => unreachable!(),
+            // M1 activities are only ever owned by a scope. A task (M2) is a leaf with no
+            // activity parent, so this too is unreachable in M1 (as is any non-node kind).
+            _ => unreachable!("activity parent cannot be a Task or non-scope in M1"),
         };
-        let exec = match super::load_execution(ctx.storage, execution).await {
-            Ok(Some(e)) => e,
-            Ok(None) => return, // owning execution already gone — nothing to complete into.
+        let scope = match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // owning scope already gone — nothing to complete into.
             Err(_) => return,
         };
-        if exec.status.is_terminal() || exec.status.is_terminating() {
-            return; // owner is past acceptance; a late CompleteState is a no-op.
+        if !scope.is_running() {
+            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
         }
 
         let actx = ActivityCtx {
             // Rehydrate the same entity-shaped activity value lifecycle events carry, so the
             // complete step observes the canonical domain payload rather than the projection-only row.
-            activity: act.value(),
-            execution_state_path: exec.state_path.clone(),
-            exec_input: exec.input.clone(),
-            variables: exec.variables.clone(),
+            //
+            // The command's `output` is the state's raw result; fold it onto the rehydrated activity
+            // as `raw_output` so the complete-step events (`state_completing_value`/
+            // `state_completed_value` via `state_raw_result`) and `complete_activity`'s
+            // `$states.result` all record the command-carried result — the complete step is
+            // self-contained and no longer depends on the `TaskCompleted` projection fold to have
+            // landed `raw_output` first.
+            activity: {
+                let mut a = act.value();
+                a.raw_output = Some(raw_result.clone());
+                a
+            },
+            execution_state_path: scope.state_path().cloned(),
+            exec_input: scope.input().clone(),
+            variables: scope.variables().clone(),
             kind: CtxKind::Complete,
         };
-        // Resolve the machine revision this execution is bound to. First use of a revision in a
+        // Resolve the machine revision this scope is bound to. First use of a revision in a
         // fresh StreamProcessor loads it from storage into the cache.
         let sm = fail_or!(
             out,
-            Some(*activity),
-            execution,
-            ctx.machine(exec.flow_version_id).await
+            Some(activity.clone()),
+            scope_ref.clone(),
+            ctx.machine_for_scope(&scope).await
         );
         let state_def = fail_or!(
             out,
-            Some(*activity),
-            execution,
-            resolve_state_for(ctx.storage, &sm, execution, &actx.state_name()).await
+            Some(activity.clone()),
+            scope_ref.clone(),
+            resolve_state_for(&sm, &scope, &actx.state_name()).await
         );
 
         // `StateCompleting` (the ing) is emitted by the framework on entering the success-finish
@@ -172,16 +208,18 @@ impl CommandHandler for CompleteStateHandler {
         // activate step. The state's `complete` then emits the ed (`StateCompleted`) after it has
         // projected `Assign`/`Output`, and routes via `emit_transition` (`StateTransitioned` +
         // command). This keeps the ing uniform across states regardless of their output handling.
-        out.emit_event(crate::event::Event::StateCompleting {
+        out.emit_event(crate::types::event::Event::StateCompleting {
             activity: state_completing_value(&actx),
         });
 
         match self.state_handlers.get(&std::mem::discriminant(state_def)) {
-            Some(handler) => handler.complete(ctx.env, out, *activity, &actx, state_def),
+            Some(handler) => handler.complete(ctx.env, out, activity.clone(), &actx, state_def),
             None => out.terminate(
-                Some(*activity),
-                execution,
-                ExecutionError::InvalidDefinition("state type not supported in M1".into()),
+                Some(activity.clone()),
+                scope_ref.clone(),
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    "state type not supported in M1".into(),
+                )),
             ),
         }
     }

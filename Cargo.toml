@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/asl", "crates/engine", "crates/logstream", "crates/proto", "crates/scheduler", "crates/server", "crates/storage", "crates/task-service", "crates/cli"]
+members = ["crates/asl", "crates/client", "crates/engine", "crates/logstream", "crates/machinery", "crates/proto", "crates/scheduler", "crates/server", "crates/storage", "crates/cli"]
 resolver = "2"
 
 [workspace.package]
@@ -22,12 +22,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_with = "3.21.0"
 spica-asl = { path = "crates/asl" }
+spica-client = { path = "crates/client" }
 spica-engine = { path = "crates/engine" }
 spica-logstream = { path = "crates/logstream" }
+spica-machinery = { path = "crates/machinery" }
 spica-proto = { path = "crates/proto" }
 spica-scheduler = { path = "crates/scheduler" }
 spica-storage = { path = "crates/storage" }
-spica-task-service = { path = "crates/task-service" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = "0.1"

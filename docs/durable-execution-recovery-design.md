@@ -100,70 +100,108 @@ The primary model is the **single scalar `lastProcessedPosition`**, adopted from
 
 ### 4.1 The single scalar `lastProcessedPosition` (`W`)
 
-Recovery is anchored on **one number** — `lastProcessedPosition` (`W`), the highest **command**
-position whose effects (including the events it produced) have been applied to the projection. It is
-persisted as a single scalar in Storage (§6); everything else derives from it.
+Recovery is anchored on **one number** — `lastProcessedPosition` (`W`), the highest log position whose
+effects (the batch that produced them) have been applied to the projection. It is persisted as a
+single scalar in Storage (§6); everything else derives from it.
 
-The watermark unit is a **command position**, not an event position, matching how the log is
-consumed: a command at position `p` emits a causally-linked batch starting at `p+1`, and every entry
-records `cause_id = Some(p)` (the `Collector` stamps `cause_id` = the position of the command being
-handled). So an `Event`'s `cause_id` names the command whose effects are now applied once that event
-is folded.
+The watermark unit is a **batch boundary**, not a bare command or event position — because every
+non-empty command batch is terminated by a dedicated `EntryPayload::Noop` entry appended atomically
+with the batch itself (`crates/engine/src/types/entry.rs`). This is the MySQL-binlog / Kafka
+batch-end-marker analogue: "batch in log ⟺ its terminating `Noop` in log" is guaranteed by append
+atomicity, so the `Noop` gives each atomic append a stable, GTID-like identity (its envelope's
+`cause_id` is the producing command's position). Advanced to the `Noop`, `W` means "everything at or
+below this position is durably applied." A fresh store reads `W = 0` and resumes from position 1.
 
-### 4.2 Advance at apply time
+### 4.2 Advance at apply time — eager-apply per batch at production
 
-`W` advances **when an event is folded** — at **apply time**. On folding an `Event` with
-`cause_id = Some(c)`, raise `W = max(W, c)` and persist it **in the same atomic unit as the fold**.
-One command may fold several events (all carrying the same `cause_id = c`), so the `max` keeps `W`
-at the highest fully-applied command.
+`W` advances **when a batch is applied** — and a batch is applied **eagerly at production time**,
+immediately after the append that made it durable, not on some later read-back. When the driver
+appends a command's `entries ++ [Noop]` and the append returns, it hands the whole batch (with its
+real log positions) to `ProcessingStateMachine::apply_batch`. The **leader** folds the batch's
+Events **in a single atomic projection transaction** and sets `W = batch_end` (the terminating Noop's
+position), all in that one transaction (`crates/engine/src/leader.rs::apply_batch`).
+
+So apply atomicity == append atomicity: a Command's entire effect — every produced Event folded, the
+watermark advanced, the correlated acknowledgements drained — commits once, all-or-nothing, exactly
+when (and only when) its batch hits the log. Sibling events sharing a `cause_id` are applied together
+in the same transaction, so a crash can never observe half a batch (the follower-read-back half-batch
+hazard is structurally impossible here — there is no read-back apply in the healthy path).
 
 The load-bearing invariant is **`W` is never ahead of the projection**: the watermark lands in
-Storage only after the producing command's event has been folded, so a restart from `W + 1` never
-skips un-applied work. This is the single scalar's core soundness property.
+Storage only in the same transaction that folds the batch, so a restart from `W + 1` never skips
+un-applied work. This is the single scalar's core soundness property.
 
-**Implemented atomically.** The fold and the `W` advance are not just written adjacently — they are
-one projection transaction. The Processor opens `Storage::begin_txn` to get an **owned**
-`Box<dyn StorageTxn>`, folds the event through a `&mut dyn StorageTxn` handle (which structurally
-cannot begin/commit — commit consumes the `Box`, so only the Processor can call it). The txn keeps
-the fold's pending rows in an in-memory overlay that its own reads resolve first (**read-your-writes**:
-a row written earlier in the same fold is visible), so read-modify-write appliers
-(`add_child`/`put_execution` on one row) compose correctly. On the fold's success the Processor hands
-`W` to `StorageTxn::commit(Some(W))`, which materializes the overlay — plus the watermark — as a
-single RocksDB `WriteBatch`: all-or-nothing. A torn
-(half-applied) projection or a watermark that separated from its fold is therefore impossible; the
-idempotent re-fold no longer has to paper over an interleaved partial state. This matches Zeebe —
-"state and `lastProcessedPosition` advance together, in one RocksDB transaction" (Appendix B.1) —
-and the log-side append stays its own (already atomic, fsync'd) step, deliberately separate.
+**Implemented atomically.** The fold and the `W` advance are one projection transaction. The
+Processor opens `Storage::begin_txn` to get an **owned** `Box<dyn StorageTxn>`, folds each Event
+through a `&mut dyn StorageTxn` handle (which structurally cannot begin/commit — commit consumes the
+`Box`, so only the Processor can call it). The txn keeps the fold's pending rows in an in-memory
+overlay that its own reads resolve first (**read-your-writes**: a row written earlier in the same
+fold is visible), so read-modify-write appliers (`add_child`/`put_execution` on one row) compose
+correctly — and across the batch's sibling Events, naturally. On the batch's success the Processor
+hands `W` to `StorageTxn::commit(Some(W))`, which materializes the overlay — plus the watermark — as a
+single RocksDB `WriteBatch`: all-or-nothing. A torn (half-applied) projection or a watermark that
+separated from its fold is therefore impossible; the idempotent re-fold no longer has to paper over an
+interleaved partial state. This matches Zeebe — "state and `lastProcessedPosition` advance together,
+in one RocksDB transaction" (Appendix B.1) — and the log-side append stays its own (already atomic,
+fsync'd) step, deliberately separate.
+
+**The leader's read-back is a skip.** Because the leader applied each batch at production, the
+live read-back loop (`run_leader`) only sees already-applied work; its Event arm is a **pure skip**
+guarded by `is_already_applied` (`entry_id.get() <= self.watermark`, asserted in `debug_assert!`), and
+its Noop arm is a no-op. Only the residual crash window (§4.4) — a batch durably appended but not yet
+folded before the crash — is folded, and that happens in the dedicated `recover_leader` startup pass
+(§4.5), not in the live loop. The `Noop` read-back is a no-op for the leader (`commit_at_noop` returns
+`None`); it exists for the log's structured batching and for a follower's atomic apply.
 
 ### 4.3 Root commands and `cause_id`
 
 An externally-appended root command has `cause_id = None`. Its own position is still a watermark
-unit, but no event carries that position until one of its children folds. In practice every command
-that changes the projection emits an event, so `W` catches up via that event's `cause_id`. A command
-whose batch is empty or reject-only leaves no fold-visible child to advance `W`; on restart it may be
-re-processed once (harmlessly — §4.4). This matches the Zeebe observation (Appendix B.6) that a
-source-less client command is fine because the watermark keys on a command's own position.
+unit, but no event carries that position until one of its children folds. Now that `W` advances to the batch's terminating `Noop`, a command whose batch is empty or
+reject-only produces **no `Noop` and no advance** — it is simply not a watermark unit. On restart it
+may be re-processed once (harmlessly — §4.4), exactly as before.
 
 ### 4.4 At-least-once crash window (accepted)
 
-Resuming from `W + 1` skips the region `<= W` entirely — no already-applied command is
-re-dispatched. The one residual window is a crash that lands **between** "a command's batch is
-durably appended" and "its event is folded + `W` persisted". On restart that single in-flight
-command is re-read from `W + 1` and **re-dispatched exactly once**:
+Resuming from `W + 1` skips the region `<= W` entirely — no already-applied batch is re-applied. The
+one residual window is a crash that lands **between** "a command's batch is durably appended
+(including its terminating `Noop`)" and "`apply_batch` folds it + persists `W`". The residual batch is
+read back by the `recover_leader` startup pass and folded **in place**: its Command is skipped (not
+re-dispatched — re-dispatching would duplicate the append), its Events are folded into one driver-owned
+transaction, and the transaction commits once at the batch's Noop. So the restart neither re-appends
+the batch nor re-fires the handler's side effects:
 
-- the log grows by one duplicate batch (append is not idempotent), and
-- a handler's external side effect may fire twice (**at-least-once**).
+- the log does **not** grow a duplicate batch (append is not idempotent, so this matters), and
+- the residual batch's effects are applied **exactly once** (not at-least-once).
 
-State converges anyway (re-fold is idempotent). This is the inherent at-least-once window of
-apply-time advancement and is **accepted** for the single-node milestone; closing it fully (e.g.
-dispatch-time advancement or an atomic log-side watermark) is deferred.
+The one genuinely harmless "re-processed once" case is a command that produced an empty/reject-only
+batch (§4.3) — it appends no `Noop`, advances no `W`, and re-reading it is a no-op. This is the whole
+of the single-node crash window; closing even the log-side window (idempotent append / an atomic
+log-side watermark) is still deferred to multi-node. Note this is a *different* failure from the
+follower sibling-loss hazard the `Noop` solves: that one drops events across a crash, while this
+window's duplicate-append risk is what `recover_leader`'s skip-commands-in-place fold removes.
 
-### 4.5 No special recovery phase (single node)
+### 4.5 Recovery as a bounded startup pass (`recover_leader`)
 
-There is **no replay phase and no process set**: because `W` never runs ahead of the fold region,
-everything already applied lies at or below `W`. On boot the loop simply tails from `W + 1` and
-processes normally — already-folded events re-fold idempotently, follow-up commands dispatch
-normally. No distinguished "recovery" code path exists.
+Because `W` never runs ahead of the fold region, everything already applied lies at or below `W`; 
+there is no process set and no replay of the whole log. On boot the leader runs **`recover_leader`**,
+a **bounded startup pass** that reads *forward from `W + 1`* (never from the head) until the durable
+tail (`LogStream::read` returning `None`), folding any crash-residual batches (§4.4) that a crash left
+above `W`:
+
+- **Command** — skipped: its batch is durable and folded below by this pass; re-dispatching would
+  duplicate the append. Only residual *Events* drive the projection.
+- **Event** — folded into a **driver-owned** transaction opened at the batch's first Event and held
+  across the siblings.
+- **Noop** — closes the batch: the still-open transaction commits atomically with `W = Noop` position
+  (`StorageTxn::commit`).
+- **Reject** — audited via `log_reject`; a restart leaves no awaiting caller, so no ack is delivered
+  (the producing client may have left this node).
+
+After the pass, `W` sits on the last durable Noop, all residuals are folded, and `run_leader` tails the
+log from `W + 1` with its Event arm a pure skip — a normal process-serve loop follows with no further
+recovery code path. This is "recovery as one distinguished pass", not a per-entry fall-through; the
+pass is identical in spirit to the follower's batched fold, but the leader drops the `after_commit`
+ack drain because there are no in-flight acks on a fresh start. (See `crates/engine/src/stream_processor.rs::recover_leader`.)
 
 ### 4.6 Committed boundary: LAC
 
@@ -203,42 +241,62 @@ the order-domain assignment stays **internal and invisible to users** (opaque UL
 
 ### 5.1 Single-node consume loop
 
+The driver (role-agnostic `StreamProcessor`) tails the log, and hands each entry to the installed
+state machine. Before tailing, the leader runs the `recover_leader` startup pass (`boot` below); the
+leader's *live* path is then: dispatch → append (+Noop) → **eager-apply** → skip read-back.
+
 ```text
-W = storage.last_processed_position()            # 0 on a fresh store
-stream = log.stream_read(EntryId(W + 1))         # == read from position 1 on a fresh store
-loop:
+boot (single node):
+  W = storage.last_processed_position()
+  recover_leader(W):                             # bounded startup pass (see §4.5)
+    for each entry at W+1, W+2, ... until tail (LogStream::read == None):
+      Command:   skip                             # batch durable + folded below; never re-dispatch
+      Event(e):  fold into a held txn             # open txn at first Event of the residual batch
+      Noop:      commit the held txn, W = noop    # close the batch atomically at its Noop
+      Reject:    log_reject(r)                    # audit only; no awaiter, no commit
+    W = storage.last_processed_position()         # now on the last durable Noop
+  stream = log.stream_read(EntryId(W + 1))        # resume right after the recovered tail
+loop:                                             # live process-serve loop (no recovery here)
   entry = stream.next()
   match entry.payload:
     Command(c):
-      produced = dispatch(c)                     # reads projection; emits events + follow-ups
-      log.append(produced)                       # atomic; assigns positions; cause_id = c's position
-    Event(e) with cause_id = Some(c):
-      fold(e)                                    # apply to projection; scheduler/task side effects
-      if c > W:
-        W = c                                    # advance at apply time...
-        storage.put_last_processed_position(W)   # ...with the fold, so W never runs ahead of it
-    Event(e) with cause_id = None:               # events always carry a cause; defensive only
-      fold(e)
+      produced = dispatch(c)                      # reads projection; emits events + follow-ups
+      if produced.entries non-empty:
+        to_append = produced.entries ++ [Noop(cause_id = c)]   # Noop terminates the atomic batch
+        last = log.append(to_append)             # atomic; assigns real positions
+        batch = materialize(produced.entries, ..., last)       # real positions + the Noop
+        apply_batch(batch)                       # EAGER: fold all Events + W=batch_end in ONE txn
+      deliver(produced.grants)                   # grants answered even if the batch was empty
+    Event(e):                                    # read-back of this leader's own batch
+      skip — everything here is at/below W       # recover_leader folded the residue; apply_batch the rest
+    Noop(n):                                     # batch terminator read back
+      (leader: no-op — its batch was already applied eagerly)
     Reject(r):
       awaken(r.request_id)                       # no fold, no watermark change
     follow-up Command:                           # a produced command is an ordinary Command
       (handled by the Command arm on its own read-back)
 ```
 
-The watermark advances only via folded events and their `cause_id`, so a command whose batch is
-reject-only or empty sits below `W` only when a later descendant command's event folds past it.
+In the healthy steady state, the read-back pass skips every Event and no-ops every Noop: all real work
+happened once, eagerly, at production. The only Events the leader ever folds outside production are the
+crash residuals, and those happen in the `recover_leader` boot pass (before the loop), not in the loop
+itself — so the loop's Event arm stays a pure skip. A command whose batch is reject-only or empty
+produces no `Noop` and no eager apply; it merely delivers its grants.
 
 ### 5.2 Restart (single node)
 
 ```text
 boot:
   W = storage.last_processed_position()
+  recover_leader(W)                              # fold any crash-residual batches above W (§4.5)
+  W = storage.last_processed_position()          # the recovered tail (last durable Noop)
   stream = log.stream_read(EntryId(W + 1))       # jump straight to the resume point
-  run §5.1 normally                              # no replay, no recovery phase
+  run the §5.1 live loop normally                # no in-loop recovery
 ```
 
-No replay phase: entries `<= W` hold only already-applied work, so skipping them is safe (§4.5).
-The accepted at-least-once window (§4.4) re-dispatches at most one in-flight command once.
+No replay of the whole log and no process set: entries `<= W` hold only already-applied work, and the
+bounded `recover_leader` pass (reading forward from `W + 1` to the tail) folds whatever a crash left
+above `W` exactly once (§4.4, §4.5).
 
 ### 5.3 Multi-node / take-over (later)
 
@@ -254,7 +312,8 @@ process-set reconstruction (which makes the answer node-agnostic) is recorded as
 | Item | Where | Notes |
 |------|-------|-------|
 | Projection | `Storage` (Rocks) | rebuilt by fold; future snapshots via RocksDB Checkpoint |
-| `lastProcessedPosition` (`W`) | `Storage`, `_global/last_processed_position` | **single scalar**; advanced **with** the fold at apply time; `0` = fresh (resume from position 1) |
+| `lastProcessedPosition` (`W`) | `Storage`, `_global/last_processed_position` | **single scalar**; advanced **eagerly with the whole-batch fold** at production time (to the batch-terminating Noop); `0` = fresh (resume from position 1) |
+| `Noop` batch terminators | LogStream | one per non-empty atomic append batch; gives `W` a natural batch granularity and a follower its atomic apply point |
 | LAC | LogStream/Meta | single-node = local durable high-water; multi-node = quorum |
 
 There is **no** process set in the primary model: `W` is the only durable recovery state beyond the
@@ -267,12 +326,14 @@ process-set variant (if ever revisited) would persist an additional log-derivabl
 ## 7. Invariants (implementation checklist)
 
 1. Dispatch + append is a single atomic step; "decided ⟺ batch present in log".
-2. `W` (`lastProcessedPosition`) advances **at apply time**, in the same write group as the fold —
-   it is never ahead of the projection.
-3. `W` is a **command position**; each produced entry carries `cause_id` = its producing command's
-   position.
-4. A restarted Processor resumes from `W + 1` and never re-dispatches any entry `<= W`.
-5. Single-node recovery has **no** distinguished replay phase — it is the normal loop (§5), with no
+2. `W` (`lastProcessedPosition`) advances **eagerly, at production time, per whole batch** — in the same
+   write group as the batch's fold — it is never ahead of the projection.
+3. `W` is a **batch-boundary position**; each non-empty atomic batch ends in a `Noop` whose envelope's
+   `cause_id` is the producing command's position.
+4. A restarted Processor resumes from `W + 1` and never re-applies any entry `<= W`; its own read-back
+   Events at or below `W` are skipped.
+5. Single-node recovery is the bounded `recover_leader` startup pass (§4.5) folding crash-residual
+   batches above `W` in place — after it, the live loop (§5) folds nothing on read-back and has no
    process set.
 6. Acks fire only for durable decisions.
 7. Different root executions never share a storage key (isolation invariant for future
@@ -291,7 +352,11 @@ process-set variant (if ever revisited) would persist an additional log-derivabl
   lastAddConfirmed.
 - **Fencing:** a former leader must not dispatch after a new leader takes over (out of scope but
   required before real multi-node).
-- **Follower roles:** serve reads from the projection; no dispatch/append; stand by.
+- **Follower roles:** serve reads from the projection; no dispatch/append; stand by. A follower
+  opens one transaction at a batch's first Event, folds each sibling into it, and commits it
+  **atomically at the terminating `Noop`** (`commit_at_noop`) — the exact sibling-loss hazard the
+  batch marker was built to solve: applying event-by-event, a crash between siblings would drop
+  later siblings, but rounding the apply off at the `Noop` makes the whole batch commit or nothing.
 - **Follower bootstrap (seed from a consistency copy).** A new follower has no local projection and
   must not rebuild it by replaying the log from position 1 (too slow). It seeds from a recent
   point-in-time copy instead: the producer takes a **RocksDB checkpoint**
@@ -334,10 +399,11 @@ process-set variant (if ever revisited) would persist an additional log-derivabl
 ### S1 — Single-node durable recovery (G1, G2) — implemented
 - Persist `lastProcessedPosition` as a **single scalar** in Storage (`last_processed_position()`,
   `put_last_processed_position()`), advanced **at apply time** along with the fold.
-- `Processor::run` loads `W` and tail-resumes from `stream_read(W + 1)` — no replay from position 1,
-  no recovery phase (§4.5, §5.2).
+- On boot, `run()` runs the bounded `recover_leader` pass (fold crash-residual batches above `W` in
+  place), then tail-resumes from `stream_read(W + 1)` — no replay from position 1 (§4.5, §5.2).
 - Validation: `crates/engine/tests/durable_resume.rs` kills/restarts a durable Rocks engine over the
-  same log + storage and asserts the restart appends no duplicate work.
+  same log + storage and asserts the restart appends no duplicate work; in-crate unit test
+  `recover_leader_folds_crash_residue_once` drives the pass directly.
 
 ### S2 — Snapshot (G3)
 - Snapshot the projection via RocksDB Checkpoint; `W` lives inside it (in-DB, like Zeebe, §B.2).

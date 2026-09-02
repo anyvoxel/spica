@@ -2,12 +2,11 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
 use crate::{ApplierContext, EventApplier};
 
-use crate::id::ExecutionId;
-use crate::{ExecutionStatus, ExecutionValue};
+use crate::{Execution, ExecutionStatus};
 
 #[derive(Default)]
 pub(crate) struct ExecutionTerminatingApplier;
@@ -15,15 +14,18 @@ pub(crate) struct ExecutionTerminatingApplier;
 impl EventApplier for ExecutionTerminatingApplier {
     fn event(&self) -> Event {
         Event::ExecutionTerminating {
-            execution: ExecutionValue {
-                id: ExecutionId::nil(),
-                flow_version_id: crate::id::FlowVersionId::nil(),
-                root_execution: ExecutionId::nil(),
-                parent: None,
-                state_path: None,
-                status: ExecutionStatus::Terminating(crate::command::TerminationReason::Cancelled),
+            execution: Execution {
+                flow_version: crate::types::meta::ObjectReference::nil(),
+                status: ExecutionStatus::Terminating(
+                    crate::types::command::TerminationReason::Cancelled,
+                ),
                 input: Default::default(),
                 output: None,
+                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                    crate::types::meta::ObjectKind::Execution,
+                    ulid::Ulid::nil(),
+                    crate::log::Timestamp::from_millis(0),
+                ),
             },
         }
     }
@@ -38,8 +40,9 @@ impl EventApplier for ExecutionTerminatingApplier {
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        if let Some(mut exec) = ctx.storage.get_execution(execution.id).await? {
+        if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
             exec.status = execution.status.clone();
+            exec.value.meta.updated_at = execution.meta.updated_at;
             exec.touch(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
         }

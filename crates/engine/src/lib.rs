@@ -18,17 +18,19 @@
 //! ## Scope and milestone roadmap
 //!
 //! Implemented: `Pass`, `Succeed`, `Fail`, `Choice`, `Wait` (literal or JSONata `Seconds`/
-//! `Timestamp`), a `Task` dispatched to user-registered [`TaskHandler`]s keyed by `Resource`,
+//! `Timestamp`), a `Task` made claimable over the engine-hosted [`TaskApi`] (a worker executes its
+//! `Resource` and reports `complete`/`fail`),
 //! `Map`/`Parallel` container fan-out (bounded-concurrency `Map` with per-settle slot replenish;
 //! `Parallel` with branch aggregation), the state-machine `TimeoutSeconds`, `$states.context`
 //! (`Execution`/`State`/`Map.Item`) binding, and execution cancellation (`Engine::terminate`).
 //!
 //! Not yet implemented (each carries a `TODO` marker at its site; see in particular
-//! `handlers/states/task.rs`, `handlers/complete_task.rs`, `task_service.rs`,
+//! `handlers/states/task.rs`, `handlers/complete_task.rs`,
 //! `handlers/states/map.rs`, and `handlers/states/mod.rs`):
 //!
-//! - **M2**: Task `HeartbeatSeconds` (`States.HeartbeatTimeout`) — the current
-//!   [`TaskHandler`] interface cannot express a client-keepalive-driven heartbeat deadline; and
+//! - **M2**: Task `HeartbeatSeconds` (`States.HeartbeatTimeout`) — the current worker/handler
+//!   contract (in `spica-client`'s `worker` module) cannot express a client-keepalive-driven
+//!   heartbeat deadline; and
 //!   re-arming a fresh `TimeoutSeconds` when a retried `Task` attempt re-invokes (the first
 //!   attempt's deadline is not reset). Task `Retry`/`Catch` matching, `TimeoutSeconds`, and
 //!   `$states.errorOutput` binding *are* implemented.
@@ -48,61 +50,52 @@
 //! `jsonata-core` represents all JSON numbers as `f64`, so an integer assigned or output via
 //! JSONata (e.g. `5`) round-trips as `5.0`. Comparisons inside JSONata are unaffected.
 
-mod activity;
 mod applier;
-mod command;
-mod context;
 mod engine;
-mod entry;
-mod error;
 mod eval_env;
-mod event;
-mod execution;
-mod flow;
-mod flow_version;
+mod follower;
 mod handler;
 mod handlers;
-mod id;
-mod job_api;
+mod leader;
 mod log;
-mod reject;
-mod result;
+mod processing;
 mod scheduler;
 mod storage;
 mod stream_processor;
-mod task;
-mod task_service;
-mod timer;
-mod variables;
+mod task_api;
+mod types;
 
-pub use activity::{
-    ActivityState, ActivityStatus, ActivityValue, MapActivityState, ParallelActivityState,
-    RetrierAttemptState, RetryState,
-};
 pub use applier::{ApplierContext, EventApplier, EventDispatcher};
-pub use command::{Command, TerminationReason, TimerPurpose};
 pub use engine::{Engine, EngineBuilder};
-pub use error::ExecutionError;
-pub use event::Event;
-pub use execution::{ExecutionStatus, ExecutionValue};
-pub use flow::{Flow, FlowStatus};
-pub use flow_version::FlowVersion;
 pub use handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
-pub use id::{
-    ActivityId, EntryId, ExecutionId, FlowId, FlowName, FlowVersionId, NodeId, RequestId, StreamId,
-    TaskId, TimerId,
-};
-pub use job_api::{ActivatedTask, TaskApi};
 pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
-pub use reject::{Reject, RejectionType};
-pub use result::{ExecutionResult, ExecutionStatusSnapshot};
 pub use scheduler::{Scheduler, TimerSink};
-pub use storage::{Activity, Execution, Storage, StorageTxn, Task, Timer};
+pub use storage::{
+    ActivityRecord, ExecutionRecord, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
+};
 pub use stream_processor::StreamProcessor;
-pub use task::{TaskStatus, TaskValue};
-pub use task_service::{TaskHandler, TaskService};
-pub use timer::{TimerStatus, TimerValue};
-pub use variables::Variables;
+pub use task_api::{ActivatedTask, TaskApi};
+pub use types::activity::{
+    Activity, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
+};
+pub use types::command::{Command, TerminationReason, TimerPurpose};
+pub use types::error::{ExecutionError, InfraError, RuntimeError};
+pub use types::event::Event;
+pub use types::execution::{Execution, ExecutionStatus};
+pub use types::flow::{Flow, FlowStatus};
+pub use types::flow_version::FlowVersion;
+pub use types::id::{
+    ActivityId, EntryId, ExecutionId, FlowName, RequestId, StreamId, ThreadId, TimerId,
+};
+pub use types::meta::{
+    ObjectAddress, ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, ScopeName,
+};
+pub use types::reject::{Reject, RejectionType};
+pub use types::result::{ExecutionResult, ExecutionStatusSnapshot};
+pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
+pub use types::thread::{Thread, ThreadStatus};
+pub use types::timer::{Timer, TimerStatus};
+pub use types::variables::Variables;
 
 // Re-export the ASL state types the public API references (so callers need only depend on
 // `spica-engine`).

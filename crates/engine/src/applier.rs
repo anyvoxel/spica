@@ -16,8 +16,8 @@ mod appliers;
 use std::collections::HashMap;
 use std::mem::discriminant;
 
-use crate::event::Event;
 use crate::log::Timestamp;
+use crate::types::event::Event;
 
 use appliers::*;
 
@@ -56,7 +56,7 @@ pub trait EventApplier: Send + Sync {
         &self,
         context: &mut ApplierContext<'_>,
         event: &Event,
-    ) -> Result<(), crate::error::ExecutionError>;
+    ) -> Result<(), crate::types::error::ExecutionError>;
 }
 
 /// Context handed to a single `EventApplier::apply` call: mutable access to the store and a handle
@@ -72,15 +72,15 @@ pub trait EventApplier: Send + Sync {
 ///
 /// M1→M2 note: there is **no** task service on the context. Applying `TaskActivated` used to invoke
 /// the handler in-process as a side effect; now it only makes the task *claimable* — a worker pulls
-/// it via the engine's `TaskApi` (see `crate::task_service`). Task settlements are inbound reports
-/// the engine validates, not side effects of a fold.
+/// it via the engine's task API (the worker-side contract lives in `spica-client`'s `worker` module).
+/// Task settlements are inbound reports the engine validates, not side effects of a fold.
 pub struct ApplierContext<'a> {
     /// Write handle into the projection. A [`StorageTxn`](crate::storage::StorageTxn), **not** the
     /// raw [`Storage`](crate::storage::Storage): the applier can fold rows but cannot commit (which
     /// consumes the `Box`) nor move the resume watermark — atomicity is *type-enforced*.
     pub storage: &'a mut dyn crate::storage::StorageTxn,
     pub scheduler: &'a dyn crate::scheduler::Scheduler,
-    pub cause_id: crate::id::EntryId,
+    pub cause_id: crate::types::id::EntryId,
     pub timestamp: Timestamp,
 }
 
@@ -114,14 +114,17 @@ impl EventDispatcher {
             TimerCancelledApplier,
             VariablesAssignedApplier,
             StateTransitionedApplier,
-            RetryScheduledApplier,
-            ParallelBranchSpawnedApplier,
             TaskActivatedApplier,
-            TaskLeasedApplier,
+            TasksClaimedApplier,
             TaskLeaseExpiredApplier,
             TaskCompletedApplier,
             TaskFailedApplier,
-            TaskCancelledApplier
+            TaskCancelledApplier,
+            ThreadCreatedApplier,
+            ThreadCompletingApplier,
+            ThreadCompletedApplier,
+            ThreadTerminatingApplier,
+            ThreadTerminatedApplier
         );
         Self { handlers: map }
     }
@@ -130,7 +133,7 @@ impl EventDispatcher {
         &self,
         ctx: &mut ApplierContext<'_>,
         event: &Event,
-    ) -> Result<(), crate::error::ExecutionError> {
+    ) -> Result<(), crate::types::error::ExecutionError> {
         let handler = self
             .handlers
             .get(&discriminant(event))

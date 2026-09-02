@@ -1,17 +1,13 @@
 use async_trait::async_trait;
 use spica_asl::State;
 
-use crate::command::{Command, TerminationReason, TimerPurpose};
-use crate::error::ExecutionError;
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
-use crate::id::NodeId;
-use crate::{ActivityStatus, RetryState, TaskStatus};
-
-/// Defaults for a `Retry` when the `Retrier` omits the optional fields, per the ASL spec.
-const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 1;
-const DEFAULT_RETRY_MAX_ATTEMPTS: i64 = 3;
-const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
+use crate::log::Timestamp;
+use crate::types::command::{Command, TerminationReason};
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::ObjectKind;
+use crate::{ActivityStatus, RetrierAttemptState, TaskStatus};
 
 /// Handles `FailTask`: a claimed task was reported **failed** (Zeebe `FailJob`), or the engine's own
 /// deadline backstop (`TaskTimeout`) marked it failed.
@@ -23,9 +19,11 @@ const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
 /// any non-terminal task. This is the source of Zeebe's at-least-once contract: only the current
 /// lease holder (or the engine deadline) advances the state once.
 ///
-/// On success it emits `TaskFailed` and routes the failure through the owning state's
-/// `Retry`/`Catch`/terminate policy — the same decision a settled failure always took, now owned
-/// exclusively by this handler (the success-only `CompleteTaskHandler` no longer carries it).
+/// The task **decides its own retry** from its frozen `retry_plan` ([[task-retry-model]] stage 2):
+/// on a matching retrier with budget remaining, the *same* task entity re-queues to `Pending` gated
+/// by `next_available_at` (the backoff) — no timer, no fresh invocation — and the handler returns.
+/// Only when no retrier matches or the budget is exhausted does the task fail terminally and hand
+/// off to the owning state's `Catch`/terminate policy, which stays on the activity.
 #[derive(Default)]
 pub struct FailTaskHandler;
 
@@ -33,9 +31,9 @@ pub struct FailTaskHandler;
 impl CommandHandler for FailTaskHandler {
     fn command(&self) -> Command {
         Command::FailTask {
-            task: crate::id::TaskId::nil(),
+            task: crate::types::meta::ObjectReference::nil(),
             worker_id: String::new(),
-            error: ExecutionError::InvalidDefinition(String::new()),
+            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(String::new())),
         }
     }
 
@@ -51,7 +49,7 @@ impl CommandHandler for FailTaskHandler {
             );
         };
 
-        let act = match ctx.storage.get_task(*task).await {
+        let act = match ctx.storage.get_task(task).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return, // task never activated; nothing to do.
         };
@@ -65,7 +63,7 @@ impl CommandHandler for FailTaskHandler {
             // report and drops.
             if !act.status.is_running() || act.worker_id.as_deref() != Some(worker_id.as_str()) {
                 tracing::warn!(
-                    task = %act.value.id,
+                    task = %act.value.reference(),
                     reported = %worker_id,
                     leased = ?act.worker_id,
                     "worker tried to fail a task it does not lease; report rejected"
@@ -74,69 +72,137 @@ impl CommandHandler for FailTaskHandler {
             }
         }
 
-        let activity_id = match act.parent {
-            NodeId::Activity(a) => a,
-            _ => return, // a task without an activity owner is an internal fault.
-        };
+        let activity_id = act
+            .meta
+            .owner
+            .clone()
+            .expect("a task always has an activity owner");
+        if activity_id.kind != ObjectKind::Activity {
+            return; // a task without an activity owner is an internal fault.
+        }
 
-        // Emit the failed task entity (lease cleared, status terminal). The paired `TaskLease` timer
-        // is a child of the activity and is swept with it on settlement — same mechanism the
-        // `TimeoutSeconds` timer relies on, so no explicit cancel here.
+        // Build the failing task entity with the lease cleared; the retry decision below mutates it.
         let mut task_value = act.value();
-        task_value.status = TaskStatus::Failed;
         task_value.worker_id = None;
         task_value.lease_until = None;
+        // Stamp the (re-queue / fail) decision moment; `created_at` is already carried on
+        // `task_value`. Both the retry and the terminal paths emit below from this same value.
+        task_value.meta.touch(Timestamp::now());
+
+        // ── Retry self-decision (on the task, from its frozen `retry_plan`) ─────────────────────
+        // Scan the frozen plan for the first entry matching the error name. Each retrier's attempt
+        // budget is independent (`retrier_attempts[index]`), and the backoff uses only that
+        // retrier's own history. On a match with budget remaining, the SAME task entity re-queues to
+        // `Pending` gated by `next_available_at` — claimable again no earlier than that instant — so
+        // the backoff needs no timer and the worker re-invocation is a normal re-claim.
+        if let Some((retrier_index, policy)) = task_value
+            .retry_plan
+            .iter()
+            .enumerate()
+            .find(|(_, p)| error_matches(&p.error_equals, error))
+        {
+            let retrier_attempts = task_value
+                .retry_state
+                .retrier_attempts
+                .get(retrier_index)
+                .map(|a| a.attempt_count)
+                .unwrap_or(0);
+            if retrier_attempts < policy.max_attempts as u32 {
+                // Backoff: policy interval × backoff_rate^attempt, capped at MaxDelaySeconds — the
+                // exponent uses this retrier's own made attempts, so two retriers never pollute each
+                // other's ladders.
+                let next_attempt = retrier_attempts + 1;
+                let delay = policy.backoff_for_attempt(retrier_attempts);
+                let now = Timestamp::now();
+                let next_available_at = now
+                    .checked_add(std::time::Duration::from_secs(delay))
+                    .unwrap_or(now);
+                // Stamp per-retrier counter + total onto the task entity, and the claimability gate.
+                if task_value.retry_state.retrier_attempts.len() <= retrier_index {
+                    task_value
+                        .retry_state
+                        .retrier_attempts
+                        .resize(retrier_index + 1, RetrierAttemptState::default());
+                }
+                task_value.retry_state.retrier_attempts[retrier_index] = RetrierAttemptState {
+                    attempt_count: next_attempt,
+                    last_retry_at: Some(now),
+                };
+                task_value.retry_state.attempts += 1;
+                task_value.status = TaskStatus::Pending;
+                task_value.retry_state.next_available_at = Some(next_available_at);
+                out.emit_event(Event::TaskFailed {
+                    task: task_value,
+                    error: error.clone(),
+                });
+                // Sweep the failed attempt's `TaskLease`/`TaskTimeout` children (a settled task
+                // leaves no live child behind). No retry timer is armed — `next_available_at` is the
+                // gate, and the re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
+                super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
+                return;
+            }
+            // Attempt budget exhausted — fall through to `Catch` (a retry that hit `MaxAttempts`
+            // no longer applies).
+        }
+
+        // ── Terminal failure → route to Catch / Terminate ──────────────────────────────────────
+        task_value.status = TaskStatus::Failed;
+        task_value.retry_state.next_available_at = None;
         out.emit_event(Event::TaskFailed {
             task: task_value,
             error: error.clone(),
         });
         // Sweep the activity's task timers (the `TaskLease` armed on assign, and any `TaskTimeout`)
-        // so a settled task leaves no live child behind: a non-terminal Retry re-arms a fresh
-        // invocation (ReleaseTaskLease would, at best, re-queue a now-terminal task), and a terminal
-        // fail is then free to terminate/drain the activity (which would sweep them anyway — this
-        // just makes the settle self-contained and avoids a stale child blocking a later complete).
-        super::cancel_activity_timers(ctx, out, activity_id).await;
-        // Route the failure through the state's error-handling policy: `Retry` (re-arm on a
-        // backoff), then `Catch` (bind errorOutput + route to the catcher's Next), then terminate.
-        // This keeps the policy local to the state definition and defers the decision to the next
-        // dispatch round where a retry timer / catcher runs.
+        // so a settled task leaves no live child behind; a terminal fail is then free to
+        // terminate/drain the activity (which would sweep them anyway — this just makes the settle
+        // self-contained and avoids a stale child blocking a later complete).
+        super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
+        // Route the terminal failure through the state's error-handling policy: `Catch` (bind
+        // errorOutput + route to the catcher's Next), then terminate. Retry was already decided
+        // above (on the task); this activity-level remainder applies only to an exhausted failure.
         self.route_failure(ctx, out, activity_id, error).await;
     }
 }
 
 impl FailTaskHandler {
-    /// Route a `Task` failure through the owning state's `Retry`/`Catch` policy, terminating only
-    /// when neither matches. Order per ASL: the first `Retry` whose `ErrorEquals` matches and whose
-    /// attempt budget is not exhausted wins (re-arm on the computed backoff); otherwise the first
-    /// `Catch` whose `ErrorEquals` matches wins (bind errorOutput + route to its `Next`); otherwise
-    /// the failure terminates the state and its execution.
+    /// Route a **terminal** `Task` failure (retry budget exhausted) through the owning state's
+    /// `Catch` policy, terminating when none matches. Order per ASL: the first `Catch` whose
+    /// `ErrorEquals` matches wins (bind errorOutput + route to its `Next`); otherwise the failure
+    /// terminates the state and its execution. Retry is **not** consulted here — the reused task
+    /// already decided it on the failure path above.
     async fn route_failure(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector,
-        activity_id: crate::id::ActivityId,
+        activity_id: crate::types::meta::ObjectReference,
         error: &ExecutionError,
     ) {
-        let activity = match ctx.storage.get_activity(activity_id).await {
+        let activity = match ctx.storage.get_activity(&activity_id).await {
             Ok(Some(a)) => a,
             _ => return,
         };
-        // Determine the owning execution. For a top-level activity this is `NodeId::Execution`.
-        // For a Parallel-branch child execution the owning *activity* is itself the branch's child
-        // execution's activity, but its `parent` is still the child `ExecutionId` that owns it —
-        // so resolving the state definition by the owning execution honors the branch's
-        // `state_path` (retry/catch then consult the right per-branch definition).
-        let execution = match activity.value.parent {
-            NodeId::Execution(e) => e,
-            _ => return, // internal fault: a completing activity must be owned by an execution.
+        // Determine the owning scope (a top-level `Execution` or a fan-out `Thread`). Resolve it so
+        // the state definition is consulted against the right `state_path` — for a branch thread,
+        // retry/catch then see the per-branch definition at the pointer location.
+        let scope_ref = activity
+            .value
+            .meta
+            .owner
+            .clone()
+            .expect("a completing activity is owned by a scope");
+        let scope = match scope_ref.kind {
+            ObjectKind::Execution | ObjectKind::Thread => {
+                // The activity's owner reference is the scope; load its uniform record once.
+                match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
+                    Ok(Some(s)) => s,
+                    _ => return, // owning scope gone — nothing to consult.
+                }
+            }
+            _ => return, // internal fault: a completing activity must be owned by a scope.
         };
-        // The owning execution binds to a machine revision; resolve it (cached by the Processor)
+        // The owning scope binds to a machine revision; resolve it (cached by the Processor)
         // before consulting the state definition.
-        let exec = match ctx.storage.get_execution(execution).await {
-            Ok(Some(e)) => e,
-            _ => return, // owning execution gone — nothing to consult.
-        };
-        let sm = match ctx.machine(exec.flow_version_id).await {
+        let sm = match ctx.machine_for_scope(&scope).await {
             Ok(s) => s,
             Err(_) => {
                 // Definition no longer resolvable — nothing left to consult; terminate.
@@ -145,9 +211,8 @@ impl FailTaskHandler {
             }
         };
         let state_def = match super::resolve_state_for(
-            ctx.storage,
             &sm,
-            execution,
+            &scope,
             &crate::handlers::state_name_from_path(activity.value.state_path.as_ptr()),
         )
         .await
@@ -160,77 +225,40 @@ impl FailTaskHandler {
             }
         };
         let State::Task(task_state) = state_def else {
-            // A non-Task activity settling a failure can't consult a Task retry/catch; terminate.
+            // A non-Task activity settling a failure can't consult a Task catch; terminate.
             self.terminate_failure(ctx, out, activity_id, error).await;
             return;
         };
-
-        // ── Retry ──────────────────────────────────────────────────────────────────────────────
-        // Scan the state's `Retry` array for the first entry matching the error name. Each retrier's
-        // own attempt budget is independent: `retrier_attempts[index]` counts how many times that
-        // specific retrier already fired, while `retry_count` stays the activity-wide total exposed on
-        // `$states.context.State.RetryCount`.
-        if let Some((retrier_index, retry)) = task_state.retry.as_deref().and_then(|rs| {
-            rs.iter()
-                .enumerate()
-                .find(|(_, r)| error_matches(r.error_equals.as_slice(), error))
-        }) {
-            let retrier_attempts =
-                retrier_attempt_count(&activity.value.retry_state, retrier_index);
-            let max_attempts = retry.max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
-            if (retrier_attempts as i64) < max_attempts {
-                // Backoff: interval × backoff_rate^attempt, capped at MaxDelaySeconds. The exponent
-                // uses the matched retrier's own already-made attempt count (not the activity-wide
-                // total), so two retriers do not pollute each other's backoff ladders.
-                let delay_secs = compute_backoff(retry, retrier_attempts);
-                let next_retrier_attempt = retrier_attempts + 1;
-                let next_retry_count = activity.value.retry_state.retry_count + 1;
-                // Stamp both the retry-bookkeeping event and the paired retry-delay timer from the
-                // same wall-clock instant so the persisted "last retry at" metadata and the derived
-                // deadline stay causally aligned.
-                let scheduled_at = crate::log::Timestamp::now();
-                out.emit_event(Event::RetryScheduled {
-                    activity: activity_id,
-                    retrier_index,
-                    retrier_attempt: next_retrier_attempt,
-                    retry_count: next_retry_count,
-                    scheduled_at,
-                });
-                let timer = out.next_timer();
-                let deadline = scheduled_at
-                    .checked_add(std::time::Duration::from_secs(delay_secs))
-                    .unwrap_or(scheduled_at);
-                out.emit_command(Command::ActivateTimer {
-                    parent: NodeId::Activity(activity_id),
-                    timer,
-                    purpose: TimerPurpose::TaskRetryDelay,
-                    deadline,
-                });
-                return;
-            }
-            // Attempt budget exhausted — fall through to `Catch` (a retry that hit `MaxAttempts`
-            // no longer applies).
-        }
 
         // ── Catch ──────────────────────────────────────────────────────────────────────────────
         if let Some(catcher) = task_state.catch.as_deref().and_then(|cs| {
             cs.iter()
                 .find(|c| error_matches(c.error_equals.as_slice(), error))
         }) {
-            let exec = match activity.value.parent {
-                NodeId::Execution(e) => e,
+            // Resolve the owning scope again for the catch context — the branch thread's
+            // `state_path`/`input`/`variables` come from the scope (Execution or Thread).
+            let catch_scope_ref = activity
+                .value
+                .meta
+                .owner
+                .clone()
+                .expect("a completing activity is owned by a scope");
+            let catch_scope = match catch_scope_ref.kind {
+                ObjectKind::Execution | ObjectKind::Thread => {
+                    match crate::storage::load_scope_ref(ctx.storage, &catch_scope_ref).await {
+                        Ok(Some(s)) => s,
+                        _ => return, // owning scope gone — nothing to catch into.
+                    }
+                }
                 _ => return,
-            };
-            let Some(ex) = ctx.storage.get_execution(exec).await.ok().flatten() else {
-                return; // owning execution gone — nothing to catch into.
             };
             let actx = ActivityCtx {
                 // Catch handling reuses the same entity-shaped activity value lifecycle events carry,
                 // so the success-style completion path sees the canonical domain payload.
                 activity: activity.value(),
-                execution_state_path: ex.state_path.clone(),
-                exec_input: ex.input.clone(),
-                variables: ex.variables.clone(),
+                execution_state_path: catch_scope.state_path().cloned(),
+                exec_input: catch_scope.input().clone(),
+                variables: catch_scope.variables().clone(),
                 kind: CtxKind::Complete,
             };
             // Bind `$states.errorOutput` (the error-output object) for the catcher's `Assign`/
@@ -246,13 +274,13 @@ impl FailTaskHandler {
                 catcher.output.as_ref(),
                 Some(&catcher.next),
                 None,
-                activity.value.retry_state.retry_count,
+                activity.value.retry_state.attempts,
                 Some(&error_output),
             );
             return;
         }
 
-        // ── Neither matched → terminate ────────────────────────────────────────────────────────
+        // ── Nothing caught → terminate ─────────────────────────────────────────────────────────
         self.terminate_failure(ctx, out, activity_id, error).await;
     }
 
@@ -264,13 +292,13 @@ impl FailTaskHandler {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector,
-        activity_id: crate::id::ActivityId,
+        activity_id: crate::types::meta::ObjectReference,
         error: &ExecutionError,
     ) {
         let reason = TerminationReason::Failed {
             error: error.clone(),
         };
-        let activity = match ctx.storage.get_activity(activity_id).await {
+        let activity = match ctx.storage.get_activity(&activity_id).await {
             Ok(Some(a)) => a,
             Ok(None) | Err(_) => return,
         };
@@ -284,14 +312,16 @@ impl FailTaskHandler {
         out.emit_event(Event::StateTerminated {
             activity: terminated_activity,
         });
-        let execution_id = match activity.value.parent {
-            NodeId::Execution(e) => e,
-            _ => return, // internal fault: activity not owned by an execution.
-        };
-        out.emit_command(Command::TerminateExecution {
-            id: execution_id,
-            reason,
-        });
+        // Route the terminal failure at the owning scope. A task may sit inside a top-level run
+        // (an `Execution`, via reference-addressed `TerminateExecution`) or inside a `Parallel`
+        // branch / `Map` item (a `Thread` — only reachable via `TerminateThread`); dispatch on kind.
+        let owner = activity
+            .value
+            .meta
+            .owner
+            .clone()
+            .expect("a completing activity is owned by an execution");
+        super::emit_scope_termination(out, &owner, reason);
     }
 }
 
@@ -313,100 +343,22 @@ fn error_matches(error_equals: &[String], error: &ExecutionError) -> bool {
     error_equals.iter().any(|s| s == name)
 }
 
-/// The already-consumed attempt count for `retrier_index`, defaulting to 0 when the retrier has not
-/// fired yet.
-fn retrier_attempt_count(retry_state: &RetryState, retrier_index: usize) -> u32 {
-    retry_state
-        .retrier_attempts
-        .get(retrier_index)
-        .map(|attempt| attempt.attempt_count)
-        .unwrap_or(0)
-}
-
-/// Compute the backoff delay in seconds for the next retry of a single retrier, given that retrier's
-/// own already-made attempt count (0 for its first retry), per `Retrier`:
-/// `IntervalSeconds * BackoffRate^attempt`, capped at `MaxDelaySeconds`.
-fn compute_backoff(retry: &spica_asl::Retrier, retrier_attempts: u32) -> u64 {
-    let interval = retry
-        .interval_seconds
-        .unwrap_or(DEFAULT_RETRY_INTERVAL_SECONDS)
-        .max(0) as f64;
-    let backoff = retry
-        .backoff_rate
-        .as_ref()
-        .and_then(|r| r.as_f64())
-        .unwrap_or(DEFAULT_RETRY_BACKOFF_RATE);
-    let attempts = retrier_attempts as f64;
-    let raw = interval * backoff.powf(attempts);
-    let capped = match retry.max_delay_seconds {
-        Some(max) if max > 0 => raw.min(max as f64),
-        _ => raw,
-    };
-    capped.ceil().max(1.0) as u64
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{compute_backoff, error_matches, retrier_attempt_count};
-    use crate::error::ExecutionError;
-    use crate::{RetrierAttemptState, RetryState};
-
-    #[test]
-    fn backoff_first_attempt() {
-        let r = spica_asl::Retrier {
-            error_equals: vec!["States.ALL".into()],
-            interval_seconds: Some(1),
-            max_attempts: Some(3),
-            backoff_rate: None,
-            max_delay_seconds: None,
-            jitter_strategy: None,
-        };
-        // Per-retrier attempt 0 → 1s (backoff_rate default 2.0 ^ 0 = 1)
-        assert_eq!(compute_backoff(&r, 0), 1);
-        // Per-retrier attempt 1 → 2s
-        assert_eq!(compute_backoff(&r, 1), 2);
-        // Per-retrier attempt 2 → 4s
-        assert_eq!(compute_backoff(&r, 2), 4);
-    }
-
-    #[test]
-    fn backoff_capped() {
-        let r = spica_asl::Retrier {
-            error_equals: vec!["States.ALL".into()],
-            interval_seconds: Some(2),
-            max_attempts: Some(3),
-            backoff_rate: None,
-            max_delay_seconds: Some(3),
-            jitter_strategy: None,
-        };
-        // Per-retrier attempt 2 → 2*4=8, capped at 3.
-        assert_eq!(compute_backoff(&r, 2), 3);
-    }
-
-    #[test]
-    fn retrier_attempts_default_to_zero() {
-        let retry_state = RetryState {
-            retry_count: 4,
-            retrier_attempts: vec![RetrierAttemptState {
-                attempt_count: 2,
-                last_retry_at: None,
-            }],
-        };
-        assert_eq!(retrier_attempt_count(&retry_state, 0), 2);
-        assert_eq!(retrier_attempt_count(&retry_state, 1), 0);
-    }
+    use super::error_matches;
+    use crate::types::error::{ExecutionError, RuntimeError};
 
     #[test]
     fn error_matches_wildcards() {
-        let err = ExecutionError::TimedOut {
+        let err = ExecutionError::Runtime(RuntimeError::TimedOut {
             message: "t".into(),
-        };
+        });
         assert!(error_matches(&["States.ALL".into()], &err));
         assert!(error_matches(
             &["States.TaskFailed".into()],
-            &ExecutionError::Cancelled {
+            &ExecutionError::Runtime(RuntimeError::Cancelled {
                 message: "c".into()
-            }
+            })
         ));
         // TaskFailed does NOT match Timeout.
         assert!(!error_matches(&["States.TaskFailed".into()], &err));

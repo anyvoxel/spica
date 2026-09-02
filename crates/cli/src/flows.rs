@@ -1,16 +1,13 @@
 //! `spica flows <verb>` — definition versioning: create a new immutable flow version, or resolve a
-//! name (+ ordinal version) to its concrete `FlowVersionId`. Both are thin gRPC calls that print the
-//! resulting id; the args and handlers live together here.
+//! name (+ ordinal version) to its concrete version `ObjectReference`. Both are thin `spica-client`
+//! calls that print the resulting reference; the args and handlers live together here.
 
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use spica_proto::v1::{
-    CreateFlowRequest, ResolveFlowVersionRequest, workflow_client::WorkflowClient,
-};
-use tonic::transport::Channel;
+use spica_client::Client;
 
 use crate::util::validate_flow_name;
 
@@ -19,7 +16,7 @@ use crate::util::validate_flow_name;
 pub(crate) enum FlowsCmd {
     /// Persist a new flow version from an ASL definition under a required, unique name.
     Create(FlowsCreateArgs),
-    /// Resolve a flow name (+ optional version) to its concrete flow version id.
+    /// Resolve a flow name (+ optional version) to its concrete version reference.
     Get(FlowsGetArgs),
 }
 
@@ -43,37 +40,26 @@ pub(crate) struct FlowsGetArgs {
     pub(crate) version: u32,
 }
 
-/// Create a new flow version and print its system-minted FlowVersionId.
-pub(crate) async fn create(
-    workflow: &mut WorkflowClient<Channel>,
-    args: &FlowsCreateArgs,
-) -> Result<()> {
+/// Create a new flow version and print its created version's ObjectReference.
+pub(crate) async fn create(client: &Client, args: &FlowsCreateArgs) -> Result<()> {
     validate_flow_name(&args.name)?;
     let definition = fs::read(&args.definition)
         .with_context(|| format!("reading definition {}", args.definition.display()))?;
-    let resp = workflow
-        .create_flow(CreateFlowRequest {
-            name: args.name.clone(),
-            definition,
-        })
+    let flow_version = client
+        .create_flow(&args.name, &definition)
         .await
-        .context("CreateFlow")?
-        .into_inner();
-    println!("{}", resp.flow_version_id);
+        .context("CreateFlow")?;
+    println!("{}", flow_version);
     Ok(())
 }
 
-/// Resolve a flow name (+ optional version) to its concrete FlowVersionId and print it.
-pub(crate) async fn get(workflow: &mut WorkflowClient<Channel>, args: &FlowsGetArgs) -> Result<()> {
+/// Resolve a flow name (+ optional ordinal version) to its concrete ObjectReference and print it.
+pub(crate) async fn get(client: &Client, args: &FlowsGetArgs) -> Result<()> {
     validate_flow_name(&args.flow_name)?;
-    let resp = workflow
-        .resolve_flow_version(ResolveFlowVersionRequest {
-            flow_name: args.flow_name.clone(),
-            version: args.version,
-        })
+    let flow_version = client
+        .resolve_flow_version(&args.flow_name, args.version)
         .await
-        .context("ResolveFlowVersion")?
-        .into_inner();
-    println!("{}", resp.flow_version_id);
+        .context("ResolveFlowVersion")?;
+    println!("{}", flow_version);
     Ok(())
 }

@@ -7,21 +7,20 @@ use super::super::{
     emit_transition, state_activated_value, state_completed_value, state_completing_value,
     state_terminated_value, state_terminating_value,
 };
-use crate::command::{Command, TerminationReason};
-use crate::context::build_states;
-use crate::error::ExecutionError;
+use crate::ActivityState;
 use crate::eval_env::EvalEnv;
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::id::{ActivityId, NodeId};
-use crate::{ActivityState, ExecutionStatus};
-
+use crate::types::command::{Command, TerminationReason};
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 /// The `Parallel` state: runs several branch sub-state-machines concurrently, waits for all of them
 /// to reach a terminal state, then transitions — or fails the whole state if any branch fails.
 ///
 /// Fan-out is **flat, not recursive**: each branch runs as a *child execution* (see
-/// [`SpawnBranchHandler`](super::super::spawn_branch::SpawnBranchHandler)) rooted under this
-/// activity and carrying a [`state_path`](crate::storage::Execution), so a branch resolves its
+/// [`SpawnThreadHandler`](super::super::spawn_thread::SpawnThreadHandler)) rooted under this
+/// activity and carrying a [`state_path`](crate::storage::ExecutionRecord), so a branch resolves its
 /// own states within the single shared machine document without copying any definition. The
 /// `Parallel` activity stays `Running` owning those children; it completes only through
 /// `child_completed` once the last branch settles, or terminates on a branch failure.
@@ -49,7 +48,7 @@ impl StateHandler for ParallelStateHandler {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -70,7 +69,7 @@ impl StateHandler for ParallelStateHandler {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
@@ -79,8 +78,14 @@ impl StateHandler for ParallelStateHandler {
         });
         emit_transition(
             out,
-            actx.activity.execution,
+            actx.activity.execution.clone(),
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             activity,
+            actx.state_path(),
             &actx.activity.input,
             None,
             Some(true),
@@ -98,10 +103,10 @@ impl StateHandler for ParallelStateHandler {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,
-        _child: crate::id::NodeId,
+        _child: ObjectReference,
     ) {
         let State::Parallel(s) = state else {
             unreachable!(
@@ -111,7 +116,7 @@ impl StateHandler for ParallelStateHandler {
         let Some(actx) = actx else {
             return; // owning execution gone — nothing to converge.
         };
-        let Some(act) = ctx.storage.get_activity(activity).await.ok().flatten() else {
+        let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
         };
         // `ProcessChildCompleted` now dispatches a `Running` activity's `child_completed` on *every*
@@ -124,49 +129,56 @@ impl StateHandler for ParallelStateHandler {
         }
 
         // The owning activity's branch fan-out (branch index -> child execution) is the convergence
-        // map: the last `ExecutionCreated`/`ParallelBranchSpawned` wrote it, and every child execution
-        // is now terminal (drain emptied `active_children` before calling us). Order by branch index
-        // so the aggregated output array matches the declared `Branches` order.
+        // map: the last `ThreadCreated` wrote it (from each thread's own `index`), and every child
+        // execution is now terminal (drain emptied `active_children` before calling us). Order by
+        // branch index so the aggregated output array matches the declared `Branches` order.
         // A non-`Parallel` repository here is an internal fault (a Parallel always fans out while
         // still `Running`); nothing to aggregate — defer.
         let ActivityState::Parallel(progress) = &act.value.activity_state else {
             return;
         };
-        let mut entries: Vec<(usize, crate::id::ExecutionId)> =
-            progress.branches.iter().map(|(i, e)| (*i, *e)).collect();
+        let mut entries: Vec<(usize, crate::types::meta::ObjectReference)> = progress
+            .branches
+            .iter()
+            .map(|(i, e)| (*i, e.clone()))
+            .collect();
         entries.sort_by_key(|(i, _)| *i);
 
         let mut outputs = Vec::with_capacity(entries.len());
-        for (_index, child_exec) in entries {
-            let Some(child) = ctx.storage.get_execution(child_exec).await.ok().flatten() else {
-                // A child execution that vanished without settling is treated as a failure — the
-                // branch never produced a result.
+        for (_index, child_scope_ref) in entries {
+            // Each branch is a `Thread` (post-split), which lives in thread storage — not execution
+            // storage. Resolve through the scope abstraction so the aggregation reads a uniform
+            // record regardless of kind; a branch that resolves to neither is treated as a failure.
+            let Some(child) = crate::storage::load_scope_ref(ctx.storage, &child_scope_ref)
+                .await
+                .ok()
+                .flatten()
+            else {
+                // A child that vanished without settling is treated as a failure — the branch never
+                // produced a result.
                 let reason = TerminationReason::Failed {
-                    error: ExecutionError::StateNotFound(format!("branch {child_exec}")),
+                    error: ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "branch {child_scope_ref}"
+                    ))),
                 };
                 fail_parallel(out, activity, actx, reason);
                 return;
             };
-            match &child.status {
-                ExecutionStatus::Completed => {
-                    outputs.push(child.output.clone().unwrap_or(Value::Null))
-                }
+            if let Some(reason) = child.termination_reason() {
                 // A failed / cancelled branch fails the whole `Parallel` per the ASL spec ("If any
                 // branch fails, the entire Parallel state fails and all branches are stopped"). The
                 // recorded `reason` becomes the Parallel's own termination reason; the
                 // `TerminateExecution` sweep then stops the surviving sibling branches.
-                ExecutionStatus::Terminated(reason) => {
-                    fail_parallel(out, activity, actx, reason.clone());
-                    return;
-                }
-                ExecutionStatus::Terminating(reason) => {
-                    fail_parallel(out, activity, actx, reason.clone());
-                    return;
-                }
-                _ => {
-                    fail_parallel(out, activity, actx, TerminationReason::Cancelled);
-                    return;
-                }
+                fail_parallel(out, activity, actx, reason.clone());
+                return;
+            }
+            if child.is_terminal() {
+                outputs.push(child.output().cloned().unwrap_or(Value::Null));
+            } else {
+                // A non-terminal branch (still Running/Completing yet drained empty) is an internal
+                // fault; fail the Parallel rather than aggregate a partial result.
+                fail_parallel(out, activity, actx, TerminationReason::Cancelled);
+                return;
             }
         }
 
@@ -179,7 +191,7 @@ impl StateHandler for ParallelStateHandler {
 fn activate_parallel(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ParallelState,
 ) {
@@ -192,7 +204,7 @@ fn activate_parallel(
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -203,24 +215,27 @@ fn activate_parallel(
         Some(arguments) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(arguments, &states, &actx.variables)
         ),
         None => actx.activity.input.clone(),
     };
 
-    // Fan out each branch as a child execution. Each child inherits `actx.activity.root_execution` (the flat
-    // query anchor), is rooted under this activity (`NodeId::Activity(activity)` — so the Parallel
-    // waits on all of them via `active_children`), and carries a `state_path` locating its
-    // branch's `states` table: the owning execution's pointer extended by
-    // `/states/<parallel>/branches/<index>/states` (the path `resolve_states_map` walks for
-    // arbitrary nesting).
-    let owner = NodeId::Activity(activity);
+    // Fan out each branch as a child Thread. Each child inherits `actx.activity.execution` (the flat
+    // query anchor), is rooted under this activity (`activity` — so the Parallel waits on all of them
+    // via `active_children`), and carries a `state_path` locating its branch's `states` table: the
+    // owning execution's pointer extended by `/states/<parallel>/branches/<index>/states` (the path
+    // `resolve_states_map` walks for arbitrary nesting).
+    let owner = activity.clone();
     for (index, branch) in state.branches.iter().enumerate() {
         let pointer = child_pointer(actx, index);
-        out.emit_command(Command::SpawnBranch {
-            parent: owner,
-            root_execution: actx.activity.root_execution,
+        out.emit_command(Command::SpawnThread {
+            parent: owner.clone(),
+            execution: actx.activity.execution.clone(),
             state_path: Some(pointer),
             branch_index: index,
             state: branch.start_at.clone(),
@@ -269,7 +284,7 @@ fn child_pointer(actx: &ActivityCtx, index: usize) -> jsonptr::PointerBuf {
 /// `TerminateState` sweep handles its `Execution` children).
 fn fail_parallel(
     out: &mut Collector,
-    _activity: ActivityId,
+    _activity: ObjectReference,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
@@ -279,10 +294,15 @@ fn fail_parallel(
     out.emit_event(Event::StateTerminated {
         activity: state_terminated_value(actx, reason.clone()),
     });
-    out.emit_command(Command::TerminateExecution {
-        id: actx.activity.execution,
+    super::super::emit_scope_termination(
+        out,
+        actx.activity
+            .meta
+            .owner
+            .as_ref()
+            .expect("an owned activity has an owner"),
         reason,
-    });
+    );
 }
 
 /// The `Parallel`'s success finish: with all branches converged, project the state result — `$states`
@@ -295,7 +315,7 @@ fn fail_parallel(
 fn finish_parallel(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ParallelState,
     aggregated: Value,
@@ -306,7 +326,7 @@ fn finish_parallel(
         &actx.state_name(),
         &actx.exec_input,
         Some(&actx.activity.input),
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None, // success path — no Catch `errorOutput`
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -317,7 +337,11 @@ fn finish_parallel(
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -327,7 +351,12 @@ fn finish_parallel(
                         local_scope.insert(k, v);
                     }
                     out.emit_event(Event::VariablesAssigned {
-                        execution: actx.activity.execution,
+                        scope: actx
+                            .activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
                     });
                 }
@@ -335,10 +364,14 @@ fn finish_parallel(
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -351,7 +384,11 @@ fn finish_parallel(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_scope)
         ),
         None => aggregated,
@@ -365,8 +402,14 @@ fn finish_parallel(
     });
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output_value,
         state.next.as_deref(),
         state.end,

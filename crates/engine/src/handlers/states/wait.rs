@@ -2,14 +2,14 @@ use serde_json::Value;
 use spica_asl::{IntOrExpr, State, WaitState, WaitTimestamp};
 
 use super::super::state_handler::StateHandler;
-use super::super::{complete_activity, eval_string_or_expr, state_activated_value};
-use crate::command::{Command, TimerPurpose};
-use crate::context::build_states;
-use crate::error::ExecutionError;
+use super::super::{complete_activity, emit_timer, eval_string_or_expr, state_activated_value};
 use crate::eval_env::EvalEnv;
 use crate::handler::{ActivityCtx, Collector};
-use crate::id::ActivityId;
 use crate::log::Timestamp;
+use crate::types::command::TimerPurpose;
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::meta::ObjectReference;
 
 /// The inclusive upper bound of a `Wait` `Seconds` value, per the ASL spec.
 const MAX_WAIT_SECONDS: i64 = 99_999_999;
@@ -25,7 +25,7 @@ impl StateHandler for WaitStateHandler {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -43,7 +43,7 @@ impl StateHandler for WaitStateHandler {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -61,7 +61,7 @@ impl StateHandler for WaitStateHandler {
             s.output.as_ref(),
             s.next.as_deref(),
             s.end,
-            actx.activity.retry_state.retry_count,
+            actx.activity.retry_state.attempts,
             None, // Wait has no Catch `errorOutput`
         );
     }
@@ -70,7 +70,7 @@ impl StateHandler for WaitStateHandler {
 fn activate_wait(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &WaitState,
 ) {
@@ -84,7 +84,7 @@ fn activate_wait(
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -99,10 +99,14 @@ fn activate_wait(
             if !(0..=MAX_WAIT_SECONDS).contains(n) {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Wait Seconds must be an integer in the range 0..99999999".into(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -110,10 +114,14 @@ fn activate_wait(
             let Some(deadline) = deadline else {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Wait Seconds overflows the absolute deadline".into(),
-                    ),
+                    )),
                 );
                 return;
             };
@@ -125,7 +133,11 @@ fn activate_wait(
             let value = fail_or!(
                 out,
                 Some(activity),
-                actx.activity.execution,
+                actx.activity
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("an owned activity has an owner"),
                 eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             // The evaluated result must be a JSON number that is an integer in range (ASL: a JSONata
@@ -150,22 +162,30 @@ fn activate_wait(
             let Some(n) = n else {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Wait Seconds expression must evaluate to an integer".into(),
-                    ),
+                    )),
                 );
                 return;
             };
             if !(0..=MAX_WAIT_SECONDS).contains(&n) {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Wait Seconds expression must evaluate to an integer in the range \
                          0..99999999"
                             .into(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -173,10 +193,14 @@ fn activate_wait(
             let Some(deadline) = deadline else {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Wait Seconds overflows the absolute deadline".into(),
-                    ),
+                    )),
                 );
                 return;
             };
@@ -188,10 +212,14 @@ fn activate_wait(
             None => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(format!(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                         "Wait Timestamp is not a valid RFC3339 timestamp: {s}"
-                    )),
+                    ))),
                 );
                 return;
             }
@@ -202,7 +230,11 @@ fn activate_wait(
             let value = fail_or!(
                 out,
                 Some(activity),
-                actx.activity.execution,
+                actx.activity
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("an owned activity has an owner"),
                 eval_string_or_expr(env, expr.as_str(), &states, &actx.variables)
             );
             let s = match value {
@@ -210,10 +242,14 @@ fn activate_wait(
                 _ => {
                     out.terminate(
                         Some(activity),
-                        actx.activity.execution,
-                        ExecutionError::InvalidDefinition(
+                        actx.activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
+                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "Wait Timestamp expression must evaluate to a string".into(),
-                        ),
+                        )),
                     );
                     return;
                 }
@@ -223,11 +259,15 @@ fn activate_wait(
                 None => {
                     out.terminate(
                         Some(activity),
-                        actx.activity.execution,
-                        ExecutionError::InvalidDefinition(format!(
+                        actx.activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
+                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                             "Wait Timestamp expression must evaluate to a valid RFC3339 \
                              timestamp: {s}"
-                        )),
+                        ))),
                     );
                     return;
                 }
@@ -245,16 +285,20 @@ fn activate_wait(
              (definition is validated on submission)"
         ),
     };
-    let timer = out.next_timer();
     // The activation work (computing the absolute deadline from Seconds/Timestamp) is done: emit the
-    // activation-complete ed, then arm the resume timer as the transition's side effect.
-    out.emit_event(crate::event::Event::StateActivated {
+    // activation-complete ed, then arm the resume timer as the transition's side effect, inlined into
+    // this batch so no separate command round-trips the arm.
+    out.emit_event(crate::types::event::Event::StateActivated {
         activity: state_activated_value(actx, actx.activity.input.clone(), None),
     });
-    out.emit_command(Command::ActivateTimer {
-        parent: crate::id::NodeId::Activity(activity),
-        timer,
-        purpose: TimerPurpose::WaitResume,
+    emit_timer(
+        out,
+        // The timer's `execution` anchor is the flat top-level run (`activity.execution`), not the
+        // immediate owner scope — it drives `Timer::execution` and the timer's
+        // `{execution.name}-{suffix}` generated name, so a branch Wait still names its root run.
+        actx.activity.execution.clone(),
+        activity,
+        TimerPurpose::WaitResume,
         deadline,
-    });
+    );
 }

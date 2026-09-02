@@ -3,12 +3,12 @@ use spica_asl::{PassState, State};
 
 use super::super::state_handler::StateHandler;
 use super::super::{emit_transition, state_activated_value, state_completed_value};
-use crate::context::build_states;
-use crate::error::ExecutionError;
 use crate::eval_env::EvalEnv;
-use crate::event::Event;
 use crate::handler::{ActivityCtx, Collector};
-use crate::id::ActivityId;
+use crate::types::context::build_states;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 
 pub struct PassStateHandler;
 
@@ -21,24 +21,29 @@ impl StateHandler for PassStateHandler {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
         // Pass is fully synchronous: no side effect to arm, so its activate simply moves it on to
         // the complete step in the very next Command. Emit the activation-complete ed first, then
         // the transition command.
-        out.emit_event(crate::event::Event::StateActivated {
+        out.emit_event(crate::types::event::Event::StateActivated {
             activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
-        out.emit_command(crate::command::Command::CompleteState { activity });
+        out.emit_command(crate::types::command::Command::CompleteState {
+            activity,
+            // A Pass's raw result is its processed input (no distinct raw output); the complete step
+            // projects any `Output` template from it.
+            output: actx.activity.input.clone(),
+        });
     }
 
     fn complete(
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -63,7 +68,7 @@ impl StateHandler for PassStateHandler {
 fn complete_pass(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &PassState,
 ) {
@@ -73,7 +78,7 @@ fn complete_pass(
         &actx.state_name(),
         &actx.exec_input,
         Some(&actx.activity.input),
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None, // no Catch `errorOutput` in the success path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -84,7 +89,11 @@ fn complete_pass(
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -94,7 +103,12 @@ fn complete_pass(
                         local_scope.insert(k, v);
                     }
                     out.emit_event(Event::VariablesAssigned {
-                        execution: actx.activity.execution,
+                        scope: actx
+                            .activity
+                            .meta
+                            .owner
+                            .clone()
+                            .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
                     });
                 }
@@ -102,10 +116,14 @@ fn complete_pass(
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity.execution,
-                    ExecutionError::InvalidDefinition(
+                    actx.activity
+                        .meta
+                        .owner
+                        .clone()
+                        .expect("an owned activity has an owner"),
+                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
-                    ),
+                    )),
                 );
                 return;
             }
@@ -116,7 +134,11 @@ fn complete_pass(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_scope)
         ),
         None => actx.activity.input.clone(),
@@ -127,8 +149,14 @@ fn complete_pass(
     });
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output_value,
         state.next.as_deref(),
         state.end,

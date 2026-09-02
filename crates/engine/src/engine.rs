@@ -7,18 +7,18 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::command::Command;
-use crate::error::ExecutionError;
-use crate::event::Event;
-use crate::id::{EntryId, ExecutionId, FlowName, FlowVersionId, RequestId, StreamId, TimerId};
-use crate::job_api::{ActivatedTask, TaskApi};
 use crate::log::{Entry, EntryPayload, LogStream, Timestamp};
-use crate::reject::Reject;
-use crate::result::ExecutionResult;
 use crate::scheduler::{Scheduler, TimerSink};
 use crate::storage::Storage;
 use crate::stream_processor::StreamProcessor;
-use crate::task_service::TaskService;
+use crate::task_api::{ActivatedTask, TaskApi};
+use crate::types::command::Command;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::Event;
+use crate::types::id::{EntryId, FlowName, RequestId, StreamId};
+use crate::types::meta::{ObjectName, ObjectReference};
+use crate::types::reject::Reject;
+use crate::types::result::ExecutionResult;
 
 /// Executes ASL state machines via the CCES architecture (Causal Command Event Sourcing).
 ///
@@ -87,12 +87,6 @@ pub struct EngineBuilder {
     /// fabricates a concrete scheduler, so the caller supplies it (see `with_scheduler`). The
     /// `Arc<dyn Scheduler>` is moved into the StreamProcessor on `start`.
     scheduler: Option<Arc<dyn Scheduler>>,
-    /// The injected external-task **worker** ([`TaskService`]) contract. `None` until
-    /// [`with_task_service`](Self::with_task_service) is called, and required by
-    /// [`start`](Self::start): like the backends/scheduler, the engine never fabricates a concrete
-    /// worker, so the caller supplies it (see `with_task_service`). On `start` the worker is spawned
-    /// and handed the engine's [`TaskApi`] + a shutdown token — it runs its own claim/settle loop.
-    task_service: Option<Arc<dyn TaskService>>,
     /// See the running [`Engine::ack`] — owned here until [`start`](Self::start) moves it.
     ack: Arc<Mutex<AckRouter>>,
 }
@@ -112,13 +106,6 @@ pub struct Engine {
     /// The running engine's state, shared (weakly) with the timer sink. `Engine` holds the only
     /// strong reference — see the type doc.
     inner: Arc<EngineInner>,
-    /// Handle to the spawned task **worker** ([`TaskService`]) — the pulled external-task consumer
-    /// that claims/settles jobs against this engine's [`TaskApi`]. Held here, next to `inner` rather
-    /// than inside it, so `start` can spawn the worker with a reference to the already-built `inner`
-    /// (no init cycle) and `stop` can await it: the worker holds a strong `Arc<dyn TaskApi>` back to
-    /// `inner` for its pull loop, so `stop` must drain it (dropping that `Arc`) before the engine's
-    /// own strong reference can be released.
-    worker: tokio::task::JoinHandle<()>,
 }
 
 /// Provide read-only [`EngineInner`] methods through the [`Engine`] wrapper (auto-deref), so callers
@@ -162,7 +149,7 @@ pub struct EngineInner {
     processor: StreamProcessorTask,
     /// The engine's response registry: every operation that must wait for an acknowledgement — flow
     /// creation landing, an execution reaching a terminal state — registers a one-shot channel
-    /// keyed by a unique [`Ack`] (its own `FlowId`/`ExecutionId`), then awaits its receiver. The
+    /// keyed by a unique [`Ack`] (its own `ExecutionId`), then awaits its receiver. The
     /// internal StreamProcessor completes the matching entry when it applies that outcome (see
     /// [`AckRouter`]). This is Zeebe's `requestId → future` model: entries are keyed by an opaque
     /// per-request id (never the target entity id), so any number of operations — including several
@@ -194,7 +181,7 @@ struct EngineTimerSink {
 
 #[async_trait::async_trait]
 impl TimerSink for EngineTimerSink {
-    async fn trigger(&self, timer: TimerId, cause_id: EntryId) {
+    async fn trigger(&self, timer: &ObjectReference, cause_id: EntryId) {
         // Route the expiry write through the engine's controlled entry — never to the log raw. If
         // the engine is gone (last strong reference dropped), there is nothing left to resume; drop.
         if let Some(engine) = self.engine.upgrade() {
@@ -208,14 +195,14 @@ impl TimerSink for EngineTimerSink {
 ///
 /// `pending` is the registry of in-flight "append a Command, then await its acknowledgement"
 /// operations, keyed by an opaque per-request id ([`RequestId`]). It is deliberately **not** keyed by
-/// a target entity id (`FlowId`/`ExecutionId`): a single flow or execution can be the target of many
+/// a target entity id (`ExecutionId`): a single flow or execution can be the target of many
 /// concurrent requests, and keying by the entity would alias them into one slot — a second `insert`
 /// overwrites the first caller's sender, so one await hangs forever and the other gets a misrouted
 /// ack. Acks are correlated per-*request* (Zeebe's `requestId`), never per-entity.
 ///
 /// `pending` is the registry of in-flight "append a Command, then await its acknowledgement"
 /// operations, keyed by an opaque per-request id ([`RequestId`]). It is deliberately **not** keyed by
-/// a target entity id (`FlowId`/`ExecutionId`): a single flow or execution can be the target of many
+/// a target entity id (`ExecutionId`): a single flow or execution can be the target of many
 /// concurrent requests, and keying by the entity would alias them into one slot — a second `insert`
 /// overwrites the first caller's sender, so one await hangs forever and the other gets a misrouted
 /// ack. Acks are correlated per-*request* (Zeebe's `requestId`), never per-entity.
@@ -230,7 +217,7 @@ pub(crate) struct AckRouter {
 }
 
 impl AckRouter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: HashMap::new(),
         }
@@ -254,11 +241,11 @@ impl AckRouter {
         }
     }
 
-    /// Route the **granted task set** of a `PullTasks` to the awaiting `activate` keyed by
+    /// Route the **granted task set** of a `ClaimTasks` to the awaiting `poll_tasks` keyed by
     /// `request_id`, completing it with [`AckOutcome::Granted`] and removing the entry. Unlike
     /// [`Self::complete`] there is no single applied `Event` to deliver — the hard-set was decided by
-    /// the `PullTasksHandler` at discovery — so the router hands back the list directly. A dropped
-    /// receiver (the `activate` was cancelled) makes the `send` fail, which we ignore.
+    /// the `ClaimTasksHandler` at discovery — so the router hands back the list directly. A dropped
+    /// receiver (the `poll_tasks` was cancelled) makes the `send` fail, which we ignore.
     pub(crate) fn complete_tasks(&mut self, request_id: RequestId, tasks: Vec<ActivatedTask>) {
         if let Some(tx) = self.pending.remove(&request_id) {
             let _ = tx.send(AckOutcome::Granted(tasks));
@@ -269,14 +256,14 @@ impl AckRouter {
 /// The payload an acknowledgement delivers to an awaiting operation: either the **applied**
 /// [`Event`] that resolves the awaited command (boxed — an `Event` is large, and this is a
 /// one-per-awaited-operation send, not a hot hot-path value), a [`Reject`] if the command was
-/// refrained from applying (see [`AckRouter::reject`]), or — for a `PullTasks` pull — the
+/// refrained from applying (see [`AckRouter::reject`]), or — for a `ClaimTasks` poll — the
 /// **granted task set** (see [`AckRouter::complete_tasks`]) decided by the handler at discovery.
 /// Widening the channel from bare `Event` to this is what lets a rejected command wake its awaiter
 /// with the reason — instead of a call that hangs forever or silently returns nothing.
 pub(crate) enum AckOutcome {
     Applied(Box<Event>),
     Rejected(Reject),
-    /// A `PullTasks` pull granted `tasks` to its awaiting `activate` (see
+    /// A `ClaimTasks` poll granted `tasks` to its awaiting `poll_tasks` (see
     /// [`AckRouter::complete_tasks`]).
     Granted(Vec<ActivatedTask>),
 }
@@ -306,7 +293,6 @@ impl EngineBuilder {
             log: Arc::new(log),
             storage: Arc::new(Mutex::new(storage)),
             scheduler: None,
-            task_service: None,
             ack: Arc::new(Mutex::new(AckRouter::new())),
         }
     }
@@ -325,30 +311,14 @@ impl EngineBuilder {
         self
     }
 
-    /// Inject the external-task **worker** ([`TaskService`]) the engine spawns. Required before
-    /// [`start`](Self::start): the engine holds it as `Option` here and `start` refuses to boot
-    /// without it (see that method's `expect`).
-    ///
-    /// Like the backends and scheduler, this is the **assembly point**: the caller builds a concrete
-    /// worker (e.g. `spica_task_service::InMemoryTaskService::spawn(handlers)`) and hands it over
-    /// type-erased, so the engine never fabricates a runtime and has no dependency on the
-    /// implementation crate (keeping `task-service → engine`, not the reverse, acyclic — see
-    /// `crate::task_service`). On `start` the worker is spawned and given the engine's
-    /// [`TaskApi`] (implemented by the running `EngineInner`) plus the same shutdown token the
-    /// StreamProcessor observes, so it stops with the engine.
-    pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
-        self.task_service = Some(task_service);
-        self
-    }
-
     /// Boot the Engine: spawns its **single long-lived StreamProcessor** on these log+storage backends and
     /// returns the running [`Engine`].
     ///
     /// This is the **only** way to obtain an [`Engine`], and it consumes the builder (`self`), so a
     /// given set of backends can be booted at most once and the returned `Engine` is *guaranteed*
-    /// running — its `processor` is never `None`. The concrete scheduler and task service injected
-    /// via [`with_scheduler`](Self::with_scheduler) / [`with_task_service`](Self::with_task_service)
-    /// are fixed for the Engine's lifetime (one StreamProcessor serves every execution).
+    /// running — its `processor` is never `None`. The concrete scheduler injected via
+    /// [`with_scheduler`](Self::with_scheduler) is fixed for the Engine's lifetime (one StreamProcessor
+    /// serves every execution).
     ///
     /// Non-blocking: `start` spawns the StreamProcessor task and returns; the StreamProcessor processes appends
     /// as they land. Engine methods follow the same shape — *register* an acknowledgement
@@ -361,29 +331,22 @@ impl EngineBuilder {
     /// type cannot express "stop then restart on the same Engine," which is the safe reading of the
     /// old convention (boot once, run many commands, stop once, drop).
     pub async fn start(self) -> Result<Engine, ExecutionError> {
-        // The scheduler and task service are the third and fourth injected backends, and — like the
-        // log/store — the engine never fabricates them. A programmer who forgets `with_scheduler` /
-        // `with_task_service` is denied here at boot (a developer-error, not a runtime condition),
-        // the same guarded-registration style used elsewhere in this crate.
+        // The scheduler is the third injected backend, and — like the log/store — the engine never
+        // fabricates it. A programmer who forgets `with_scheduler` is denied here at boot (a
+        // developer-error, not a runtime condition), the same guarded-registration style used
+        // elsewhere in this crate.
         let scheduler = self
             .scheduler
             .expect("EngineBuilder::start requires with_scheduler to have been called");
-        let task_service = self
-            .task_service
-            .expect("EngineBuilder::start requires with_task_service to have been called");
         let mut processor = StreamProcessor::new();
         let log = Arc::clone(&self.log);
         let storage = Arc::clone(&self.storage);
         let ack = Arc::clone(&self.ack);
-        // Controlled-shutdown token for the StreamProcessor loop (and the worker): on `stop` we
-        // `cancel()` it and await the task, letting the loop drain its current iteration and return
-        // cleanly — rather than `JoinHandle::abort`, which hard-kills the spawned future mid-iteration
-        // with no teardown.
+        // Controlled-shutdown token for the StreamProcessor loop: on `stop` we `cancel()` it and await
+        // the task, letting the loop drain its current iteration and return cleanly — rather than
+        // `JoinHandle::abort`, which hard-kills the spawned future mid-iteration with no teardown.
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
-        // The worker observes the same shutdown as the StreamProcessor: cloned before `cancel` is
-        // moved into the engine state below.
-        let worker_cancel = cancel.clone();
         // Clone the scheduler handle for the loop: the original is kept here to inject the timer sink
         // afterwards, since the sink weakly references the running engine's `Arc<EngineInner>`, which
         // only exists once the loop has been spawned and handed its `StreamProcessorTask` handle.
@@ -414,15 +377,7 @@ impl EngineBuilder {
         scheduler.attach_sink(Arc::new(EngineTimerSink {
             engine: Arc::downgrade(&inner),
         }));
-        // Spawn the task worker: hand it the engine (as the inbound `TaskApi` it claims/settles
-        // against) and the same shutdown token the StreamProcessor observes. The worker registers its
-        // `resource`s on boot, then runs its own pull loop — the engine's single writer is unchanged
-        // (every claim/settle is an inbound command validated and appended by `TaskApi`).
-        let api: Arc<dyn TaskApi> = inner.clone();
-        let worker = tokio::spawn(async move {
-            task_service.run(api, worker_cancel).await;
-        });
-        let engine = Engine { inner, worker };
+        let engine = Engine { inner };
         info!("engine started: internal processor running");
         Ok(engine)
     }
@@ -436,26 +391,32 @@ impl Engine {
     /// Commands (duplicate events), so the type refuses to let a stopped Engine be reused. Convention
     /// today: boot once, run many commands, stop once.
     pub async fn stop(self) {
-        // Destructure the engine's two running handles. The worker MUST be drained before the
-        // engine's strong reference is released: it holds a strong `Arc<dyn TaskApi>` back to `inner`
-        // for its pull loop, so it is awaited (after the shared cancel signal) to ensure it finishes
-        // and drops that `Arc` — otherwise the inbound-API reference keeps `inner` alive past `stop`.
-        let Engine { inner, worker } = self;
-        // Signal the run loop (and the worker, which observes the same token) to stop tailing.
+        // `inner` must be the engine's sole strong owner here: any worker a caller spawned against
+        // [`Self::task_api`] holds a strong `Arc<dyn TaskApi>` → `Arc<EngineInner>` back to it, so the
+        // caller MUST stop (and release) that worker *before* stopping the engine, or this unwrap
+        // fails. That is the worker-lifecycle contract spelled out in [`Self::task_api`].
+        let Engine { inner } = self;
+        // Signal the run loop to stop tailing.
         inner.processor.cancel.cancel();
-        // Await the worker first so its strong `Arc<dyn TaskApi>` back to `inner` is released. Only
-        // then is `inner` alone, so it can be unwrapped to reach the processor handle. (`unreachable!`
-        // rather than `expect` so this needs no `Debug` on `EngineInner`.)
-        let _ = worker.await;
+        // Drain the loop's current iteration and await it, so shutdown is a closed loop (nothing
+        // drains after we return). (`unreachable!` rather than `expect` so this needs no `Debug` on
+        // `EngineInner`.)
         let inner = match Arc::try_unwrap(inner) {
             Ok(inner) => inner,
-            Err(_) => unreachable!("worker drained above; engine is the sole remaining owner"),
+            Err(_) => unreachable!("engine is the sole remaining owner of its inner state"),
         };
-        // With the worker gone, drain the processor's current iteration and await its task, so
-        // shutdown is a closed loop (nothing drains after we return).
         let task = inner.processor;
         let _ = task.handle.await;
-        info!("engine stopped: internal processor and worker shut down");
+        info!("engine stopped: internal processor shut down");
+    }
+
+    /// Hand a worker the engine-hosted inbound [`TaskApi`] (this running engine's `EngineInner`
+    /// implements it), so the worker can claim/settle tasks externally — the engine no longer spawns
+    /// or owns any worker. The returned `Arc<dyn TaskApi>` is a strong reference to the engine's inner
+    /// state, so **stop any worker you spawn with it before [`Engine::stop`]** — otherwise the engine
+    /// cannot be unwrapped and cleanly shut down.
+    pub fn task_api(&self) -> Arc<dyn TaskApi> {
+        self.inner.clone()
     }
 }
 
@@ -470,13 +431,15 @@ impl EngineInner {
     /// Zeebe leaves the same protection in the event-driven fold. Envelopes with placeholders; the
     /// log stamps the real position and its own stream id, and `cause_id` causally hangs this off the
     /// `TimerActivated` that armed it.
-    async fn trigger_timer(&self, timer: TimerId, cause_id: EntryId) {
+    async fn trigger_timer(&self, timer: &ObjectReference, cause_id: EntryId) {
         let entry = Entry {
             stream_id: StreamId::nil(), // the log stamps its own id at append.
             entry_id: EntryId::nil(),   // placeholder — the log assigns the real position.
             cause_id: Some(cause_id),
             timestamp: Timestamp::now(),
-            payload: EntryPayload::Command(Command::TriggerTimer { timer }),
+            payload: EntryPayload::Command(Command::TriggerTimer {
+                timer: timer.clone(),
+            }),
         };
         // The append only fails if the engine's own log handle is already gone (shut down); log the
         // dropped fire rather than panic, which would kill the scheduler loop and every other timer.
@@ -521,11 +484,11 @@ impl EngineInner {
         }
     }
 
-    /// Await the **granted task set** of a [`Command::PullTasks`] pull on `rx` (the channel
+    /// Await the **granted task set** of a [`Command::ClaimTasks`] poll on `rx` (the channel
     /// registered by [`Self::register_ack`]). This is the same "append a Command, then await its ack"
-    /// primitive as [`Self::await_ack`], specialized for the `AckOutcome::Granted` a `PullTasks`
+    /// primitive as [`Self::await_ack`], specialized for the `AckOutcome::Granted` a `ClaimTasks`
     /// delivers (there is no single applied `Event` to hand back — the list was decided by the
-    /// `PullTasksHandler` at discovery). Returns `Ok(tasks)` on a successful grant, or the same
+    /// `ClaimTasksHandler` at discovery). Returns `Ok(tasks)` on a successful grant, or the same
     /// [`AckFailure`]s as [`Self::await_ack`] (rejected / dropped).
     async fn await_ack_tasks(
         rx: oneshot::Receiver<AckOutcome>,
@@ -534,7 +497,7 @@ impl EngineInner {
             Ok(AckOutcome::Granted(tasks)) => Ok(tasks),
             Ok(AckOutcome::Rejected(reject)) => Err(AckFailure::Rejected(reject)),
             Ok(AckOutcome::Applied(_)) => {
-                unreachable!("a PullTasks ack delivers Granted, never an applied Event")
+                unreachable!("a ClaimTasks ack delivers Granted, never an applied Event")
             }
             Err(_) => Err(AckFailure::Dropped),
         }
@@ -546,24 +509,21 @@ impl EngineInner {
     /// machine-readable reason.
     fn ack_failure_error(failure: AckFailure) -> ExecutionError {
         match failure {
-            AckFailure::Dropped => ExecutionError::InvalidDefinition(
+            AckFailure::Dropped => ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                 "no acknowledgement received (engine not started, or its StreamProcessor never applied the \
                  awaited outcome)"
                     .to_string(),
-            ),
-            AckFailure::Rejected(reject) => ExecutionError::Rejected {
-                kind: reject.rejection_type,
-                reason: reject.rejection_reason,
-            },
+            )),
+            AckFailure::Rejected(reject) => ExecutionError::Rejected(reject),
         }
     }
 
     /// Create a new version of a flow under `name` from its raw ASL definition string
     /// (the JSON-encoded form of a [`StateMachine`]), persisting it to Storage, and return
-    /// the **never-reused [`FlowVersionId`]** executions of this definition bind to. `CreateFlow`
+    /// the **never-reused [`ObjectReference`]** executions of this definition bind to. `CreateFlow`
     /// creates a **new** flow: passing a `name` that **already exists** is rejected with
     /// [`ExecutionError::InvalidDefinition`] (a future "add a version to an existing flow" operation
-    /// is a separate concern); the owning [`Flow`]'s audit `flow_id` is minted by the handler.
+    /// is a separate concern); the version's `ObjectName` (`{name}-{version}`) and `uid` are minted by the handler.
     ///
     /// The definition is **validated at this boundary** — a string that doesn't parse as a
     /// `StateMachine` is rejected with [`ExecutionError::InvalidDefinition`] before anything is
@@ -584,15 +544,15 @@ impl EngineInner {
         &self,
         name: FlowName,
         definition: &str,
-    ) -> Result<FlowVersionId, ExecutionError> {
+    ) -> Result<ObjectReference, ExecutionError> {
         // Validate the definition at the boundary, **before anything is written** (fail fast): a raw
         // definition that doesn't parse as a `StateMachine` is rejected up front, so a malformed flow
         // can never enter the log or Storage. The parsed model is discarded here — the durable record
         // is the raw string; execution parses it on demand via `HandlerContext::machine`.
         if serde_json::from_str::<spica_asl::StateMachine>(definition).is_err() {
-            return Err(ExecutionError::InvalidDefinition(
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                 "malformed flow definition: does not parse as a StateMachine".to_string(),
-            ));
+            )));
         }
 
         // Boundary pre-check: `CreateFlow` creates only new names, so refuse an already-existing one
@@ -607,14 +567,14 @@ impl EngineInner {
         {
             let storage = self.storage.lock().await;
             if storage.get_flow_by_name(name.clone()).await?.is_some() {
-                return Err(ExecutionError::InvalidDefinition(format!(
-                    "flow {name} already exists"
+                return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    format!("flow {name} already exists"),
                 )));
             }
         }
 
-        // An opaque request id keys this operation's ack. The identities (`flow_id`, and the
-        // `flow_version_id` this method returns) are minted by the handler and echoed back on the
+        // An opaque request id keys this operation's ack. The identities (the version's
+        // `ObjectReference`, which this method returns) are minted by the handler and echoed back on the
         // `FlowVersionCreated` event, so we learn them only once the ack lands — registration still
         // happens **before** the append (see `register_ack`): the long-lived StreamProcessor can only emit
         // `FlowVersionCreated` after it reads the appended `CreateFlow`, so an early register
@@ -639,7 +599,7 @@ impl EngineInner {
 
         // Wait for the acknowledgement that this definition is durably applied — the matching
         // `FlowVersionCreated` event (the one the StreamProcessor routes a CreateFlow ack on) delivered to
-        // our own channel — and read back the handler-minted `flow_version_id` (the identity
+        // our own channel — and read back the handler-minted version reference (the identity
         // executions bind to). The await is the ordering guarantee that the definition is folded into
         // Storage before `create_flow` returns (so a later `start_for_revision` always dispatches
         // after it) — see the method-level note. A slack path: if the handler refuses the command
@@ -655,56 +615,72 @@ impl EngineInner {
                 "ack registry routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        tracing::info!(name = %name, flow_version_id = %flow_version.flow_version_id, version = flow_version.version, "flow created, acked");
-        Ok(flow_version.flow_version_id)
+        tracing::info!(name = %name, flow_version = %flow_version.reference(), version = flow_version.version, "flow created, acked");
+        Ok(flow_version.reference())
     }
 
     /// Aborts a running execution by appending `TerminateExecution{Cancelled}` to the log. The
     /// StreamProcessor drives the unwind: `ExecutionTerminating`, then child cleanup, then
-    /// `ExecutionTerminated{Cancelled}`. The termination handler resolves the target by
-    /// `execution_id` from Storage (not by stream), so the appended entry needs no stream chosen here
-    /// — the log stamps its own id at append.
+    /// `ExecutionTerminated{Cancelled}`. The termination handler resolves the target by `name` (with
+    /// an optional `uid` incarnation guard) from Storage (not by stream), so the appended entry needs
+    /// no stream chosen here — the log stamps its own id at append.
     pub async fn terminate(
-        execution_id: ExecutionId,
+        name: ObjectName,
+        uid: Option<ulid::Ulid>,
         logstream: &(impl LogStream<EntryPayload> + ?Sized),
     ) -> Result<(), ExecutionError> {
         logstream
             .append(vec![Entry {
                 // Stream placeholder — the log stamps its own id at append.
                 stream_id: StreamId::nil(),
-                entry_id: crate::id::EntryId::nil(), // placeholder — the log assigns the position.
+                entry_id: crate::types::id::EntryId::nil(), // placeholder — the log assigns the position.
                 cause_id: None,
                 timestamp: Timestamp::now(),
                 payload: EntryPayload::Command(Command::TerminateExecution {
-                    id: execution_id,
-                    reason: crate::command::TerminationReason::Cancelled,
+                    name,
+                    uid,
+                    reason: crate::types::command::TerminationReason::Cancelled,
                 }),
             }])
             .await?;
         Ok(())
     }
 
-    /// Resolve the latest created version's id under `name` from the **persisted** Storage
-    /// projection. Used by [`resolve_version_id`](Self::resolve_version_id) (version `0` = latest); a
-    /// past-state lookup, so it does not go through the future-awaiting [`await_ack`](Self::await_ack).
+    /// Resolve the latest created version's [`ObjectReference`] under `name` from the **persisted**
+    /// Storage projection. Used by [`resolve_version_id`](Self::resolve_version_id) (version `0` =
+    /// latest); a past-state lookup, so it does not go through the future-awaiting
+    /// [`await_ack`](Self::await_ack).
     ///
     /// This read is safe while the long-lived StreamProcessor runs: it acquires the Storage lock **per**
     /// entry, releasing it between entries (see the `storage` field doc), so this read never issues a
     /// blocking write-hold on the StreamProcessor's applies.
-    async fn latest_version_id(&self, name: &FlowName) -> Result<FlowVersionId, ExecutionError> {
+    async fn latest_version(&self, name: &FlowName) -> Result<ObjectReference, ExecutionError> {
         let storage = self.storage.lock().await;
-        // The owning `Flow` keeps an O(1) pointer to its newest version; resolve it by name.
+        // The owning `Flow` keeps an O(1) counter of its newest ordinal; resolve that ordinal to the
+        // concrete version row (keyed by `{flow_name}-{version}`), then to its reference.
         let flow = storage
             .get_flow_by_name(name.clone())
             .await?
             .ok_or_else(|| {
-                ExecutionError::InvalidDefinition(format!("flow {name} has no created version"))
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "flow {name} has no created version"
+                )))
             })?;
-        Ok(flow.latest_flow_version_id)
+        storage
+            .flow_version_of(name.clone(), flow.latest_version)
+            .await?
+            .map(|ver| ver.reference())
+            .ok_or_else(|| {
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "flow {name} has no version {}",
+                    flow.latest_version
+                )))
+            })
     }
 
-    /// Starts an execution against a **specific created version** (`flow_version_id`), with no Task
-    /// handlers beyond those the Engine was booted with. The definition must already be created.
+    /// Starts an execution against a **specific created version** (`flow_version` — an
+    /// [`ObjectReference`] naming the version's `object_name`+`uid`), with no Task handlers beyond
+    /// those the Engine was booted with. The definition must already be created.
     ///
     /// The Engine's single long-lived StreamProcessor drives the execution; this method mints an opaque
     /// [`RequestId`], **registers** a one-shot acknowledgement channel under it, **appends** the
@@ -717,10 +693,37 @@ impl EngineInner {
     /// durable projection alone, even across an Engine restart.
     pub async fn start_for_revision(
         &self,
-        flow_version_id: FlowVersionId,
+        name: ObjectName,
+        flow_version: ObjectReference,
         input: Value,
-    ) -> Result<ExecutionId, ExecutionError> {
+    ) -> Result<ObjectReference, ExecutionError> {
         // A running Engine is guaranteed by the type; no "engine not started" guard is needed.
+
+        // Boundary pre-check: `CreateExecution` creates only new names — the name is now the
+        // execution's storage primary key (per-scope unique) — so refuse an already-live one
+        // **before** registering/awaiting anything. This read acquires the Storage lock per-read and
+        // drops it immediately (the StreamProcessor holds it only per-entry), so it never blocks an
+        // apply; it is a fast user-facing guard against the common duplicate-start mistake. The
+        // handler re-checks atomically at dispatch time (see `create_execution.rs`), the
+        // authoritative serialized point — this early check is an optimization + clear error, not the
+        // enforcement mechanism. NOTE: not atomic with the later append — two concurrent same-name
+        // starts could both pass this read; the handler's in-order check bounds the damage (the loser
+        // emits a `Reject` → `ExecutionError::Rejected`).
+        {
+            let storage = self.storage.lock().await;
+            // A name-only probe (nil uid) suffices: storage keys executions by name, so the uid is
+            // irrelevant to the read.
+            let probe = crate::types::meta::ObjectReference::new(
+                crate::types::meta::ObjectKind::Execution,
+                name.clone(),
+                ulid::Ulid::nil(),
+            );
+            if storage.get_execution(&probe).await?.is_some() {
+                return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    format!("execution {name} already exists"),
+                )));
+            }
+        }
 
         // A fresh opaque `request_id` (never the target `execution_id`) keys this operation's ack,
         // registered *before* the `CreateExecution` append (see `register_ack`): the StreamProcessor only
@@ -729,9 +732,15 @@ impl EngineInner {
         // precede it. The
         // birth event echoes this request id (see `AckRouter`), so — unlike the previous terminal-ack
         // flow — no `execution → request` routing bookkeeping is needed. The machine resolves from
-        // Storage (by `flow_version_id`) at dispatch time.
+        // Storage (by `flow_version` reference) at dispatch time.
         let request_id = RequestId::new();
         let rx = self.register_ack(request_id).await;
+        // The execution's durable `uid` is **not** minted here — the `CreateExecution` handler mints it
+        // at dispatch and echoes the finished `Execution` back on `ExecutionCreated`. That stays
+        // replay-deterministic because the produced event lands in the same atomic batch as the
+        // command (a committed command is conclusive; an aborted one re-dispatches fresh). The caller
+        // only ever observes the reference via the awaited birth event below, so no uid is needed up
+        // front.
         self.log
             .append(vec![Entry {
                 // Stream placeholder — the log stamps its own id at append.
@@ -741,8 +750,8 @@ impl EngineInner {
                 timestamp: Timestamp::now(),
                 payload: EntryPayload::Command(Command::CreateExecution {
                     request_id,
-                    id: ExecutionId::new(),
-                    flow_version_id,
+                    name,
+                    flow_version,
                     input,
                 }),
             }])
@@ -756,25 +765,29 @@ impl EngineInner {
             Err(failure) => return Err(Self::ack_failure_error(failure)),
         };
         match event {
-            Event::ExecutionCreated { execution, .. } => Ok(execution.id),
+            Event::ExecutionCreated { execution, .. } => Ok(execution.reference()),
             _ => unreachable!("await_ack only delivers this request's ExecutionCreated"),
         }
     }
 
     /// Abort a running execution by issuing a `TerminateExecution{Cancelled}` on the Engine's own
     /// log — the `&self` (running-engine) analogue of the raw-seam free function [`terminate`](Self::terminate),
-    /// so the Server's `Arc<Engine>` can cancel by `execution_id` without holding a caller-supplied
-    /// log or knowing the execution's stream up front.
+    /// so the Server's `Arc<Engine>` can cancel by `name` (with an optional `uid` incarnation guard)
+    /// without holding a caller-supplied log or knowing the execution's stream up front.
     ///
     /// Non-blocking: appends the command and returns once it is durable; settlement is observed by
     /// polling [`wait_for_execution`](Self::wait_for_execution) / [`execution_status`](Self::execution_status),
     /// which surface it as `Terminated(Cancelled)`. The termination handler resolves the target by
-    /// `execution_id` from Storage (not by stream), and the log stamps its own stream id at append —
-    /// so the cancellation needs no stream chosen here.
-    pub async fn cancel_execution(&self, execution_id: ExecutionId) -> Result<(), ExecutionError> {
-        // The handler ignores which stream the command lands on, resolving the execution by id;
-        // the log stamps its own stream id at append.
-        Self::terminate(execution_id, &*self.log).await
+    /// `name` from Storage (not by stream), and the log stamps its own stream id at append — so the
+    /// cancellation needs no stream chosen here.
+    pub async fn cancel_execution(
+        &self,
+        name: ObjectName,
+        uid: Option<ulid::Ulid>,
+    ) -> Result<(), ExecutionError> {
+        // The handler ignores which stream the command lands on, resolving the execution by name (and
+        // its optional incarnation guard); the log stamps its own stream id at append.
+        Self::terminate(name, uid, &*self.log).await
     }
 
     /// Wait for the execution started by [`start_for_revision`](Self::start_for_revision) to reach a
@@ -784,7 +797,7 @@ impl EngineInner {
     /// or not the original caller is still alive, and even across an Engine restart. Polls at a
     /// fixed interval (no overall timeout) until the execution lands in a terminal status:
     ///
-    /// - `Completed` → the decided [`ExecutionResult`](crate::result::ExecutionResult).
+    /// - `Completed` → the decided [`ExecutionResult`](crate::types::result::ExecutionResult).
     /// - `Terminated(reason)` → `Err(reason.to_execution_error())`.
     /// - `Running`/`Completing`/`Terminating` → keep polling.
     ///
@@ -792,7 +805,7 @@ impl EngineInner {
     /// returns [`ExecutionError`] immediately rather than polling forever.
     pub async fn wait_for_execution(
         &self,
-        execution_id: ExecutionId,
+        execution: &ObjectReference,
     ) -> Result<ExecutionResult, ExecutionError> {
         // Poll the durable projection. The interval keeps contention on the shared Storage lock low
         // (the StreamProcessor releases it between entries — see the `storage` field doc — so this read
@@ -802,10 +815,10 @@ impl EngineInner {
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         loop {
             let storage = self.storage.lock().await;
-            let exec = storage.get_execution(execution_id).await?.ok_or_else(|| {
-                ExecutionError::InvalidDefinition(format!(
-                    "execution {execution_id} has no projection to await (never created or GC'd)"
-                ))
+            let exec = storage.get_execution(execution).await?.ok_or_else(|| {
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "execution {execution} has no projection to await (never created or GC'd)"
+                )))
             })?;
             drop(storage);
             match &exec.status {
@@ -823,9 +836,9 @@ impl EngineInner {
         }
     }
 
-    /// Resolve the persisted `FlowVersionId` for `(name, version)` **without blocking on settlement**
+    /// Resolve the persisted [`ObjectReference`] for `(name, version)` **without blocking on settlement**
     /// or awaiting any live ack: `version == 0` selects the latest created version (the "latest"
-    /// convention), any other `version` resolves through the flow's `(flow_id, version)` index.
+    /// convention), any other `version` resolves through the flow's `(name, version)` index.
     ///
     /// This is the non-awaiting *resolution* step a caller performs before
     /// [`start_for_revision`](Self::start_for_revision), exposed so the Server's `StartExecution` can
@@ -835,25 +848,23 @@ impl EngineInner {
         &self,
         name: FlowName,
         version: u32,
-    ) -> Result<FlowVersionId, ExecutionError> {
+    ) -> Result<ObjectReference, ExecutionError> {
         // Version 0 is the server's "latest" convention.
         if version == 0 {
-            return self.latest_version_id(&name).await;
+            return self.latest_version(&name).await;
         }
         let storage = self.storage.lock().await;
-        let flow = storage
-            .get_flow_by_name(name.clone())
-            .await?
-            .ok_or_else(|| {
-                ExecutionError::InvalidDefinition(format!("flow {name} has no created version"))
-            })?;
+        // The version is keyed by the flow's own name + ordinal (its sole identity), so a (missing)
+        // flow and a (missing) version both surface as a version lookup miss.
         let ver = storage
-            .flow_version_of(flow.flow_id, version)
+            .flow_version_of(name.clone(), version)
             .await?
             .ok_or_else(|| {
-                ExecutionError::InvalidDefinition(format!("flow {name} has no version {version}"))
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                    "flow {name} has no version {version}"
+                )))
             })?;
-        Ok(ver.flow_version_id)
+        Ok(ver.reference())
     }
 
     /// Read a **non-blocking** snapshot of an execution's current state from the persisted
@@ -867,10 +878,10 @@ impl EngineInner {
     /// distinguish "unknown" from "in flight".
     pub async fn execution_status(
         &self,
-        execution_id: ExecutionId,
-    ) -> Result<Option<crate::result::ExecutionStatusSnapshot>, ExecutionError> {
+        execution: &ObjectReference,
+    ) -> Result<Option<crate::types::result::ExecutionStatusSnapshot>, ExecutionError> {
         let storage = self.storage.lock().await;
-        let Some(exec) = storage.get_execution(execution_id).await? else {
+        let Some(exec) = storage.get_execution(execution).await? else {
             return Ok(None);
         };
         // A `Terminated` execution reports its failure exactly like `wait_for_execution` does — the
@@ -882,7 +893,7 @@ impl EngineInner {
             }
             _ => (None, None),
         };
-        Ok(Some(crate::result::ExecutionStatusSnapshot {
+        Ok(Some(crate::types::result::ExecutionStatusSnapshot {
             status: exec.status.clone(),
             output: exec.output.clone(),
             error_name,
@@ -899,25 +910,46 @@ impl EngineInner {
 /// `CompleteTask` is only honored for the leasing worker). The worker never writes the log itself.
 #[async_trait::async_trait]
 impl TaskApi for EngineInner {
-    async fn activate(
+    async fn poll_tasks(
         &self,
         worker_id: &str,
         resource: &str,
         max_tasks: usize,
         lease_seconds: u64,
     ) -> Result<Vec<ActivatedTask>, ExecutionError> {
-        // Defer allocation to the StreamProcessor: append ONE `PullTasks` command, whose handler
+        // Read-first gate (finding #12): an idle poll — nothing claimable **right now** — is a strict
+        // idempotent pure query and must not write a durable `ClaimTasks` entry (the worker busy-polls
+        // every few ms, so idle polls would otherwise bury the causal chain in no-op commands). This
+        // discovery is best-effort: it only decides whether to bother appending; the authoritative
+        // allotment still happens in the serialized dispatch. A task that appeared since this read is
+        // picked up by the next poll; one that raced away only costs a single empty command write. A
+        // discovery read failure likewise means "nothing claimable now" — the worker just polls again.
+        let claimable_now = {
+            let storage = self.storage.lock().await;
+            match storage.activatable_tasks(resource, max_tasks).await {
+                Ok(t) => {
+                    let now = Timestamp::now();
+                    t.into_iter()
+                        .any(|t| !t.retry_state.next_available_at.is_some_and(|at| now < at))
+                }
+                Err(_) => false,
+            }
+        };
+        if !claimable_now {
+            return Ok(Vec::new());
+        }
+        // Defer allocation to the StreamProcessor: append ONE `ClaimTasks` command, whose handler
         // (running in the serialized, lock-holding command arm) discovers `Pending` tasks of
         // `resource`, leases each to this worker, and returns the granted set via our ack channel.
         // This is the fix that removes the old allocation-at-API-time bug — a projection read + one
-        // `AssignTask` per task raced concurrent pulls (TOCTOU) and could allocate already-cancelled
+        // `ClaimTasks` raced concurrent pulls (TOCTOU) and could allocate already-cancelled
         // tasks. Now allocation is decided in the same snapshot the fold writes, exactly-once-wise,
         // and the grant travels the same "register an ack, then await its channel" path every other
         // blocking Engine method uses. Register our one-shot *before* appending so the handler's
         // delivery is guaranteed to find a channel.
         let request_id = RequestId::new();
         let rx = self.register_ack(request_id).await;
-        self.append_command(Command::PullTasks {
+        self.append_command(Command::ClaimTasks {
             request_id,
             worker_id: worker_id.to_string(),
             resource: resource.to_string(),
@@ -934,25 +966,52 @@ impl TaskApi for EngineInner {
     async fn complete(
         &self,
         worker_id: &str,
-        task: crate::id::TaskId,
+        task: ObjectName,
+        request_id: RequestId,
         output: Value,
     ) -> Result<(), ExecutionError> {
-        self.append_command(Command::CompleteTask {
+        // A request/response report (mirroring `poll_tasks` below): register a one-shot ack under the
+        // worker-supplied `request_id` *before* appending, append the `CompleteTask` command, then
+        // await the echoed outcome. The worker learns whether its settlement was actually applied
+        // (the `TaskCompleted` matching its id) or refused (a `Reject`), instead of fire-and-forget.
+        let rx = self.register_ack(request_id).await;
+        // The worker addresses a task by its **canonical name** (finding #13), so build the
+        // `ObjectReference` straight from it — `uid` is irrelevant to the name-keyed lookup, so carry
+        // nil. No re-derivation from a uid needed (the old `for_uid`/`child-<uid>` bridge is gone).
+        let task_ref = ObjectReference::new(
+            crate::types::meta::ObjectKind::Task,
             task,
+            ulid::Ulid::nil(),
+        );
+        self.append_command(Command::CompleteTask {
+            request_id,
+            task: task_ref,
             worker_id: worker_id.to_string(),
             output,
         })
-        .await
+        .await?;
+        match Self::await_ack(rx).await {
+            // The awaited `TaskCompleted` was applied — the settlement is durable. Its payload is
+            // not needed here (the task's terminal state is already projected into Storage).
+            Ok(_) => Ok(()),
+            Err(failure) => Err(Self::ack_failure_error(failure)),
+        }
     }
 
     async fn fail(
         &self,
         worker_id: &str,
-        task: crate::id::TaskId,
+        task: ObjectName,
         error: ExecutionError,
     ) -> Result<(), ExecutionError> {
-        self.append_command(Command::FailTask {
+        // Same name→`ObjectReference` bridge as `complete` (see above, finding #13).
+        let task_ref = ObjectReference::new(
+            crate::types::meta::ObjectKind::Task,
             task,
+            ulid::Ulid::nil(),
+        );
+        self.append_command(Command::FailTask {
+            task: task_ref,
             worker_id: worker_id.to_string(),
             error,
         })

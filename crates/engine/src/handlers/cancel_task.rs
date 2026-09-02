@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 
 use crate::TaskStatus;
-use crate::command::Command;
-use crate::event::Event;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::types::command::Command;
+use crate::types::event::Event;
 
 /// Handles `CancelTask`: an in-flight `Task` is cancelled because its owning activity/execution is
 /// being torn down. Emits only `TaskCancelled`, which marks the task `Cancelled` in storage and
-/// drains it from its parent. The physical call is deliberately left running (see the
-/// [`TaskService`](crate::task_service::TaskService) docs); a later `CompleteTask` for
+/// drains it from its parent. The physical work on the worker is deliberately left running (the
+/// worker owns cancellation of its own call); a later `CompleteTask` for
 /// this task is swallowed by the `CompleteTaskHandler`'s non-`Running` guard — exactly the race
 /// guard a `CancelTimer` + late `TriggerTimer` already uses.
 #[derive(Default)]
@@ -18,7 +18,7 @@ pub struct CancelTaskHandler;
 impl CommandHandler for CancelTaskHandler {
     fn command(&self) -> Command {
         Command::CancelTask {
-            task: crate::id::TaskId::nil(),
+            task: crate::types::meta::ObjectReference::nil(),
         }
     }
 
@@ -30,7 +30,7 @@ impl CommandHandler for CancelTaskHandler {
         };
         let Some(task_value) = ctx
             .storage
-            .get_task(*task)
+            .get_task(task)
             .await
             .ok()
             .flatten()
@@ -39,8 +39,17 @@ impl CommandHandler for CancelTaskHandler {
             return;
         };
         out.emit_event(Event::TaskCancelled {
-            task: crate::TaskValue {
+            task: crate::Task {
                 status: TaskStatus::Cancelled,
+                // Stamp the cancel moment; `created_at` is carried forward by the explicit `meta`
+                // reading `task_value.meta.created_at` (the `..task_value` spread still fills the
+                // remaining fields).
+                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                    crate::types::meta::ObjectKind::Task,
+                    task_value.meta.uid,
+                    task_value.meta.created_at,
+                    crate::log::Timestamp::now(),
+                ),
                 ..task_value
             },
         });

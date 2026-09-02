@@ -2,7 +2,7 @@
 //! revision and returns the id at birth, non-blocking), `GetExecution` (point-in-time snapshot,
 //! polled to settlement), and `StopExecution` (issue an abort, non-blocking).
 
-use spica_engine::{ExecutionId, ExecutionStatus, FlowName, FlowVersionId};
+use spica_engine::{ExecutionId, ExecutionStatus, FlowName, ObjectKind, ObjectReference};
 use spica_proto::v1::{
     ExecutionState, GetExecutionRequest, GetExecutionResponse, StartExecutionRequest,
     StartExecutionResponse, StopExecutionRequest, StopExecutionResponse,
@@ -10,7 +10,7 @@ use spica_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::common::{Svc, parse_ulid, to_status};
+use crate::common::{Svc, parse_ref, parse_ulid, to_status};
 
 #[tonic::async_trait]
 impl ExecutionService for Svc {
@@ -24,12 +24,10 @@ impl ExecutionService for Svc {
         let input: serde_json::Value = serde_json::from_slice(&req.input)
             .map_err(|e| Status::invalid_argument(format!("input is not valid JSON: {e}")))?;
 
-        // Resolve the revision to a concrete FlowVersionId: either the explicit handle CreateFlow
-        // returned, or a (name, version) lookup resolved non-blocking against the projection.
-        let fvid = match req.target {
-            Some(spica_proto::v1::start_execution_request::Target::FlowVersionId(s)) => {
-                parse_ulid::<FlowVersionId>(&s, "flow_version_id")?
-            }
+        // Resolve the revision to a concrete version reference: either the explicit reference
+        // CreateFlow returned, or a (name, version) lookup resolved non-blocking against the projection.
+        let flow_version = match req.target {
+            Some(spica_proto::v1::start_execution_request::Target::FlowVersion(r)) => parse_ref(r)?,
             Some(spica_proto::v1::start_execution_request::Target::FlowName(name)) => {
                 let name = FlowName::new(&name)
                     .map_err(|e| Status::invalid_argument(format!("invalid flow name: {e}")))?;
@@ -40,19 +38,27 @@ impl ExecutionService for Svc {
             }
             None => {
                 return Err(Status::invalid_argument(
-                    "StartExecution: no target (flow_version_id or flow_name) set",
+                    "StartExecution: no target (flow_version or flow_name) set",
                 ));
             }
         };
 
-        tracing::debug!(flow_version = %fvid.0, "StartExecution");
+        tracing::debug!(flow_version = %flow_version, "StartExecution");
+        // The engine requires a user-supplied execution name; validate it here at the gRPC boundary
+        // (`ObjectName::plain` bans the reserved `-`, among other invalids) so a bad or missing name is
+        // rejected before any command is appended.
+        let name = spica_engine::ObjectName::plain(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("invalid execution name: {e}")))?;
         let execution_id = self
             .engine
-            .start_for_revision(fvid, input)
+            .start_for_revision(name, flow_version, input)
             .await
             .map_err(to_status)?;
         Ok(Response::new(StartExecutionResponse {
-            execution_id: execution_id.0.to_string(),
+            execution_id: execution_id.uid.to_string(),
+            // Echo the validated name back as the primary handle — the key later GetExecution /
+            // StopExecution calls resolve by.
+            name: req.name,
         }))
     }
 
@@ -63,13 +69,21 @@ impl ExecutionService for Svc {
         request: Request<GetExecutionRequest>,
     ) -> Result<Response<GetExecutionResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = parse_ulid::<ExecutionId>(&req.execution_id, "execution_id")?;
+        // The execution's user-supplied name (validated here exactly as StartExecution does) — the
+        // per-scope-unique key the projection is indexed by.
+        let name = spica_engine::ObjectName::plain(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("invalid execution name: {e}")))?;
 
-        // Never blocks on settlement: it's a single projection read under the engine's internal
-        // storage lock.
+        // Never blocks on settlement: it's a single projection read (name-keyed) under the engine's
+        // internal storage lock. The uid is left nil — storage indexes executions by name, so the
+        // lookup resolves regardless of incarnation.
         let snapshot = self
             .engine
-            .execution_status(execution_id)
+            .execution_status(&ObjectReference::new(
+                ObjectKind::Execution,
+                name,
+                ulid::Ulid::nil(),
+            ))
             .await
             .map_err(to_status)?;
         let Some(snap) = snapshot else {
@@ -120,15 +134,23 @@ impl ExecutionService for Svc {
         request: Request<StopExecutionRequest>,
     ) -> Result<Response<StopExecutionResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = parse_ulid::<ExecutionId>(&req.execution_id, "execution_id")?;
+        // The execution's user-supplied name (validated here at the gRPC boundary exactly as
+        // StartExecution does) — the per-scope-unique key the termination resolves by.
+        let name = spica_engine::ObjectName::plain(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("invalid execution name: {e}")))?;
+        // Optional incarnation guard: an empty uid skips it; a present one is parsed and passed through
+        // so the termination is refused unless the named execution is exactly this incarnation.
+        let uid = if req.uid.is_empty() {
+            None
+        } else {
+            Some(parse_ulid::<ExecutionId>(&req.uid, "uid")?.into())
+        };
 
-        tracing::debug!(execution = %execution_id.0, "StopExecution");
+        tracing::debug!(name = %name, "StopExecution");
         self.engine
-            .cancel_execution(execution_id)
+            .cancel_execution(name, uid)
             .await
             .map_err(to_status)?;
-        Ok(Response::new(StopExecutionResponse {
-            execution_id: execution_id.0.to_string(),
-        }))
+        Ok(Response::new(StopExecutionResponse { name: req.name }))
     }
 }

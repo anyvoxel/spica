@@ -9,8 +9,8 @@
 //! ```text
 //! spica [--address <endpoint>] [--pretty]
 //!   flows
-//!     create <DEFINITION> --name NAME            persist a new flow version -> FlowVersionId
-//!     get <FLOW_NAME> [--version N]              resolve a name(+version) -> FlowVersionId
+//!     create <DEFINITION> --name NAME            persist a new flow version -> ObjectReference
+//!     get <FLOW_NAME> [--version N]              resolve a name(+version) -> ObjectReference
 //!   executions (exec)
 //!     start [--flow-version-id ID | --name NAME [--version N]] [INPUT]   start -> ExecutionId (at birth)
 //!     stop <EXECUTION_ID>                          abort a running execution (non-blocking)
@@ -31,14 +31,12 @@ mod util;
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use spica_proto::v1::execution_client::ExecutionClient;
-use spica_proto::v1::workflow_client::WorkflowClient;
+use spica_client::Client;
 
 use crate::executions::ExecutionsCmd;
 use crate::flows::FlowsCmd;
-use crate::util::channel;
 
 /// Global CLI shape: one `--address` (endpoint) + `--pretty`, then a resource-scoped subcommand.
 #[derive(Parser)]
@@ -79,26 +77,22 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Route a parsed subcommand to its handler. One gRPC channel is dialed up front and cloned per
-/// client, so whichever service a subcommand needs already shares the connection.
+/// Route a parsed subcommand to its handler. One `spica-client` dials the endpoint up front and
+/// shares a single connection across every service.
 async fn dispatch(cli: &Cli) -> Result<()> {
-    let channel = channel(&cli.address).await?;
+    let client = Client::connect(&cli.address)
+        .await
+        .context("connecting to spica-server (is it running?)")?;
     match &cli.command {
-        Command::Flows(cmd) => {
-            let mut workflow = WorkflowClient::new(channel);
-            match cmd {
-                FlowsCmd::Create(a) => flows::create(&mut workflow, a).await,
-                FlowsCmd::Get(a) => flows::get(&mut workflow, a).await,
-            }
-        }
-        Command::Executions(cmd) => {
-            let mut execution = ExecutionClient::new(channel);
-            match cmd {
-                ExecutionsCmd::Start(a) => executions::start(&mut execution, a).await,
-                ExecutionsCmd::Stop(a) => executions::stop(&mut execution, a).await,
-                ExecutionsCmd::Get(a) => executions::get(&mut execution, cli.pretty, a).await,
-                ExecutionsCmd::Wait(a) => executions::wait(&mut execution, cli.pretty, a).await,
-            }
-        }
+        Command::Flows(cmd) => match cmd {
+            FlowsCmd::Create(a) => flows::create(&client, a).await,
+            FlowsCmd::Get(a) => flows::get(&client, a).await,
+        },
+        Command::Executions(cmd) => match cmd {
+            ExecutionsCmd::Start(a) => executions::start(&client, a).await,
+            ExecutionsCmd::Stop(a) => executions::stop(&client, a).await,
+            ExecutionsCmd::Get(a) => executions::get(&client, cli.pretty, a).await,
+            ExecutionsCmd::Wait(a) => executions::wait(&client, cli.pretty, a).await,
+        },
     }
 }

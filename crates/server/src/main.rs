@@ -1,11 +1,12 @@
 //! `spica-server` — the spica workflow engine exposed as a gRPC service.
 //!
 //! A **single-node** gRPC server: it constructs one durable [`Engine`] (RocksDB log + storage),
-//! starts its single long-lived StreamProcessor, and serves the two RPC services from the wire contract —
-//! [`Workflow`](spica_proto::v1::workflow_server) (`CreateFlow`) and
+//! starts its single long-lived StreamProcessor, and serves the three RPC services from the wire contract —
+//! [`Workflow`](spica_proto::v1::workflow_server) (`CreateFlow`),
 //! [`Execution`](spica_proto::v1::execution_server) (`StartExecution` / `GetExecution` /
-//! `StopExecution`). Each service's handlers live in its own module ([`workflow`], [`execution`]);
-//! shared service state + helpers are in [`common`].
+//! `StopExecution`), and [`Task`](spica_proto::v1::task_server) (`PollTasks` / `CompleteTask` /
+//! `FailTask` — the out-of-process worker's claim/settle API). Each service's handlers live in its
+//! own module ([`workflow`], [`execution`], [`task`]); shared service state + helpers are in [`common`].
 //!
 //! The remote client (`spica` CLI) drives a run as **CreateFlow → StartExecution → poll
 //! GetExecution**: `StartExecution` returns the execution id at birth and the client settles by
@@ -14,20 +15,20 @@
 
 mod common;
 mod execution;
+mod task;
 mod workflow;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use spica_engine::{EngineBuilder, EntryPayload, LogStream, Scheduler, Storage, TaskService};
+use spica_engine::{EngineBuilder, EntryPayload, LogStream, Scheduler, Storage};
 use spica_logstream::RocksLogStream;
 use spica_proto::v1::execution_server::ExecutionServer;
+use spica_proto::v1::task_server::TaskServer;
 use spica_proto::v1::workflow_server::WorkflowServer;
 use spica_scheduler::InMemoryScheduler;
 use spica_storage::RocksStorage;
-use spica_task_service::InMemoryTaskService;
 
 use crate::common::Svc;
 
@@ -78,12 +79,10 @@ async fn main() -> anyhow::Result<()> {
     let scheduler: Arc<dyn Scheduler> = InMemoryScheduler::spawn();
     // No worker is attached in this M1 server: a Task simply stays claimable/pending (Zeebe
     // semantics); if its state sets `TimeoutSeconds`, the engine's `TaskTimeout` backstop fails it
-    // after that window. A production server would attach concrete `TaskHandler`s (see
-    // `spica-task-service`).
-    let task_service: Arc<dyn TaskService> = InMemoryTaskService::spawn(HashMap::new());
+    // after that window. A production server would spawn a worker (via `spica-client`'s `worker`
+    // module, `InMemoryTaskService::spawn`) against `engine.task_api()`.
     let engine = EngineBuilder::with_backends(log, storage)
         .with_scheduler(scheduler)
-        .with_task_service(task_service)
         .start()
         .await
         .context("start engine processor")?;
@@ -94,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
     };
     tonic::transport::Server::builder()
         .add_service(WorkflowServer::new(svc.clone()))
-        .add_service(ExecutionServer::new(svc))
+        .add_service(ExecutionServer::new(svc.clone()))
+        .add_service(TaskServer::new(svc))
         .serve(args.listen.parse().context("parse listen address")?)
         .await?;
     Ok(())
@@ -102,17 +102,12 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use serde_json::Value;
     use spica_asl::StateMachine;
-    use spica_engine::{
-        EngineBuilder, EntryPayload, FlowName, LogStream, Scheduler, Storage, TaskService,
-    };
+    use spica_engine::{EngineBuilder, EntryPayload, FlowName, LogStream, Scheduler, Storage};
     use spica_logstream::RocksLogStream;
     use spica_scheduler::InMemoryScheduler;
     use spica_storage::RocksStorage;
-    use spica_task_service::InMemoryTaskService;
 
     /// A unique per-test path under the system temp dir, removed after the test.
     fn temp_path(tag: &str) -> std::path::PathBuf {
@@ -141,22 +136,27 @@ mod tests {
         let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir).unwrap());
         let scheduler: std::sync::Arc<dyn Scheduler> = InMemoryScheduler::spawn();
         // No task worker is attached (as in the real server); see main().
-        let task_service: std::sync::Arc<dyn TaskService> =
-            InMemoryTaskService::spawn(HashMap::new());
         let engine = EngineBuilder::with_backends(log, storage)
             .with_scheduler(scheduler)
-            .with_task_service(task_service)
             .start()
             .await
             .unwrap();
         let name = FlowName::new("test").unwrap();
         let definition = serde_json::to_string(&sm).unwrap();
-        let flow_version_id = engine.create_flow(name, &definition).await.unwrap();
+        let flow_version = engine.create_flow(name, &definition).await.unwrap();
         let execution_id = engine
-            .start_for_revision(flow_version_id, Value::Null)
+            .start_for_revision(
+                spica_engine::ObjectName::generated_with_suffix(
+                    "exec",
+                    &ulid::Ulid::new().to_string(),
+                )
+                .expect("a ULID-suffixed generated name is always valid"),
+                flow_version,
+                Value::Null,
+            )
             .await
             .unwrap();
-        let result = engine.wait_for_execution(execution_id).await.unwrap();
+        let result = engine.wait_for_execution(&execution_id).await.unwrap();
         assert_eq!(result.output, Value::Null);
 
         // Drop the engine (releasing its DB handles) before removing the directories.

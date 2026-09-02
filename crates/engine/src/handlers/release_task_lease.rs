@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
 use crate::TaskStatus;
-use crate::command::Command;
-use crate::event::Event;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::types::command::Command;
+use crate::types::event::Event;
 
 /// Handles `ReleaseTaskLease`: a claimed task's `TaskLease` deadline elapsed without a settlement
 /// (Zeebe activation timeout / worker unavailability), so the task is re-queued for another worker.
@@ -21,7 +21,7 @@ pub struct ReleaseTaskLeaseHandler;
 impl CommandHandler for ReleaseTaskLeaseHandler {
     fn command(&self) -> Command {
         Command::ReleaseTaskLease {
-            task: crate::id::TaskId::nil(),
+            task: crate::types::meta::ObjectReference::nil(),
         }
     }
 
@@ -32,7 +32,7 @@ impl CommandHandler for ReleaseTaskLeaseHandler {
             );
         };
 
-        let act = match ctx.storage.get_task(*task).await {
+        let act = match ctx.storage.get_task(task).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return, // task gone; nothing to release.
         };
@@ -43,10 +43,16 @@ impl CommandHandler for ReleaseTaskLeaseHandler {
         }
 
         // Return the task to `Pending`, clearing the worker/lease so a fresh pull can claim it.
+        // `next_available_at` is cleared too: a lease-expiry re-queue is a *new* eligibility (the
+        // prior backoff gate belongs to a claim that is no longer held), so the task is immediately
+        // claimable rather than inheriting a stale waiting period.
         let mut task_value = act.value();
         task_value.status = TaskStatus::Pending;
         task_value.worker_id = None;
         task_value.lease_until = None;
+        task_value.retry_state.next_available_at = None;
+        // Stamp the re-queue moment; `created_at` is already carried on `task_value`.
+        task_value.meta.touch(crate::log::Timestamp::now());
         out.emit_event(Event::TaskLeaseExpired { task: task_value });
     }
 }

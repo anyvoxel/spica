@@ -4,7 +4,7 @@ use super::super::state_handler::StateHandler;
 use super::super::{emit_transition, state_activated_value, state_completed_value};
 use crate::eval_env::EvalEnv;
 use crate::handler::{ActivityCtx, Collector};
-use crate::id::ActivityId;
+use crate::types::meta::ObjectReference;
 
 pub struct SucceedStateHandler;
 
@@ -17,23 +17,28 @@ impl StateHandler for SucceedStateHandler {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
         // No side effect: a Succeed state's success is resolved in the complete step. Emit the
         // activation-complete ed, then hand off to the complete step via `CompleteState`.
-        out.emit_event(crate::event::Event::StateActivated {
+        out.emit_event(crate::types::event::Event::StateActivated {
             activity: state_activated_value(actx, actx.activity.input.clone(), None),
         });
-        out.emit_command(crate::command::Command::CompleteState { activity });
+        out.emit_command(crate::types::command::Command::CompleteState {
+            activity,
+            // A Succeed's raw result is its processed input (no distinct raw output); the complete
+            // step projects any `Output` template from it.
+            output: actx.activity.input.clone(),
+        });
     }
 
     fn complete(
         &self,
         env: &mut EvalEnv,
         out: &mut Collector,
-        activity: ActivityId,
+        activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     ) {
@@ -55,17 +60,17 @@ impl StateHandler for SucceedStateHandler {
 fn complete_succeed(
     env: &mut EvalEnv,
     out: &mut Collector,
-    activity: ActivityId,
+    activity: ObjectReference,
     actx: &ActivityCtx,
     state: &SucceedState,
 ) {
-    let states = crate::context::build_states(
+    let states = crate::types::context::build_states(
         &actx.activity.input,
         Some(&actx.activity.input),
         &actx.state_name(),
         &actx.exec_input,
         Some(&actx.activity.input),
-        actx.activity.retry_state.retry_count,
+        actx.activity.retry_state.attempts,
         None, // no Catch `errorOutput` in the succeed path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -73,18 +78,28 @@ fn complete_succeed(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity.execution,
+            actx.activity
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &actx.variables)
         ),
         None => actx.activity.input.clone(),
     };
-    out.emit_event(crate::event::Event::StateCompleted {
+    out.emit_event(crate::types::event::Event::StateCompleted {
         activity: state_completed_value(actx, output.clone()),
     });
     emit_transition(
         out,
-        actx.activity.execution,
+        actx.activity.execution.clone(),
+        actx.activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner"),
         activity,
+        actx.state_path(),
         &output,
         None,
         Some(true),

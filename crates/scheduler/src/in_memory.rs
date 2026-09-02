@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use spica_engine::{EntryId, Scheduler, TimerId, TimerSink, Timestamp};
+use spica_engine::{EntryId, ObjectReference, Scheduler, TimerSink, Timestamp};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::time::DelayQueue;
@@ -20,18 +20,18 @@ use tokio_util::time::delay_queue::Key;
 enum SchedulerInput {
     /// Arm a timer to fire `TriggerTimer` at the absolute `deadline`.
     Schedule {
-        timer: TimerId,
+        timer: ObjectReference,
         deadline: Timestamp,
         cause_id: EntryId,
     },
     /// Cancel a previously-armed timer (a `TimerCancelled` event was applied).
-    Cancel { timer: TimerId },
+    Cancel { timer: ObjectReference },
 }
 
 /// Envelope context a fired timer needs, captured when it was armed.
 #[derive(Debug, Clone)]
 struct PendingTimer {
-    timer: TimerId,
+    timer: ObjectReference,
     /// Causal link back to the `TimerActivated` entry that armed it.
     cause_id: EntryId,
 }
@@ -72,8 +72,8 @@ impl InMemoryScheduler {
         let loop_sink = Arc::clone(&sink);
         tokio::spawn(async move {
             let mut queue: DelayQueue<PendingTimer> = DelayQueue::new();
-            // timer-id -> DelayQueue key, for cancelling a pending timer by id.
-            let mut by_id: HashMap<TimerId, Key> = HashMap::new();
+            // timer-reference -> DelayQueue key, for cancelling a pending timer by reference.
+            let mut by_id: HashMap<ObjectReference, Key> = HashMap::new();
             loop {
                 tokio::select! {
                     maybe = input_rx.recv() => {
@@ -84,14 +84,21 @@ impl InMemoryScheduler {
                         };
                         match input {
                             SchedulerInput::Schedule { timer, deadline, cause_id } => {
-                                // Replace any prior arm for the same id (defensive; arms are unique).
+                                // Replace any prior arm for the same reference (defensive; arms are
+                                // unique).
                                 if let Some(old) = by_id.remove(&timer) {
                                     queue.remove(&old);
                                 }
                                 // Derive the wait from the persisted absolute deadline; a deadline
                                 // already in the past fires immediately (saturating to zero).
                                 let wait = deadline.saturating_duration_since(Timestamp::now());
-                                let key = queue.insert(PendingTimer { timer, cause_id }, wait);
+                                // Clone the reference into the queue entry; the original is the
+                                // cancellation key recorded in `by_id` (ObjectReference, unlike the
+                                // former Copy TimerId, is not Copy).
+                                let key = queue.insert(
+                                    PendingTimer { timer: timer.clone(), cause_id },
+                                    wait,
+                                );
                                 by_id.insert(timer, key);
                             }
                             SchedulerInput::Cancel { timer } => {
@@ -113,7 +120,7 @@ impl InMemoryScheduler {
                             .expect("scheduler sink lock is not poisoned")
                             .clone();
                         match sink {
-                            Some(sink) => sink.trigger(timer, cause_id).await,
+                            Some(sink) => sink.trigger(&timer, cause_id).await,
                             None => {
                                 // The engine should always attach a sink before arming a timer; a
                                 // fire here means the wiring is broken. We must NOT write to the log
@@ -142,29 +149,32 @@ impl Scheduler for InMemoryScheduler {
             .expect("scheduler sink lock is not poisoned") = Some(sink);
     }
 
-    fn schedule(&self, timer: TimerId, deadline: Timestamp, cause_id: EntryId) {
+    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp, cause_id: EntryId) {
         let _ = self.tx.send(SchedulerInput::Schedule {
-            timer,
+            timer: timer.clone(),
             deadline,
             cause_id,
         });
     }
 
-    fn cancel(&self, timer: TimerId) {
-        let _ = self.tx.send(SchedulerInput::Cancel { timer });
+    fn cancel(&self, timer: &ObjectReference) {
+        let _ = self.tx.send(SchedulerInput::Cancel {
+            timer: timer.clone(),
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spica_engine::ObjectKind;
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::time::sleep;
     use ulid::Ulid;
 
-    fn timer() -> TimerId {
-        TimerId::from(Ulid::new())
+    fn timer() -> ObjectReference {
+        ObjectReference::for_uid(ObjectKind::Timer, Ulid::new())
     }
 
     /// An absolute deadline `from` now by `offset`.
@@ -180,7 +190,7 @@ mod tests {
     /// observe the expiry callback without a real log. Mirrors how the engine connects its sink.
     #[derive(Clone, Default)]
     struct RecordingSink {
-        triggered: Arc<Mutex<Vec<(TimerId, EntryId)>>>,
+        triggered: Arc<Mutex<Vec<(ObjectReference, EntryId)>>>,
     }
 
     impl RecordingSink {
@@ -188,15 +198,18 @@ mod tests {
             Self::default()
         }
         /// Snapshot of every `(timer, cause_id)` this sink has been asked to trigger.
-        fn snaps(&self) -> Vec<(TimerId, EntryId)> {
+        fn snaps(&self) -> Vec<(ObjectReference, EntryId)> {
             self.triggered.lock().unwrap().clone()
         }
     }
 
     #[async_trait::async_trait]
     impl TimerSink for RecordingSink {
-        async fn trigger(&self, timer: TimerId, cause_id: EntryId) {
-            self.triggered.lock().unwrap().push((timer, cause_id));
+        async fn trigger(&self, timer: &ObjectReference, cause_id: EntryId) {
+            self.triggered
+                .lock()
+                .unwrap()
+                .push((timer.clone(), cause_id));
         }
     }
 
@@ -208,7 +221,7 @@ mod tests {
 
         let timer = timer();
         let cause = EntryId::new(1);
-        s.schedule(timer, deadline_after(Duration::from_millis(30)), cause);
+        s.schedule(&timer, deadline_after(Duration::from_millis(30)), cause);
 
         // Poll the recording sink until the trigger lands (it arrives on a background loop).
         let fired = tokio::time::timeout(Duration::from_secs(1), async {
@@ -233,11 +246,11 @@ mod tests {
 
         let timer = timer();
         s.schedule(
-            timer,
+            &timer,
             deadline_after(Duration::from_millis(15)),
             EntryId::new(2),
         );
-        s.cancel(timer);
+        s.cancel(&timer);
 
         // Allow enough time that a leaked arm would definitely have fired, then assert silence.
         sleep(Duration::from_millis(60)).await;

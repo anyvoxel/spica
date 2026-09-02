@@ -1,38 +1,20 @@
-//! Shared client-side plumbing for the `spica` CLI subcommands: connection handling, input reading,
-//! and output / validation helpers. Kept here so the resource modules (`flows`, `executions`) and the
-//! root `dispatch` don't duplicate it.
+//! Shared client-side plumbing for the `spica` CLI subcommands: input reading and output /
+//! validation helpers. Kept here so the resource modules (`flows`, `executions`) and the root
+//! `dispatch` don't duplicate it. Connection handling now lives in `spica-client`
+//! ([`Client::connect`](spica_client::Client::connect)), so there is no per-invocation channel
+//! dialing or endpoint normalization in this binary.
 
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use spica_proto::v1::ExecutionState;
-use tonic::transport::{Channel, Endpoint};
-
-/// Dial a gRPC channel to the server; created once per invocation and cloned per service client.
-pub(crate) async fn channel(address: &str) -> Result<Channel> {
-    let endpoint = normalize_endpoint(address);
-    Endpoint::from_shared(endpoint)
-        .context("parsing --address")?
-        .connect()
-        .await
-        .context("connecting to spica-server (is it running?)")
-}
+use spica_client::ExecutionState;
 
 /// Read the execution input file into raw bytes; absent input defaults to JSON `null`.
 pub(crate) fn read_input(path: &Option<PathBuf>) -> Result<Vec<u8>> {
     match path {
         Some(p) => Ok(fs::read(p).with_context(|| format!("reading input {}", p.display()))?),
         None => Ok(b"null".to_vec()),
-    }
-}
-
-/// Accept either a bare host:port or a full `http://…` target; tonic endpoints require a scheme.
-pub(crate) fn normalize_endpoint(address: &str) -> String {
-    if address.contains("://") {
-        address.to_string()
-    } else {
-        format!("http://{address}")
     }
 }
 
@@ -54,7 +36,7 @@ pub(crate) fn state_label(state: ExecutionState) -> &'static str {
         ExecutionState::Completed => "COMPLETED",
         ExecutionState::Terminated => "TERMINATED",
         ExecutionState::NotFound => "NOT_FOUND",
-        _ => "ACTIVE",
+        ExecutionState::Active => "ACTIVE",
     }
 }
 

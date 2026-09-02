@@ -11,8 +11,8 @@ auto_impl.workspace = true
 rocksdb = "0.25"
 serde.workspace = true
 serde_json.workspace = true
+spica-machinery = { workspace = true }
 thiserror.workspace = true
-time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 

@@ -2,14 +2,11 @@
 
 use async_trait::async_trait;
 
-use crate::error::ExecutionError;
-use crate::event::Event;
-use crate::{
-    ActivityState, ActivityStatus, ActivityValue, ApplierContext, EventApplier, RetryState,
-};
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
+use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
 
-use crate::id::{ActivityId, ExecutionId, NodeId};
-use crate::storage::Activity;
+use crate::storage::ActivityRecord;
 
 #[derive(Default)]
 pub(crate) struct StateActivatingApplier;
@@ -17,11 +14,8 @@ pub(crate) struct StateActivatingApplier;
 impl EventApplier for StateActivatingApplier {
     fn event(&self) -> Event {
         Event::StateActivating {
-            activity: ActivityValue {
-                id: ActivityId::nil(),
-                execution: ExecutionId::nil(),
-                root_execution: ExecutionId::nil(),
-                parent: NodeId::Execution(ExecutionId::nil()),
+            activity: Activity {
+                execution: crate::types::meta::ObjectReference::nil(),
                 state_path: jsonptr::PointerBuf::new(),
                 status: ActivityStatus::Running,
                 raw_input: Default::default(),
@@ -30,6 +24,11 @@ impl EventApplier for StateActivatingApplier {
                 activity_state: ActivityState::Leaf,
                 retry_state: RetryState::default(),
                 output: None,
+                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                    crate::types::meta::ObjectKind::Activity,
+                    crate::types::id::ActivityId::nil().into(),
+                    crate::log::Timestamp::from_millis(0),
+                ),
             },
         }
     }
@@ -47,21 +46,48 @@ impl EventApplier for StateActivatingApplier {
         // `StateActivating` is the creation moment of the projection row: the event already carries
         // the canonical domain entity, and storage only adds its projection-only `active_children`
         // bookkeeping alongside it.
-        let mut row = Activity::from_value(activity.clone(), std::collections::HashSet::new());
+        let mut row =
+            ActivityRecord::from_value(activity.clone(), std::collections::HashSet::new());
         // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_activity(row).await?;
         ctx.storage
-            .add_child(activity.parent, NodeId::Activity(activity.id))
+            .add_child(
+                activity
+                    .meta
+                    .owner
+                    .clone()
+                    .expect("an owned activity has an owner"),
+                activity.reference(),
+            )
             .await?;
-        if let Some(mut exec) = ctx.storage.get_execution(activity.execution).await? {
-            // Track the currently active state only in the projection row. The event-carried
-            // execution value stays focused on durable domain facts, while this storage-only cursor
-            // keeps the single-active-state invariant easy to observe and debug.
-            exec.current_activity = Some(activity.id);
-            // Newest activation also touches the owning execution's update time.
-            exec.touch(ctx.timestamp);
-            ctx.storage.put_execution(exec).await?;
+        // Advance the owning scope's projection-only `current_activity` cursor. The scope that owns
+        // this activity is `activity.meta.owner` (an `Execution` for a top-level activity, a `Thread`
+        // for one inside a `Parallel` branch / `Map` item) — *not* `activity.execution`, which is only
+        // the shared top-level anchor and would wrongly move a deeply-nested activity's cursor onto
+        // the root. Matching on the owner's kind updates whichever record actually holds the cursor.
+        let ownership = activity
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner");
+        let uid = activity.reference().uid;
+        match ownership.kind {
+            crate::types::meta::ObjectKind::Execution => {
+                if let Some(mut exec) = ctx.storage.get_execution(&ownership).await? {
+                    exec.current_activity = Some(uid.into());
+                    exec.touch(ctx.timestamp);
+                    ctx.storage.put_execution(exec).await?;
+                }
+            }
+            crate::types::meta::ObjectKind::Thread => {
+                if let Some(mut thread) = ctx.storage.get_thread(&ownership).await? {
+                    thread.current_activity = Some(uid.into());
+                    thread.touch(ctx.timestamp);
+                    ctx.storage.put_thread(thread).await?;
+                }
+            }
+            _ => {} // a non-scope owner resolves to nothing (silent) — no cursor to move.
         }
         Ok(())
     }
