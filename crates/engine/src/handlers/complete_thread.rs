@@ -11,8 +11,8 @@ use crate::types::meta::ObjectReference;
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
 /// output on its row, cancels any owned timers, and — once children drain (immediately if none) —
-/// emits `ThreadCompleted` then relays the settle back to the owning container Activity via
-/// `ProcessChildCompleted` so the `Parallel`/`Map` converges once its last branch/item drains.
+/// emits `ThreadCompleted` then runs the inline `child_completed::child_settled` so the owning
+/// container Activity converges once its last branch/item drains.
 ///
 /// Mirrors [`CompleteExecutionHandler`](super::complete_execution::CompleteExecutionHandler) but is
 /// `Thread`-only: a top-level `Execution`'s success is driven by that handler, so the two verbs (and
@@ -30,7 +30,7 @@ impl CommandHandler for CompleteThreadHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CompleteThread { thread, output } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -60,10 +60,11 @@ impl CommandHandler for CompleteThreadHandler {
         completing_thread.output = Some(output.clone());
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
-        completing_thread.meta.touch(Timestamp::now());
+        completing_thread.meta.with_update_at(Timestamp::now());
         out.emit_event(Event::ThreadCompleting {
             thread: completing_thread,
-        });
+        })
+        .await;
 
         let children = thread_row.active_children.clone();
         let pending_children = super::complete_execution::cancel_timers(out, children);
@@ -71,17 +72,15 @@ impl CommandHandler for CompleteThreadHandler {
             let mut completed_thread = thread_row.value();
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
-            completed_thread.meta.touch(Timestamp::now());
+            completed_thread.meta.with_update_at(Timestamp::now());
             out.emit_event(Event::ThreadCompleted {
                 thread: completed_thread,
-            });
-            // A fan-out thread is always owned by its container Activity; relay its settle so the
-            // parallel/map converges once its last branch/item drains.
+            })
+            .await;
+            // A fan-out thread is always owned by its container Activity; run the inline reaction so
+            // the parallel/map converges once its last branch/item drains.
             if let Some(owner) = thread_row.value.meta.owner.clone() {
-                out.emit_command(Command::ProcessChildCompleted {
-                    owner,
-                    child: thread_ref.clone(),
-                });
+                super::child_completed::child_settled(ctx, out, owner, thread_ref.clone()).await;
             }
         } else {
             tracing::debug!(

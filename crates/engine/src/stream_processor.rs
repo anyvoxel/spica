@@ -8,19 +8,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::TaskStatus;
-use crate::engine::AckRouter;
 use crate::handler::CommandHandler;
 use crate::handlers::{
     ActivateStateHandler, ActivateTaskHandler, CancelTaskHandler, CancelTimerHandler,
     ClaimTasksHandler, CompleteExecutionHandler, CompleteStateHandler, CompleteTaskHandler,
-    CompleteThreadHandler, CreateExecutionHandler, CreateFlowHandler, FailTaskHandler,
-    ProcessChildCompletedHandler, ReleaseTaskLeaseHandler, SpawnThreadHandler,
-    TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler, TriggerTimerHandler,
+    CompleteThreadHandler, ContinueCompleteHandler, ContinueTerminateHandler,
+    CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, ReleaseTaskLeaseHandler,
+    SpawnThreadHandler, TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler,
+    TriggerTimerHandler,
 };
+use crate::hook::Hook;
 use crate::leader::Leader;
 use crate::log::{Entry, EntryPayload, LogStream, Timestamp};
 use crate::processing::{ProcessingHandles, ProcessingStateMachine, Role};
-use crate::scheduler::Scheduler;
 use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
@@ -88,13 +88,14 @@ impl StreamProcessor {
             CreateExecutionHandler,
             CompleteExecutionHandler,
             CompleteThreadHandler,
+            ContinueCompleteHandler,
+            ContinueTerminateHandler,
             TerminateExecutionHandler,
             ActivateStateHandler,
             CompleteStateHandler,
             TerminateStateHandler,
             TriggerTimerHandler,
             CancelTimerHandler,
-            ProcessChildCompletedHandler,
             ActivateTaskHandler,
             ClaimTasksHandler,
             CompleteTaskHandler,
@@ -117,12 +118,13 @@ impl StreamProcessor {
     /// the target execution reaches a terminal state.
     ///
     /// Real-time scheduling: armed timers are *facts* (`TimerActivated`), and the actual wall-clock
-    /// delay is a side effect driven by applying that event — the role feeds each event through an
-    /// [`EventDispatcher`](crate::EventDispatcher), and the `TimerActivated` applier hands the arm to
-    /// the injected [`Scheduler`]. The scheduler owns a single `DelayQueue` loop and, on expiry, calls
-    /// the engine's injected [`TimerSink`] (see `crate::scheduler`), which appends the `TriggerTimer`
-    /// *through the engine's controlled write entry* — so this loop never pulls fired timers itself
-    /// and the log keeps a single writer.
+    /// delay is a side effect **derived downstream** from that durable fact via the injected
+    /// [`Hook`](crate::Hook) observer — this loop does not know a scheduler. After a batch's commit,
+    /// `after_commit` reports each applied event (including `TimerActivated`, which carries the
+    /// timer's absolute `deadline`); a consumer re-derives the arm/cancel on its scheduler from those
+    /// facts. An expired timer re-enters this loop as an ordinary inbound `TriggerTimer` command
+    /// appended by the consumer's sink — so the engine never pulls fired timers and the log keeps a
+    /// single writer.
     ///
     /// **Resume watermark (single-node model):** `Storage` is a disposable projection rebuilt by
     /// replaying Events (idempotent fold) — Commands are **never re-run** here. To make "which
@@ -147,20 +149,10 @@ impl StreamProcessor {
         &mut self,
         logstream: &L,
         storage: Arc<Mutex<Box<dyn Storage>>>,
-        scheduler: Arc<dyn Scheduler>,
-        ack: Arc<Mutex<AckRouter>>,
+        hook: Arc<dyn Hook>,
         cancel: CancellationToken,
     ) -> Result<(), ExecutionError> {
-        // TODO(shutdown+join): `run` returns on the `cancel` token, but the scheduler is a
-        // caller-injected `Arc<dyn …>` that the engine does *not* spawn — its loop's shutdown is owned
-        // by the concrete implementation, and this loop already relies on drop. Nothing here awaits
-        // that loop. The task worker is likewise caller-owned and observes its own cancel token; this
-        // loop no longer references it — worker settlements arrive as ordinary inbound commands.
-        let handles = ProcessingHandles {
-            storage,
-            scheduler,
-            ack,
-        };
+        let handles = ProcessingHandles { storage, hook };
         tracing::debug!(
             role = ?self.state_machine.role(),
             "processing role installed"
@@ -305,11 +297,11 @@ impl StreamProcessor {
     /// The **leader** driver loop: write path + own read-back. Tails the log and for each entry:
     ///
     /// - **Command** — dispatch it; if it produced a non-empty batch, append `batch ++ [Noop]`
-    ///   atomically, then open one transaction, eager-apply the whole batch (`apply_batch`), commit
-    ///   the batch-end watermark, and (post-commit) drain the correlated acks. Grants and rejections
-    ///   are answered right after the append.
-    /// - **Event** — always skipped: `recover_leader` folded any crash residue at startup, and
-    ///   production `apply_batch` eagerly applied this batch, so the Event is at/below the watermark.
+    ///   atomically, then commit the work transaction the dispatch already eager-folded into (with
+    ///   the batch-end watermark), replay its deferred timer side effects, and (post-commit) drain the
+    ///   correlated acks. Grants and rejections are answered right after the append.
+    /// - **Event** — always skipped: `recover_leader` folded any crash residue at startup, and the
+    ///   work transaction eagerly applied this batch, so the Event is at/below the watermark.
     ///   The leader never folds Events in its live loop (`is_already_applied` is only a debug guard).
     /// - **Noop / Reject** — skipped: the batch was applied at production, and a rejection's ack was
     ///   already delivered in the Command arm that produced it.
@@ -360,49 +352,35 @@ impl StreamProcessor {
                             if !produced.entries.is_empty() {
                                 let mut to_append: Vec<Entry> = produced.entries.clone();
                                 to_append.push(noop(StreamId::nil(), entry_id));
+                                // Append the batch atomically; on failure the `?` propagates and
+                                // `produced.work` is dropped, rolling the working txn back — nothing
+                                // durable was written, so there is no dirty data.
                                 let last = logstream.append(to_append).await?;
-                                let batch = materialize_batch(
-                                    &produced.entries,
-                                    logstream.stream_id(),
-                                    entry_id,
-                                    last,
-                                );
-                                // Eager-apply the whole batch in one **driver-owned** transaction:
-                                // fold its Events + advance the resume watermark, then commit the
-                                // batch-end watermark. The read-back pass later skips these events
-                                // (position <= watermark), so the leader folds a command's effects
-                                // exactly once. The transaction opens only after the append is
-                                // durable (never apply-before-append — see the recovery design doc).
-                                let storage_guard = handles.storage.lock().await;
-                                let mut txn = storage_guard.begin_txn()?;
-                                let w = self
-                                    .state_machine
-                                    .apply_batch(&mut *txn, &batch, handles)
-                                    .await?;
-                                // The leader always folds a produced batch, so `w` is `Some`; commit
-                                // it with the fold in the same atomic all-or-nothing transaction.
-                                txn.commit(w)?;
-                                drop(storage_guard);
+                                // Commit the eager-folded working txn now that its append is durable,
+                                // advancing the resume watermark to the batch-end position (the Noop).
+                                // This is the single authoritative fold of the batch — no post-append
+                                // `apply_batch` re-fold exists on the live path.
+                                produced.work.commit(Some(last.get())).await?;
+                                self.state_machine.set_resume_position(last.get());
                                 // Post-commit: drain the deferred acks whose Event is now durable.
                                 self.state_machine.after_commit(handles).await;
                             }
 
-                            // Answer grants and rejections now (post-append), and defer only the
-                            // event-correlated ones — which `after_commit` drained above. A
-                            // `ClaimTasks` grant (and a rejection's refusal) is decided at dispatch
-                            // and must be answered even when the pull produced **no events**; with no
-                            // event to correlate, an event arm would never fire it and the caller
-                            // would hang.
-                            let mut ack_g = handles.ack.lock().await;
-                            for (request_id, tasks) in produced.grants {
-                                ack_g.complete_tasks(request_id, tasks);
-                            }
+                            // Report durable rejections to the injected Hook. Rejections are decided at
+                            // dispatch and answered even when the pull produced **no events** — with no
+                            // event to carry them, they must be reported directly or the awaiting caller
+                            // would hang. (Events of a produced batch were already reported by
+                            // `after_commit` above, post-commit; a task grant rides its durable
+                            // `TasksClaimed` and needs no separate report.)
                             for rej in produced.entries.iter().filter_map(|e| match &e.payload {
                                 EntryPayload::Reject(r) => Some(r),
                                 _ => None,
                             }) {
                                 log_reject(rej);
-                                ack_g.reject(rej.request_id, rej.clone());
+                                handles
+                                    .hook
+                                    .on_command_rejected(rej.request_id, rej)
+                                    .await;
                             }
                         }
                         Entry {
@@ -600,46 +578,6 @@ fn noop(stream_id: StreamId, cause_id: EntryId) -> Entry {
     }
 }
 
-/// Stamp a just-appended produced batch with its real log positions and terminate it with the
-/// `Noop` commit mark, returning the batch **as it appears on the log**: the produced entries at
-/// `[last - n + 1, last - 1]` and the Noop at `last`. The produced entries leave `process_command`
-/// with placeholder ids (the log assigns the real ones), so this is how the driver hands
-/// [`ProcessingStateMachine::apply_batch`] a batch whose positions it can eager-apply. `cause_id` is
-/// echoed onto the trailing Noop as the batch's identity.
-fn materialize_batch(
-    entries: &[Entry],
-    stream_id: StreamId,
-    cause_id: EntryId,
-    last: EntryId,
-) -> Vec<Entry> {
-    let n = entries.len();
-    let first = last.get() - n as i64;
-    let mut batch: Vec<Entry> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| Entry {
-            stream_id,
-            entry_id: EntryId::new(first + i as i64),
-            cause_id: e.cause_id,
-            timestamp: e.timestamp,
-            payload: e.payload.clone(),
-        })
-        .collect();
-    batch.push(noop_with_pos(stream_id, cause_id, last));
-    batch
-}
-
-/// The [`noop`] marker with a concrete position already applied (used when materializing a batch).
-fn noop_with_pos(stream_id: StreamId, cause_id: EntryId, entry_id: EntryId) -> Entry {
-    Entry {
-        stream_id,
-        entry_id,
-        cause_id: Some(cause_id),
-        timestamp: Timestamp::now(),
-        payload: EntryPayload::Noop,
-    }
-}
-
 /// Emits a human-friendly tracing line for each [`Reject`] as the run loop reads it — a refused
 /// command, concurrently with its durable record on the log. Logged at `warn`: a rejection is
 /// always noteworthy (a client command that could not be honored), but it is a normal control-flow
@@ -798,7 +736,10 @@ pub(crate) fn log_event(event: &Event) {
                 "task activated"
             );
         }
-        Event::TasksClaimed { tasks } => {
+        Event::TasksClaimed {
+            request_id: _,
+            tasks,
+        } => {
             debug!(
                 count = tasks.len(),
                 worker = ?tasks.first().and_then(|t| t.worker_id.as_deref()),
@@ -842,13 +783,6 @@ pub(crate) fn log_event(event: &Event) {
         Event::StateTransitioned { activity, next, .. } => {
             info!(activity = %activity, next = %next, "state routed to next");
         }
-        Event::ProcessChildCompletedHandled { owner, child } => {
-            debug!(
-                owner = %owner,
-                child = %child,
-                "process child completed handled (no projection to make)"
-            );
-        }
     }
 }
 
@@ -860,7 +794,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
-    use crate::engine::AckRouter;
+    use crate::engine::NoopHook;
     use crate::log::InMemoryLogStream;
     use crate::storage::{
         ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
@@ -872,17 +806,6 @@ mod tests {
     use crate::types::meta::ObjectReference;
 
     use super::*;
-
-    /// A no-op scheduler: recovery folds timer-arming Events without arming anything in this unit
-    /// test (the same minimal stand-in the follower tests use).
-    #[derive(Default)]
-    struct NullScheduler;
-    #[async_trait]
-    impl crate::scheduler::Scheduler for NullScheduler {
-        fn attach_sink(&self, _sink: Arc<dyn crate::scheduler::TimerSink>) {}
-        fn schedule(&self, _t: &ObjectReference, _d: Timestamp, _c: EntryId) {}
-        fn cancel(&self, _t: &ObjectReference) {}
-    }
 
     /// The durable state a [`FakeStore`] commit materializes: the resume watermark plus a count of
     /// projection writes folded into the batch. A write only lands when its transaction **commits**,
@@ -970,6 +893,13 @@ mod tests {
         ) -> Result<Option<FlowVersion>, ExecutionError> {
             unimplemented!("not exercised by the recovery test")
         }
+        async fn activatable_tasks(
+            &mut self,
+            _r: &str,
+            _l: usize,
+        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+            unimplemented!("not exercised by the recovery test")
+        }
         async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
             unimplemented!("not exercised by the recovery test")
         }
@@ -999,6 +929,12 @@ mod tests {
         ) -> Result<(), ExecutionError> {
             unimplemented!("not exercised by the recovery test")
         }
+        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+            unimplemented!("not exercised by the recovery test")
+        }
+        async fn put_next_generated_seq(&mut self, _seq: i64) -> Result<(), ExecutionError> {
+            unimplemented!("not exercised by the recovery test")
+        }
     }
 
     /// A minimal in-crate [`Storage`] whose fold commits are observable, matching the follower tests'
@@ -1020,6 +956,9 @@ mod tests {
         async fn put_last_processed_position(&mut self, p: i64) -> Result<(), ExecutionError> {
             self.0.lock().unwrap().committed_watermark = Some(p);
             Ok(())
+        }
+        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+            unimplemented!("not exercised by the recovery test")
         }
 
         async fn get_execution(
@@ -1121,9 +1060,66 @@ mod tests {
     fn handles(storage: Arc<Mutex<Box<dyn Storage>>>) -> ProcessingHandles {
         ProcessingHandles {
             storage,
-            scheduler: Arc::new(NullScheduler),
-            ack: Arc::new(Mutex::new(AckRouter::new())),
+            hook: Arc::new(NoopHook),
         }
+    }
+
+    /// A hook that records the events it observed, so a test can assert the engine reports the
+    /// durable events it produces.
+    #[derive(Default)]
+    struct RecordingHook {
+        applied: StdMutex<Vec<Event>>,
+    }
+    #[async_trait]
+    impl Hook for RecordingHook {
+        async fn on_event_applied(&self, event: &Event) {
+            self.applied.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// The leader reports each event it makes durable as an `on_event_applied` Hook fact
+    /// (post-commit), which is what an injected `Hook` observer correlates to a waiting request.
+    #[tokio::test]
+    async fn leader_reports_applied_events_to_the_hook() {
+        let mut sp = StreamProcessor::new();
+        let state = Arc::new(StdMutex::new(FakeState::default()));
+        let storage: Arc<Mutex<Box<dyn Storage>>> =
+            Arc::new(Mutex::new(Box::new(FakeStore(state.clone()))));
+        let hook = Arc::new(RecordingHook::default());
+        let handles = ProcessingHandles {
+            storage,
+            hook: Arc::clone(&hook) as Arc<dyn Hook>,
+        };
+        let request_id = RequestId::new();
+        let cmd = Command::CreateFlow {
+            request_id,
+            name: FlowName::new("flow").expect("literal name is valid"),
+            definition: r#"{ "StartAt": "A", "States": { "A": { "Type": "Succeed" } } }"#
+                .to_string(),
+        };
+        let produced = sp
+            .state_machine
+            .process_command(EntryId::new(1), &cmd, &handles)
+            .await
+            .unwrap();
+        assert!(
+            !produced.entries.is_empty(),
+            "CreateFlow produced an emitted batch"
+        );
+        // The driver commits the working txn, then `after_commit` reports the batch's events.
+        produced.work.commit(Some(1)).await.unwrap();
+        sp.state_machine.after_commit(&handles).await;
+        let applied = hook.applied.lock().unwrap();
+        assert!(
+            applied.iter().any(|ev| matches!(
+                ev,
+                Event::FlowVersionCreated {
+                    request_id: r,
+                    ..
+                } if *r == request_id
+            )),
+            "expected the echoed FlowVersionCreated to be reported, got {applied:?}"
+        );
     }
 
     /// A `FlowVersionCreated` event that folds cleanly into the fake store (its applier touches only
@@ -1134,15 +1130,16 @@ mod tests {
             Event::FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: crate::types::meta::ObjectMeta::born_named(
+                    meta: crate::types::meta::ObjectMeta::builder(
                         crate::types::meta::ObjectKind::FlowVersion,
-                        FlowVersion::version_name(
-                            &FlowName::new("flow").expect("literal name is valid"),
-                            1,
-                        ),
                         ulid::Ulid::new(),
-                        Timestamp::now(),
                     )
+                    .name(FlowVersion::version_name(
+                        &FlowName::new("flow").expect("literal name is valid"),
+                        1,
+                    ))
+                    .at(Timestamp::now())
+                    .build()
                     .with_owner(crate::types::meta::OwnerReference::new(
                         crate::types::meta::ObjectKind::Flow,
                         crate::types::meta::ObjectName::plain("flow")
@@ -1151,6 +1148,7 @@ mod tests {
                     )),
                     version: 1,
                     definition: String::new(),
+                    checksum: FlowVersion::definition_checksum(""),
                 },
             },
         )
@@ -1165,6 +1163,14 @@ mod tests {
         // whose eager-apply never committed before the crash — the O the storage still says 0.
         let log = InMemoryLogStream::<EntryPayload>::default();
         let (ts, ev) = flow_version_event();
+        let residual_uid: ulid::Ulid = TimerId::new().into();
+        let residual_timer = crate::types::meta::ObjectReference::new(
+            crate::types::meta::ObjectKind::Timer,
+            crate::types::meta::PlainName::new("child")
+                .expect("static literal is a valid segment")
+                .generated_from_key(residual_uid.0 as u64),
+            residual_uid,
+        );
         log.append(vec![
             // The residual Command: recovery must skip it — re-dispatching would re-append a duplicate
             // batch. `CancelTimer` needs only a TimerId, so it's the cheapest Command to fabricate.
@@ -1174,10 +1180,7 @@ mod tests {
                 cause_id: None,
                 timestamp: ts,
                 payload: EntryPayload::Command(Command::CancelTimer {
-                    timer: crate::types::meta::ObjectReference::for_uid(
-                        crate::types::meta::ObjectKind::Timer,
-                        TimerId::new().into(),
-                    ),
+                    timer: residual_timer,
                 }),
             },
             Entry {

@@ -114,19 +114,6 @@ pub enum Event {
     /// `status = Terminated(reason)`.
     ThreadTerminated { thread: Thread },
 
-    /// Durable confirmation that a [`Command::ProcessChildCompleted`] was handled even though the
-    /// addressed `owner` had nothing to project in response — most commonly a `Parallel` whose
-    /// sibling branches are still in flight, or an already-terminal owner absorbing a duplicate.
-    /// Every dispatched command must leave a causally-tied follow-up (the CCES watermark rule); this
-    /// is that follow-up for the no-op case. It changes no state because the no-op projection changed
-    /// none — it exists so the stream records receipt and advances the watermark. Carries the
-    /// `owner` it was addressed to and the `child` that settled, so the record is traceable to the
-    /// specific command instance.
-    ProcessChildCompletedHandled {
-        owner: ObjectReference,
-        child: ObjectReference,
-    },
-
     /// Result of `Command::ActivateState` — the state was entered and the lifecycle stream records
     /// the full event-carried [`Activity`](crate::Activity) for that moment.
     ///
@@ -179,18 +166,18 @@ pub enum Event {
     },
 
     /// The state finished successfully and routed to its successor — `next` is the resolved
-    /// transition target; `output` is the projection result that becomes the successor's input. It
-    /// is the pure "routing resolved" marker: the actual hop (the successor's `ActivateState`) is
-    /// carried by the following `Command`. Emitted only for a real State→State hop — a terminal
-    /// `End` routes to `CompleteExecution` instead and carries no marker. Emitted between
-    /// `StateCompleted` and the transition command so the transition decision is recorded in the
-    /// stream independent of the throwing code (`Command::ActivateState` allocates the successor's
-    /// id internally, so routing names the target but not the new activity). The foldable data
-    /// (`output`, `next`) lives on the following command's bookkeeping; the applier is a no-op,
-    /// mirroring `StateActivated`.
+    /// transition **target path** (the JSON Pointer into the shared machine doc, self-locating);
+    /// `output` is the projection result that becomes the successor's input. It is the pure "routing
+    /// resolved" marker: the actual hop (the successor's `ActivateState`) is carried by the following
+    /// `Command`. Emitted only for a real State→State hop — a terminal `End` routes to
+    /// `CompleteExecution` instead and carries no marker. Emitted between `StateCompleted` and the
+    /// transition command so the transition decision is recorded in the stream independent of the
+    /// throwing code (`Command::ActivateState` allocates the successor's id internally, so routing
+    /// names the target path but not the new activity). The foldable data (`output`, `next`) lives on
+    /// the following command's bookkeeping; the applier is a no-op, mirroring `StateActivated`.
     StateTransitioned {
         activity: ObjectReference,
-        next: String,
+        next: jsonptr::PointerBuf,
     },
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────
@@ -208,7 +195,13 @@ pub enum Event {
     /// settle them; the worker/lease fields are the durable record a restarted engine needs to keep
     /// honoring the claim. Batched (one event per poll, not per task) because all claims share one
     /// causal `ClaimTasks` batch — the applier folds each entry against its own `Pending` stake.
-    TasksClaimed { tasks: Vec<Task> },
+    /// `request_id` echoes the poll it answers, so the awaiting caller's grant is resolved from this
+    /// durable record. Emitted even for an empty claim (a poll that crossed the read-first gate but
+    /// raced to nothing) so every appended `ClaimTasks` has a response entry.
+    TasksClaimed {
+        request_id: RequestId,
+        tasks: Vec<Task>,
+    },
     /// The claimed task's lease elapsed before a settle (`ReleaseTaskLease`): `status` returns to
     /// `Pending` and `worker_id`/`lease_until` are cleared, so the task is re-claimable by any worker
     /// (or the same one, if it stalled then recovered — Zeebe's activation-timeout re-queue).

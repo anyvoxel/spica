@@ -26,12 +26,15 @@ impl EventApplier for TaskCompletedApplier {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
             output: Default::default(),
         }
@@ -64,15 +67,15 @@ impl EventApplier for TaskCompletedApplier {
                 .expect("an owned task always has an owner");
             t.status = TaskStatus::Completed;
             // Sync the domain value's transition stamp from the event (the row's own `updated_at`
-            // is the entry timestamp via `touch`, a separate concept).
-            t.value.meta.touch(task.meta.updated_at);
-            t.touch(ctx.timestamp);
+            // is the entry timestamp via `with_update_at`, a separate concept).
+            t.value.meta.with_update_at(task.meta.updated_at);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             if parent.kind == ObjectKind::Activity
                 && let Some(mut act) = ctx.storage.get_activity(&parent).await?
             {
                 act.value.raw_output = Some(output.clone());
-                act.touch(ctx.timestamp);
+                act.with_update_at(ctx.timestamp);
                 ctx.storage.put_activity(act).await?;
             }
             ctx.storage.remove_child(parent, task.reference()).await?;

@@ -54,10 +54,10 @@ impl StateHandler for MapStateHandler {
         }))
     }
 
-    fn activate(
+    async fn activate(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -67,24 +67,25 @@ impl StateHandler for MapStateHandler {
                 "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        activate_map(env, out, activity, actx, s);
+        activate_map(env, out, activity, actx, s).await;
     }
 
     // A `Map` never completes through the shared `CompleteState` path: it is an async container
     // that finishes only once every item settles (or fails on an item failure), so its `complete` is
     // not reached in normal flow. This arm stays as a defensive fallback — same rationale as
     // `ParallelStateHandler::complete` — routing the current input onward to avoid wedging.
-    fn complete(
+    async fn complete(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
         out.emit_event(Event::StateCompleted {
-            activity: state_completed_value(actx, actx.activity.input.clone()),
-        });
+            activity: state_completed_value(actx, actx.activity.raw_input.clone()),
+        })
+        .await;
         emit_transition(
             out,
             actx.activity.execution.clone(),
@@ -95,15 +96,16 @@ impl StateHandler for MapStateHandler {
                 .expect("an owned activity has an owner"),
             activity,
             actx.state_path(),
-            &actx.activity.input,
+            &actx.activity.raw_input,
             None,
             Some(true),
-        );
+        )
+        .await;
     }
 
-    /// The per-settle **replenish** hook, resumed by `ProcessChildCompleted`'s Running arm on *every*
-    /// item settle (not only when `active_children` drains — that is what lets a `Map` refill a
-    /// freed `MaxConcurrency` slot while other items are still in flight). This settle already
+    /// The per-settle **replenish** hook, dispatched by the inline child-settled reaction's Running
+    /// arm on *every* item settle (not only when `active_children` drains — that is what lets a `Map`
+    /// refill a freed `MaxConcurrency` slot while other items are still in flight). This settle already
     /// drained one child; the hook:
     ///
     /// 1. identifies the settled item (by `child` → `children` reverse lookup) and reads its
@@ -115,7 +117,7 @@ impl StateHandler for MapStateHandler {
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,
@@ -135,7 +137,7 @@ impl StateHandler for MapStateHandler {
         // The iteration plan + item child map live in the `Map` state-specific repository, folded
         // from the `StateActivated` activation product; without it this activity is not (or no
         // longer) a Map's — nothing to drive.
-        let ActivityState::Map(progress) = &act.value.activity_state else {
+        let Some(ActivityState::Map(progress)) = act.value.activity_state.as_ref() else {
             return;
         };
 
@@ -178,7 +180,7 @@ impl StateHandler for MapStateHandler {
                     output: Box::new(Value::Null),
                 }),
             };
-            fail_map(out, activity, actx, reason);
+            fail_map(out, activity, actx, reason).await;
             return;
         }
 
@@ -226,7 +228,7 @@ impl StateHandler for MapStateHandler {
                     .unwrap_or(Value::Null);
                 outputs.push(output);
             }
-            finish_map(ctx.env, out, activity, actx, s, Value::Array(outputs));
+            finish_map(ctx.env, out, activity, actx, s, Value::Array(outputs)).await;
             return;
         }
 
@@ -271,9 +273,9 @@ impl StateHandler for MapStateHandler {
     }
 }
 
-fn activate_map(
+async fn activate_map(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &MapState,
@@ -283,12 +285,12 @@ fn activate_map(
     // `$states.input` and in-scope variables. No `Map.Item` binding here — `Items` is the whole
     // array, not a per-item value.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.attempts,
+        actx.activity.retry_count(),
         None,
         None,
     );
@@ -331,7 +333,7 @@ fn activate_map(
                 }
             }
         }
-        None => match &actx.activity.input {
+        None => match &actx.activity.raw_input {
             Value::Array(arr) => arr.clone(),
             _ => {
                 fail_or!(
@@ -354,13 +356,12 @@ fn activate_map(
         },
     };
 
-    // Resolve `MaxConcurrency` (default 0 = unlimited). A literal is a non-negative integer; a
-    // JSONata string must evaluate to one.
+    // Resolve `MaxConcurrency` (default 0 = unlimited). The model's accessor supplies the spec
+    // default for an omitted field; a literal is a non-negative integer, a JSONata string one.
     let max_concurrency: usize =
-        match &state.max_concurrency {
-            None => 0,
-            Some(IntOrExpr::Int(n)) if *n >= 0 => *n as usize,
-            Some(IntOrExpr::Int(_)) => {
+        match state.max_concurrency() {
+            IntOrExpr::Int(n) if n >= 0 => n as usize,
+            IntOrExpr::Int(_) => {
                 fail_or!(
                     out,
                     Some(activity),
@@ -375,7 +376,7 @@ fn activate_map(
                 );
                 return;
             }
-            Some(IntOrExpr::Expr(expr)) => {
+            IntOrExpr::Expr(expr) => {
                 let evaluated = fail_or!(
                     out,
                     Some(activity),
@@ -394,14 +395,14 @@ fn activate_map(
                     Some(f) if f.fract() == 0.0 && f.is_finite() && f >= 0.0 => f as usize,
                     _ => {
                         fail_or!(
-                        out,
-                        Some(activity),
-                        actx.activity.meta.owner.clone().expect("an owned activity has an owner"),
-                        Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                            "Map MaxConcurrency expression must evaluate to a non-negative integer"
-                                .into(),
-                        )))
-                    );
+                    out,
+                    Some(activity),
+                    actx.activity.meta.owner.clone().expect("an owned activity has an owner"),
+                    Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                        "Map MaxConcurrency expression must evaluate to a non-negative integer"
+                            .into(),
+                    )))
+                );
                         return;
                     }
                 }
@@ -443,7 +444,7 @@ fn activate_map(
     out.emit_event(Event::StateActivated {
         activity: state_activated_value(
             actx,
-            actx.activity.input.clone(),
+            actx.activity.raw_input.clone(),
             Some(ActivityState::Map(MapActivityState {
                 items: items.clone(),
                 total: items.len(),
@@ -451,14 +452,15 @@ fn activate_map(
                 children: std::collections::HashMap::new(),
             })),
         ),
-    });
+    })
+    .await;
 
     // An empty items array spawns no children, so nobody will ever trigger `child_completed` —
     // converge immediately to an empty result rather than wedging. `finish_map` is synchronous and
     // needs no storage for the empty aggregation.
     if initial_batch == 0 {
         tracing::debug!(activity = %activity, "map has no items; converging immediately");
-        finish_map(env, out, activity, actx, state, Value::Array(Vec::new()));
+        finish_map(env, out, activity, actx, state, Value::Array(Vec::new())).await;
     }
 }
 
@@ -490,18 +492,20 @@ fn item_pointer(actx: &ActivityCtx) -> jsonptr::PointerBuf {
 /// (with the default 0 tolerance, that is *any* failure). Emits the activity's failure ed and throws
 /// `TerminateExecution` on the owning execution from the same step, mirroring
 /// `parallel.rs::fail_parallel`; the sweep then stops the still-in-flight sibling items.
-fn fail_map(
-    out: &mut Collector,
+async fn fail_map(
+    out: &mut Collector<'_>,
     _activity: ObjectReference,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
     out.emit_event(Event::StateTerminating {
         activity: state_terminating_value(actx, reason.clone()),
-    });
+    })
+    .await;
     out.emit_event(Event::StateTerminated {
         activity: state_terminated_value(actx, reason.clone()),
-    });
+    })
+    .await;
     super::super::emit_scope_termination(
         out,
         actx.activity
@@ -521,21 +525,21 @@ fn fail_map(
 /// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
 /// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the success
 /// finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing uniform.
-fn finish_map(
+async fn finish_map(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &MapState,
     aggregated: Value,
 ) {
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         Some(&aggregated), // `$states.result` = the ordered per-item outputs
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // success path — no Catch `errorOutput`
         None, // not projecting a Map item — no `context.Map.Item` binding
     );
@@ -567,7 +571,8 @@ fn finish_map(
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {
@@ -605,10 +610,12 @@ fn finish_map(
 
     out.emit_event(Event::StateCompleting {
         activity: state_completing_value(actx),
-    });
+    })
+    .await;
     out.emit_event(Event::StateCompleted {
         activity: state_completed_value(actx, output_value.clone()),
-    });
+    })
+    .await;
     emit_transition(
         out,
         actx.activity.execution.clone(),
@@ -622,5 +629,6 @@ fn finish_map(
         &output_value,
         state.next.as_deref(),
         state.end,
-    );
+    )
+    .await;
 }

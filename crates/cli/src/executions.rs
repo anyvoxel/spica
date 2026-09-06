@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use spica_client::{Client, ExecutionState, ObjectReference, StartExecution, Target};
+use spica_client::{Client, Code, ExecutionState, ObjectReference, StartExecution, Target};
 
 use crate::util::{print_json, printable_error, read_input, state_label, validate_flow_name};
 
@@ -71,7 +71,7 @@ pub(crate) struct ExecutionsWaitArgs {
     /// The execution's user-supplied name (required) — the run to poll to settlement.
     #[arg(long)]
     pub(crate) execution_name: String,
-    /// Poll interval in ms between GetExecution calls while the run is in flight.
+    /// Poll interval in ms between Query reads while the run is in flight.
     #[arg(long, default_value_t = 100)]
     pub(crate) poll_ms: u64,
 }
@@ -125,7 +125,7 @@ pub(crate) async fn get(client: &Client, pretty: bool, args: &ExecutionsGetArgs)
     let snap = client
         .get_execution(&args.execution_name)
         .await
-        .context("GetExecution")?;
+        .context("GetObject")?;
     println!("state: {}", state_label(snap.state));
     match snap.state {
         ExecutionState::Completed => {
@@ -140,7 +140,7 @@ pub(crate) async fn get(client: &Client, pretty: bool, args: &ExecutionsGetArgs)
                 printable_error(&snap.error_output)
             );
         }
-        _ => {} // ACTIVE / NOT_FOUND: nothing further to show on a one-shot read.
+        _ => {} // ACTIVE: nothing further to show on a one-shot read.
     }
     Ok(())
 }
@@ -148,10 +148,17 @@ pub(crate) async fn get(client: &Client, pretty: bool, args: &ExecutionsGetArgs)
 /// Poll an execution until it settles: print output (exit 0) or surface the failure (exit 1).
 pub(crate) async fn wait(client: &Client, pretty: bool, args: &ExecutionsWaitArgs) -> Result<()> {
     loop {
-        let snap = client
-            .get_execution(&args.execution_name)
-            .await
-            .context("GetExecution")?;
+        // A missing execution is now a gRPC `NotFound` (Query GetObject), not an in-band state —
+        // surface it as the friendly "no projection" error instead of a raw status.
+        let snap = match client.get_execution(&args.execution_name).await {
+            Err(st) if st.code() == Code::NotFound => {
+                bail!(
+                    "execution {}: no projection (never created or GC'd)",
+                    args.execution_name
+                );
+            }
+            snap => snap.context("GetObject")?,
+        };
         match snap.state {
             ExecutionState::Completed => {
                 let output: serde_json::Value =
@@ -164,12 +171,6 @@ pub(crate) async fn wait(client: &Client, pretty: bool, args: &ExecutionsWaitArg
                     "execution terminated: {} {}",
                     snap.error_name,
                     printable_error(&snap.error_output)
-                );
-            }
-            ExecutionState::NotFound => {
-                bail!(
-                    "execution {}: no projection (never created or GC'd)",
-                    args.execution_name
                 );
             }
             // Still in flight; poll again after the interval.

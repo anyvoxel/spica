@@ -14,13 +14,16 @@ impl EventApplier for FlowCreatedApplier {
         Event::FlowCreated {
             request_id: crate::types::id::RequestId::nil(),
             flow: crate::types::flow::Flow {
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Flow,
+                    ulid::Ulid::nil(),
+                )
+                .name(
                     crate::types::meta::ObjectName::plain("default")
                         .expect("static placeholder name is valid"),
-                    ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
                 status: crate::types::flow::FlowStatus::Active,
                 latest_version: 0,
             },
@@ -43,6 +46,7 @@ impl EventApplier for FlowCreatedApplier {
         // name (see the event docs), and the `FlowVersionCreatedApplier` co-applied in the same batch
         // later advances `latest_version` to this version — the flow row carries the initial
         // counter here, and the version applier reconciles it (a replay-safe ordering).
-        ctx.storage.put_flow(flow.clone()).await
+        ctx.storage.put_flow(flow.clone()).await?;
+        Ok(())
     }
 }

@@ -45,7 +45,7 @@ impl TimerRecord {
     }
 
     /// Record a row write at `at` (a mutation applier): advances `updated_at`, leaves `created_at`.
-    pub fn touch(&mut self, at: Timestamp) {
+    pub fn with_update_at(&mut self, at: Timestamp) {
         self.updated_at = at;
     }
 }

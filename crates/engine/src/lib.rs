@@ -22,7 +22,7 @@
 //! `Resource` and reports `complete`/`fail`),
 //! `Map`/`Parallel` container fan-out (bounded-concurrency `Map` with per-settle slot replenish;
 //! `Parallel` with branch aggregation), the state-machine `TimeoutSeconds`, `$states.context`
-//! (`Execution`/`State`/`Map.Item`) binding, and execution cancellation (`Engine::terminate`).
+//! (`Execution`/`State`/`Map.Item`) binding, and execution cancellation (`Engine::cancel_execution`).
 //!
 //! Not yet implemented (each carries a `TODO` marker at its site; see in particular
 //! `handlers/states/task.rs`, `handlers/complete_task.rs`,
@@ -39,7 +39,7 @@
 //!   `ToleratedFailurePercentage` (current behavior equals the default tolerance of 0), and
 //!   threading `$states.context.Map.Item` down into the item-processor child states.
 //! - **Cross-cutting**: submission-time `spica_asl::StateMachine::validate()`; a fully-designed
-//!   recovery path for `Command::ProcessChildCompleted` over container (Map/Parallel) states;
+//!   recovery path for the inline child-settled reaction over container (Map/Parallel) states;
 //!   `$states.context.StateMachine` stats.
 //!
 //! The CCES seams (LogStream/Storage/StreamProcessor/CommandHandler) are the foundation a distributed
@@ -56,20 +56,23 @@ mod eval_env;
 mod follower;
 mod handler;
 mod handlers;
+mod hook;
 mod leader;
 mod log;
 mod processing;
-mod scheduler;
+mod query;
 mod storage;
 mod stream_processor;
 mod task_api;
 mod types;
+mod working;
 
 pub use applier::{ApplierContext, EventApplier, EventDispatcher};
 pub use engine::{Engine, EngineBuilder};
 pub use handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
+pub use hook::Hook;
 pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
-pub use scheduler::{Scheduler, TimerSink};
+pub use query::{QueryListPage, QueryObject};
 pub use storage::{
     ActivityRecord, ExecutionRecord, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
 };
@@ -88,10 +91,10 @@ pub use types::id::{
     ActivityId, EntryId, ExecutionId, FlowName, RequestId, StreamId, ThreadId, TimerId,
 };
 pub use types::meta::{
-    ObjectAddress, ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, ScopeName,
+    ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName, ScopeName,
 };
 pub use types::reject::{Reject, RejectionType};
-pub use types::result::{ExecutionResult, ExecutionStatusSnapshot};
+pub use types::result::ExecutionResult;
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
 pub use types::thread::{Thread, ThreadStatus};
 pub use types::timer::{Timer, TimerStatus};

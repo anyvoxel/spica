@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
+use crate::{Activity, ActivityStatus, ApplierContext, EventApplier};
 
 use crate::types::meta::ObjectKind;
 
@@ -21,16 +21,17 @@ impl EventApplier for StateTerminatedApplier {
                     crate::types::command::TerminationReason::Cancelled,
                 ),
                 raw_input: Default::default(),
-                input: Default::default(),
+                input: None,
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
                     crate::types::id::ActivityId::nil().into(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -67,7 +68,7 @@ impl EventApplier for StateTerminatedApplier {
                 // Mirror `StateCompleted`: once the owned activity terminates, the execution-level
                 // projection cursor must be cleared so the unwind sees no stale "current" state.
                 exec.current_activity = None;
-                exec.touch(ctx.timestamp);
+                exec.with_update_at(ctx.timestamp);
                 ctx.storage.put_execution(exec).await?;
             }
         }

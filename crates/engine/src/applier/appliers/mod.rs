@@ -13,7 +13,6 @@ mod execution_terminated;
 mod execution_terminating;
 mod flow_created;
 mod flow_version_created;
-mod process_child_completed_handled;
 mod state_activated;
 mod state_activating;
 mod state_completed;
@@ -44,7 +43,6 @@ pub(crate) use execution_terminated::ExecutionTerminatedApplier;
 pub(crate) use execution_terminating::ExecutionTerminatingApplier;
 pub(crate) use flow_created::FlowCreatedApplier;
 pub(crate) use flow_version_created::FlowVersionCreatedApplier;
-pub(crate) use process_child_completed_handled::ProcessChildCompletedHandledApplier;
 pub(crate) use state_activated::StateActivatedApplier;
 pub(crate) use state_activating::StateActivatingApplier;
 pub(crate) use state_completed::StateCompletedApplier;
@@ -67,3 +65,23 @@ pub(crate) use timer_activated::TimerActivatedApplier;
 pub(crate) use timer_cancelled::TimerCancelledApplier;
 pub(crate) use timer_triggered::TimerTriggeredApplier;
 pub(crate) use variables_assigned::VariablesAssignedApplier;
+
+/// Raise the partition's generated-name counter to `suffix + 1` when a create event folds a
+/// generated-name child. At runtime the counter is already advanced when the name was minted
+/// (`Collector::next_generated_seq`); this **replays it** so that on recovery — where storage is
+/// rebuilt from events and mint never re-runs — the counter is reconstructed from the persisted
+/// names and no future mint collides. Idempotent (`max`); a plain (non-counter) name carries no
+/// suffix and is skipped.
+pub(crate) async fn bump_generated_seq(
+    storage: &mut dyn crate::storage::StorageTxn,
+    name: &crate::types::meta::ObjectName,
+) -> Result<(), crate::types::error::ExecutionError> {
+    let Some(suffix) = name.suffix() else {
+        return Ok(());
+    };
+    let current = storage.next_generated_seq().await?;
+    storage
+        .put_next_generated_seq(current.max(suffix as i64 + 1))
+        .await?;
+    Ok(())
+}

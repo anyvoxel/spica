@@ -11,8 +11,8 @@ use crate::types::event::Event;
 /// The child is projected by a `ThreadCreated{parent, execution, state_path}` (which wires it
 /// into its owner's `active_children` via the applier), then entered at its `StartAt` state via
 /// `ActivateState`. From there it runs as a self-contained sub-state-machine — its internal hops
-/// happen entirely within the thread, and its terminal hop cascades back to `parent` through
-/// `ProcessChildCompleted`, so the owning `Parallel`/`Map` activity only learns the child settled
+/// happen entirely within the thread, and its terminal hop runs the inline child-settled reaction
+/// back to `parent`, so the owning `Parallel`/`Map` activity only learns the child settled
 /// when the whole branch/item finishes. This is the flat (non-recursive) fan-out: the thread is
 /// stored as one row with a `state_path` into the shared machine, never copying branch state.
 ///
@@ -41,7 +41,7 @@ impl CommandHandler for SpawnThreadHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::SpawnThread {
             owner,
             execution,
@@ -107,7 +107,10 @@ impl CommandHandler for SpawnThreadHandler {
         // `uid`. Not the opaque `child-<uid>` placeholder. Minted once and reused for the reference
         // and the serialized `meta.name`, so the storage row key (`thread.reference()`) matches the
         // sibling `ActivateState` owner.
-        let thread_name = execution.name.base().to_generated();
+        let thread_name = execution
+            .name
+            .base()
+            .generated_from_key(out.next_generated_seq().await);
         let reference = crate::types::meta::ObjectReference::new(
             crate::types::meta::ObjectKind::Thread,
             thread_name.clone(),
@@ -139,15 +142,17 @@ impl CommandHandler for SpawnThreadHandler {
                 output: None,
                 // Birth: `created_at == now` (fan-out moment). The owner is the SpawnThread command's
                 // `parent` Parallel/Map activity, converted to the reference form stored in meta.
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Thread,
-                    thread_name,
                     uid,
-                    Timestamp::now(),
                 )
+                .name(thread_name)
+                .at(Timestamp::now())
+                .build()
                 .with_owner(owner.clone()),
             },
-        });
+        })
+        .await;
         // Enter the branch at its `StartAt` state. The child's path = the thread's branch/item
         // `state_path` (its enclosing `states` table) extended by the start state's name, so the
         // carried path locates the state self-containedly. `owner` is the new Thread (the branch's

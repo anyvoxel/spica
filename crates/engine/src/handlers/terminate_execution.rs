@@ -25,7 +25,7 @@ impl CommandHandler for TerminateExecutionHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::TerminateExecution { name, uid, reason } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -89,10 +89,11 @@ impl CommandHandler for TerminateExecutionHandler {
         terminating_execution.status = crate::ExecutionStatus::Terminating(reason.clone());
         // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
         // carries forward.
-        terminating_execution.meta.touch(Timestamp::now());
+        terminating_execution.meta.with_update_at(Timestamp::now());
         out.emit_event(Event::ExecutionTerminating {
             execution: terminating_execution,
-        });
+        })
+        .await;
 
         let children = exec.active_children.clone();
         let mut pending = 0usize;
@@ -119,7 +120,7 @@ impl CommandHandler for TerminateExecutionHandler {
         if pending == 0 {
             let mut terminated_execution = exec.value();
             terminated_execution.status = crate::ExecutionStatus::Terminated(reason.clone());
-            terminated_execution.meta.touch(Timestamp::now());
+            terminated_execution.meta.with_update_at(Timestamp::now());
             // Termination is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionTerminated` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an
@@ -127,17 +128,14 @@ impl CommandHandler for TerminateExecutionHandler {
             let terminated_event = Event::ExecutionTerminated {
                 execution: terminated_execution,
             };
-            out.emit_event(terminated_event);
-            // A terminating child execution (a Parallel branch that failed) relays its settle to its
-            // owning node — the `Parallel` activity — the same way a successful branch does (see
-            // `CompleteExecutionHandler`). Without this the failed branch drains `P`'s `active_children`
-            // but nobody triggers `P`'s `child_completed`, so a failed Parallel never converges and the
-            // tree wedges. The top-level run (`parent: None`) has no owner and relays nothing.
+            out.emit_event(terminated_event).await;
+            // A terminating child execution (a Parallel branch that failed) runs the inline reaction
+            // to its owning node — the `Parallel` activity — the same way a successful branch does
+            // (see `CompleteExecutionHandler`). Without this the failed branch drains `P`'s
+            // `active_children` but nobody converges `P`, so a failed Parallel never finishes and the
+            // tree wedges. The top-level run (`parent: None`) has no owner and reacts to nothing.
             if let Some(owner) = exec.value.meta.owner.clone() {
-                out.emit_command(Command::ProcessChildCompleted {
-                    owner,
-                    child: exec_ref.clone(),
-                });
+                super::child_completed::child_settled(ctx, out, owner, exec_ref.clone()).await;
             }
         } else {
             tracing::debug!(

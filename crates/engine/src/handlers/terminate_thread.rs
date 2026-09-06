@@ -14,7 +14,7 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 /// container Activity (a `Parallel`/`Map` sweep tearing down a branch/item), never by the external
 /// name-addressed root terminate. Emits `ThreadTerminating`, sweeps owned children (timers, child
 /// activities, and nested child threads — each recursively terminating its own subtree), and —
-/// once drained — emits `ThreadTerminated{reason}` plus a `ProcessChildCompleted` relay so the
+/// once drained — emits `ThreadTerminated{reason}` plus the inline child-settled reaction so the
 /// owning container converges on its settle.
 #[derive(Default)]
 pub struct TerminateThreadHandler;
@@ -28,7 +28,7 @@ impl CommandHandler for TerminateThreadHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::TerminateThread { thread, reason } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -57,10 +57,11 @@ impl CommandHandler for TerminateThreadHandler {
         terminating_thread.status = ThreadStatus::Terminating(reason.clone());
         // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
         // carries forward.
-        terminating_thread.meta.touch(Timestamp::now());
+        terminating_thread.meta.with_update_at(Timestamp::now());
         out.emit_event(Event::ThreadTerminating {
             thread: terminating_thread,
-        });
+        })
+        .await;
 
         let children = thread_row.active_children.clone();
         let mut pending = 0usize;
@@ -99,17 +100,15 @@ impl CommandHandler for TerminateThreadHandler {
         if pending == 0 {
             let mut terminated_thread = thread_row.value();
             terminated_thread.status = ThreadStatus::Terminated(reason.clone());
-            terminated_thread.meta.touch(Timestamp::now());
+            terminated_thread.meta.with_update_at(Timestamp::now());
             out.emit_event(Event::ThreadTerminated {
                 thread: terminated_thread,
-            });
-            // Relay the settle to its owning container Activity so the `Parallel`/`Map` converges
-            // once its last branch/item drains (mirrors the `Execution` completion relay).
+            })
+            .await;
+            // Run the inline child-settled reaction so the owning container converges (mirrors the
+            // `Execution` termination reaction).
             if let Some(owner) = thread_row.value.meta.owner.clone() {
-                out.emit_command(Command::ProcessChildCompleted {
-                    owner,
-                    child: thread_ref.clone(),
-                });
+                super::child_completed::child_settled(ctx, out, owner, thread_ref.clone()).await;
             }
         } else {
             tracing::debug!(

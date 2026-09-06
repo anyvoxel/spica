@@ -5,14 +5,14 @@
 use spica_engine::FlowName;
 use spica_proto::v1::{
     CreateFlowRequest, CreateFlowResponse, ResolveFlowVersionRequest, ResolveFlowVersionResponse,
-    workflow_server::Workflow as WorkflowService,
+    workflow_service_server::WorkflowService as WorkflowServiceTrait,
 };
 use tonic::{Request, Response, Status};
 
 use crate::common::{Svc, proto_ref, to_status};
 
 #[tonic::async_trait]
-impl WorkflowService for Svc {
+impl WorkflowServiceTrait for Svc {
     /// Persist a new flow version and return its created version's `ObjectReference`.
     async fn create_flow(
         &self,
@@ -26,7 +26,7 @@ impl WorkflowService for Svc {
 
         tracing::debug!(flow = %name, bytes = req.definition.len(), "CreateFlow");
         let flow = self
-            .engine
+            .facade
             .create_flow(name, definition)
             .await
             .map_err(to_status)?;

@@ -6,7 +6,6 @@ use crate::Task;
 use crate::TaskStatus;
 use crate::handler::{Collector, CommandHandler, HandlerContext};
 use crate::log::Timestamp;
-use crate::task_api::ActivatedTask;
 use crate::types::command::{Command, TimerPurpose};
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, ObjectReference};
@@ -16,9 +15,10 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 /// Runs in the StreamProcessor's serialized, lock-holding command arm, so discovery and leasing are
 /// decided against the same projection snapshot the fold writes. It discovers up to `max_tasks`
 /// `Pending` tasks of `resource`, leases each to `worker_id` (arming its `DeliveryLease` timer), and
-/// returns the granted set to the awaiting `poll_tasks` via the acknowledgment channel
-/// (`AckOutcome::Granted`). All claimed tasks ride **one** batched `TasksClaimed` event (they share
-/// this single causal batch), with per-task lease timers.
+/// reports one batched `TasksClaimed` **durable** response (they share a single causal batch, with
+/// per-task lease timers). The awaiting `poll_tasks` resolves its grant from that durable event —
+/// the discovery-time `Task` snapshot embedded in it — so the exact set is re-derived from the log,
+/// never re-read.
 ///
 /// The returned set is the handler's *discovery-time* grant (direct return, not re-read): a narrow
 /// race — a concurrent pull that discovers the same task before this one's `TasksClaimed` is applied —
@@ -40,7 +40,7 @@ impl CommandHandler for ClaimTasksHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::ClaimTasks {
             request_id,
             worker_id,
@@ -59,21 +59,28 @@ impl CommandHandler for ClaimTasksHandler {
         // immediately — absurd for a pull).
         let Some(lease_until) = Timestamp::now().checked_add(Duration::from_secs(*lease_seconds))
         else {
-            out.ack_request_tasks(*request_id, Vec::new());
+            out.emit_event(Event::TasksClaimed {
+                request_id: *request_id,
+                tasks: Vec::new(),
+            })
+            .await;
             return;
         };
         // Discover `Pending` tasks of `resource` under the command arm's storage lock — the same
         // snapshot the fold writes against — so allocation is decided against authoritative state.
         let tasks = match ctx.storage.activatable_tasks(resource, *max_tasks).await {
             Ok(t) => t,
-            // Discovery is a read; a failure here leaves the pull with nothing granted — report the
-            // empty set rather than failing the whole worker loop.
+            // Discovery is a read; a failure here leaves the pull with nothing granted — the empty
+            // debt is still answered, rather than failing the whole worker loop.
             Err(_) => {
-                out.ack_request_tasks(*request_id, Vec::new());
+                out.emit_event(Event::TasksClaimed {
+                    request_id: *request_id,
+                    tasks: Vec::new(),
+                })
+                .await;
                 return;
             }
         };
-        let mut granted = Vec::with_capacity(tasks.len());
         let mut claimed = Vec::new();
         for t in tasks {
             // A retrying task is not claimable until its `next_available_at` backoff gate lapses;
@@ -102,28 +109,18 @@ impl CommandHandler for ClaimTasksHandler {
                 Ok(Some(a)) => a.value().execution,
                 _ => ObjectReference::nil(),
             };
-            granted.push(ActivatedTask {
-                task: t.value.meta.name.clone(),
-                resource: t.value.resource.clone(),
-                arguments: t.value.arguments.clone(),
-            });
-            claimed.push(emit_lease(
-                activity_id,
-                execution,
-                t.value,
-                worker_id,
-                lease_until,
-                out,
-            ));
+            claimed.push(
+                emit_lease(activity_id, execution, t.value, worker_id, lease_until, out).await,
+            );
         }
-        // One batched claim fact for the whole poll — all entries share this single causal batch
-        // (the per-task lease timers above are their own arming facts).
-        if !claimed.is_empty() {
-            out.emit_event(Event::TasksClaimed { tasks: claimed });
-        }
-        // Return the discovery-time grant to the awaiting `poll_tasks`; the conditional `TasksClaimed`
-        // applier reconciles any later stale/racing lease to exactly-once state.
-        out.ack_request_tasks(*request_id, granted);
+        // One batched claim fact for the whole poll — every appended `ClaimTasks` answers its awaiting
+        // caller with a durable `TasksClaimed` (all entries share this single causal batch; the
+        // per-task lease timers above are their own arming facts).
+        out.emit_event(Event::TasksClaimed {
+            request_id: *request_id,
+            tasks: claimed,
+        })
+        .await;
     }
 }
 
@@ -133,19 +130,19 @@ impl CommandHandler for ClaimTasksHandler {
 /// stalled / crashed worker does not hold it forever. The timer is minted inline so the arm lands in
 /// the same causal batch as the claimed task. Returns the mutated claim value for the handler to
 /// collect into its single batched `TasksClaimed`.
-fn emit_lease(
+async fn emit_lease(
     activity_id: ObjectReference,
     execution: ObjectReference,
     mut task_value: Task,
     worker_id: &str,
     lease_until: Timestamp,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
 ) -> Task {
     task_value.status = TaskStatus::Running;
     task_value.worker_id = Some(worker_id.to_string());
     task_value.lease_until = Some(lease_until);
     // Stamp the claim moment; `created_at` is already carried on `task_value`.
-    task_value.meta.touch(Timestamp::now());
+    task_value.meta.with_update_at(Timestamp::now());
     // Claimed — the backoff gate is spent (cleared so a later lease-expiry re-queue is immediately
     // claimable rather than inheriting a stale waiting period).
     task_value.retry_state.next_available_at = None;
@@ -157,6 +154,7 @@ fn emit_lease(
         activity_id,
         TimerPurpose::DeliveryLease,
         lease_until,
-    );
+    )
+    .await;
     task_value
 }

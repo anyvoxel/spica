@@ -19,12 +19,15 @@ impl EventApplier for TimerTriggeredApplier {
                 purpose: crate::TimerPurpose::WaitResume,
                 status: TimerStatus::Completed,
                 deadline: crate::Timestamp::from_millis(0),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Timer,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::Timestamp::from_millis(0),
                     crate::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         }
     }
@@ -48,9 +51,9 @@ impl EventApplier for TimerTriggeredApplier {
                 .expect("an owned timer always has an owner");
             t.value.status = TimerStatus::Completed;
             // Sync the domain value's transition stamp from the event (the row's own `updated_at` is
-            // the entry timestamp via `touch`, a separate concept).
-            t.value.meta.touch(timer.meta.updated_at);
-            t.touch(ctx.timestamp);
+            // the entry timestamp via `with_update_at`, a separate concept).
+            t.value.meta.with_update_at(timer.meta.updated_at);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
             ctx.storage.remove_child(parent, timer.reference()).await?;
         }

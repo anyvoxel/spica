@@ -21,7 +21,7 @@ impl CommandHandler for TriggerTimerHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::TriggerTimer { timer } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -49,11 +49,12 @@ impl CommandHandler for TriggerTimerHandler {
                 // `updated_at`.
                 meta: {
                     let mut m = act.value.meta.clone();
-                    m.touch(crate::log::Timestamp::now());
+                    m.with_update_at(crate::log::Timestamp::now());
                     m
                 },
             },
-        });
+        })
+        .await;
 
         match act.value.purpose {
             TimerPurpose::WaitResume => {
@@ -70,7 +71,7 @@ impl CommandHandler for TriggerTimerHandler {
                 // A Wait's raw result is its processed input (no distinct raw output). Load it so the
                 // `CompleteState` command carries the raw result, keeping the command self-describing.
                 let raw_result = match ctx.storage.get_activity(&activity_id).await {
-                    Ok(Some(act)) => act.value().input,
+                    Ok(Some(act)) => act.value().input.clone().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null, // owner gone — the handler will no-op.
                 };
                 out.emit_command(Command::CompleteState {

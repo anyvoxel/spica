@@ -11,9 +11,8 @@ mod common;
 use std::path::Path;
 
 use serde_json::Value;
-use spica_engine::{EngineBuilder, EntryId, EntryPayload, FlowName, LogStream, ObjectName};
+use spica_engine::{EngineBuilder, EntryId, EntryPayload, Event, FlowName, LogStream, PlainName};
 use spica_logstream::RocksLogStream;
-use spica_scheduler::InMemoryScheduler;
 use spica_storage::RocksStorage;
 
 /// A single-terminal-state machine — one execution routes A → Succeed, settling deterministically.
@@ -50,11 +49,12 @@ async fn run_one_execution(log_path: &Path, storage_path: &Path) {
     // own handles, so the caller can reuse the same paths across "restarts".
     let log = RocksLogStream::<EntryPayload>::open(log_path).expect("open log");
     let storage = RocksStorage::open(storage_path).expect("open storage");
-    let engine = EngineBuilder::with_backends(Box::new(log), Box::new(storage))
-        .with_scheduler(InMemoryScheduler::spawn())
-        .start()
-        .await
-        .expect("engine boots");
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
+        Box::new(log),
+        Box::new(storage),
+    ))
+    .await
+    .expect("engine boots");
     // A fresh anonymous flow each run keeps name-keyed rows (and their entry counts) from coupling
     // across restarts: every execution exercises the identical state machine path.
     let flow_name =
@@ -65,8 +65,9 @@ async fn run_one_execution(log_path: &Path, storage_path: &Path) {
         .expect("create flow");
     let execution_id = engine
         .start_for_revision(
-            ObjectName::generated_with_suffix("resume", &ulid::Ulid::new().to_string())
-                .expect("ULID-suffixed generated name is valid"),
+            PlainName::new("resume")
+                .expect("static literal is a valid segment")
+                .generated_from_key(ulid::Ulid::new().0 as u64),
             flow_version,
             Value::Null,
         )
@@ -118,4 +119,108 @@ async fn restart_resumes_from_last_processed_position_without_reappend() {
     let _ = std::fs::remove_dir_all(&storage_path);
     let _ = std::fs::remove_dir_all(&fresh_log);
     let _ = std::fs::remove_dir_all(&fresh_storage);
+}
+
+/// A two-branch `Parallel`: each branch fan-outs as a child Thread, so one run emits two generated
+/// thread names (exercising the per-partition naming counter).
+const PARALLEL_SM: &str = r#"{
+  "StartAt": "P",
+  "States": {
+    "P": { "Type": "Parallel", "End": true, "Branches": [
+      { "StartAt": "A", "States": { "A": { "Type": "Pass", "End": true } } },
+      { "StartAt": "B", "States": { "B": { "Type": "Pass", "End": true } } }
+    ] }
+  }
+}"#;
+
+/// Boot a durable Engine over `log`/`storage` and run a two-branch `Parallel` to completion, then
+/// stop cleanly. Each run is a *distinctly-named* execution, so only the shared per-partition counter
+/// suffix can distinguish one run's children from another's — a re-issued suffix across a restart is
+/// detectable even though the name bases differ.
+async fn run_parallel_execution(log_path: &Path, storage_path: &Path) {
+    let log = RocksLogStream::<EntryPayload>::open(log_path).expect("open log");
+    let storage = RocksStorage::open(storage_path).expect("open storage");
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
+        Box::new(log),
+        Box::new(storage),
+    ))
+    .await
+    .expect("engine boots");
+    // A fresh anonymous flow each run keeps name-keyed flow rows (and their entry counts) from
+    // coupling across restarts, exactly as the resume test above.
+    let flow_name =
+        FlowName::new(&format!("par_{}", ulid::Ulid::new())).expect("ULID-suffixed name is valid");
+    let flow_version = engine
+        .create_flow(flow_name, PARALLEL_SM)
+        .await
+        .expect("create flow");
+    let exec_name = PlainName::new("resume")
+        .expect("static literal is a valid segment")
+        .generated_from_key(ulid::Ulid::new().0 as u64);
+    let execution_id = engine
+        .start_for_revision(exec_name, flow_version, Value::Null)
+        .await
+        .expect("start parallel execution");
+    engine
+        .wait_for_execution(&execution_id)
+        .await
+        .expect("parallel execution completes");
+    engine.stop().await; // controlled shutdown: drains the loop, drops the Rocks handles.
+}
+
+/// Parse the decimal generated-name suffix from every `ThreadCreated` currently in the durable log
+/// at `path`. Runs under differently-named *bases*, so only the shared per-partition suffix can tell
+/// a post-restart mint from a pre-restart one — a re-issued suffix (counter reset) is what we're
+/// guarding against.
+async fn thread_suffixes(path: &Path) -> Vec<i64> {
+    let log = RocksLogStream::<EntryPayload>::open(path).expect("open log to inspect");
+    let mut suffixes = Vec::new();
+    let mut from = EntryId::new(1);
+    while let Some(entry) = log.read(from).await.expect("read log entry") {
+        if let EntryPayload::Event(Event::ThreadCreated { thread }) = entry.payload {
+            let name = thread.meta.name;
+            let Some(tail) = name.suffix() else {
+                panic!("a counter-minted thread name must carry a suffix: {name}");
+            };
+            suffixes.push(tail as i64);
+        }
+        from = EntryId::new(from.get() + 1);
+    }
+    drop(log); // release the exclusive dir lock before the caller reopens the path.
+    suffixes
+}
+
+#[tokio::test]
+async fn generated_names_do_not_collide_across_restart() {
+    // A `Parallel` fan-out mints child Thread names from this partition's u64 counter. Restarting on
+    // the same durable store must never re-issue a suffix used before the restart: a repeat would
+    // silently overwrite the earlier row. (The pre-fix 40-bit random tail could collide; the counter
+    // — persisted, and reconstructed by the create appliers on a rebuild-from-events — cannot.)
+    let log_path = temp_path("log");
+    let storage_path = temp_path("storage");
+
+    run_parallel_execution(&log_path, &storage_path).await;
+    let first = thread_suffixes(&log_path).await;
+    assert_eq!(
+        first.len(),
+        2,
+        "one Parallel with 2 branches spawns 2 threads per run"
+    );
+
+    run_parallel_execution(&log_path, &storage_path).await;
+    let all = thread_suffixes(&log_path).await;
+    assert!(
+        all.len() > first.len(),
+        "the post-restart run must spawn fresh threads (counter not stuck)"
+    );
+
+    let unique: std::collections::HashSet<_> = all.iter().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "generated-name suffixes must be unique across the restart — a repeat is a silent overwrite"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
 }

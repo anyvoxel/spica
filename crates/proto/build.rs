@@ -8,6 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // `ObjectMeta.owner` is a proto3 `optional` field (an absent owner is meaningful — roots have
+        // none), which protoc gates behind this flag.
+        .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(&[proto], &[dir])?;
     // Rebuild when the contract changes.
     println!("cargo:rerun-if-changed={proto}");

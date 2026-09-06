@@ -23,7 +23,7 @@ use crate::types::error::ExecutionError;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
 use crate::types::id::FlowName;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
 
 pub use activity::ActivityRecord;
 pub use execution::ExecutionRecord;
@@ -84,6 +84,27 @@ pub trait Storage: Send + Sync {
         resource: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError>;
+
+    /// Enumerate `kind`'s rows in storage-key order (k8s-style LIST over one kind), returning each
+    /// row's canonical addressing [`ObjectName`] + its raw serialized (serde JSON) value bytes —
+    /// the uniform, kind-agnostic feed the Query read facade deserializes into typed rows. Starts
+    /// **after** `start_after` (exclusive; `None` = from the first row) and returns at most `limit`
+    /// rows, so a caller pages by passing the previous page's last name back as `start_after`.
+    ///
+    /// The default refuses: only the real backends (`RocksStorage`/`InMemoryStorage`) implement the
+    /// range scan; the read facade is the only consumer, never the handler path.
+    async fn list_kind(
+        &self,
+        kind: ObjectKind,
+        _start_after: Option<&ObjectName>,
+        _limit: usize,
+    ) -> Result<Vec<(ObjectName, Vec<u8>)>, ExecutionError> {
+        Err(ExecutionError::Runtime(
+            crate::types::error::RuntimeError::InvalidDefinition(format!(
+                "list_kind({kind:?}) not implemented by this storage backend"
+            )),
+        ))
+    }
 
     /// Upsert an `ExecutionRecord` record (read-modify-write by an `EventApplier`).
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError>;
@@ -164,6 +185,11 @@ pub trait Storage: Send + Sync {
     /// Advance and persist the resume watermark (see [`Storage::last_processed_position`]). Written
     /// with the rest of an event fold so the watermark is never ahead of the projection.
     async fn put_last_processed_position(&mut self, position: i64) -> Result<(), ExecutionError>;
+    /// This partition's generated-name counter (see `KeyBuilder::next_generated_seq`): the next
+    /// suffix a generated object name may take, unique within the partition without cross-partition
+    /// coordination. Derived — rebuilt by re-folding the create events on replay, so it is never
+    /// ahead of the projection.
+    async fn next_generated_seq(&self) -> Result<i64, ExecutionError>;
 }
 
 /// A write-scoped, **owned** projection transaction, handed to an [`EventApplier`]
@@ -214,6 +240,17 @@ pub trait StorageTxn: Send {
         &mut self,
         id: ObjectReference,
     ) -> Result<HashSet<ObjectReference>, ExecutionError>;
+
+    /// Scan up to `limit` available (`TaskStatus::Pending`) tasks of `resource`, read-your-writes:
+    /// the pending batch is consulted first, then committed rows — the overlay equivalent of
+    /// [`Storage::activatable_tasks`], letting a handler pulling work see its own just-emitted
+    /// task rows (the no-op scheduler's overlay never arms physical side effects).
+    async fn activatable_tasks(
+        &mut self,
+        resource: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, ExecutionError>;
+
     async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, ExecutionError>;
     async fn get_flow_version(
         &mut self,
@@ -252,6 +289,13 @@ pub trait StorageTxn: Send {
     /// Persist a flow version into this transaction's pending batch (also the version index row).
     async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), ExecutionError>;
 
+    /// Read this partition's generated-name counter (see [`Storage::next_generated_seq`]),
+    /// overlay-first so a fold sees its own earlier bump.
+    async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError>;
+    /// Advance this partition's generated-name counter into this fold's pending batch; landed
+    /// atomically with the rest of the fold on [`StorageTxn::commit`].
+    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError>;
+
     /// Atomically commit this fold: land **all** buffered writes and, when `watermark` is `Some`,
     /// the resume watermark advance, all-or-nothing. Making the watermark part of the same atomic
     /// batch as the projection is what guarantees it can never run ahead of the projection.
@@ -264,4 +308,122 @@ pub trait StorageTxn: Send {
     /// The projection remains a rebuildable cache, so this is a non-fsync path: writes go through
     /// RocksDB's default WAL without a per-call fsync (see `crates/storage` module docs).
     fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError>;
+}
+
+/// The **read-only** face of a working [`StorageTxn`]: the row/flow reads plus the work-pull scan,
+/// all `&self`. A [`CommandHandler`](crate::CommandHandler) reads state through this — it can never
+/// write, commit, or move the watermark — while the same underlying txn is mutated by the
+/// applier/collector. `Storage` is also one (see the blanket below), so helpers that only need to
+/// read stay generic over this narrower contract instead of the full `Storage`.
+#[async_trait]
+pub trait ReadonlyStorageTxn: Send + Sync {
+    async fn get_execution(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ExecutionRecord>, ExecutionError>;
+    async fn get_thread(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ThreadRecord>, ExecutionError>;
+    async fn get_activity(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ActivityRecord>, ExecutionError>;
+    async fn get_timer(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<TimerRecord>, ExecutionError>;
+    async fn get_task(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<TaskRecord>, ExecutionError>;
+    async fn get_children(
+        &self,
+        id: ObjectReference,
+    ) -> Result<HashSet<ObjectReference>, ExecutionError>;
+    async fn activatable_tasks(
+        &self,
+        resource: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, ExecutionError>;
+    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError>;
+    async fn get_flow_version(
+        &self,
+        version: &ObjectReference,
+    ) -> Result<Option<FlowVersion>, ExecutionError>;
+    async fn flow_version_of(
+        &self,
+        name: FlowName,
+        version: u32,
+    ) -> Result<Option<FlowVersion>, ExecutionError>;
+    async fn next_generated_seq(&self) -> Result<i64, ExecutionError>;
+}
+
+/// Every [`Storage`] is already a `ReadonlyStorageTxn`: its read methods are exactly this face, so
+/// the blanket forwards them — letting a helper accept `&dyn ReadonlyStorageTxn` and be called with
+/// either committed storage or the working overlay, with no trait upcasting.
+#[async_trait]
+impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
+    async fn get_execution(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+        <T as Storage>::get_execution(self, reference).await
+    }
+    async fn get_thread(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ThreadRecord>, ExecutionError> {
+        <T as Storage>::get_thread(self, reference).await
+    }
+    async fn get_activity(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<ActivityRecord>, ExecutionError> {
+        <T as Storage>::get_activity(self, reference).await
+    }
+    async fn get_timer(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<TimerRecord>, ExecutionError> {
+        <T as Storage>::get_timer(self, reference).await
+    }
+    async fn get_task(
+        &self,
+        reference: &ObjectReference,
+    ) -> Result<Option<TaskRecord>, ExecutionError> {
+        <T as Storage>::get_task(self, reference).await
+    }
+    async fn get_children(
+        &self,
+        id: ObjectReference,
+    ) -> Result<HashSet<ObjectReference>, ExecutionError> {
+        <T as Storage>::get_children(self, id).await
+    }
+    async fn activatable_tasks(
+        &self,
+        resource: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+        <T as Storage>::activatable_tasks(self, resource, limit).await
+    }
+    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+        <T as Storage>::get_flow_by_name(self, name).await
+    }
+    async fn get_flow_version(
+        &self,
+        version: &ObjectReference,
+    ) -> Result<Option<FlowVersion>, ExecutionError> {
+        <T as Storage>::get_flow_version(self, version).await
+    }
+    async fn flow_version_of(
+        &self,
+        name: FlowName,
+        version: u32,
+    ) -> Result<Option<FlowVersion>, ExecutionError> {
+        <T as Storage>::flow_version_of(self, name, version).await
+    }
+    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+        <T as Storage>::next_generated_seq(self).await
+    }
 }

@@ -1,4 +1,6 @@
-//! `TimerCancelled` event projection: folds the `Event::TimerCancelled` into Storage.
+//! `TimerCancelled` event projection: folds the `Event::TimerCancelled` into Storage. The physical
+//! descheduling is not folded here — a consumer re-derives `cancel` from the durable event via the
+//! injected `Hook`.
 
 use async_trait::async_trait;
 
@@ -8,7 +10,7 @@ use crate::{ApplierContext, EventApplier};
 
 use crate::TimerStatus;
 
-/// `TimerCancelled` folds the terminal status into Storage and deschedules the pending deadline.
+/// `TimerCancelled` folds the terminal status into Storage.
 #[derive(Default)]
 pub(crate) struct TimerCancelledApplier;
 #[async_trait]
@@ -20,12 +22,15 @@ impl EventApplier for TimerCancelledApplier {
                 purpose: crate::TimerPurpose::WaitResume,
                 status: TimerStatus::Cancelled,
                 deadline: crate::Timestamp::from_millis(0),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Timer,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::Timestamp::from_millis(0),
                     crate::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         }
     }
@@ -40,7 +45,6 @@ impl EventApplier for TimerCancelledApplier {
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
         };
-        ctx.scheduler.cancel(&timer.reference());
         if let Some(mut t) = ctx.storage.get_timer(&timer.reference()).await? {
             let parent = t
                 .value
@@ -50,11 +54,13 @@ impl EventApplier for TimerCancelledApplier {
                 .expect("an owned timer always has an owner");
             t.value.status = TimerStatus::Cancelled;
             // Sync the domain value's transition stamp from the event (see timer_triggered.rs).
-            t.value.meta.touch(timer.meta.updated_at);
-            t.touch(ctx.timestamp);
+            t.value.meta.with_update_at(timer.meta.updated_at);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
             ctx.storage.remove_child(parent, timer.reference()).await?;
         }
+        // The physical descheduling is not folded here — a consumer re-derives `cancel` from the
+        // durable `TimerCancelled` event once it is committed.
         Ok(())
     }
 }

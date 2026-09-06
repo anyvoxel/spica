@@ -21,11 +21,12 @@ impl EventApplier for ExecutionCreatedApplier {
                 status: ExecutionStatus::Running,
                 input: Default::default(),
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Execution,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -49,9 +50,8 @@ impl EventApplier for ExecutionCreatedApplier {
         exec.born(ctx.timestamp);
         ctx.storage.put_execution(exec).await?;
         // A child execution (a Parallel branch) is added to its owner's `active_children` so the
-        // owner drains (Completing/Terminating) waits on it via the shared cascade, and the
-        // `ProcessChildCompleted` drain notices it as in-flight. The top-level run (no owner) is
-        // owned by nothing and adds nothing.
+        // owner drains (Completing/Terminating) waits on it via the shared cascade, and the inline
+        // drain reaction notices it as in-flight. The top-level run (no owner) is owned by nothing.
         if let Some(owner) = execution.meta.owner.clone() {
             ctx.storage.add_child(owner, execution.reference()).await?;
         }

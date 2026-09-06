@@ -37,7 +37,7 @@ impl CommandHandler for FailTaskHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::FailTask {
             task,
             worker_id,
@@ -87,7 +87,7 @@ impl CommandHandler for FailTaskHandler {
         task_value.lease_until = None;
         // Stamp the (re-queue / fail) decision moment; `created_at` is already carried on
         // `task_value`. Both the retry and the terminal paths emit below from this same value.
-        task_value.meta.touch(Timestamp::now());
+        task_value.meta.with_update_at(Timestamp::now());
 
         // ── Retry self-decision (on the task, from its frozen `retry_plan`) ─────────────────────
         // Scan the frozen plan for the first entry matching the error name. Each retrier's attempt
@@ -134,7 +134,8 @@ impl CommandHandler for FailTaskHandler {
                 out.emit_event(Event::TaskFailed {
                     task: task_value,
                     error: error.clone(),
-                });
+                })
+                .await;
                 // Sweep the failed attempt's `DeliveryLease`/`TaskTimeout` children (a settled task
                 // leaves no live child behind). No retry timer is armed — `next_available_at` is the
                 // gate, and the re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
@@ -151,7 +152,8 @@ impl CommandHandler for FailTaskHandler {
         out.emit_event(Event::TaskFailed {
             task: task_value,
             error: error.clone(),
-        });
+        })
+        .await;
         // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // so a settled task leaves no live child behind; a terminal fail is then free to
         // terminate/drain the activity (which would sweep them anyway — this just makes the settle
@@ -173,7 +175,7 @@ impl FailTaskHandler {
     async fn route_failure(
         &self,
         ctx: &mut HandlerContext<'_>,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity_id: crate::types::meta::ObjectReference,
         error: &ExecutionError,
     ) {
@@ -274,9 +276,10 @@ impl FailTaskHandler {
                 catcher.output.as_ref(),
                 Some(&catcher.next),
                 None,
-                activity.value.retry_state.attempts,
+                activity.value.retry_count(),
                 Some(&error_output),
-            );
+            )
+            .await;
             return;
         }
 
@@ -291,7 +294,7 @@ impl FailTaskHandler {
     async fn terminate_failure(
         &self,
         ctx: &mut HandlerContext<'_>,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity_id: crate::types::meta::ObjectReference,
         error: &ExecutionError,
     ) {
@@ -306,12 +309,14 @@ impl FailTaskHandler {
         terminating_activity.status = ActivityStatus::Terminating(reason.clone());
         out.emit_event(Event::StateTerminating {
             activity: terminating_activity,
-        });
+        })
+        .await;
         let mut terminated_activity = activity.value();
         terminated_activity.status = ActivityStatus::Terminated(reason.clone());
         out.emit_event(Event::StateTerminated {
             activity: terminated_activity,
-        });
+        })
+        .await;
         // Route the terminal failure at the owning scope. A task may sit inside a top-level run
         // (an `Execution`, via reference-addressed `TerminateExecution`) or inside a `Parallel`
         // branch / `Map` item (a `Thread` — only reachable via `TerminateThread`); dispatch on kind.

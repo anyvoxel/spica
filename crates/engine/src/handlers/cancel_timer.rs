@@ -6,9 +6,9 @@ use crate::types::command::Command;
 use crate::types::event::Event;
 
 /// Handles `CancelTimer`: marks an armed timer cancelled. Idempotent — a no-op for a timer that
-/// already fired or was already cancelled. After recording the timer's terminal state, notifies
-/// the owner: a cancel is often the last thing draining a Completing/Terminating owner, so the
-/// [`ProcessChildCompleted`] notice lets the owner's own handler emit its deferred ed.
+/// already fired or was already cancelled. After recording the timer's terminal state, runs the
+/// inline child-settled reaction: a cancel is often the last thing draining a Completing/Terminating
+/// owner, so [`child_completed::child_settled`] lets the owner converge in the same batch.
 #[derive(Default)]
 pub struct CancelTimerHandler;
 
@@ -20,7 +20,7 @@ impl CommandHandler for CancelTimerHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CancelTimer { timer } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -45,19 +45,22 @@ impl CommandHandler for CancelTimerHandler {
                 // removal. Stamp the cancel moment as `updated_at`.
                 meta: {
                     let mut m = act.value.meta.clone();
-                    m.touch(crate::log::Timestamp::now());
+                    m.with_update_at(crate::log::Timestamp::now());
                     m
                 },
             },
-        });
-        out.emit_command(Command::ProcessChildCompleted {
-            owner: act
-                .value
+        })
+        .await;
+        super::child_completed::child_settled(
+            ctx,
+            out,
+            act.value
                 .meta
                 .owner
                 .clone()
                 .expect("a live timer is always owned"),
-            child: timer.clone(),
-        });
+            timer.clone(),
+        )
+        .await;
     }
 }

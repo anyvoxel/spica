@@ -12,10 +12,9 @@ use spica_asl::StateMachine;
 use spica_client::worker::{TaskFailure, TaskService};
 use spica_engine::{
     Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, ExecutionError, FlowName,
-    InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId,
+    InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId, TaskApi,
 };
 use spica_logstream::LogError;
-use spica_scheduler::InMemoryScheduler;
 use spica_storage::InMemoryStorage;
 use tokio::sync::Mutex;
 
@@ -60,12 +59,10 @@ async fn activity_name_derives_from_execution_name_base() {
     // instead of the opaque `child-<ulid>` placeholder. Observe the real, durable log (same shared
     // wrapper idiom as `dump_events`) rather than any reconstructed view.
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 
@@ -127,12 +124,10 @@ async fn timer_name_derives_from_execution_name_base() {
     // base) as base, mirroring #3 — so a timer is locatable at the run level rather than the opaque
     // `child-<ulid>` placeholder. Read the real durable log (same RetainedLog idiom).
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 
@@ -190,12 +185,10 @@ async fn task_name_derives_from_execution_name_base() {
     // mirroring #3/#11 — not the old `child-<uid>` placeholder. Read the real durable log and check
     // the `TaskActivated` event's task name.
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 
@@ -205,7 +198,7 @@ async fn task_name_derives_from_execution_name_base() {
     // Task's physical call completes and the run can terminate; cancel it before the engine drops.
     let cancel = tokio_util::sync::CancellationToken::new();
     let worker = {
-        let api = Arc::new(common::EngineTaskApi::new(engine.task_api()));
+        let api = Arc::new(common::EngineTaskApi::new(Arc::new(engine.clone())));
         let cancel = cancel.clone();
         let mut handlers = std::collections::HashMap::new();
         handlers.insert(
@@ -269,12 +262,10 @@ async fn thread_name_derives_from_execution_name_base() {
     // (the plain base) as base, mirroring #3/#11/#13 — not the old `child-<uid>` placeholder. Read the
     // real durable log and check a `ThreadCreated` event's thread name.
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 
@@ -335,18 +326,15 @@ async fn idle_poll_writes_no_durable_entry() {
     // not write a durable `ClaimTasks` entry — the worker's ~10ms busy poll would otherwise flood the
     // causal chain with no-op commands. The read-first gate short-circuits to an empty grant.
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 
     let before = log.lock().await.entries().len();
     let granted = engine
-        .task_api()
         .poll_tasks("w-idle", "arn:aws:states:::lambda:invoke", 10, 60)
         .await
         .expect("idle poll returns without error");
@@ -737,12 +725,10 @@ async fn activate_state_carries_self_locating_state_path() {
     // every emitted ActivateState carries exactly the resolved path (branch order is nondeterministic,
     // so compare as a sorted list).
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(RetainedLog(Arc::clone(&log))),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("engine starts");
 

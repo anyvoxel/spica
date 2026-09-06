@@ -17,13 +17,15 @@ impl EventApplier for FlowVersionCreatedApplier {
         Event::FlowVersionCreated {
             request_id: crate::types::id::RequestId::nil(),
             flow_version: crate::types::flow_version::FlowVersion {
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::FlowVersion,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
                 version: 0,
                 definition: String::new(),
+                checksum: crate::types::flow_version::FlowVersion::definition_checksum(""),
             },
         }
     }
@@ -68,20 +70,23 @@ impl EventApplier for FlowVersionCreatedApplier {
         let mut flow = match ctx.storage.get_flow_by_name(flow_name.clone()).await? {
             Some(existing) => existing,
             None => Flow {
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Flow,
+                    flow_uid,
+                )
+                .name(
                     crate::types::meta::ObjectName::plain(flow_name.as_str())
                         .expect("a valid FlowName is a valid user object name"),
-                    flow_uid,
-                    flow_version.meta.created_at,
-                ),
+                )
+                .at(flow_version.meta.created_at)
+                .build(),
                 status: FlowStatus::Active,
                 latest_version: flow_version.version,
             },
         };
         flow.latest_version = flow_version.version;
         // A new version is a flow *update*: advance the pointer and stamp the write moment.
-        flow.meta.touch(ctx.timestamp);
+        flow.meta.with_update_at(ctx.timestamp);
         ctx.storage.put_flow(flow).await?;
         Ok(())
     }

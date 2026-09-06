@@ -35,6 +35,9 @@ struct InMemoryDb {
     /// Resume watermark — last fully processed command position (see
     /// [`Storage::last_processed_position`]). `0` = nothing processed.
     last_processed_position: i64,
+    /// Partition-local generated-name counter (see [`Storage::next_generated_seq`]), the next suffix
+    /// a generated object name may take. `0` = none minted yet.
+    next_generated_seq: i64,
 }
 
 /// In-process, in-memory [`Storage`] used as the M1 synchronous/test default.
@@ -201,6 +204,50 @@ impl Storage for InMemoryStorage {
         Ok(self.db().children(&id))
     }
 
+    async fn list_kind(
+        &self,
+        kind: ObjectKind,
+        start_after: Option<&ObjectName>,
+        limit: usize,
+    ) -> Result<Vec<(ObjectName, Vec<u8>)>, ExecutionError> {
+        // Mirror the persisted RocksDB range scan at the map level: gather the kind's rows, order
+        // by the addressing name (stable key order, matching Rocks), then apply the strict-after
+        // pagination offset and page cutoff. Values are serialized to their JSON bytes exactly as
+        // `RocksStorage` stores them, so the two backends feed the Query facade identically.
+        let db = self.db();
+        let mut rows: Vec<(ObjectName, Vec<u8>)> = match kind {
+            ObjectKind::Execution => encode_rows(&db.executions),
+            ObjectKind::Thread => encode_rows(&db.threads),
+            ObjectKind::Activity => encode_rows(&db.activities),
+            ObjectKind::Timer => encode_rows(&db.timers),
+            ObjectKind::Task => encode_rows(&db.tasks),
+            // Flows are keyed by their immutable `FlowName`, a plain name — convert to an
+            // `ObjectName` so the returned key matches the other kinds' addressing shape.
+            ObjectKind::Flow => db
+                .flows
+                .iter()
+                .map(|(name, flow)| {
+                    (
+                        ObjectName::plain(name.as_str())
+                            .expect("a FlowName is a valid plain ObjectName"),
+                        serde_json::to_vec(flow).expect("Flow serializes"),
+                    )
+                })
+                .collect(),
+            ObjectKind::FlowVersion => encode_rows(&db.flow_versions),
+        };
+        rows.sort_by_key(|a| a.0.as_str());
+        let after = start_after.map(|a| a.as_str());
+        Ok(rows
+            .into_iter()
+            .filter(|(name, _)| match &after {
+                Some(a) => name.as_str().as_bytes() > a.as_bytes(),
+                None => true,
+            })
+            .take(limit)
+            .collect())
+    }
+
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
         self.db().executions.insert(exec.meta.name.clone(), exec);
         Ok(())
@@ -252,8 +299,9 @@ impl Storage for InMemoryStorage {
         self.db().flows.insert(
             flow.meta
                 .name
-                .as_flow_name()
-                .expect("a Flow's meta.name is always a user FlowName"),
+                .as_plain()
+                .expect("a Flow's meta.name is always a user FlowName")
+                .clone(),
             flow,
         );
         Ok(())
@@ -294,6 +342,9 @@ impl Storage for InMemoryStorage {
         self.db().last_processed_position = position;
         Ok(())
     }
+    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+        Ok(self.db().next_generated_seq)
+    }
 
     fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
         // Hand the StreamProcessor an **owned** fold transaction: a clone of the shared interior plus an
@@ -323,6 +374,8 @@ struct InMemoryBatch {
     flows: HashMap<FlowName, Flow>,
     // Version rows, keyed by the version's own `{flow}-{version}` name (see `InMemoryDb`).
     flow_versions: HashMap<ObjectName, FlowVersion>,
+    // Pending bump of the partition-local generated-name counter (`None` = no bump in this fold).
+    next_generated_seq: Option<i64>,
 }
 
 /// Atomic projection transaction for [`InMemoryStorage`]. Owns a clone of the shared
@@ -419,6 +472,30 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
+    async fn activatable_tasks(
+        &mut self,
+        resource: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+        // read-your-writes: the committed rows, with the pending batch winning by name — so a task
+        // folded earlier in this batch is seen (and its replacement status supersedes the committed one).
+        let mut tasks: HashMap<ObjectName, TaskRecord> = self
+            .inner
+            .lock()
+            .expect("in-memory storage lock poisoned")
+            .tasks
+            .clone();
+        for (k, v) in &self.batch.tasks {
+            tasks.insert(k.clone(), v.clone());
+        }
+        Ok(tasks
+            .values()
+            .filter(|t| t.value.resource == resource && t.value.status == TaskStatus::Pending)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn get_children(
         &mut self,
         id: ObjectReference,
@@ -511,8 +588,9 @@ impl StorageTxn for InMemoryTxn {
         let name = flow
             .meta
             .name
-            .as_flow_name()
-            .expect("a Flow's meta.name is always a user FlowName");
+            .as_plain()
+            .expect("a Flow's meta.name is always a user FlowName")
+            .clone();
         self.batch.flows.insert(name, flow);
         Ok(())
     }
@@ -558,6 +636,23 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
+    async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+        // Overlay-first: a fold must see its own earlier bump within the same batch.
+        if let Some(seq) = self.batch.next_generated_seq {
+            return Ok(seq);
+        }
+        Ok(self
+            .inner
+            .lock()
+            .expect("in-memory storage lock poisoned")
+            .next_generated_seq)
+    }
+
+    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
+        self.batch.next_generated_seq = Some(seq);
+        Ok(())
+    }
+
     fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
         let batch = self.batch;
         let mut db = self.inner.lock().expect("in-memory storage lock poisoned");
@@ -569,6 +664,9 @@ impl StorageTxn for InMemoryTxn {
         db.tasks.extend(batch.tasks);
         db.flows.extend(batch.flows);
         db.flow_versions.extend(batch.flow_versions);
+        if let Some(seq) = batch.next_generated_seq {
+            db.next_generated_seq = db.next_generated_seq.max(seq);
+        }
         if let Some(w) = watermark {
             db.last_processed_position = w;
         }
@@ -658,12 +756,30 @@ impl InMemoryTxn {
     }
 }
 
+/// Serialize a name-keyed row map into `(name, JSON bytes)` pairs — the in-memory twin of the
+/// RocksDB `list_kind` range scan's raw-value feed. Rows always serialize (they derive `Serialize`),
+/// so the `expect` documents that invariant rather than guarding a recoverable failure.
+fn encode_rows<K, V>(map: &HashMap<K, V>) -> Vec<(ObjectName, Vec<u8>)>
+where
+    K: Clone + Into<ObjectName>,
+    V: serde::Serialize,
+{
+    map.iter()
+        .map(|(k, v)| {
+            (
+                k.clone().into(),
+                serde_json::to_vec(v).expect("storage rows are serializable"),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine::{
-        Execution, ExecutionStatus, ObjectKind, ObjectName, ObjectReference, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timestamp, Variables,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
@@ -671,7 +787,9 @@ mod tests {
         let uid = ulid::Ulid::new();
         ObjectReference::new(
             ObjectKind::Execution,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -682,18 +800,18 @@ mod tests {
             value: Execution {
                 flow_version: ObjectReference::new(
                     ObjectKind::FlowVersion,
-                    ObjectName::generated_with_suffix("flow", "00000001").unwrap(),
+                    PlainName::new("flow").unwrap().generated_from_key(1),
                     ulid::Ulid::nil(),
                 ),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Execution,
                     id.uid,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                ),
+                )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build(),
             },
             variables: Variables::new(),
             current_activity: None,

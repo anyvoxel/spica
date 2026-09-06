@@ -21,11 +21,12 @@ impl EventApplier for ThreadTerminatingApplier {
                 ),
                 input: Default::default(),
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Thread,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -43,7 +44,7 @@ impl EventApplier for ThreadTerminatingApplier {
         if let Some(mut row) = ctx.storage.get_thread(&thread.reference()).await? {
             row.status = thread.status.clone();
             row.value.meta.updated_at = thread.meta.updated_at;
-            row.touch(ctx.timestamp);
+            row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
         }
         Ok(())

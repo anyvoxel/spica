@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
+use crate::{Activity, ActivityStatus, ApplierContext, EventApplier};
 
 #[derive(Default)]
 pub(crate) struct StateTerminatingApplier;
@@ -19,16 +19,17 @@ impl EventApplier for StateTerminatingApplier {
                     crate::types::command::TerminationReason::Cancelled,
                 ),
                 raw_input: Default::default(),
-                input: Default::default(),
+                input: None,
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
                     crate::types::id::ActivityId::nil().into(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }

@@ -1,14 +1,16 @@
 use std::collections::HashMap;
+use std::mem::Discriminant;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::StateMachine;
+use spica_asl::{State, StateMachine};
 
+use crate::applier::EventDispatcher;
 use crate::eval_env::EvalEnv;
+use crate::handlers::state_handler::StateHandler;
 use crate::log::{Entry, EntryPayload, Timestamp};
-use crate::storage::Storage;
-use crate::task_api::ActivatedTask;
+use crate::storage::ReadonlyStorageTxn;
 use crate::types::activity::Activity;
 use crate::types::command::{Command, TerminationReason};
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -17,6 +19,7 @@ use crate::types::id::{ActivityId, EntryId, ExecutionId, RequestId, StreamId, Ti
 use crate::types::meta::ObjectReference;
 use crate::types::reject::{Reject, RejectionType};
 use crate::types::variables::Variables;
+use crate::working::WorkingState;
 
 /// Collects the [`Entry`]s a handler emits while handling one Command, enveloping each with the
 /// call's `cause_id` / `stream_id` / `timestamp` and a placeholder `entry_id` (the log assigns the
@@ -35,36 +38,83 @@ use crate::types::variables::Variables;
 /// Each entry's `timestamp` is stamped fresh at `push` time, so within one handled Command the
 /// emitted Events + follow-up Commands each carry their own write moment rather than sharing a
 /// single captured time.
-pub struct Collector {
+pub struct Collector<'a> {
     cause_id: EntryId,
     entries: Vec<Entry>,
-    /// Deferred acknowledgement side effects declared by the handler (see [`AckSideEffect`]).
-    acks: Vec<AckSideEffect>,
+    /// The eager-apply sink into the leader's working overlay: each emitted `Event` is folded into
+    /// the working txn immediately (not deferred to a later flush). `None` for a collector with no
+    /// working overlay (a pure non-overlay dispatch).
+    overlay: Option<OverlaySink<'a>>,
 }
 
-impl Collector {
-    pub fn new(cause_id: EntryId) -> Self {
+/// The eager-apply channel from the [`Collector`] into the leader's working overlay: on each
+/// [`Collector::emit_event`] the emitted `Event` is folded into the working txn. The fold is a pure
+/// projection — a consumer re-derives any external side effect (e.g. a timer arm) from the durable
+/// event via the injectable [`Hook`](crate::Hook).
+pub(crate) struct OverlaySink<'a> {
+    work: &'a WorkingState,
+    dispatcher: &'a EventDispatcher,
+}
+
+impl<'a> OverlaySink<'a> {
+    pub(crate) fn new(work: &'a WorkingState, dispatcher: &'a EventDispatcher) -> Self {
+        Self { work, dispatcher }
+    }
+
+    async fn apply(&self, event: &Event, timestamp: Timestamp) -> Result<(), ExecutionError> {
+        self.work
+            .apply_projection(self.dispatcher, event, timestamp)
+            .await
+    }
+}
+
+impl<'a> Collector<'a> {
+    pub(crate) fn new(cause_id: EntryId, overlay: Option<OverlaySink<'a>>) -> Self {
         Self {
             cause_id,
             entries: Vec::new(),
-            acks: Vec::new(),
+            overlay,
         }
     }
 
     /// Emit an [`Event`], enveloped into an [`Entry`] with this call's `cause_id`, a fresh
     /// `timestamp`, and placeholder `entry_id`/`stream_id` (the log assigns the real positions and
-    /// its own stream id on append).
-    pub fn emit_event(&mut self, event: Event) {
-        self.push(EntryPayload::Event(event));
+    /// its own stream id on append), then — when this collector carries a working overlay — fold the
+    /// event into it immediately so a subsequent read in the same dispatch sees the effect.
+    pub async fn emit_event(&mut self, event: Event) {
+        let entry = self.build(EntryPayload::Event(event.clone()));
+        if let Some(ov) = &self.overlay {
+            let ts = entry.timestamp;
+            // The overlay is the authoritative fold of this batch — a projection failure is fatal for
+            // this command, so it is surfaced rather than swallowed (the whole working txn rolls back
+            // if the caller chooses not to commit).
+            if let Err(e) = ov.apply(&event, ts).await {
+                tracing::error!(error = ?e, "eager overlay projection failed during dispatch");
+            }
+        }
+        self.entries.push(entry);
     }
 
-    /// Emit a subsequent [`Command`] (enveloped).
+    /// Emit a subsequent [`Command`] (enveloped). Commands are never projected into the overlay —
+    /// they are dispatched on a later round.
     pub fn emit_command(&mut self, command: Command) {
         self.push(EntryPayload::Command(command));
     }
 
-    fn push(&mut self, payload: EntryPayload) {
-        self.entries.push(Entry {
+    /// Mint the next generated-name suffix: this partition's counter, read-and-advanced through the
+    /// working overlay (persisted with the batch, and read-your-writes so a sibling minted earlier
+    /// in the same batch is counted). Only a collector that carries an overlay can coordinate —
+    /// leader and test-dispatch overlays always do (see `leader.rs`); a bare no-overlay collector
+    /// mints `0` for an isolated single command with no batch sibling to coordinate with.
+    pub async fn next_generated_seq(&mut self) -> u64 {
+        match &self.overlay {
+            Some(ov) => ov.work.mint_generated_seq().await,
+            None => 0,
+        }
+    }
+
+    fn build(&self, payload: EntryPayload) -> Entry {
+        Entry {
             stream_id: StreamId::nil(), // placeholder — the LogStream stamps its own id at append.
             entry_id: EntryId::nil(),   // placeholder — the LogStream stamps positions at append.
             cause_id: Some(self.cause_id),
@@ -73,7 +123,11 @@ impl Collector {
             // cheaply record its own write moment.
             timestamp: Timestamp::now(),
             payload,
-        });
+        }
+    }
+
+    fn push(&mut self, payload: EntryPayload) {
+        self.entries.push(self.build(payload));
     }
 
     /// Allocate a fresh [`ActivityId`] (for a new [`Command::ActivateState`]). Activities are ULIDs
@@ -137,51 +191,17 @@ impl Collector {
         self.terminate(None, execution, error);
     }
 
-    /// Consume the collector, returning the collected [`Entry`]s and any deferred acknowledgement
-    /// side effects. The [`StreamProcessor`](crate::StreamProcessor) uses both: it appends the entries, then
-    /// executes each ack once its [`Event`] has been applied to Storage.
-    pub fn into_parts(self) -> (Vec<Entry>, Vec<AckSideEffect>) {
-        (self.entries, self.acks)
-    }
-
-    /// Consume the collector, returning the collected [`Entry`]s, discarding any deferred acks.
-    /// Convenience for single-shot [`dispatch`](crate::StreamProcessor::dispatch) callers (e.g. tests)
-    /// that drive a stream by hand without an [`AckRouter`](crate::AckRouter) to complete acks into.
+    /// Consume the collector, returning the collected [`Entry`]s. The
+    /// [`StreamProcessor`](crate::StreamProcessor) appends the entries and reports their durable
+    /// facts to its injected [`Hook`](crate::Hook) — every response (including a task grant) rides a
+    /// durable entry.
     pub fn into_entries(self) -> Vec<Entry> {
         self.entries
     }
 
-    /// Whether the collector has produced no entries. Handlers use this to guarantee a dispatched
-    /// command always leaves a causally-tied follow-up, emitting a confirmation when it would
-    /// otherwise be silent (`ProcessChildCompleted`'s no-op receipt).
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Declare an acknowledgement to be executed once `event` has been applied to Storage, waking
-    /// the awaiting `request_id` with `event`. Side effects are deferred rather than executed at
-    /// dispatch: the StreamProcessor — which alone knows when an Entry is durably appended *and* applied
-    /// — correlates this with the applied `event` and completes the pending ack then, the Zeebe
-    /// post-commit side-effect model (see [`AckSideEffect`]).
-    pub fn ack_request(&mut self, request_id: RequestId, event: Event) {
-        self.acks.push(AckSideEffect::CompleteRequest {
-            request_id,
-            event: Box::new(event),
-        });
-    }
-
-    /// Declare an acknowledgement that delivers a **granted task set** to the awaiting `request_id` —
-    /// the response channel of a `poll_tasks` (`TaskApi::poll_tasks`). Unlike `CompleteRequest`, there is
-    /// no single event to correlate: the granted list is decided by the `ClaimTasksHandler` at discovery,
-    /// and delivered once the producing command's events are applied (`AckOutcome::Granted`). The
-    /// collector's own `cause_id` (the producing command's entry) is carried so the StreamProcessor can
-    /// fire it when any of that command's events is applied.
-    pub fn ack_request_tasks(&mut self, request_id: RequestId, tasks: Vec<ActivatedTask>) {
-        self.acks.push(AckSideEffect::CompleteRequestTasks {
-            request_id,
-            cause_id: self.cause_id,
-            tasks,
-        });
+    /// Convenience alias for [`Self::into_entries`] at sites that distinguish the composed responses.
+    pub fn into_parts(self) -> Vec<Entry> {
+        self.into_entries()
     }
 
     /// Refuse a client-originated awaiting command: emit a [`Reject`] record (a command refused
@@ -224,11 +244,16 @@ impl Collector {
 /// StreamProcessor never branches on Command type.
 pub struct HandlerContext<'a> {
     pub env: &'a mut EvalEnv,
-    pub storage: &'a dyn Storage,
+    /// The leader's working-overlay [`Storage`] read face — how the handler reads state. Never a
+    /// write path: mutations flow through emitted events, applied by the applier.
+    pub storage: &'a dyn ReadonlyStorageTxn,
     /// The StreamProcessor's per-version machine cache. Handlers resolve the machine an execution is
     /// bound to through [`Self::machine`], never from a single in-memory `sm` — so a recovered
     /// Engine re-resolves definitions by id from storage instead of re-supplying them.
     pub definitions: &'a mut HashMap<ObjectReference, Arc<StateMachine>>,
+    /// The shared `State` → [`StateHandler`] dispatch table, threaded through so the inline
+    /// child-settled cascade can route a `Running` container's replenish without a follow-up command.
+    pub(crate) state_handlers: &'a HashMap<Discriminant<State>, Box<dyn StateHandler>>,
 }
 
 impl HandlerContext<'_> {
@@ -361,43 +386,5 @@ pub trait CommandHandler: Send + Sync {
     /// object-safe for the `Box<dyn CommandHandler>` dispatch table.
     fn command(&self) -> Command;
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector);
-}
-
-/// A request/execution acknowledgement that a handler *declares* but does not execute, to be
-/// completed **after** the corresponding [`Event`] has been applied to Storage — the in-process
-/// analogue of Zeebe's side effects, which Zeebe also runs after the transaction commits rather
-/// than as part of it. Response delivery is a post-commit effect precisely because it must not race
-/// the projection: a caller must never see its acknowledgement before the event that produced it is
-/// durable and folded into Storage.
-///
-/// The handler that decides an operation's outcome declares the ack (via
-/// [`Collector::ack_request`] / [`Collector::ack_execution`]) instead of the StreamProcessor *guessing*
-/// which Event resolves which awaited request from a hand-written match — the handler is the single
-/// source of truth for its own completion. The StreamProcessor keeps declared acks as `pending` and, in
-/// its event-apply arm, executes the ones that correlate to the just-applied Event, then delivers.
-/// Correlation is by event *variant* plus a stable identity (the `request_id` a request ack carries
-/// into its echoed Event) — deliberately not full value equality, because Event payloads do not
-/// round-trip through the LogStream byte-for-byte.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AckSideEffect {
-    /// Acknowledge a request awaiting a specific echoed Event (e.g. the [`Event::FlowVersionCreated`]
-    /// a `CreateFlow` caller awaits, or the [`Event::ExecutionCreated`] a `start` caller awaits),
-    /// delivering that Event once it is applied. Boxed like [`AckOutcome::Applied`]: the awaited
-    /// `Event` can be large, and this is a one-per-request value — keeping it boxed keeps the
-    /// `AckSideEffect` enum's variants close in size (so `Vec<AckSideEffect>` stays dense on the
-    /// ready path, and Clippy's `large_enum_variant` stays quiet).
-    CompleteRequest {
-        request_id: RequestId,
-        event: Box<Event>,
-    },
-    /// Acknowledge a `ClaimTasks` request by delivering the granted task set (`AckOutcome::Granted`)
-    /// once any of the producing command's events is applied — no single event to correlate, so the
-    /// list (already decided by the handler at discovery) is carried directly, keyed to the command's
-    /// `cause_id`.
-    CompleteRequestTasks {
-        request_id: RequestId,
-        cause_id: EntryId,
-        tasks: Vec<ActivatedTask>,
-    },
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>);
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
@@ -54,18 +55,17 @@ impl ActivityStatus {
 /// `raw_output`/`output`/...) lives on `Activity` directly because every state needs it; this
 /// enum holds only what *some* states need. A new container state (or a Map gaining
 /// `ItemSelector`/`ToleratedFailure*`) adds a variant rather than widening the shared struct.
+/// `Activity.activity_state` is `None` while no state-specific data exists (Pass/Wait/Task/Choice/
+/// Succeed/Fail), and `Some` once a container's repository materializes.
 ///
-/// - `Leaf` — no state-specific runtime data (Pass/Wait/Task/Choice/Succeed/Fail).
 /// - `Parallel(ParallelActivityState)` — the branch index → child execution fan-out map, so
 ///   convergence aggregates branch outputs in declaration order.
 /// - `Map(MapActivityState)` — the `Map` iteration plan (items/total/cap) harvested from the
 ///   activation product on `Event::StateActivated`. The running completed/failed tallies are **not**
 ///   stored here: they are derived live from the terminal status of the parallel child executions, so
 ///   a follower rebuilds them from each child's own terminal event without extra projections.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ActivityState {
-    #[default]
-    Leaf,
     Parallel(ParallelActivityState),
     Map(MapActivityState),
 }
@@ -109,6 +109,7 @@ pub struct MapActivityState {
 /// This is the entity-shaped payload Activity lifecycle events carry. It intentionally excludes
 /// projection-only bookkeeping such as `active_children`; those remain on `storage::ActivityRecord`, the
 /// storage projection row, so event payloads stay focused on the Activity's own domain state.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Activity {
     /// Shared identity + timing metadata. `meta.uid` is the activity's identity (durable object uid);
@@ -139,15 +140,14 @@ pub struct Activity {
     /// e.g. projecting `Arguments`), so a follower / auditor can inspect both the original and the
     /// processed view of what the state ran on.
     pub raw_input: Value,
-    /// The input this state actually processes — the result of the state's dialogue-level input
-    /// preprocessing applied to `raw_input`. For states that consume their raw input verbatim
-    /// (Pass/Choice/Wait/Succeed/Fail and Map/Parallel activations without `Arguments`), this is a
-    /// copy of `raw_input` (never `None`); for a `Task`/`Parallel` with `Arguments` it is the
-    /// projected arguments (the value a `$states` projection would see). Kept so the processed
-    /// view is directly inspectable for debugging/auditing without re-running the projection. It is
-    /// **not** determined at entry, so `StateActivating` pins it to `Null`; the processed value is
-    /// carried on `Event::StateActivated`.
-    pub input: Value,
+    /// The input this state actually processes — the state's **processed** input after the
+    /// dialogue-level input preprocessing (e.g. projecting `Arguments`) ran on `raw_input`. `None`
+    /// before processing: `StateActivating` pins it (the entry input lives verbatim in `raw_input`);
+    /// the processed value is carried on `Event::StateActivated` and forwarded by every later
+    /// lifecycle event. Kept distinct from `raw_input` so an auditor can compare the original and
+    /// the processed view; for a state that consumes its raw input verbatim (no `Arguments`) the
+    /// processed input is a copy of `raw_input`.
+    pub input: Option<Value>,
     /// The state's **raw result** before any complete-step `Output` projection. For a `Task` this is
     /// the `Resource`'s returned payload; for a synchronous state with no distinct raw result it is
     /// the processed `input` (see [`state_raw_result`](crate::handlers::state_raw_result) — the same
@@ -158,15 +158,16 @@ pub struct Activity {
     /// final projected view of the state's result.
     pub raw_output: Option<Value>,
     /// The **state-specific runtime repository** — data only a container state's activity carries.
-    /// `Leaf` for every non-container state (Pass/Wait/Task/Choice/...), which hold no state-specific
+    /// `None` for every non-container state (Pass/Wait/Task/Choice/...), which hold no state-specific
     /// runtime data. A `Parallel` holds its branch index → child execution fan-out map; a `Map` holds
     /// its iteration plan harvested from the activation product. Kept as an enum so state-specific
     /// data is *typed* (not a bunch of `Option`s/empty collections polluting the shared skeleton) and
     /// grows by adding a variant for a new container state.
-    pub activity_state: ActivityState,
+    pub activity_state: Option<ActivityState>,
     /// Retry-specific runtime state: total retry count exposed to `$states.context.State.RetryCount`
-    /// plus per-retrier attempt metadata (`attempt_count` and `last_retry_at`).
-    pub retry_state: RetryState,
+    /// plus per-retrier attempt metadata (`attempt_count` and `last_retry_at`). `None` until a retry
+    /// has actually occurred (an activity without a recorded retry carries no run-state).
+    pub retry_state: Option<RetryState>,
     /// The terminal output once `StateCompleted` lands — the value after the state's complete-step
     /// `Output` projection (or the raw result / processed input when no `Output` is present).
     pub output: Option<Value>,
@@ -177,5 +178,11 @@ impl Activity {
     /// `obj-<uid>` name, and uid) — the identity every other object uses to reference the activity.
     pub fn reference(&self) -> ObjectReference {
         ObjectReference::new(ObjectKind::Activity, self.meta.name.clone(), self.meta.uid)
+    }
+
+    /// The total retry count, exposed to `$states.context.State.RetryCount` — `0` until a retry has
+    /// occurred (the field is `None` then).
+    pub fn retry_count(&self) -> u32 {
+        self.retry_state.as_ref().map(|r| r.attempts).unwrap_or(0)
     }
 }

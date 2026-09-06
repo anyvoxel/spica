@@ -21,9 +21,8 @@
 //!   batch atomically — the same granularity as the leader's eager apply. Transactions are
 //!   **driver-owned**: the driver opens one held transaction per batch (now that `begin_txn` no longer
 //!   borrows the store), folds each Event in via `apply_event`, and commits the returned watermark.
-//! - `apply_batch` is a no-op (a follower produces no batches to apply), as is `after_commit` (a
-//!   follower has no awaiting callers); `is_already_applied` is always `false` (it folds every
-//!   replicated Event).
+//! - `after_commit` is a no-op (a follower has no awaiting callers); `is_already_applied` is always
+//!   `false` (it folds every replicated Event).
 //! - Rejections are audited by the driver's `log_reject` trace — a follower has no awaiting caller.
 //!
 //! This is a **single-node stub**: nothing installs a `Follower` yet, and the open multi-node design
@@ -103,19 +102,8 @@ impl ProcessingStateMachine for Follower {
         // only through the Events that follow in the same batch, which we buffer here.
         Ok(CommandProcessed {
             entries: Vec::new(),
-            grants: Vec::new(),
+            work: crate::working::WorkingState::empty(),
         })
-    }
-
-    async fn apply_batch(
-        &mut self,
-        _txn: &mut dyn StorageTxn,
-        _batch: &[crate::log::Entry],
-        _handles: &ProcessingHandles,
-    ) -> Result<Option<i64>, ExecutionError> {
-        // A follower produces no batches, so there is never a just-appended batch of its own to apply
-        // eagerly; its apply happens on read-back, at the batch's Noop (`commit_at_noop`).
-        Ok(None)
     }
 
     async fn apply_event(
@@ -125,7 +113,7 @@ impl ProcessingStateMachine for Follower {
         timestamp: Timestamp,
         _cause_id: Option<EntryId>,
         event: &Event,
-        handles: &ProcessingHandles,
+        _handles: &ProcessingHandles,
     ) -> Result<Option<i64>, ExecutionError> {
         // Fold this Event into the **driver-held** transaction for the in-flight batch, but do **not**
         // commit — the batch isn't whole until its Noop, so returning `None` leaves the watermark
@@ -134,15 +122,12 @@ impl ProcessingStateMachine for Follower {
         // crash mid-batch leaves *none* of the transaction's writes committed (all are re-read and
         // re-folded on restart), rather than dropping the tail siblings.
         //
-        // TODO(multi-node): a follower should not arm timers it does not own (the leader dispatches
-        // and owns the schedule); feeding `handles.scheduler` below folds timer-arming Events into
-        // this replica's projection. Until leader/follower scheduling is coordinated, a deployed
-        // follower must be built with a no-op scheduler.
+        // TODO(multi-node): a follower replays Events into its own projection and never owns the
+        // schedule — it derives no timer side effects downstream (its consumer would need to observe
+        // and co-ordinate with the leader's timer arms).
         debug!(entry_id = %entry_id, "follower folding event");
         let mut ctx = ApplierContext {
             storage: &mut *txn,
-            scheduler: handles.scheduler.as_ref(),
-            cause_id: entry_id,
             timestamp,
         };
         self.dispatcher.apply(&mut ctx, event).await?;
@@ -185,7 +170,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::Storage;
-    use crate::engine::AckRouter;
+    use crate::engine::NoopHook;
     use crate::storage::{
         ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     };
@@ -195,18 +180,6 @@ mod tests {
     use crate::types::meta::ObjectReference;
 
     use super::*;
-
-    /// A no-op scheduler: applying timer-arming Events must not actually arm anything in this unit
-    /// test (and, per the `TODO(multi-node)` in `apply_event`/`commit_at_noop`, a real follower
-    /// shouldn't arm timers either).
-    #[derive(Default)]
-    struct NullScheduler;
-    #[async_trait]
-    impl crate::scheduler::Scheduler for NullScheduler {
-        fn attach_sink(&self, _sink: Arc<dyn crate::scheduler::TimerSink>) {}
-        fn schedule(&self, _t: &ObjectReference, _d: Timestamp, _c: EntryId) {}
-        fn cancel(&self, _t: &ObjectReference) {}
-    }
 
     /// The durable state a [`FakeStore`] commit materializes: the resume watermark plus a count of
     /// projection writes folded into the batch. A write only lands when its transaction **commits**,
@@ -295,6 +268,13 @@ mod tests {
         ) -> Result<Option<FlowVersion>, ExecutionError> {
             unimplemented!("not exercised by the follower batch test")
         }
+        async fn activatable_tasks(
+            &mut self,
+            _r: &str,
+            _l: usize,
+        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+            unimplemented!("not exercised by the follower batch test")
+        }
         async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
             unimplemented!("not exercised by the follower batch test")
         }
@@ -324,6 +304,12 @@ mod tests {
         ) -> Result<(), ExecutionError> {
             unimplemented!("not exercised by the follower batch test")
         }
+        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+            unimplemented!("not exercised by the follower batch test")
+        }
+        async fn put_next_generated_seq(&mut self, _seq: i64) -> Result<(), ExecutionError> {
+            unimplemented!("not exercised by the follower batch test")
+        }
     }
 
     /// A minimal in-crate [`Storage`] whose fold commits are observable. A real store can't be used
@@ -345,6 +331,9 @@ mod tests {
         async fn put_last_processed_position(&mut self, p: i64) -> Result<(), ExecutionError> {
             self.0.lock().unwrap().committed_watermark = Some(p);
             Ok(())
+        }
+        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+            unimplemented!("not exercised by the follower batch test")
         }
 
         async fn get_execution(
@@ -446,8 +435,7 @@ mod tests {
     fn handles(storage: Arc<Mutex<Box<dyn Storage>>>) -> ProcessingHandles {
         ProcessingHandles {
             storage,
-            scheduler: Arc::new(NullScheduler),
-            ack: Arc::new(Mutex::new(AckRouter::new())),
+            hook: Arc::new(NoopHook),
         }
     }
 
@@ -460,15 +448,16 @@ mod tests {
             Event::FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: crate::types::meta::ObjectMeta::born_named(
+                    meta: crate::types::meta::ObjectMeta::builder(
                         crate::types::meta::ObjectKind::FlowVersion,
-                        FlowVersion::version_name(
-                            &FlowName::new("flow").expect("literal name is valid"),
-                            1,
-                        ),
                         ulid::Ulid::new(),
-                        Timestamp::now(),
                     )
+                    .name(FlowVersion::version_name(
+                        &FlowName::new("flow").expect("literal name is valid"),
+                        1,
+                    ))
+                    .at(Timestamp::now())
+                    .build()
                     .with_owner(crate::types::meta::OwnerReference::new(
                         crate::types::meta::ObjectKind::Flow,
                         crate::types::meta::ObjectName::plain("flow")
@@ -477,6 +466,7 @@ mod tests {
                     )),
                     version: 1,
                     definition: String::new(),
+                    checksum: FlowVersion::definition_checksum(""),
                 },
             },
         )

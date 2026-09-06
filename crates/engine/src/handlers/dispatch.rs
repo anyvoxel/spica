@@ -34,7 +34,7 @@ macro_rules! state_handler_entry {
 /// both the `ActivateState` and `CompleteState` command handlers. Routing by
 /// [`Discriminant`](std::mem::Discriminant) mirrors the `Command` table and keeps each state's
 /// activate/complete behavior in one impl.
-pub(super) fn build_state_handlers() -> HashMap<std::mem::Discriminant<State>, Box<dyn StateHandler>>
+pub(crate) fn build_state_handlers() -> HashMap<std::mem::Discriminant<State>, Box<dyn StateHandler>>
 {
     let mut h: HashMap<std::mem::Discriminant<State>, Box<dyn StateHandler>> = HashMap::new();
     state_handler_entry!(

@@ -25,12 +25,15 @@ impl EventApplier for TaskLeaseExpiredApplier {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         }
     }
@@ -54,8 +57,8 @@ impl EventApplier for TaskLeaseExpiredApplier {
             t.worker_id = None;
             t.lease_until = None;
             // Sync the domain value's transition stamp from the event (see task_completed.rs).
-            t.value.meta.touch(task.meta.updated_at);
-            t.touch(ctx.timestamp);
+            t.value.meta.with_update_at(task.meta.updated_at);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_task(t).await?;
         }
         Ok(())

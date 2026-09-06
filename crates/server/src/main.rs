@@ -1,20 +1,24 @@
 //! `spica-server` — the spica workflow engine exposed as a gRPC service.
 //!
 //! A **single-node** gRPC server: it constructs one durable [`Engine`] (RocksDB log + storage),
-//! starts its single long-lived StreamProcessor, and serves the three RPC services from the wire contract —
-//! [`Workflow`](spica_proto::v1::workflow_server) (`CreateFlow`),
-//! [`Execution`](spica_proto::v1::execution_server) (`StartExecution` / `GetExecution` /
-//! `StopExecution`), and [`Task`](spica_proto::v1::task_server) (`PollTasks` / `CompleteTask` /
-//! `FailTask` — the out-of-process worker's claim/settle API). Each service's handlers live in its
-//! own module ([`workflow`], [`execution`], [`task`]); shared service state + helpers are in [`common`].
+//! starts its single long-lived StreamProcessor, and serves the four RPC services from the wire
+//! contract — [`Workflow`](spica_proto::v1::workflow_service_server) (`CreateFlow` / `ResolveFlowVersion`),
+//! [`Execution`](spica_proto::v1::execution_service_server) (`StartExecution` / `StopExecution`),
+//! [`Task`](spica_proto::v1::task_service_server) (`PollTasks` / `CompleteTask` / `FailTask` — the
+//! out-of-process worker's claim/settle API), and [`Query`](spica_proto::v1::query_server)
+//! (`GetObject` / `ListObjects` — the k8s-style read API over the projection). Each service's
+//! handlers live in its own module ([`workflow`], [`execution`], [`task`], [`query`]); shared
+//! service state + helpers are in [`common`].
 //!
-//! The remote client (`spica` CLI) drives a run as **CreateFlow → StartExecution → poll
-//! GetExecution**: `StartExecution` returns the execution id at birth and the client settles by
-//! polling `GetExecution` (a non-blocking snapshot read), so there is no fire-and-forget or
-//! blocking "Wait" RPC on the wire.
+//! The remote client (`spica` CLI) drives a run as **CreateFlow → StartExecution → poll Query**: a
+//! run is started (returning its id at birth) and settled by polling `Query.GetObject` on kind
+//! `execution` — a non-blocking point-in-time read — so there is no fire-and-forget or blocking
+//! "Wait" RPC on the wire, and no per-kind snapshot RPC.
 
 mod common;
+mod consumer;
 mod execution;
+mod query;
 mod task;
 mod workflow;
 
@@ -22,12 +26,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use spica_engine::{EngineBuilder, EntryPayload, LogStream, Scheduler, Storage};
+use spica_engine::{EngineBuilder, EntryPayload, LogStream, Storage};
 use spica_logstream::RocksLogStream;
-use spica_proto::v1::execution_server::ExecutionServer;
-use spica_proto::v1::task_server::TaskServer;
-use spica_proto::v1::workflow_server::WorkflowServer;
-use spica_scheduler::InMemoryScheduler;
+use spica_proto::v1::execution_service_server::ExecutionServiceServer;
+use spica_proto::v1::query_server::QueryServer;
+use spica_proto::v1::task_service_server::TaskServiceServer;
+use spica_proto::v1::workflow_service_server::WorkflowServiceServer;
+use spica_scheduler::{InMemoryScheduler, Scheduler};
 use spica_storage::RocksStorage;
 
 use crate::common::Svc;
@@ -72,29 +77,34 @@ async fn main() -> anyhow::Result<()> {
     // has no RPC-bound operation methods), boots the StreamProcessor, and returns the running `Engine`; its
     // single StreamProcessor replays the log into the storage projection on boot and runs for the process
     // lifetime (HTTP/2 keepalive keeps it alive). The running `Engine` is then wrapped in the `Arc`
-    // shared by the two service handles.
+    // shared by the four service handles.
     let log: Box<dyn LogStream<EntryPayload>> =
         Box::new(RocksLogStream::<EntryPayload>::open(&log_dir)?);
     let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir)?);
     let scheduler: Arc<dyn Scheduler> = InMemoryScheduler::spawn();
-    // No worker is attached in this M1 server: a Task simply stays claimable/pending (Zeebe
-    // semantics); if its state sets `TimeoutSeconds`, the engine's `TaskTimeout` backstop fails it
-    // after that window. A production server would spawn a worker (via `spica-client`'s `worker`
-    // module, `InMemoryTaskService::spawn`) against `engine.task_api()`.
+    // The consumer layer: an `AckHook` observer injected into the engine correlates awaited commands'
+    // outcomes to their callers; the `Facade` wraps engine + ack to expose the blocking convenience API.
+    // Timer scheduling is consumer-owned: `build_observer` composes the ack correlation with a hook that
+    // re-derives physical timer arms from durable events, and returns the engine slot the booted engine
+    // fills in for the sink (see `spica_server::consumer`).
+    let ack = Arc::new(consumer::AckHook::new());
+    let (hook, engine_slot) = consumer::build_observer(ack.clone(), scheduler);
     let engine = EngineBuilder::with_backends(log, storage)
-        .with_scheduler(scheduler)
+        .with_hook(hook)
         .start()
         .await
         .context("start engine processor")?;
+    let engine = Arc::new(engine);
+    *engine_slot.lock().await = Some(Arc::downgrade(&engine));
     tracing::info!(listen = %args.listen, "spica-server listening");
 
-    let svc = Svc {
-        engine: Arc::new(engine),
-    };
+    let facade = consumer::Facade::new(engine.clone(), ack);
+    let svc = Svc { engine, facade };
     tonic::transport::Server::builder()
-        .add_service(WorkflowServer::new(svc.clone()))
-        .add_service(ExecutionServer::new(svc.clone()))
-        .add_service(TaskServer::new(svc))
+        .add_service(WorkflowServiceServer::new(svc.clone()))
+        .add_service(ExecutionServiceServer::new(svc.clone()))
+        .add_service(TaskServiceServer::new(svc.clone()))
+        .add_service(QueryServer::new(svc))
         .serve(args.listen.parse().context("parse listen address")?)
         .await?;
     Ok(())
@@ -104,9 +114,9 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use serde_json::Value;
     use spica_asl::StateMachine;
-    use spica_engine::{EngineBuilder, EntryPayload, FlowName, LogStream, Scheduler, Storage};
+    use spica_engine::{EngineBuilder, EntryPayload, FlowName, LogStream, Storage};
     use spica_logstream::RocksLogStream;
-    use spica_scheduler::InMemoryScheduler;
+    use spica_scheduler::{InMemoryScheduler, Scheduler};
     use spica_storage::RocksStorage;
 
     /// A unique per-test path under the system temp dir, removed after the test.
@@ -136,21 +146,25 @@ mod tests {
         let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir).unwrap());
         let scheduler: std::sync::Arc<dyn Scheduler> = InMemoryScheduler::spawn();
         // No task worker is attached (as in the real server); see main().
-        let engine = EngineBuilder::with_backends(log, storage)
-            .with_scheduler(scheduler)
-            .start()
-            .await
-            .unwrap();
+        let ack = std::sync::Arc::new(super::consumer::AckHook::new());
+        let (hook, engine_slot) = super::consumer::build_observer(ack.clone(), scheduler);
+        let engine = std::sync::Arc::new(
+            EngineBuilder::with_backends(log, storage)
+                .with_hook(hook)
+                .start()
+                .await
+                .unwrap(),
+        );
+        *engine_slot.lock().await = Some(std::sync::Arc::downgrade(&engine));
+        let facade = super::consumer::Facade::new(engine.clone(), ack);
         let name = FlowName::new("test").unwrap();
         let definition = serde_json::to_string(&sm).unwrap();
-        let flow_version = engine.create_flow(name, &definition).await.unwrap();
-        let execution_id = engine
+        let flow_version = facade.create_flow(name, &definition).await.unwrap();
+        let execution_id = facade
             .start_for_revision(
-                spica_engine::ObjectName::generated_with_suffix(
-                    "exec",
-                    &ulid::Ulid::new().to_string(),
-                )
-                .expect("a ULID-suffixed generated name is always valid"),
+                spica_engine::PlainName::new("exec")
+                    .expect("static literal is a valid segment")
+                    .generated_from_key(ulid::Ulid::new().0 as u64),
                 flow_version,
                 Value::Null,
             )

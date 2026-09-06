@@ -19,18 +19,19 @@ mod activate_task;
 mod assign_task;
 mod cancel_task;
 mod cancel_timer;
+mod child_completed;
 mod complete_execution;
 mod complete_state;
 mod complete_task;
 mod complete_thread;
+mod continue_;
 mod create_execution;
 mod create_flow;
 mod dispatch;
 mod fail_task;
-mod process_child_completed;
 mod release_task_lease;
 mod spawn_thread;
-mod state_handler;
+pub(crate) mod state_handler;
 mod states;
 mod terminate_execution;
 mod terminate_state;
@@ -46,16 +47,18 @@ pub use complete_execution::CompleteExecutionHandler;
 pub use complete_state::CompleteStateHandler;
 pub use complete_task::CompleteTaskHandler;
 pub use complete_thread::CompleteThreadHandler;
+pub use continue_::{ContinueCompleteHandler, ContinueTerminateHandler};
 pub use create_execution::CreateExecutionHandler;
 pub use create_flow::CreateFlowHandler;
 pub use fail_task::FailTaskHandler;
-pub use process_child_completed::ProcessChildCompletedHandler;
 pub use release_task_lease::ReleaseTaskLeaseHandler;
 pub use spawn_thread::SpawnThreadHandler;
 pub use terminate_execution::TerminateExecutionHandler;
 pub use terminate_state::TerminateStateHandler;
 pub use terminate_thread::TerminateThreadHandler;
 pub use trigger_timer::TriggerTimerHandler;
+
+pub(crate) use dispatch::build_state_handlers;
 
 use std::collections::HashMap;
 
@@ -247,8 +250,8 @@ pub(crate) fn resolve_state_from_path<'a>(
 /// Loads the owning [`crate::storage::ExecutionRecord`] for a state-ish command. Returns `Ok(None)` when
 /// the owning node is gone (already terminal) — the caller treats that as an idempotent no-op rather
 /// than a failure.
-pub(super) async fn load_execution(
-    storage: &dyn crate::storage::Storage,
+pub(super) async fn load_execution<S: crate::storage::ReadonlyStorageTxn + ?Sized>(
+    storage: &S,
     execution: &ObjectReference,
 ) -> Result<Option<crate::storage::ExecutionRecord>, ExecutionError> {
     storage.get_execution(execution).await
@@ -262,7 +265,7 @@ pub(super) async fn load_execution(
 /// two store kinds address differently — a bare `TerminateExecution` silently misses a Thread and
 /// leaves the branch Running, wedging its container.
 pub(super) fn emit_scope_termination(
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     scope: &ObjectReference,
     reason: TerminationReason,
 ) {
@@ -295,11 +298,11 @@ pub(super) fn emit_scope_termination(
 /// in the same batch **before** the caller's `CompleteState` — a `CancelTimer` command would only
 /// produce `TimerCancelled` as a *later* log entry, after which `CompleteState` had already read the
 /// activity with its child still attached. The applier deschedules the deadline and detaches the
-/// child, which is all the settle path needs (`ProcessChildCompleted` omitted: the activity itself is
-/// about to complete via `CompleteState`).
+/// child, which is all the settle path needs (the activity itself is about to complete via
+/// `CompleteState`, so no parent drain reaction is needed here).
 pub(super) async fn cancel_activity_timers(
     ctx: &HandlerContext<'_>,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
 ) {
     let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
@@ -327,11 +330,12 @@ pub(super) async fn cancel_activity_timers(
                 // removal. Stamp the cancel moment as `updated_at`.
                 meta: {
                     let mut m = t.value.meta.clone();
-                    m.touch(crate::log::Timestamp::now());
+                    m.with_update_at(crate::log::Timestamp::now());
                     m
                 },
             },
-        });
+        })
+        .await;
     }
 }
 
@@ -368,14 +372,13 @@ pub(crate) fn state_name_from_path(path: &jsonptr::Pointer) -> String {
 /// step, so a follower can rebuild the same domain activity object from the stream alone. It does
 /// **not** carry the processed `input`: at the entering (`ing`) moment the state has only received
 /// its **raw** input (kept in `raw_input`), and the state's own activate — which emits
-/// `StateActivated` — computes and carries the processed view. So `input` is pinned to `Null` here
-/// and the meaningful value moves with `StateActivated`.
+/// The entering `StateActivating` event. The processed input isn't determined until the state
+/// finishes activating (`StateActivated` carries it), so `input` is left `None` here — the raw
+/// entry input (verbatim in `raw_input`) is all that's real.
 pub(super) fn state_activating(actx: &ActivityCtx, _activity: ObjectReference) -> Event {
-    let mut activity = actx.activity.clone();
-    // The processed input isn't determined until the state finishes activating (`StateActivated`);
-    // never carry/trust it on the entering event — the raw input (in `raw_input`) is all that's real.
-    activity.input = Value::Null;
-    Event::StateActivating { activity }
+    Event::StateActivating {
+        activity: actx.activity.clone(),
+    }
 }
 
 /// Build a new [`Activity`] from the current context, replacing only the fields the lifecycle
@@ -392,16 +395,16 @@ pub(super) fn activity_value_with(
     // re-stamp `updated_at` to the transition moment — the meta-level equivalent of the old
     // `created_at` forward + `updated_at` re-stamp.
     let mut meta = actx.activity.meta.clone();
-    meta.touch(crate::log::Timestamp::now());
+    meta.with_update_at(crate::log::Timestamp::now());
     Activity {
         meta,
         execution: actx.activity.execution.clone(),
         state_path: actx.activity.state_path.clone(),
         status: status.unwrap_or_else(|| actx.activity.status.clone()),
         raw_input: actx.activity.raw_input.clone(),
-        input: input.unwrap_or_else(|| actx.activity.input.clone()),
+        input: input.or_else(|| actx.activity.input.clone()),
         raw_output: raw_output.unwrap_or_else(|| actx.activity.raw_output.clone()),
-        activity_state: activity_state.unwrap_or_else(|| actx.activity.activity_state.clone()),
+        activity_state: activity_state.or(actx.activity.activity_state.clone()),
         retry_state: actx.activity.retry_state.clone(),
         output: output.unwrap_or_else(|| actx.activity.output.clone()),
     }
@@ -472,7 +475,7 @@ pub(crate) fn state_raw_result(actx: &ActivityCtx) -> Value {
     actx.activity
         .raw_output
         .clone()
-        .unwrap_or_else(|| actx.activity.input.clone())
+        .unwrap_or_else(|| actx.activity.raw_input.clone())
 }
 
 /// Build the `StateCompleting` payload by flipping only the lifecycle status. Unlike the input side
@@ -492,16 +495,16 @@ pub(super) fn state_completing_value(actx: &ActivityCtx) -> Activity {
 }
 
 /// Records the successful state finish's routing — emitting the `StateTransitioned` marker that
-/// names the resolved target `next` — then throws the transition [`Command`] that actually performs
-/// the hop. The marker is only emitted for a real State→State hop (`Command::ActivateState`): a
-/// terminal `End` routes to `CompleteExecution` with no next state, so it carries no marker. Kept
+/// carries the resolved target **path** — then throws the transition [`Command`] that actually
+/// performs the hop. The marker is only emitted for a real State→State hop (`Command::ActivateState`):
+/// a terminal `End` routes to `CompleteExecution` with no next state, so it carries no marker. Kept
 /// separate from the pure `transition_command` resolver so the routing decision is visible on the
 /// stream ahead of the command that carries it (`Command::ActivateState` allocates the successor's
-/// activity id internally, so the marker can only name the state, not the new activity). On
+/// activity id internally, so the marker can only name the target path, not the new activity). On
 /// `NoTerminal` the failure is recorded via `out`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_transition(
-    out: &mut Collector,
+pub(super) async fn emit_transition(
+    out: &mut Collector<'_>,
     execution: ObjectReference,
     owner: ObjectReference,
     activity: ObjectReference,
@@ -528,17 +531,19 @@ pub(super) fn emit_transition(
             });
         }
     } else if let Some(next) = next {
-        // The successor's activity id is allocated inside the `ActivateState` handler (see its
-        // doc); this marker names only the target state, so nothing is minted here.
-        out.emit_event(crate::types::event::Event::StateTransitioned {
-            activity,
-            next: next.to_string(),
-        });
         // The successor lives as a sibling of the completing state in the same enclosing `states`
         // table — that table is the completing activity's `state_path` minus its own leaf.
         let mut next_path = activity_state_path.clone();
         next_path.pop_back();
         next_path.push_back(next);
+        // The marker carries the resolved target *path* (self-locating), not a bare name that would
+        // need the completing activity's context to be reconstructed.
+        out.emit_event(crate::types::event::Event::StateTransitioned {
+            activity,
+            next: next_path.clone(),
+        })
+        .await;
+        // The successor's activity id is allocated inside the `ActivateState` handler (see its doc).
         out.emit_command(Command::ActivateState {
             execution,
             owner,
@@ -562,30 +567,32 @@ pub(super) fn emit_transition(
 /// ExecutionTimeout). The name is decoupled from the timer's `uid` and must be carried forward by
 /// later timer events (`TimerTriggered`/`TimerCancelled` preserve the row's meta instead of
 /// re-deriving it).
-pub(super) fn emit_timer(
-    out: &mut Collector,
+pub(super) async fn emit_timer(
+    out: &mut Collector<'_>,
     execution: ObjectReference,
     owner: ObjectReference,
     purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
     let timer_uid: ulid::Ulid = out.next_timer().into();
-    let timer_name = execution.name.base().to_generated();
+    let timer_name = execution
+        .name
+        .base()
+        .generated_from_key(out.next_generated_seq().await);
     out.emit_event(Event::TimerActivated {
         timer: crate::Timer {
             execution,
             purpose,
             status: crate::TimerStatus::Active,
             deadline,
-            meta: crate::types::meta::ObjectMeta::born_named(
-                ObjectKind::Timer,
-                timer_name,
-                timer_uid,
-                crate::log::Timestamp::now(),
-            )
-            .with_owner(owner),
+            meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, timer_uid)
+                .name(timer_name)
+                .at(crate::log::Timestamp::now())
+                .build()
+                .with_owner(owner),
         },
-    });
+    })
+    .await;
 }
 
 /// Shared tail of a successful state completion (Wait resume; Pass/Succeed/Choice now carry their
@@ -598,11 +605,11 @@ pub(super) fn emit_timer(
 ///
 /// This runs only from the `complete` step (see [`state_handler::StateHandler::complete`]) — never
 /// from `activate`. Reads variable mutation from `Assign` into the local variables used for the output
-/// projection, then drains via a `ProcessChildCompleted` notice to its parent (once drained).
+/// projection, then run the inline child-settled reaction that drains the parent (once drained).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn complete_activity(
+pub(super) async fn complete_activity(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     assign: Option<&AssignObject>,
@@ -620,15 +627,15 @@ pub(super) fn complete_activity(
         .activity
         .raw_output
         .as_ref()
-        .unwrap_or(&actx.activity.input);
+        .unwrap_or(&actx.activity.raw_input);
     // Activate-phase Assign was already applied (mutating scope); the output projection runs with
     // that updated scope so it can reference the Just-assigned variables.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         Some(raw_result),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
+        Some(&actx.activity.raw_input),
         retry_count,
         error_output,
         None, // not a Map item — no `context.Map.Item` binding
@@ -661,7 +668,8 @@ pub(super) fn complete_activity(
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {
@@ -697,7 +705,8 @@ pub(super) fn complete_activity(
 
     out.emit_event(Event::StateCompleted {
         activity: state_completed_value(actx, output_value.clone()),
-    });
+    })
+    .await;
 
     emit_transition(
         out,
@@ -712,5 +721,6 @@ pub(super) fn complete_activity(
         &output_value,
         next,
         end,
-    );
+    )
+    .await;
 }

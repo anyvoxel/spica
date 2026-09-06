@@ -7,14 +7,13 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    Activity, ActivityId, ActivityState, ActivityStatus, Command, Entry, EntryId, EntryPayload,
-    Event, Execution, ExecutionError, ExecutionId, ExecutionStatus, Flow, FlowName, FlowStatus,
-    FlowVersion, InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId,
-    RetryPolicy, RetryState, RuntimeError, Scheduler, Storage, StreamProcessor, Task, TaskStatus,
-    TerminationReason, Thread, ThreadStatus, Timer, TimerId, TimerPurpose, TimerSink, TimerStatus,
-    Timestamp, Variables,
+    Activity, ActivityId, ActivityStatus, Command, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionError, ExecutionId, ExecutionStatus, Flow, FlowName, FlowStatus, FlowVersion,
+    InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId, RetryPolicy,
+    RetryState, RuntimeError, Storage, StreamProcessor, Task, TaskStatus, TerminationReason,
+    Thread, ThreadStatus, Timer, TimerId, TimerPurpose, TimerStatus, Timestamp, Variables,
 };
-use spica_scheduler::InMemoryScheduler;
+use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
 use tokio_stream::StreamExt;
 
@@ -28,8 +27,9 @@ fn exec_ref() -> spica_engine::ObjectReference {
     let uid: ulid::Ulid = ExecutionId::new().into();
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Execution,
-        spica_engine::ObjectName::generated_with_suffix("child", &uid.to_string())
-            .expect("execution object name is always valid"),
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(uid.0 as u64),
         uid,
     )
 }
@@ -40,8 +40,9 @@ fn act_ref() -> spica_engine::ObjectReference {
     let uid: ulid::Ulid = ActivityId::new().into();
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Activity,
-        spica_engine::ObjectName::generated_with_suffix("child", &uid.to_string())
-            .expect("activity object name is always valid"),
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(uid.0 as u64),
         uid,
     )
 }
@@ -52,8 +53,9 @@ fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectReference {
     let uid: ulid::Ulid = task;
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Task,
-        spica_engine::ObjectName::generated_with_suffix("child", &uid.to_string())
-            .expect("task object name is always valid"),
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(uid.0 as u64),
         uid,
     )
 }
@@ -65,8 +67,9 @@ fn timer_ref(timer: TimerId) -> spica_engine::ObjectReference {
     let uid: ulid::Ulid = timer.into();
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Timer,
-        spica_engine::ObjectName::generated_with_suffix("child", &uid.to_string())
-            .expect("timer object name is always valid"),
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(uid.0 as u64),
         uid,
     )
 }
@@ -92,13 +95,14 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
     );
     storage
         .put_flow(Flow {
-            meta: spica_engine::ObjectMeta::born_named(
+            meta: spica_engine::ObjectMeta::builder(
                 spica_engine::ObjectKind::Flow,
-                spica_engine::ObjectName::plain("test_flow").expect("static name is valid"),
                 // Name is the flow's sole identity — no generation id, so uid is nil.
                 ulid::Ulid::nil(),
-                created_at,
-            ),
+            )
+            .name(spica_engine::ObjectName::plain("test_flow").expect("static name is valid"))
+            .at(created_at)
+            .build(),
             status: FlowStatus::Active,
             // Newest-version counter — the version seeded below is the only one, so it is the latest.
             latest_version: version,
@@ -107,15 +111,19 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
         .unwrap();
     storage
         .put_flow_version(FlowVersion {
-            meta: spica_engine::ObjectMeta::born_named(
+            meta: spica_engine::ObjectMeta::builder(
                 spica_engine::ObjectKind::FlowVersion,
-                version_name.clone(),
                 flow_version_uid,
-                created_at,
             )
+            .name(version_name.clone())
+            .at(created_at)
+            .build()
             .with_owner(owner),
             version,
             definition: serde_json::to_string(&sm).expect("state machine serializes"),
+            checksum: FlowVersion::definition_checksum(
+                &serde_json::to_string(&sm).expect("state machine serializes"),
+            ),
         })
         .await
         .unwrap();
@@ -126,23 +134,17 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
     )
 }
 
-/// Applies events to storage through the real [`EventDispatcher`] + in-memory scheduler, mirroring
-/// the event path of `StreamProcessor::run` — so timer events actually reach the scheduler. `EntryId`
-/// in the applier context defaults to 1 (it only marks causality for scheduling, which projection
-/// tests don't otherwise exercise).
+/// Applies events to storage through the real [`EventDispatcher`], mirroring the event path of
+/// `StreamProcessor::run`. Projection tests only fold state and never wait on a fired timer, so any
+/// applier-declared timer effects are discarded here (unlike `collect_events`, which routes them).
 struct Projector {
     dispatcher: spica_engine::EventDispatcher,
-    scheduler: std::sync::Arc<InMemoryScheduler>,
 }
 
 impl Projector {
     fn new() -> Self {
-        // No sink is attached here: projection tests only fold state and never wait on a fired
-        // timer, so the scheduler's expiry callback goes unobserved. The service task exits once
-        // the strong references drop below.
         Self {
             dispatcher: spica_engine::EventDispatcher::new(),
-            scheduler: InMemoryScheduler::spawn(),
         }
     }
 
@@ -163,10 +165,10 @@ impl Projector {
     ) {
         let mut txn = storage.begin_txn().unwrap();
         {
+            // A test projector folds Events into a scratch txn; any applier-declared timer effects are
+            // discarded (no real scheduler is attached to these raw-seam drivers).
             let mut ctx = spica_engine::ApplierContext {
                 storage: &mut *txn,
-                scheduler: self.scheduler.as_ref(),
-                cause_id: spica_engine::EntryId::new(1),
                 timestamp,
             };
             self.dispatcher.apply(&mut ctx, event).await.unwrap();
@@ -190,13 +192,14 @@ struct AppendingSink {
 
 #[async_trait::async_trait]
 impl TimerSink for AppendingSink {
-    async fn trigger(&self, timer: &ObjectReference, cause_id: EntryId) {
+    async fn trigger(&self, timer: &ObjectReference) {
         // Envelope the fired command with placeholders; the log stamps the real position and stream.
+        // The fired `TriggerTimer` carries no cause — provenance is derived from the entry that armed it.
         self.log
             .append(vec![Entry {
                 stream_id: spica_engine::StreamId::nil(), // the log stamps the stream on append
                 entry_id: spica_engine::EntryId::nil(),
-                cause_id: Some(cause_id),
+                cause_id: None,
                 timestamp: spica_engine::Timestamp::now(),
                 payload: EntryPayload::Command(Command::TriggerTimer {
                     timer: timer.clone(),
@@ -207,13 +210,25 @@ impl TimerSink for AppendingSink {
     }
 }
 
+/// Re-derive the physical schedule from a durable timer event — the consumer-owned analogue of the
+/// engine's former post-commit effect replay (see [`collect_events`]).
+fn apply_event_to_scheduler(scheduler: &std::sync::Arc<InMemoryScheduler>, event: &Event) {
+    match event {
+        Event::TimerActivated { timer } => {
+            scheduler.schedule(&timer.reference(), timer.deadline);
+        }
+        Event::TimerCancelled { timer } => scheduler.cancel(&timer.reference()),
+        _ => {}
+    }
+}
+
 /// Drives `sm` with `input` end-to-end through the raw CCES seam (no `Engine::start` async
 /// wrapping), collecting every event applied to Storage. Stops when the execution reaches a
-/// terminal status. Timer scheduling mirrors `StreamProcessor::run`: a real [`Scheduler`] owns a
-/// `DelayQueue`, `TimerActivated`/`TimerCancelled` events are fed to it via the
-/// [`EventDispatcher`], and this driver injects an [`AppendingSink`] (mirroring the engine's
-/// `EngineTimerSink`) that the scheduler calls on expiry to append the fired `TriggerTimer` — the
-/// push-through-engine path that keeps the log single-writer and strictly ordered.
+/// terminal status. Timer scheduling mirrors the consumer-owned model: a real [`Scheduler`] owns a
+/// `DelayQueue`, and the physical arm/cancel is re-derived here from the durable
+/// `TimerActivated`/`TimerCancelled` event (the engine itself declares no effects). This driver
+/// injects an [`AppendingSink`] that the scheduler calls on expiry to append the fired
+/// `TriggerTimer` — the push-into-log path that keeps the log single-writer and strictly ordered.
 async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
     // Boxed in `Arc` so the injected [`AppendingSink`] and this driver share the same underlying log.
     let logstream = std::sync::Arc::new(InMemoryLogStream::new());
@@ -255,17 +270,18 @@ async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
                             &event,
                             Event::ExecutionCompleted { .. } | Event::ExecutionTerminated { .. }
                         );
+                        // Fold the event into a scratch txn; the fold is a pure projection.
                         let mut txn = storage.begin_txn().unwrap();
                         {
                             let mut ctx = spica_engine::ApplierContext {
                                 storage: &mut *txn,
-                                scheduler: scheduler.as_ref(),
-                                cause_id: entry.entry_id,
                                 timestamp: entry.timestamp,
                             };
                             dispatcher.apply(&mut ctx, &event).await.unwrap();
                         }
                         txn.commit(None).unwrap();
+                        // Re-derive any physical schedule from the durable event (no effects in band).
+                        apply_event_to_scheduler(&scheduler, &event);
                         events.push(event);
                         if terminal {
                             break;
@@ -323,7 +339,6 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::TaskCancelled { .. } => "TaskCancelled",
         Event::VariablesAssigned { .. } => "VariablesAssigned",
         Event::StateTransitioned { .. } => "StateTransitioned",
-        Event::ProcessChildCompletedHandled { .. } => "ProcessChildCompletedHandled",
     }
 }
 
@@ -358,12 +373,15 @@ async fn storage_projects_execution_and_activity_state() {
                     status: ExecutionStatus::Running,
                     input: json!({ "x": 1 }),
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
-                    ),
+                    )
+                    .build(),
                 },
             },
         )
@@ -377,17 +395,20 @@ async fn storage_projects_execution_and_activity_state() {
                     state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
                     status: ActivityStatus::Running,
                     raw_input: json!({ "x": 1 }),
-                    input: json!({ "x": 1 }),
+                    input: Some(json!({ "x": 1 })),
                     raw_output: None,
-                    activity_state: ActivityState::Leaf,
-                    retry_state: RetryState::default(),
+                    activity_state: None,
+                    retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Activity,
                         activity.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -411,12 +432,15 @@ async fn storage_projects_execution_and_activity_state() {
                     status: ExecutionStatus::Completed,
                     input: json!({ "x": 1 }),
                     output: Some(json!({ "done": true })),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
-                    ),
+                    )
+                    .build(),
                 },
             },
         )
@@ -449,12 +473,15 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(100),
                         spica_engine::Timestamp::from_millis(100),
-                    ),
+                    )
+                    .build(),
                 },
             },
         )
@@ -482,12 +509,15 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                     status: ExecutionStatus::Completed,
                     input: json!({}),
                     output: Some(json!(true)),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(100),
                         spica_engine::Timestamp::from_millis(300),
-                    ),
+                    )
+                    .build(),
                 },
             },
         )
@@ -525,18 +555,15 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
         status: ActivityStatus::Running,
         raw_input: json!({}),
-        input: json!({}),
+        input: Some(json!({})),
         raw_output: None,
-        activity_state: ActivityState::Leaf,
-        retry_state: RetryState::default(),
+        activity_state: None,
+        retry_state: None,
         output: None,
-        meta: spica_engine::ObjectMeta::placeholder_with_times(
-            spica_engine::ObjectKind::Activity,
-            activity.uid,
-            ts(at),
-            ts(at),
-        )
-        .with_owner(exec.clone()),
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Activity, activity.uid)
+            .timestamps(ts(at), ts(at))
+            .build()
+            .with_owner(exec.clone()),
     };
     // Activity birth (created == updated), then a lifecycle transition advances `updated_at`.
     projector
@@ -552,12 +579,12 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
             &mut storage,
             &Event::StateActivated {
                 activity: Activity {
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Activity,
                         activity.uid,
-                        ts(100),
-                        ts(200),
-                    ),
+                    )
+                    .timestamps(ts(100), ts(200))
+                    .build(),
                     ..act_birth(100)
                 },
             },
@@ -581,13 +608,10 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         purpose: TimerPurpose::ExecutionTimeout,
         status: TimerStatus::Active,
         deadline: ts(500),
-        meta: spica_engine::ObjectMeta::placeholder_with_times(
-            spica_engine::ObjectKind::Timer,
-            timer.0,
-            ts(100),
-            ts(100),
-        )
-        .with_owner(exec.clone()),
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer.0)
+            .timestamps(ts(100), ts(100))
+            .build()
+            .with_owner(exec.clone()),
     };
     projector
         .apply(
@@ -603,12 +627,12 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
             &Event::TimerTriggered {
                 timer: Timer {
                     status: TimerStatus::Completed,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Timer,
                         timer.0,
-                        ts(100),
-                        ts(150),
-                    ),
+                    )
+                    .timestamps(ts(100), ts(150))
+                    .build(),
                     ..timer_birth
                 },
             },
@@ -637,13 +661,10 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         lease_until: None,
         retry_plan: vec![],
         retry_state: RetryState::default(),
-        meta: spica_engine::ObjectMeta::placeholder_with_times(
-            spica_engine::ObjectKind::Task,
-            task,
-            ts(100),
-            ts(100),
-        )
-        .with_owner(activity.clone()),
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+            .timestamps(ts(100), ts(100))
+            .build()
+            .with_owner(activity.clone()),
     };
     projector
         .apply(
@@ -662,12 +683,9 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     status: TaskStatus::Completed,
                     worker_id: None,
                     lease_until: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
-                        spica_engine::ObjectKind::Task,
-                        task,
-                        ts(100),
-                        ts(180),
-                    ),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+                        .timestamps(ts(100), ts(180))
+                        .build(),
                     ..task_birth
                 },
                 output: Value::Null,
@@ -711,12 +729,15 @@ async fn projection_records_create_and_update_timestamps() {
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
-                    ),
+                    )
+                    .build(),
                 },
             },
             t(100),
@@ -752,17 +773,17 @@ async fn projection_records_create_and_update_timestamps() {
                     state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
-                    input: json!({}),
+                    input: Some(json!({})),
                     raw_output: None,
-                    activity_state: ActivityState::Leaf,
-                    retry_state: RetryState::default(),
+                    activity_state: None,
+                    retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Activity,
                         activity.uid,
-                        t(200),
-                        t(200),
                     )
+                    .timestamps(t(200), t(200))
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -778,17 +799,17 @@ async fn projection_records_create_and_update_timestamps() {
                     state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
                     status: ActivityStatus::Completed,
                     raw_input: json!({}),
-                    input: json!({}),
+                    input: Some(json!({})),
                     raw_output: None,
-                    activity_state: ActivityState::Leaf,
-                    retry_state: RetryState::default(),
+                    activity_state: None,
+                    retry_state: None,
                     output: Some(json!(42)),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Activity,
                         activity.uid,
-                        t(200),
-                        t(300),
                     )
+                    .timestamps(t(200), t(300))
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -810,12 +831,12 @@ async fn projection_records_create_and_update_timestamps() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Active,
                     deadline: t(500),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Timer,
                         timer.0,
-                        t(400),
-                        t(400),
                     )
+                    .timestamps(t(400), t(400))
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -831,12 +852,12 @@ async fn projection_records_create_and_update_timestamps() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Completed,
                     deadline: t(500),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Timer,
                         timer.0,
-                        t(400),
-                        t(450),
                     )
+                    .timestamps(t(400), t(450))
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -863,13 +884,10 @@ async fn projection_records_create_and_update_timestamps() {
                     lease_until: None,
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
-                        spica_engine::ObjectKind::Task,
-                        task,
-                        t(600),
-                        t(600),
-                    )
-                    .with_owner(activity.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+                        .timestamps(t(600), t(600))
+                        .build()
+                        .with_owner(activity.clone()),
                 },
             },
             t(600),
@@ -889,13 +907,10 @@ async fn projection_records_create_and_update_timestamps() {
                     lease_until: None,
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
-                        spica_engine::ObjectKind::Task,
-                        task,
-                        t(600),
-                        t(650),
-                    )
-                    .with_owner(activity.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+                        .timestamps(t(600), t(650))
+                        .build()
+                        .with_owner(activity.clone()),
                 },
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: "S".to_string(),
@@ -1044,11 +1059,12 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
         status: ThreadStatus::Running,
         input: json!({}),
         output: None,
-        meta: spica_engine::ObjectMeta::born_placeholder(
+        meta: spica_engine::ObjectMeta::builder(
             spica_engine::ObjectKind::Thread,
             ulid::Ulid::new(),
-            spica_engine::Timestamp::from_millis(0),
         )
+        .at(spica_engine::Timestamp::from_millis(0))
+        .build()
         .with_owner(activity.clone()),
     };
     let thread_ref = thread.reference();
@@ -1066,12 +1082,15 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Execution,
                         exec.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
-                    ),
+                    )
+                    .build(),
                 },
             },
         )
@@ -1095,17 +1114,20 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                     state_path: jsonptr::PointerBuf::parse("/states/P").unwrap(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
-                    input: json!({}),
+                    input: Some(json!({})),
                     raw_output: None,
-                    activity_state: ActivityState::Leaf,
-                    retry_state: RetryState::default(),
+                    activity_state: None,
+                    retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Activity,
                         activity.uid,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -1185,12 +1207,15 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Execution,
                     exec.uid,
+                )
+                .timestamps(
                     spica_engine::Timestamp::from_millis(0),
                     spica_engine::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         },
         Event::StateActivating {
@@ -1199,17 +1224,20 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 state_path: jsonptr::PointerBuf::parse("/states/W").unwrap(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
-                input: Value::Null,
+                input: Some(Value::Null),
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Activity,
                     activity.uid,
+                )
+                .timestamps(
                     spica_engine::Timestamp::from_millis(0),
                     spica_engine::Timestamp::from_millis(0),
                 )
+                .build()
                 .with_owner(exec.clone()),
             },
         },
@@ -1219,17 +1247,20 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 state_path: jsonptr::PointerBuf::parse("/states/W").unwrap(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
-                input: Value::Null,
+                input: Some(Value::Null),
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Activity,
                     activity.uid,
+                )
+                .timestamps(
                     spica_engine::Timestamp::from_millis(0),
                     spica_engine::Timestamp::from_millis(0),
                 )
+                .build()
                 .with_owner(exec.clone()),
             },
         },
@@ -1239,13 +1270,13 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
-                    spica_engine::ObjectKind::Timer,
-                    timer.0,
-                    spica_engine::Timestamp::from_millis(0),
-                    spica_engine::Timestamp::from_millis(0),
-                )
-                .with_owner(activity.clone()),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer.0)
+                    .timestamps(
+                        spica_engine::Timestamp::from_millis(0),
+                        spica_engine::Timestamp::from_millis(0),
+                    )
+                    .build()
+                    .with_owner(activity.clone()),
             },
         },
     ] {
@@ -1344,12 +1375,15 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Active,
                     deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Timer,
                         timer.0,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -1364,12 +1398,15 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Cancelled,
                     deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Timer,
                         timer.0,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
+                    .build()
                     .with_owner(exec.clone()),
                 },
             },
@@ -1468,7 +1505,9 @@ async fn engine_start_fail_produces_state_failed_error() {
 async fn engine_create_flow_rejects_malformed_definition() {
     // A running engine is required to attempt `create_flow` (the typestate denies an unstarted
     // engine an operation), but the malformed-definition rejection is what we assert here.
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
     // A definition that isn't even valid JSON, a JSON doc that isn't a StateMachine at all
     // (missing `StartAt`), and a `StartAt` of the wrong type are all rejected at the `create_flow`
     // boundary — a non-parseable definition must never enter the log nor Storage. Reusing one name
@@ -1560,12 +1599,10 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::born_named(
-                    spica_engine::ObjectKind::Execution,
-                    name.clone(),
-                    uid,
-                    Timestamp::from_millis(0),
-                ),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Execution, uid)
+                    .name(name.clone())
+                    .at(Timestamp::from_millis(0))
+                    .build(),
             },
             variables: Variables::new(),
             current_activity: None,
@@ -1635,12 +1672,10 @@ async fn seed_named_execution(
                 status,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::born_named(
-                    spica_engine::ObjectKind::Execution,
-                    name,
-                    uid,
-                    Timestamp::from_millis(0),
-                ),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Execution, uid)
+                    .name(name)
+                    .at(Timestamp::from_millis(0))
+                    .build(),
             },
             variables: Variables::new(),
             current_activity: None,
@@ -1841,7 +1876,9 @@ async fn engine_explicit_lifecycle_runs_many_executions_on_one_processor() {
           }
         }"#,
     );
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
     // Create a definition (returns its never-reused version reference), then run *two* executions
     // against that one created version — both driven by the same long-lived StreamProcessor, no session
     // per run.
@@ -1890,7 +1927,9 @@ async fn start_returns_id_before_terminal_and_wait_resolves_output() {
           "States": { "P": { "Type": "Pass", "Output": "{% 21 * 2 %}", "End": true } }
         }"#,
     );
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
     let definition = serde_json::to_string(&sm).unwrap();
     let flow_version = engine
         .create_flow(FlowName::new("my_flow").unwrap(), &definition)
@@ -1917,7 +1956,9 @@ async fn wait_for_execution_surfaces_failure_reason() {
     let sm = parse_sm(
         r#"{ "StartAt": "F", "States": { "F": { "Type": "Fail", "Error": "E1", "Cause": "boom" } } }"#,
     );
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
     let definition = serde_json::to_string(&sm).unwrap();
     let flow_version = engine
         .create_flow(FlowName::new("my_flow").unwrap(), &definition)
@@ -1955,7 +1996,9 @@ async fn many_waiters_resolve_the_same_execution() {
           "States": { "W": { "Type": "Wait", "Seconds": 1, "End": true } }
         }"#,
     );
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
     let definition = serde_json::to_string(&sm).unwrap();
     let flow_version = engine
         .create_flow(FlowName::new("my_flow").unwrap(), &definition)
@@ -1991,7 +2034,9 @@ async fn engine_runs_many_create_flow_concurrently() {
         }"#,
     );
     let definition = serde_json::to_string(&sm).unwrap();
-    let engine = common::in_memory_builder().start().await.unwrap();
+    let engine = common::LocalClient::start(common::in_memory_builder())
+        .await
+        .unwrap();
 
     // `create_flow` takes `&self`, so ten independent tasks can register + append + await their own
     // ack concurrently instead of serializing through the Engine (or fighting over one stream cursor).
@@ -2050,13 +2095,10 @@ async fn seed_task(
                 lease_until,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
-                    spica_engine::ObjectKind::Task,
-                    task_id,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                )
-                .with_owner(act_ref()),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task_id)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build()
+                    .with_owner(act_ref()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2112,12 +2154,12 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Task,
                     other_resource,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
                 )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build()
                 .with_owner(act_ref()),
             },
             created_at: Timestamp::from_millis(0),
@@ -2140,7 +2182,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
     let leased: Vec<_> = entries
         .iter()
         .filter_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TasksClaimed { tasks }) => Some(tasks.iter()),
+            EntryPayload::Event(Event::TasksClaimed { tasks, .. }) => Some(tasks.iter()),
             _ => None,
         })
         .flatten()
@@ -2202,7 +2244,7 @@ async fn poll_tasks_respects_max_tasks() {
     let leased = entries
         .iter()
         .filter_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TasksClaimed { tasks }) => Some(tasks.len()),
+            EntryPayload::Event(Event::TasksClaimed { tasks, .. }) => Some(tasks.len()),
             _ => None,
         })
         .sum::<usize>();
@@ -2230,6 +2272,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
         .apply(
             &mut storage,
             &Event::TasksClaimed {
+                request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
                     execution: spica_engine::ObjectReference::nil(),
                     resource: "r".to_string(),
@@ -2240,12 +2283,15 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                     lease_until: Some(Timestamp::from_millis(2000)),
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
+                    meta: spica_engine::ObjectMeta::builder(
                         spica_engine::ObjectKind::Task,
                         running,
+                    )
+                    .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
+                    .build()
                     .with_owner(act_ref()),
                 }],
             },
@@ -2270,6 +2316,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
         .apply(
             &mut storage,
             &Event::TasksClaimed {
+                request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
                     execution: spica_engine::ObjectReference::nil(),
                     resource: "r".to_string(),
@@ -2280,13 +2327,13 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                     lease_until: Some(Timestamp::from_millis(2000)),
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
-                    meta: spica_engine::ObjectMeta::placeholder_with_times(
-                        spica_engine::ObjectKind::Task,
-                        done,
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(act_ref()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, done)
+                        .timestamps(
+                            spica_engine::Timestamp::from_millis(0),
+                            spica_engine::Timestamp::from_millis(0),
+                        )
+                        .build()
+                        .with_owner(act_ref()),
                 }],
             },
         )
@@ -2487,7 +2534,7 @@ async fn release_requeues_task_for_a_fresh_claim() {
     assert!(
         entries
             .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks }) if !tasks.is_empty())),
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks, .. }) if !tasks.is_empty())),
         "a re-queued task can be claimed by a fresh worker: {entries:?}"
     );
 }
@@ -2577,13 +2624,10 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
                     max_delay_seconds: None,
                 }],
                 retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
-                    spica_engine::ObjectKind::Task,
-                    task,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                )
-                .with_owner(parent.clone()),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build()
+                    .with_owner(parent.clone()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2660,13 +2704,10 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
                     retrier_attempts: vec![],
                     next_available_at: Some(Timestamp::from_millis(4_000_000_000_000)),
                 },
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
-                    spica_engine::ObjectKind::Task,
-                    task,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                )
-                .with_owner(act_ref()),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build()
+                    .with_owner(act_ref()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2688,7 +2729,7 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
     assert!(
         !entries
             .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks }) if !tasks.is_empty())),
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks, .. }) if !tasks.is_empty())),
         "a retrying task whose backoff gate has not lapsed must not be claimable: {entries:?}"
     );
 }

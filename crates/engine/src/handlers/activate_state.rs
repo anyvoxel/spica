@@ -43,7 +43,7 @@ impl CommandHandler for ActivateStateHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::ActivateState {
             execution,
             owner,
@@ -57,8 +57,8 @@ impl CommandHandler for ActivateStateHandler {
         };
         // This command creates a *new* activity, so its identity is allocated here (not carried by
         // the command, and not by the preceding `StateTransitioned` marker, which names only the
-        // target state — see its doc). Minting via the collector keeps it deterministic within the
-        // same atomic batch.
+        // target state's path — see its doc). Minting via the collector keeps it deterministic within
+        // the same atomic batch.
         let activity_uid: ulid::Ulid = out.next_activity().into();
         // Name the activity as a child of its owning execution (finding #3): the generated name's
         // plain base is the execution's name (carried verbatim through every nesting level, so a
@@ -67,7 +67,10 @@ impl CommandHandler for ActivateStateHandler {
         // ExecutionTimeout timer), which deliberately decouples a child's name suffix from its own
         // `uid`. Minted once and reused for both the reference and the serialized `meta.name` below,
         // because storage lookups are keyed by the reference's name and must match the stored row.
-        let activity_name = execution.name.base().to_generated();
+        let activity_name = execution
+            .name
+            .base()
+            .generated_from_key(out.next_generated_seq().await);
         let activity = crate::types::meta::ObjectReference::new(
             crate::types::meta::ObjectKind::Activity,
             activity_name.clone(),
@@ -122,21 +125,22 @@ impl CommandHandler for ActivateStateHandler {
                 state_path: state_path.clone(),
                 status: crate::ActivityStatus::Running,
                 raw_input: input.clone(),
-                input: input.clone(),
+                input: None,
                 raw_output: None,
-                activity_state: crate::ActivityState::Leaf,
-                retry_state: crate::types::task::RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
                 // Birth: `meta.created_at == meta.updated_at == now` (entry moment). The owner is
                 // the owning scope named by the command — an activity's parent is always the scope
                 // (execution or thread) that contains it. The generated name reuses the same
                 // reference-address name minted above (execution-name base + activity uid).
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
-                    activity_name,
                     activity_uid,
-                    crate::log::Timestamp::now(),
                 )
+                .name(activity_name)
+                .at(crate::log::Timestamp::now())
+                .build()
                 .with_owner(owner.clone()),
             },
             execution_state_path,
@@ -164,10 +168,15 @@ impl CommandHandler for ActivateStateHandler {
         // `StateActivated` — is not emitted here: it belongs to each `StateHandler::activate`, which
         // publishes it only once the state has finished processing its input (e.g. after Choice has
         // routed its rules), just before the state's own follow-up command.
-        out.emit_event(state_activating(&actx, activity.clone()));
+        out.emit_event(state_activating(&actx, activity.clone()))
+            .await;
 
         match self.state_handlers.get(&std::mem::discriminant(state_def)) {
-            Some(handler) => handler.activate(ctx.env, out, activity.clone(), &actx, state_def),
+            Some(handler) => {
+                handler
+                    .activate(ctx.env, out, activity.clone(), &actx, state_def)
+                    .await
+            }
             None => out.terminate(
                 Some(activity.clone()),
                 execution.clone(),

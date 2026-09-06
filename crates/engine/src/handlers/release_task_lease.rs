@@ -25,7 +25,7 @@ impl CommandHandler for ReleaseTaskLeaseHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::ReleaseTaskLease { task } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -52,7 +52,8 @@ impl CommandHandler for ReleaseTaskLeaseHandler {
         task_value.lease_until = None;
         task_value.retry_state.next_available_at = None;
         // Stamp the re-queue moment; `created_at` is already carried on `task_value`.
-        task_value.meta.touch(crate::log::Timestamp::now());
-        out.emit_event(Event::TaskLeaseExpired { task: task_value });
+        task_value.meta.with_update_at(crate::log::Timestamp::now());
+        out.emit_event(Event::TaskLeaseExpired { task: task_value })
+            .await;
     }
 }

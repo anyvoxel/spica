@@ -29,7 +29,7 @@ impl CommandHandler for CompleteExecutionHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CompleteExecution { execution, output } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -71,10 +71,11 @@ impl CommandHandler for CompleteExecutionHandler {
         completing_execution.output = Some(output.clone());
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
-        completing_execution.meta.touch(Timestamp::now());
+        completing_execution.meta.with_update_at(Timestamp::now());
         out.emit_event(Event::ExecutionCompleting {
             execution: completing_execution,
-        });
+        })
+        .await;
 
         let children = exec.active_children.clone();
         let pending_children = cancel_timers(out, children);
@@ -82,7 +83,7 @@ impl CommandHandler for CompleteExecutionHandler {
             let mut completed_execution = exec.value();
             completed_execution.status = ExecutionStatus::Completed;
             completed_execution.output = Some(output.clone());
-            completed_execution.meta.touch(Timestamp::now());
+            completed_execution.meta.with_update_at(Timestamp::now());
             // Completion is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionCompleted` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an
@@ -90,7 +91,7 @@ impl CommandHandler for CompleteExecutionHandler {
             let completed_event = Event::ExecutionCompleted {
                 execution: completed_execution,
             };
-            out.emit_event(completed_event);
+            out.emit_event(completed_event).await;
             // The top-level run has no parent — `Engine::start` observes its `ExecutionCompleted`
             // directly — but a relayed finish (from a scope below) never arrives here, so no owner
             // relay is needed for a root execution.
@@ -108,7 +109,7 @@ impl CommandHandler for CompleteExecutionHandler {
 /// A scope's non-timer children (its activity) drain through their own terminal cascade, not here.
 /// Shared by the `Execution` and `Thread` completion handlers.
 pub(super) fn cancel_timers(
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     children: std::collections::HashSet<ObjectReference>,
 ) -> usize {
     let mut pending = 0usize;

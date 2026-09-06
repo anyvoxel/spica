@@ -39,14 +39,14 @@ impl EventApplier for VariablesAssignedApplier {
             ObjectKind::Execution => {
                 if let Some(mut exec) = ctx.storage.get_execution(scope).await? {
                     exec.variables = variables.clone();
-                    exec.touch(ctx.timestamp);
+                    exec.with_update_at(ctx.timestamp);
                     ctx.storage.put_execution(exec).await?;
                 }
             }
             ObjectKind::Thread => {
                 if let Some(mut thread) = ctx.storage.get_thread(scope).await? {
                     thread.variables = variables.clone();
-                    thread.touch(ctx.timestamp);
+                    thread.with_update_at(ctx.timestamp);
                     ctx.storage.put_thread(thread).await?;
                 }
             }

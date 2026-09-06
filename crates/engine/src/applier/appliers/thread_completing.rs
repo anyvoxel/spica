@@ -20,11 +20,12 @@ impl EventApplier for ThreadCompletingApplier {
                 status: ThreadStatus::Completing,
                 input: Default::default(),
                 output: Some(Default::default()),
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Thread,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -44,7 +45,7 @@ impl EventApplier for ThreadCompletingApplier {
             row.output = thread.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
             row.value.meta.updated_at = thread.meta.updated_at;
-            row.touch(ctx.timestamp);
+            row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
         }
         Ok(())

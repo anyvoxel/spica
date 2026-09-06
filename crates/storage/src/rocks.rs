@@ -40,15 +40,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rocksdb::{OptimisticTransactionDB, Transaction};
+use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
 use spica_engine::{
     ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, InfraError,
-    ObjectKind, ObjectReference, Storage, StorageTxn, TaskRecord, TaskStatus, ThreadRecord,
-    TimerRecord,
+    ObjectKind, ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, TaskStatus,
+    ThreadRecord, TimerRecord,
 };
 
-use crate::{KeyBuilder, Scope};
+use crate::{KeyBuilder, Kind, Scope};
 
 /// Read a single committed row: deserialize `T` from the value at `key`, or `None` if absent.
 // Storage-boundary helper returning the engine façade (see `open` for the `result_large_err` rationale).
@@ -225,6 +225,44 @@ impl Storage for RocksStorage {
         Ok(out)
     }
 
+    async fn list_kind(
+        &self,
+        kind: ObjectKind,
+        start_after: Option<&ObjectName>,
+        limit: usize,
+    ) -> Result<Vec<(ObjectName, Vec<u8>)>, ExecutionError> {
+        // A forward prefix scan over one kind's range (k8s-style LIST). Keys are byte-ordered text,
+        // so the pure-ASCII name suffix compares lexicographically — a `>`-from-`start_after` filter
+        // and the page cutoff are both plain string/bounds checks; the raw value bytes are returned
+        // untouched for the facade to decode into the kind's typed row.
+        let prefix = self.keys.kind_prefix(Kind::from_object(kind));
+        let after = start_after.as_ref().map(|n| n.as_str());
+        let mut out: Vec<(ObjectName, Vec<u8>)> = Vec::new();
+        for item in self.db.prefix_iterator(prefix.clone()) {
+            let (key, value) = item.map_err(|e| {
+                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} scan: {e}")))
+            })?;
+            let name = &key[prefix.len()..];
+            let name = std::str::from_utf8(name).map_err(|e| {
+                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} name: {e}")))
+            })?;
+            if after
+                .as_ref()
+                .is_some_and(|a| name.as_bytes() <= a.as_bytes())
+            {
+                continue;
+            }
+            let name = ObjectName::from_parsed(name).map_err(|e| {
+                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} name: {e}")))
+            })?;
+            out.push((name, value.to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// `active_children` is stored on the parent row, so this reads it back like
     /// [`InMemoryStorage`](crate::InMemoryStorage) does (a leaf — TimerRecord/TaskRecord — owns nothing).
     async fn get_children(
@@ -347,8 +385,9 @@ impl Storage for RocksStorage {
         let name = flow
             .meta
             .name
-            .as_flow_name()
-            .expect("a Flow's meta.name is always a user FlowName");
+            .as_plain()
+            .expect("a Flow's meta.name is always a user FlowName")
+            .clone();
         put_row(&self.db, self.keys.flow(&name), &flow)
     }
 
@@ -389,6 +428,10 @@ impl Storage for RocksStorage {
         // A standalone watermark write, used outside a fold; inside a fold the StreamProcessor passes the
         // advance to `StorageTxn::commit` so it lands in the same atomic batch as the projection.
         put_row(&self.db, self.keys.last_processed_position(), &position)
+    }
+
+    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+        Ok(get_row(&self.db, self.keys.next_generated_seq())?.unwrap_or(0))
     }
 
     fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
@@ -465,6 +508,39 @@ impl StorageTxn for RocksTxn {
         reference: &ObjectReference,
     ) -> Result<Option<TaskRecord>, ExecutionError> {
         txn_get(&self.txn, self.keys.task(reference))
+    }
+
+    async fn activatable_tasks(
+        &mut self,
+        resource: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+        // A forward prefix scan through the transaction iterator, which applies the pending
+        // WriteBatch over the committed store (read-your-writes): a task folded earlier in this
+        // batch is seen, with its buffered status winning. No per-resource queue index in M1.
+        let prefix = self.keys.task_prefix();
+        let iter = self
+            .txn
+            .iterator(IteratorMode::From(&prefix, Direction::Forward));
+        let mut out: Vec<TaskRecord> = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| {
+                ExecutionError::Infra(InfraError::Log(format!("rocksdb txn task scan: {e}")))
+            })?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let task: TaskRecord = serde_json::from_slice(&value).map_err(|e| {
+                ExecutionError::Infra(InfraError::Log(format!("rocksdb txn task decode: {e}")))
+            })?;
+            if task.value.resource == resource && task.value.status == TaskStatus::Pending {
+                out.push(task);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn get_children(
@@ -587,8 +663,9 @@ impl StorageTxn for RocksTxn {
         let name = flow
             .meta
             .name
-            .as_flow_name()
-            .expect("a Flow's meta.name is always a user FlowName");
+            .as_plain()
+            .expect("a Flow's meta.name is always a user FlowName")
+            .clone();
         txn_put(&self.txn, self.keys.flow(&name), &flow)
     }
 
@@ -617,6 +694,17 @@ impl StorageTxn for RocksTxn {
             self.keys
                 .flow_version(&FlowVersion::version_name(&name, version)),
         )
+    }
+
+    async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+        // The native RocksDB Transaction reads its own pending writes (read-your-writes for free),
+        // so a fold sees its own earlier bump within the same batch.
+        Ok(txn_get(&self.txn, self.keys.next_generated_seq())?.unwrap_or(0))
+    }
+
+    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
+        txn_put(&self.txn, self.keys.next_generated_seq(), &seq)?;
+        Ok(())
     }
 
     fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
@@ -648,7 +736,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine::{
-        Execution, ExecutionStatus, ObjectKind, ObjectName, ObjectReference, Timer, TimerId,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timer, TimerId,
         TimerPurpose, TimerStatus, Timestamp, Variables,
     };
 
@@ -657,7 +745,21 @@ mod tests {
         let uid = ulid::Ulid::new();
         ObjectReference::new(
             ObjectKind::Execution,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
+            uid,
+        )
+    }
+
+    /// A distinct timer reference (`child-<uid>`), matching a `Timer::reference()`.
+    fn timer_ref() -> ObjectReference {
+        let uid = ulid::Ulid::new();
+        ObjectReference::new(
+            ObjectKind::Timer,
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -673,18 +775,18 @@ mod tests {
             value: Execution {
                 flow_version: ObjectReference::new(
                     ObjectKind::FlowVersion,
-                    ObjectName::generated_with_suffix("flow", "00000001").unwrap(),
+                    PlainName::new("flow").unwrap().generated_from_key(1),
                     ulid::Ulid::nil(),
                 ),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Execution,
                     id.uid,
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                ),
+                )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build(),
             },
             variables: Variables::new(),
             current_activity: None,
@@ -723,10 +825,7 @@ mod tests {
     async fn add_and_remove_child_tracks_active_children() {
         let path = temp_path("children");
         let id = test_exec_ref();
-        let child = spica_engine::ObjectReference::for_uid(
-            spica_engine::ObjectKind::Timer,
-            TimerId::new().into(),
-        );
+        let child = timer_ref();
         {
             let mut store = RocksStorage::open(&path).unwrap();
             store
@@ -747,16 +846,7 @@ mod tests {
                 HashSet::from([child.clone()])
             );
             // a leaf parent (TimerRecord) owns nothing and never grows
-            assert!(
-                store
-                    .get_children(spica_engine::ObjectReference::for_uid(
-                        spica_engine::ObjectKind::Timer,
-                        TimerId::new().into(),
-                    ))
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(store.get_children(timer_ref()).await.unwrap().is_empty());
             // remove, then reflect
             store
                 .remove_child(parent.clone(), child.clone())
@@ -779,21 +869,25 @@ mod tests {
                 .unwrap();
             // A timer under the same numeric-ish space is a distinct key namespace.
             let timer_uid = TimerId::new();
-            let timer_ref = spica_engine::ObjectReference::for_uid(
-                spica_engine::ObjectKind::Timer,
-                timer_uid.into(),
+            let uid: ulid::Ulid = timer_uid.into();
+            let timer_ref = ObjectReference::new(
+                ObjectKind::Timer,
+                PlainName::new("child")
+                    .unwrap()
+                    .generated_from_key(uid.0 as u64),
+                uid,
             );
             let t = TimerRecord::from_value(Timer {
                 execution: id.clone(),
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
-                meta: spica_engine::ObjectMeta::placeholder_with_times(
+                meta: spica_engine::ObjectMeta::builder(
                     spica_engine::ObjectKind::Timer,
                     timer_uid.into(),
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
                 )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build()
                 .with_owner(id.clone()),
             });
             store.put_timer(t.clone()).await.unwrap();

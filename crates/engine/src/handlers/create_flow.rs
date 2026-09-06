@@ -46,7 +46,7 @@ impl CommandHandler for CreateFlowHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CreateFlow {
             request_id,
             name,
@@ -114,33 +114,37 @@ impl CommandHandler for CreateFlowHandler {
             flow: Flow {
                 // The flow carries its real, user-supplied name (the primary key) plus a fresh
                 // `meta.uid` — every object has an independent incarnation id.
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Flow,
+                    flow_uid,
+                )
+                .name(
                     crate::types::meta::ObjectName::plain(name.as_str())
                         .expect("a valid FlowName is a valid user object name"),
-                    flow_uid,
-                    created_at,
-                ),
+                )
+                .at(created_at)
+                .build(),
                 status: FlowStatus::Active,
                 // A flow is born with its first version (ordinal 1); the version applier advances
                 // this counter on later publishes.
                 latest_version: 1,
             },
-        });
-        // The CreateFlow caller awaits the request echoed on `FlowVersionCreated` (this version's
-        // birth); declare that ack so the StreamProcessor completes the awaiting caller only once this
-        // version event is durably applied to Storage (see `AckSideEffect::CompleteRequest`).
+        })
+        .await;
+        // The CreateFlow caller awaits the request echoed on this `FlowVersionCreated` (the version's
+        // birth); an injected `Hook` observer wakes it as soon as the engine reports this event applied.
         let version_event = Event::FlowVersionCreated {
             request_id: *request_id,
             flow_version: FlowVersion {
                 // A flow version is owned by its flow: the meta carries an owner reference to the
                 // owning `Flow` (same scope, inherited) bundling the flow's own name and uid.
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::FlowVersion,
-                    flow_version,
                     flow_version_uid,
-                    created_at,
                 )
+                .name(flow_version)
+                .at(created_at)
+                .build()
                 .with_owner(crate::types::meta::OwnerReference::new(
                     crate::types::meta::ObjectKind::Flow,
                     crate::types::meta::ObjectName::plain(name.as_str())
@@ -149,9 +153,11 @@ impl CommandHandler for CreateFlowHandler {
                 )),
                 version: 1,
                 definition: definition.clone(),
+                // Fingerprint the raw definition once at the single mint point; it rides the event
+                // to storage unchanged (a version's content is immutable once created).
+                checksum: FlowVersion::definition_checksum(definition),
             },
         };
-        out.ack_request(*request_id, version_event.clone());
-        out.emit_event(version_event);
+        out.emit_event(version_event).await;
     }
 }

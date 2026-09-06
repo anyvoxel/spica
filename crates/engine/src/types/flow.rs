@@ -2,6 +2,7 @@
 //! [`FlowVersion`](crate::FlowVersion)s.
 
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use crate::types::meta::ObjectMeta;
 
@@ -29,6 +30,7 @@ pub enum FlowStatus {
 /// brand-new versions — never an aliased holdover.
 ///
 /// Executions never bind to the flow itself; they bind to a specific version's reference.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Flow {
     /// Shared identity + timing metadata. `meta.name` is the flow's real, user-supplied primary key

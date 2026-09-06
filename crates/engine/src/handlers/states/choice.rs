@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State};
 
@@ -13,15 +14,16 @@ use crate::types::meta::ObjectReference;
 pub struct ChoiceStateHandler;
 
 #[allow(clippy::too_many_arguments)]
+#[async_trait]
 impl StateHandler for ChoiceStateHandler {
     fn state(&self) -> State {
         State::Choice(ChoiceState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
@@ -33,20 +35,21 @@ impl StateHandler for ChoiceStateHandler {
         // therefore routes through the framework's uniform complete step (`CompleteState` →
         // `StateCompleting` → `complete`), like every other M1 state.
         out.emit_event(crate::types::event::Event::StateActivated {
-            activity: state_activated_value(actx, actx.activity.input.clone(), None),
-        });
+            activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
+        })
+        .await;
         out.emit_command(crate::types::command::Command::CompleteState {
             activity,
             // A Choice's raw result is its processed input (no distinct raw output); the chosen
             // branch is resolved in the complete step's routing.
-            output: actx.activity.input.clone(),
+            output: actx.activity.raw_input.clone(),
         });
     }
 
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -59,7 +62,7 @@ impl StateHandler for ChoiceStateHandler {
                 "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        complete_choice(env, out, activity, actx, s);
+        complete_choice(env, out, activity, actx, s).await;
     }
 }
 
@@ -68,9 +71,9 @@ impl StateHandler for ChoiceStateHandler {
 /// `Assign`/`Output` from the chosen rule override the state level, and the rule-provided `next` (or
 /// `Default`) drives the transition. No `next` and no `Default` is a `NoChoiceMatched` failure.
 #[allow(clippy::too_many_arguments)]
-fn complete_choice(
+async fn complete_choice(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ChoiceState,
@@ -79,12 +82,12 @@ fn complete_choice(
     // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed/Fail) — however
     // late an `Assign` is applied, derived values read consistently with the variables already folded.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // no Catch `errorOutput` in the choice path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -197,7 +200,8 @@ fn complete_choice(
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_variables.clone(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {
@@ -228,7 +232,7 @@ fn complete_choice(
                 .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_variables)
         ),
-        None => actx.activity.input.clone(),
+        None => actx.activity.raw_input.clone(),
     };
 
     // The routing + projection is done: emit the state's success ed (`StateCompleting` was already
@@ -237,7 +241,8 @@ fn complete_choice(
     // mandatory for Choice via rule/Default), never a terminal `End`.
     out.emit_event(Event::StateCompleted {
         activity: state_completed_value(actx, output_value.clone()),
-    });
+    })
+    .await;
     emit_transition(
         out,
         actx.activity.execution.clone(),
@@ -251,5 +256,6 @@ fn complete_choice(
         &output_value,
         Some(&rule_next),
         None,
-    );
+    )
+    .await;
 }

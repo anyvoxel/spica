@@ -37,12 +37,15 @@ impl EventApplier for TaskFailedApplier {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
             error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(String::new())),
         }
@@ -68,7 +71,7 @@ impl EventApplier for TaskFailedApplier {
             // Fold the entity verbatim (status, cleared worker/lease, + the retry bookkeeping the
             // handler stamped: `attempts`, `retrier_attempts`, `next_available_at`).
             t.value = task.clone();
-            t.touch(ctx.timestamp);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             if retryable {
                 // The reused task stays a child (claimable again after `next_available_at` lapses).
@@ -77,8 +80,8 @@ impl EventApplier for TaskFailedApplier {
                 if parent.kind == ObjectKind::Activity
                     && let Some(mut act) = ctx.storage.get_activity(&parent).await?
                 {
-                    act.retry_state.attempts = task.retry_state.attempts;
-                    act.touch(ctx.timestamp);
+                    act.retry_state.get_or_insert_default().attempts = task.retry_state.attempts;
+                    act.with_update_at(ctx.timestamp);
                     ctx.storage.put_activity(act).await?;
                 }
             } else {
