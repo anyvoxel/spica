@@ -1,40 +1,64 @@
 syntax = "proto3";
 
 // The wire contract for the spica workflow server. A remote client (`spica` CLI or any gRPC client)
-// drives a state machine run through two coarse services:
+// drives a state machine run through two coarse services, and reads the persisted projection through
+// a k8s-style Query API:
 //
-//   - Workflow.CreateFlow    persists a definition and returns its created version's ObjectReference.
-//   - Execution.StartExecution  binds that reference and returns the execution id at birth.
-//   - Execution.GetExecution    returns a point-in-time status snapshot; the client POLLS this until
-//                               the execution settles (COMPLETED / TERMINATED) — there is no
-//                               fire-and-forget/blocking "Wait" RPC.
-//   - Execution.StopExecution   aborts a running execution (issues TerminateExecution{Cancelled}).
-//   - Task.PollTasks            claims available tasks for a worker (Zeebe ActivateJobs);
-//                               Task.CompleteTask / Task.FailTask settle a claim — the
-//                               out-of-process TaskApi a worker reaches over the network.
+//   - WorkflowService.CreateFlow       persists a definition and returns its created version's ref.
+//   - WorkflowService.ResolveFlowVersion resolves a name (+version) to a concrete version reference.
+//   - ExecutionService.StartExecution   binds that reference and returns the execution id at birth.
+//   - ExecutionService.StopExecution    aborts a running execution.
+//   - TaskService.PollTasks / CompleteTask / FailTask — the worker's claim/settle API.
+//   - Query.GetObject / ListObjects — a k8s-style read API over the persisted projection: GET one
+//                                      object of any kind by name, or LIST a kind with limit +
+//                                      continue-token pagination. This replaces the historical
+//                                      per-kind `GetExecution` snapshot RPC.
+//
+// The write services carry a `*Service` suffix so their names never collide with the mirrored entity
+// messages of the same kind (`Execution`, `Task`, ...) — the entities are the payloads, the services
+// are the API groups that act on them (k8s's storage/API alignment).
+//
+// Entities are mirrored from the engine's persisted projection (storage and API stay aligned, the
+// k8s model): each entity gets a structured message; JSON `Value` fields and the deeply nested
+// runtime bookkeeping (`activity_state`, `retry_plan`, `retry_state`, `ExecutionError`) travel as
+// `bytes` in their serde JSON form — the established convention for JSON-to-bytes on the wire
+// (compare `definition` / `input` / `output`), keeping the mirror faithful yet tractable.
 package spica.v1;
 
-// Definition lifecycle: create and version a state machine.
-service Workflow {
+service WorkflowService {
   rpc CreateFlow(CreateFlowRequest) returns (CreateFlowResponse);
-  // Resolve a flow name (+ optional ordinal version) to its concrete version ObjectReference without
-  // starting an execution — a non-blocking projection read, so the reference can be captured for
-  // later reuse.
   rpc ResolveFlowVersion(ResolveFlowVersionRequest) returns (ResolveFlowVersionResponse);
 }
 
-// Execution lifecycle: start a run and observe its status by polling.
-service Execution {
-  // Issues an execution immediately and returns its id at birth (non-blocking). Settling is observed
-  // by polling GetExecution. The requested revision is addressed by an explicit version reference, or
-  // by a flow name + optional ordinal (0 = latest).
+// Execution lifecycle: start a run and abort it. Settlement is observed through the Query API
+// (`Query.GetObject` / `ListObjects` on kind `execution`).
+service ExecutionService {
   rpc StartExecution(StartExecutionRequest) returns (StartExecutionResponse);
-  // Point-in-time snapshot of one execution; the client polls until state is terminal.
-  rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
-  // Abort a running execution by issuing TerminateExecution{Cancelled}. Non-blocking: appends the
-  // command and returns; the client observes settlement (TERMINATED) by polling GetExecution.
   rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
 }
+
+// Task lifecycle: the out-of-process worker's inbound claim/settle API — the wire realization of the
+// in-process `TaskApi` (Zeebe's ActivateJobs / CompleteJob / FailJob). A worker polls available work
+// by resource, executes its handler, then settles each claim with a complete (success) or fail
+// (error). The server validates every call against the log (single-writer), exactly as the in-process
+// engine-side trait does.
+service TaskService {
+  rpc PollTasks(PollTasksRequest) returns (PollTasksResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+}
+
+// k8s-style read API over the persisted projection: GET one object of any kind by name, or LIST a
+// kind with limit + continue-token pagination. Both are non-blocking point-in-time reads straight
+// from current Storage — there are no watch/listen semantics, only the current snapshot.
+service Query {
+  // Get one object by kind + addressing name; NOT_FOUND when no row exists for that (kind, name).
+  rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  // List a kind's rows within the current storage scope, paged by `limit` + `continue_token`.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+}
+
+// --- Shared identity ---
 
 message ObjectReference {
   // The referenced object's kind (e.g. "flow" or "flowversion").
@@ -44,6 +68,260 @@ message ObjectReference {
   // The referenced object's never-reused incarnation id (ULID string).
   string uid = 3;
 }
+
+// Shared identity + timing metadata, mirroring the engine's `ObjectMeta`: the k8s-style uniform
+// object identity every persisted entity carries.
+message ObjectMeta {
+  // The object's kind (e.g. "execution").
+  string kind = 1;
+  // Top-level isolation boundary (tenant) the object lives under.
+  string tenant = 2;
+  // Scope within the tenant (namespace).
+  string namespace = 3;
+  // The addressing key — the object's primary key within (kind, tenant, namespace).
+  string name = 4;
+  // The opaque, never-reused incarnation id (ULID string).
+  string uid = 5;
+  // When the object was created, milliseconds since the UNIX epoch.
+  int64 created_at_millis = 6;
+  // When the object was last updated, milliseconds since the UNIX epoch.
+  int64 updated_at_millis = 7;
+  // The object that owns this one, if any (mirrors `meta.owner`); absent for roots.
+  optional ObjectReference owner = 8;
+}
+
+// A terminal failure's identity — the ASL error name plus its error-output object.
+message ErrorFailure {
+  // The ASL error name (e.g. "States.NoChoiceMatched"), mirrored from `TerminationReason::Failed`.
+  string error_name = 1;
+  // The error-output object serialized as JSON; empty when none.
+  bytes output = 2;
+}
+
+// Why a `Terminating`/`Terminated` node wound down abnormally, mirroring `TerminationReason`. Exactly
+// one of `failed` / `timed_out` / `cancelled` is set (all false = unset, e.g. not terminated).
+message TerminationReason {
+  // `TerminationReason::Failed{error}` — the execution failed with this error.
+  ErrorFailure failed = 1;
+  // `TerminationReason::TimedOut` — the state-machine `TimeoutSeconds` fired first.
+  bool timed_out = 2;
+  // `TerminationReason::Cancelled` — an external request aborted the run.
+  bool cancelled = 3;
+}
+
+// --- Query messages ---
+
+message GetObjectRequest {
+  // The object kind to read (e.g. "execution", "flow", "flowversion", "thread", "activity",
+  // "timer", "task") — the first key segment of the addressed row.
+  string kind = 1;
+  // The object's addressing name (its primary key within the kind).
+  string name = 2;
+}
+message GetObjectResponse {
+  // The resolved object; absent variants are unset. NOT_FOUND when no row exists for (kind, name).
+  Object object = 1;
+}
+
+message ListObjectsRequest {
+  // The object kind to list (same set as GetObject). Required.
+  string kind = 1;
+  // Upper bound on rows returned in this page; 0 = server default.
+  uint32 limit = 2;
+  // The opaque token from a prior response's `continue_token`, to resume the next page. Empty = the
+  // first page.
+  string continue_token = 3;
+}
+message ListObjectsResponse {
+  // The page of objects (at most `limit`), in storage key order.
+  repeated Object objects = 1;
+  // Non-empty when more rows remain; pass it back as the next request's `continue_token`.
+  string continue_token = 2;
+}
+
+// One persisted object of any kind — the k8s-style uniform read shape; exactly one variant is set.
+message Object {
+  oneof object {
+    Flow flow = 1;
+    FlowVersion flow_version = 2;
+    Execution execution = 3;
+    Thread thread = 4;
+    Activity activity = 5;
+    Timer timer = 6;
+    Task task = 7;
+  }
+}
+
+// --- Entity mirrors (storage projection <-> API aligned) ---
+
+// A logical flow (the mutable aggregate holding its versions' pointer), mirroring `Flow`.
+message Flow {
+  ObjectMeta meta = 1;
+  FlowStatus status = 2;
+  // The highest published version ordinal; publishing a new version increments it.
+  uint32 latest_version = 3;
+}
+enum FlowStatus {
+  FLOW_STATUS_UNSPECIFIED = 0;
+  FLOW_STATUS_ACTIVE = 1;
+  FLOW_STATUS_DELETED = 2;
+}
+
+// One immutable published version of a flow, mirroring `FlowVersion`.
+message FlowVersion {
+  ObjectMeta meta = 1;
+  // This version's ordinal within its flow (1, 2, 3, ...).
+  uint32 version = 2;
+  // The ASL definition serialized as JSON (exactly the submitted raw string, opaque to the wire).
+  bytes definition = 3;
+  // CRC-64/ECMA checksum of `definition`'s bytes — a content-consistency fingerprint.
+  uint64 checksum = 4;
+}
+
+// The persisted projection row of a top-level execution, mirroring `Execution` + its `variables`.
+message Execution {
+  ObjectMeta meta = 1;
+  // The immutable flow version this execution is bound to.
+  ObjectReference flow_version = 2;
+  ExecutionStatus status = 3;
+  // Present when `status` is TERMINATING/TERMINATED.
+  TerminationReason termination_reason = 4;
+  // The original execution input (JSON).
+  bytes input = 5;
+  // The decided success output (JSON), present once COMPLETED.
+  bytes output = 6;
+  // The execution's current variable scope — `Variables` returned alongside the entity.
+  map<string, bytes> variables = 7;
+}
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  EXECUTION_STATUS_RUNNING = 1;
+  EXECUTION_STATUS_COMPLETING = 2;
+  EXECUTION_STATUS_TERMINATING = 3;
+  EXECUTION_STATUS_COMPLETED = 4;
+  EXECUTION_STATUS_TERMINATED = 5;
+}
+
+// The persisted projection row of a scoped sub-run (Parallel branch / Map item), mirroring `Thread`
+// + its `variables`.
+message Thread {
+  ObjectMeta meta = 1;
+  // The top-level execution this thread belongs to (the flat query anchor of the tree).
+  ObjectReference execution = 2;
+  // The JSON Pointer into the shared machine locating this thread's sub-`states` table.
+  string state_path = 3;
+  // This thread's ordinal within its container (branch/item index, 0-based).
+  uint64 index = 4;
+  ThreadStatus status = 5;
+  // Present when `status` is TERMINATING/TERMINATED.
+  TerminationReason termination_reason = 6;
+  // The thread's input (JSON).
+  bytes input = 7;
+  // The thread's decided output (JSON), present once COMPLETED.
+  bytes output = 8;
+  // The thread's variable scope — returned alongside the entity.
+  map<string, bytes> variables = 9;
+}
+enum ThreadStatus {
+  THREAD_STATUS_UNSPECIFIED = 0;
+  THREAD_STATUS_RUNNING = 1;
+  THREAD_STATUS_COMPLETING = 2;
+  THREAD_STATUS_TERMINATING = 3;
+  THREAD_STATUS_COMPLETED = 4;
+  THREAD_STATUS_TERMINATED = 5;
+}
+
+// The persisted projection row of an Activity (one executing state), mirroring `Activity`.
+message Activity {
+  ObjectMeta meta = 1;
+  // The top-level execution this activity belongs to (the flat query anchor).
+  ObjectReference execution = 2;
+  // The complete JSON Pointer to this state's definition within the shared machine.
+  string state_path = 3;
+  ActivityStatus status = 4;
+  // Present when `status` is TERMINATING/TERMINATED.
+  TerminationReason termination_reason = 5;
+  // The raw input received on entry (JSON).
+  bytes raw_input = 6;
+  // The processed input the state runs on (JSON); empty before processing.
+  bytes input = 7;
+  // The raw result before Output projection (JSON).
+  bytes raw_output = 8;
+  // The terminal output after Output projection (JSON), present once COMPLETED.
+  bytes output = 9;
+  // The state-specific runtime repository (`ActivityState`: Parallel/Map fan-out), serde JSON.
+  bytes activity_state = 10;
+  // The retry runtime state (`RetryState`), serde JSON; empty until a retry has occurred.
+  bytes retry_state = 11;
+}
+enum ActivityStatus {
+  ACTIVITY_STATUS_UNSPECIFIED = 0;
+  ACTIVITY_STATUS_RUNNING = 1;
+  ACTIVITY_STATUS_COMPLETING = 2;
+  ACTIVITY_STATUS_TERMINATING = 3;
+  ACTIVITY_STATUS_COMPLETED = 4;
+  ACTIVITY_STATUS_TERMINATED = 5;
+}
+
+// The persisted projection row of a Timer, mirroring `Timer`.
+message Timer {
+  ObjectMeta meta = 1;
+  // The top-level execution this timer belongs to.
+  ObjectReference execution = 2;
+  TimerPurpose purpose = 3;
+  TimerStatus status = 4;
+  // Absolute wall-clock moment the timer fires, milliseconds since the UNIX epoch.
+  int64 deadline_millis = 5;
+}
+enum TimerPurpose {
+  TIMER_PURPOSE_UNSPECIFIED = 0;
+  // The state-machine `TimeoutSeconds` deadline; firing terminates the execution `TimedOut`.
+  TIMER_PURPOSE_EXECUTION_TIMEOUT = 1;
+  // A `Wait` state's `Seconds` delay; firing completes the owning state.
+  TIMER_PURPOSE_WAIT_RESUME = 2;
+  // A Task state's `TimeoutSeconds` deadline; firing fails the in-flight task `States.Timeout`.
+  TIMER_PURPOSE_TASK_TIMEOUT = 3;
+  // The delivery lease on a claimed Task; firing re-queues a stalled worker's task.
+  TIMER_PURPOSE_DELIVERY_LEASE = 4;
+}
+enum TimerStatus {
+  TIMER_STATUS_UNSPECIFIED = 0;
+  TIMER_STATUS_ACTIVE = 1;
+  TIMER_STATUS_COMPLETED = 2;
+  TIMER_STATUS_CANCELLED = 3;
+}
+
+// The persisted projection row of a Task, mirroring `Task`.
+message Task {
+  ObjectMeta meta = 1;
+  // The owning top-level run.
+  ObjectReference execution = 2;
+  // The Resource URI the task calls.
+  string resource = 3;
+  // The projected arguments passed to the resource (JSON).
+  bytes arguments = 4;
+  TaskStatus status = 5;
+  // The ASL `TimeoutSeconds` deadline (millis since epoch); empty when none.
+  int64 deadline_millis = 6;
+  // The worker currently leasing this task; empty when unclaimed.
+  string worker_id = 7;
+  // The claiming worker's lease expiry (millis since epoch); empty unless RUNNING.
+  int64 lease_until_millis = 8;
+  // The frozen Retry plan (serde JSON), empty when no retry.
+  bytes retry_plan = 9;
+  // The retry run-state (`RetryState`, serde JSON).
+  bytes retry_state = 10;
+}
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_COMPLETED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_CANCELLED = 5;
+}
+
+// --- Write/command messages (kept from the pre-Query API) ---
 
 message CreateFlowRequest {
   // The immutable logical flow name ([A-Za-z0-9_], 1..=64). Recreating a name bumps its version.
@@ -88,37 +366,9 @@ message StartExecutionResponse {
   // The ExecutionId (ULID string), issued at birth — usable with StopExecution's optional `uid`
   // incarnation guard.
   string execution_id = 1;
-  // The execution's user-supplied name — the per-scope-unique handle subsequent GetExecution /
+  // The execution's user-supplied name — the per-scope-unique handle subsequent Query reads /
   // StopExecution calls resolve by.
   string name = 2;
-}
-
-message GetExecutionRequest {
-  // The execution's user-supplied name (as passed to StartExecution) — the per-scope-unique key the
-  // projection is indexed by.
-  string name = 1;
-}
-message GetExecutionResponse {
-  // The execution's lifecycle state (a point-in-time snapshot).
-  ExecutionState state = 1;
-  // Terminal state output (JSON), present once state == COMPLETED.
-  bytes output = 2;
-  // ASL error name, present once state == TERMINATED (e.g. "States.NoChoiceMatched").
-  string error_name = 3;
-  // Error output (JSON), present once state == TERMINATED.
-  bytes error_output = 4;
-}
-
-enum ExecutionState {
-  EXECUTION_STATE_UNSPECIFIED = 0;
-  // Still in flight (Running / Completing / Terminating).
-  ACTIVE = 1;
-  // Settled successfully; `output` carries the result.
-  COMPLETED = 2;
-  // Settled abnormally; `error_name` / `error_output` describe the failure.
-  TERMINATED = 3;
-  // No projection exists for the requested id (never created or GC'd).
-  NOT_FOUND = 4;
 }
 
 message StopExecutionRequest {
@@ -129,27 +379,10 @@ message StopExecutionRequest {
   string uid = 2;
 }
 // StopExecution is fire-and-forget (non-blocking): this empty confirmation only means the
-// termination command was accepted, not that the execution has settled — poll GetExecution for that.
+// termination command was accepted, not that the execution has settled — poll Query for that.
 message StopExecutionResponse {
   // The execution name the termination was issued for, echoed back as confirmation.
   string name = 1;
-}
-
-// Task lifecycle: the out-of-process worker's inbound claim/settle API — the wire realization of the
-// in-process `TaskApi` (Zeebe's ActivateJobs / CompleteJob / FailJob). A worker polls available work
-// by resource, executes its handler, then settles each claim with a complete (success) or fail
-// (error). The server validates every call against the log (single-writer), exactly as the in-process
-// engine-side trait does.
-service Task {
-  // Pull up to `max_tasks` available (`Pending`) tasks of `resource`, leasing each to `worker_id` for
-  // `lease_seconds`. Non-blocking discovery (a point-in-time claim): returns whatever is claimable
-  // now — possibly empty — and the client polls its own cadence, mirroring GetExecution.
-  rpc PollTasks(PollTasksRequest) returns (PollTasksResponse);
-  // Report a task completed with `output`. Fire-and-forget: the empty confirmation only means the
-  // settlement command was accepted; any subsequent validation failure is observed on the next poll.
-  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
-  // Report a task failed with `error`. Fire-and-forget, mirroring CompleteTask.
-  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
 }
 
 message PollTasksRequest {

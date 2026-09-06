@@ -22,17 +22,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
-use spica_client::worker::{
-    ClaimedTask, InMemoryTaskService, TaskApi as WorkerTaskApi, TaskApiError, TaskFailure,
-    TaskHandler, TaskService,
-};
+use spica_client::worker::{InMemoryTaskService, TaskFailure, TaskHandler, TaskService};
 use spica_engine::{
-    EngineBuilder, Entry, EntryId, EntryPayload, ExecutionError, ExecutionResult, FlowName,
-    InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId,
+    EngineBuilder, Entry, EntryId, EntryPayload, ExecutionResult, InMemoryLogStream, LogStream,
+    StreamId,
 };
-use spica_scheduler::InMemoryScheduler;
 use spica_storage::InMemoryStorage;
 use tokio_util::sync::CancellationToken;
+
+// The blocking convenience client (create_flow / start_for_revision + ack correlation) now lives with
+// the consumer, not the engine; the example reuses the integration suite's `tests/common` LocalClient.
+#[path = "../tests/common/mod.rs"]
+mod common;
 
 /// A `LogStream` wrapper that carries its own `Arc` handle so the log can be read back for the dump:
 /// the builder consumes a `Box<dyn LogStream>`, but we hand it a clone of this shared wrapper and keep
@@ -58,85 +59,6 @@ impl LogStream<EntryPayload> for SharedLog {
     }
 }
 
-/// The engine-side half of the worker boundary inside this example: presents the engine's inbound
-/// [`spica_engine::TaskApi`] as the worker-facing [`spica_client::worker::TaskApi`] so an
-/// [`InMemoryTaskService`] completes Tasks against the running engine. (Mirrors `tests/common`.)
-struct EngineTaskApi {
-    inner: Arc<dyn spica_engine::TaskApi>,
-}
-
-impl EngineTaskApi {
-    fn new(inner: Arc<dyn spica_engine::TaskApi>) -> Self {
-        Self { inner }
-    }
-    fn task_name(s: &str, op: &str) -> Result<spica_engine::ObjectName, TaskApiError> {
-        spica_engine::ObjectName::from_parsed(s)
-            .map_err(|_| TaskApiError(format!("{op}: invalid task name: {s:?}")))
-    }
-    fn request_id(s: &str, op: &str) -> Result<spica_engine::RequestId, TaskApiError> {
-        s.parse::<ulid::Ulid>()
-            .map(spica_engine::RequestId::from)
-            .map_err(|_| TaskApiError(format!("{op}: invalid request_id ULID: {s:?}")))
-    }
-}
-
-#[async_trait]
-impl WorkerTaskApi for EngineTaskApi {
-    async fn poll_tasks(
-        &self,
-        worker_id: &str,
-        resource: &str,
-        max_tasks: usize,
-        lease_seconds: u64,
-    ) -> Result<Vec<ClaimedTask>, TaskApiError> {
-        let tasks = self
-            .inner
-            .poll_tasks(worker_id, resource, max_tasks, lease_seconds)
-            .await
-            .map_err(|e| TaskApiError(e.to_string()))?;
-        Ok(tasks
-            .into_iter()
-            .map(|t| ClaimedTask {
-                task_name: t.task.as_str().to_string(),
-                resource: t.resource,
-                arguments: t.arguments,
-            })
-            .collect())
-    }
-    async fn complete(
-        &self,
-        worker_id: &str,
-        task_name: &str,
-        request_id: &str,
-        output: Value,
-    ) -> Result<(), TaskApiError> {
-        let name = Self::task_name(task_name, "CompleteTask")?;
-        let request_id = Self::request_id(request_id, "CompleteTask")?;
-        self.inner
-            .complete(worker_id, name, request_id, output)
-            .await
-            .map_err(|e| TaskApiError(e.to_string()))
-    }
-    async fn fail(
-        &self,
-        worker_id: &str,
-        task_name: &str,
-        error: TaskFailure,
-    ) -> Result<(), TaskApiError> {
-        let name = Self::task_name(task_name, "FailTask")?;
-        let TaskFailure { error_name, output } = error;
-        let exec_err = ExecutionError::Runtime(RuntimeError::StateFailed {
-            state: String::new(),
-            error: error_name,
-            output: Box::new(output),
-        });
-        self.inner
-            .fail(worker_id, name, exec_err)
-            .await
-            .map_err(|e| TaskApiError(e.to_string()))
-    }
-}
-
 /// A `TaskHandler` that echoes its arguments back as the task's output.
 #[derive(Default)]
 struct EchoHandler;
@@ -148,49 +70,62 @@ impl TaskHandler for EchoHandler {
     }
 }
 
-fn anonymous_name() -> FlowName {
-    FlowName::new(&format!("anon_{}", ulid::Ulid::new()))
-        .expect("a ULID-suffixed anonymous name always satisfies FlowName's charset")
-}
-
-fn execution_name() -> ObjectName {
-    ObjectName::plain(&format!("run_{}", ulid::Ulid::new()))
-        .expect("a ULID-suffixed user name is always valid")
-}
-
 fn parse_sm(s: &str) -> StateMachine {
     serde_json::from_str(s).expect("state machine fixture must parse")
 }
 
-/// Render one log [`Entry`] — its envelope plus its full payload (Command / Event / Noop / Reject)
-/// as pretty JSON, so the whole logstream is visible in real log order. The envelope fields are the
-/// durable log facts: the causal `entry_id` (batch position), the `cause_id` (the producing
-/// command), the `stream_id`, and the frozen `timestamp`.
-fn entry_line(entry: &Entry) -> String {
-    let (kind, body) = match &entry.payload {
-        EntryPayload::Command(c) => (
-            "COMMAND",
-            serde_json::to_string_pretty(c).unwrap_or_else(|_| "<unserializable>".into()),
-        ),
-        EntryPayload::Event(e) => (
-            "EVENT  ",
-            serde_json::to_string_pretty(e).unwrap_or_else(|_| "<unserializable>".into()),
-        ),
-        EntryPayload::Noop => ("NOOP   ", "{}".to_string()),
-        EntryPayload::Reject(r) => (
-            "REJECT ",
-            serde_json::to_string_pretty(r).unwrap_or_else(|_| "<unserializable>".into()),
-        ),
-    };
-    let body = body.replace('\n', "\n        ");
-    let cause = entry
-        .cause_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    format!(
-        "[{kind} entry {} cause {cause} stream {}]\n        {body}\n",
-        entry.entry_id, entry.stream_id
-    )
+/// One log [`Entry`] rendered as a JSON node: the durable envelope (`entry_id`/`cause_id`/`stream_id`
+/// /`timestamp`) plus the full payload. `children` is filled by [`attach_children`].
+fn entry_node(entry: &Entry) -> Value {
+    json!({
+        "entry_id": entry.entry_id.to_string(),
+        "cause_id": entry.cause_id.map(|c| c.to_string()),
+        "stream_id": entry.stream_id.to_string(),
+        "timestamp": serde_json::to_value(entry.timestamp).unwrap_or(Value::Null),
+        "payload": serde_json::to_value(&entry.payload).unwrap_or(Value::Null),
+        "children": [],
+    })
+}
+
+/// Recursively render one node and graft its children — the entries whose `cause_id` names this
+/// `entry_id`. A Command's produced Events *and* its batch-terminating Noop hang directly under it,
+/// so the whole causal batch reads as one subtree.
+fn attach_children(
+    entry_id: EntryId,
+    by_id: &HashMap<EntryId, &Entry>,
+    children_of: &HashMap<EntryId, Vec<EntryId>>,
+) -> Value {
+    let entry = by_id[&entry_id];
+    let kids = children_of
+        .get(&entry_id)
+        .map(|ids| {
+            ids.iter()
+                .map(|id| attach_children(*id, by_id, children_of))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut node = entry_node(entry);
+    node["children"] = json!(kids);
+    node
+}
+
+/// The whole log as one tree rooted at cause: each no-cause Command is a root, and every later entry
+/// is a child of the entry that produced it (its `cause_id`). Real log order is preserved because
+/// every parent precedes its children, and children are attached in order.
+fn build_tree(entries: &[Entry]) -> Value {
+    let by_id: HashMap<EntryId, &Entry> = entries.iter().map(|e| (e.entry_id, e)).collect();
+    let mut children_of: HashMap<EntryId, Vec<EntryId>> = HashMap::new();
+    for entry in entries {
+        if let Some(cause) = &entry.cause_id {
+            children_of.entry(*cause).or_default().push(entry.entry_id);
+        }
+    }
+    let roots: Vec<Value> = entries
+        .iter()
+        .filter(|e| e.cause_id.is_none())
+        .map(|e| attach_children(e.entry_id, &by_id, &children_of))
+        .collect();
+    json!({ "roots": roots })
 }
 
 /// The happy-path machine: a Pass, a Choice (JSONata condition), a Wait (1s timer), a Task (worker),
@@ -252,72 +187,45 @@ const FAIL_SM: &str = r#"{
 #[tokio::main]
 async fn main() {
     let out_path = "/Users/bytedance/workspace/github.com/anyvoxel/spica/events_dump.json";
-    let mut dump = String::new();
-
-    dump.push_str("=== spica engine logstream dump ===\n");
-    dump.push_str(
-        "Every log entry in real log order: Commands (read + dispatched by the leader), the\n",
-    );
-    dump.push_str(
-        "Events they produced, the terminating Noop that commits each causal batch, and any\n",
-    );
-    dump.push_str(
-        "Rejections — with the envelope fields (entry/cause/stream) that stitch cause→effect.\n",
-    );
-    dump.push_str("Note the retained two-phase Activate/Complete model: every synchronous state\n");
-    dump.push_str(
-        "(Pass/Choice/Succeed) spans TWO causal batches (Activate, then Complete). Succeed and\n",
-    );
-    dump.push_str("Fail are both terminal, so Fail is shown in a separate run.\n\n");
-
-    run_and_dump(
-        "RUN 1 — happy path (Pass, Choice, Wait, Task, Parallel, Map, Succeed)",
-        HAPPY_SM,
-        json!({ "greet": "hi", "items": [ { "n": 1 }, { "n": 2 } ] }),
-        &mut dump,
+    // Each run becomes one JSON object whose `log` is a tree rooted at cause: a no-cause Command is a
+    // root, and every entry hangs as a child of the entry that produced it (its `cause_id`).
+    let runs = vec![
+        run_tree(
+            "RUN 1 — happy path (Pass, Choice, Wait, Task, Parallel, Map, Succeed)",
+            HAPPY_SM,
+            json!({ "greet": "hi", "items": [ { "n": 1 }, { "n": 2 } ] }),
+        )
+        .await,
+        run_tree("RUN 2 — terminal Fail (Pass -> Fail)", FAIL_SM, Value::Null).await,
+    ];
+    let out = json!({ "runs": runs });
+    std::fs::write(
+        out_path,
+        serde_json::to_string_pretty(&out).expect("the dump serializes to JSON"),
     )
-    .await;
-
-    dump.push_str("\n\n");
-    run_and_dump(
-        "RUN 2 — terminal Fail (Pass -> Fail)",
-        FAIL_SM,
-        Value::Null,
-        &mut dump,
-    )
-    .await;
-
-    std::fs::write(out_path, &dump).expect("write event dump to file");
+    .expect("write event dump to file");
     println!("wrote event dump to {out_path}");
-    eprintln!("{dump}");
 }
 
 /// Build an engine backed by a shared (readable) log + a worker, run one machine, wait for its
-/// outcome, and append every log Event to `dump` under `title`.
-async fn run_and_dump(title: &str, sm_def: &str, input: Value, dump: &mut String) {
-    dump.push_str(&format!("== {title} ==\n"));
-    dump.push_str(&format!(
-        "state machine input: {}\n\n",
-        serde_json::to_string_pretty(&input).unwrap()
-    ));
-
+/// outcome, and return a JSON object carrying the run's input, outcome, and its whole log as a
+/// cause-rooted entry tree.
+async fn run_tree(title: &str, sm_def: &str, input: Value) -> Value {
     // Build the shared log + storage + scheduler, and the engine over them.
     let log = Arc::new(tokio::sync::Mutex::new(
         InMemoryLogStream::<EntryPayload>::new(),
     ));
-    let engine = EngineBuilder::with_backends(
+    let engine = common::LocalClient::start(EngineBuilder::with_backends(
         Box::new(SharedLog(log.clone())),
         Box::new(InMemoryStorage::new()),
-    )
-    .with_scheduler(InMemoryScheduler::spawn())
-    .start()
+    ))
     .await
     .expect("start engine");
 
     // Boot a worker against the engine's inbound TaskApi so the Task state completes.
     let cancel = CancellationToken::new();
     let worker = {
-        let api = Arc::new(EngineTaskApi::new(engine.task_api()));
+        let api = Arc::new(common::EngineTaskApi::new(Arc::new(engine.clone())));
         let cancel = cancel.clone();
         let handlers: HashMap<String, Arc<dyn TaskHandler>> = HashMap::from([(
             "arn:aws:states:::lambda:invoke".to_string(),
@@ -330,34 +238,25 @@ async fn run_and_dump(title: &str, sm_def: &str, input: Value, dump: &mut String
     let sm = parse_sm(sm_def);
     let definition = serde_json::to_string(&sm).unwrap();
     let flow_version = engine
-        .create_flow(anonymous_name(), &definition)
+        .create_flow(common::anonymous_name(), &definition)
         .await
         .expect("create flow");
     let execution = engine
-        .start_for_revision(execution_name(), flow_version, input)
+        .start_for_revision(common::execution_name(), flow_version, input.clone())
         .await
         .expect("start execution");
 
     // Await the terminal outcome (Completed => Ok; a Fail run => Err with the StateFailed reason).
-    let outcome = engine.wait_for_execution(&execution).await;
-    match &outcome {
-        Ok(ExecutionResult { output }) => {
-            dump.push_str(&format!("run output: {output}\n\n"));
-        }
-        Err(e) => {
-            dump.push_str(&format!("run terminated with error: {e}\n\n"));
-        }
-    }
+    let result = match engine.wait_for_execution(&execution).await {
+        Ok(ExecutionResult { output }) => json!({ "output": output }),
+        Err(e) => json!({ "error": e.to_string() }),
+    };
 
     cancel.cancel();
     let _ = worker.await;
 
-    // Dump the entire log: every Command (which the leader read and dispatched), the produced
-    // Events, the terminating Noop that commits each causal batch, and any Rejections — all in real
-    // log order, with the envelope fields that stitch cause→effect together.
-    let entries = log.lock().await.entries();
-    for entry in &entries {
-        dump.push_str(&entry_line(entry));
-    }
+    // The durable log is the single source of truth for the whole trace; render it as a tree.
+    let log_val = build_tree(&log.lock().await.entries());
     drop(engine);
+    json!({ "title": title, "input": input, "result": result, "log": log_val })
 }

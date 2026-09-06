@@ -16,15 +16,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::engine::AckRouter;
+use crate::hook::Hook;
 use crate::log::{Entry, Timestamp};
-use crate::scheduler::Scheduler;
 use crate::storage::{Storage, StorageTxn};
-use crate::task_api::ActivatedTask;
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::types::id::{EntryId, RequestId};
+use crate::types::id::EntryId;
+use crate::working::WorkingState;
 
 /// The processing role installed in the driver's [`Box<dyn ProcessingStateMachine>`]. Modelling it as
 /// an enum (rather than a free-form string) lets the driver and callers branch on role — e.g. only
@@ -52,26 +51,26 @@ impl std::fmt::Display for Role {
 }
 
 /// The injected runtime handles a [`ProcessingStateMachine`] reaches through: the projection
-/// [`Storage`], the timer [`Scheduler`], and the request [`AckRouter`]. Bundled so the three process
+/// [`Storage`] and the observation [`Hook`] the driver reports facts to (whose concrete
+/// implementation is the request AckHook, owned by the consumer). Bundled so the three process
 /// entry-points share one signature, even though a given role may touch only a subset (a follower
-/// folds no projection and delivers no acks, for example).
+/// folds no projection and reports no facts, for example).
 pub(crate) struct ProcessingHandles {
     pub(crate) storage: Arc<Mutex<Box<dyn Storage>>>,
-    pub(crate) scheduler: Arc<dyn Scheduler>,
-    pub(crate) ack: Arc<Mutex<AckRouter>>,
+    pub(crate) hook: Arc<dyn Hook>,
 }
 
 /// What a role reports after processing one **command** entry.
 ///
 /// `entries` are what the driver appends to the log (always empty for a follower, which produces
-/// nothing). `grants` are the task sets a `ClaimTasks` decided at discovery — they must be answered
-/// even when the pull produced no events, so the driver delivers them immediately after the append,
-/// rather than deferring them to an event the way a [`CompleteRequest`](crate::handler::AckSideEffect::CompleteRequest)
-/// ack is deferred.
+/// nothing). Every response — including a `ClaimTasks` grant — rides a durable entry, so nothing is
+/// reported outside the appended batch.
 pub(crate) struct CommandProcessed {
     pub(crate) entries: Vec<Entry>,
-    /// `(request_id, granted tasks)` pairs the driver delivers once the append is durable.
-    pub(crate) grants: Vec<(RequestId, Vec<ActivatedTask>)>,
+    /// The working projection overlay of this batch, already eager-folded during dispatch. The driver
+    /// commits it (with the batch-end watermark) once its append is durable, and drops it — rolling
+    /// back — on an append failure, so the txn is the authoritative, crash-consistent fold of the batch.
+    pub(crate) work: WorkingState,
 }
 
 /// The per-role processing contract for a single log entry, mirroring Zeebe's `ProcessingStateMachine`
@@ -103,26 +102,14 @@ pub(crate) trait ProcessingStateMachine: Send + std::any::Any {
     fn set_resume_position(&mut self, position: i64);
 
     /// Process (but do not append) one [`Command`] entry. The **leader** dispatches it into produced
-    /// `entries` + task `grants`; the driver appends `entries` (terminated by a `Noop`), folds them,
-    /// and delivers `grants`. A follower's implementation returns nothing and produces no entries.
+    /// `entries`; the driver appends `entries` (terminated by a `Noop`), folds them, and reports
+    /// their durable facts. A follower's implementation returns nothing and produces no entries.
     async fn process_command(
         &mut self,
         entry_id: EntryId,
         command: &Command,
         handles: &ProcessingHandles,
     ) -> Result<CommandProcessed, ExecutionError>;
-
-    /// Eager-apply a just-appended, non-empty produced `batch` into the **driver-owned** `txn` —
-    /// **leader only**. Folds the batch's Events in one atomic projection transaction and returns the
-    /// batch-end watermark to commit (the terminating [`EntryPayload::Noop`](crate::log::EntryPayload::Noop)
-    /// position), so apply atomicity matches the append's and the read-back pass skips these Events
-    /// instead of re-processing them. A follower produces no batches, so it returns `None` (no-op).
-    async fn apply_batch(
-        &mut self,
-        txn: &mut dyn StorageTxn,
-        batch: &[Entry],
-        handles: &ProcessingHandles,
-    ) -> Result<Option<i64>, ExecutionError>;
 
     /// Fold one read-back [`Event`] into the **driver-owned** `txn`. Both roles fold into the same
     /// transaction the driver already opened; they differ in what the driver does with the returned

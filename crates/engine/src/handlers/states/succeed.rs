@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use spica_asl::{State, SucceedState};
 
 use super::super::state_handler::StateHandler;
@@ -8,15 +9,16 @@ use crate::types::meta::ObjectReference;
 
 pub struct SucceedStateHandler;
 
+#[async_trait]
 impl StateHandler for SucceedStateHandler {
     fn state(&self) -> State {
         State::Succeed(SucceedState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
@@ -24,20 +26,21 @@ impl StateHandler for SucceedStateHandler {
         // No side effect: a Succeed state's success is resolved in the complete step. Emit the
         // activation-complete ed, then hand off to the complete step via `CompleteState`.
         out.emit_event(crate::types::event::Event::StateActivated {
-            activity: state_activated_value(actx, actx.activity.input.clone(), None),
-        });
+            activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
+        })
+        .await;
         out.emit_command(crate::types::command::Command::CompleteState {
             activity,
             // A Succeed's raw result is its processed input (no distinct raw output); the complete
             // step projects any `Output` template from it.
-            output: actx.activity.input.clone(),
+            output: actx.activity.raw_input.clone(),
         });
     }
 
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -50,27 +53,27 @@ impl StateHandler for SucceedStateHandler {
                 "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        complete_succeed(env, out, activity, actx, s);
+        complete_succeed(env, out, activity, actx, s).await;
     }
 }
 
 // Terminal: complete the state with its (evaluated) output, then complete the whole execution with
 // the same output. `StateCompleting` is emitted by the `CompleteStateHandler` framework; this
 // projects the output, emits `StateCompleted`, and routes to `End` (`CompleteExecution`).
-fn complete_succeed(
+async fn complete_succeed(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &SucceedState,
 ) {
     let states = crate::types::context::build_states(
-        &actx.activity.input,
-        Some(&actx.activity.input),
+        &actx.activity.raw_input,
+        Some(&actx.activity.raw_input),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // no Catch `errorOutput` in the succeed path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -85,11 +88,12 @@ fn complete_succeed(
                 .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &actx.variables)
         ),
-        None => actx.activity.input.clone(),
+        None => actx.activity.raw_input.clone(),
     };
     out.emit_event(crate::types::event::Event::StateCompleted {
         activity: state_completed_value(actx, output.clone()),
-    });
+    })
+    .await;
     emit_transition(
         out,
         actx.activity.execution.clone(),
@@ -103,5 +107,6 @@ fn complete_succeed(
         &output,
         None,
         Some(true),
-    );
+    )
+    .await;
 }

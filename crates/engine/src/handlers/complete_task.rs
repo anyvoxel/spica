@@ -13,9 +13,10 @@ use crate::types::reject::RejectionType;
 ///
 /// A request/**response** boundary (mirroring `CreateFlow`/`CreateExecution`): the worker mints a
 /// `request_id` and the outcome is echoed back through it — the applied [`Event::TaskCompleted`] on
-/// success (via `ack_request`), or a [`Reject`](crate::Reject) when the settlement guard refuses
-/// (via `Collector::reject`). Without this a `CompleteTask` would be fire-and-forget; with it,
-/// `TaskApi::complete` awaits and reports the *actual* processing result to the completing worker.
+/// success (an injected `Hook` observer wakes the awaiter), or a [`Reject`](crate::Reject) when the
+/// settlement guard refuses (via `Collector::reject`). Without this a `CompleteTask` would be
+/// fire-and-forget; with it, `TaskApi::complete` awaits and reports the *actual* processing result
+/// to the completing worker.
 ///
 /// Idempotent and lease-guarded: the authoritative settlement guard is that the task is currently
 /// `Running` (leased) **to the reporting `worker_id`**. A late `CompleteTask` after a cancel, a
@@ -40,7 +41,7 @@ impl CommandHandler for CompleteTaskHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CompleteTask {
             request_id,
             task,
@@ -124,16 +125,16 @@ impl CommandHandler for CompleteTaskHandler {
         task_value.worker_id = None;
         task_value.lease_until = None;
         // Stamp the completion moment; `created_at` is already carried on `task_value`.
-        task_value.meta.touch(crate::log::Timestamp::now());
+        task_value.meta.with_update_at(crate::log::Timestamp::now());
         let completed = Event::TaskCompleted {
             request_id: *request_id,
             task: task_value,
             output: output.clone(),
         };
-        // The success settlement echoes the worker's own request id back as the ack — the request/response
-        // contract that lets the awaiting `TaskApi::complete` report that this settlement was applied.
-        out.ack_request(*request_id, completed.clone());
-        out.emit_event(completed);
+        // The success settlement echoes the worker's own request id back on the event; the `AckHook`
+        // observer wakes the awaiting `TaskApi::complete` with it (the request/response contract that
+        // lets it report this settlement was applied).
+        out.emit_event(completed).await;
         // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // before `CompleteState`: the M1 activity-completion guard refuses to finish an activity that
         // still has live children, and a settled task must leave none behind. Fired-since timers are

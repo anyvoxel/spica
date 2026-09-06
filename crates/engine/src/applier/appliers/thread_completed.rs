@@ -20,11 +20,12 @@ impl EventApplier for ThreadCompletedApplier {
                 status: ThreadStatus::Completed,
                 input: Default::default(),
                 output: Some(Default::default()),
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Thread,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -47,7 +48,7 @@ impl EventApplier for ThreadCompletedApplier {
             // A terminal thread cannot still hold an in-flight state activation cursor.
             row.current_activity = None;
             let parent = row.value.meta.owner.clone();
-            row.touch(ctx.timestamp);
+            row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
             if let Some(owner) = parent {
                 ctx.storage.remove_child(owner, thread.reference()).await?;

@@ -31,12 +31,12 @@ impl CompleteStateHandler {
 
     async fn cascade_parent_after_terminal(
         &self,
-        ctx: &HandlerContext<'_>,
-        out: &mut Collector,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
         activity: crate::types::meta::ObjectReference,
     ) {
         // A synchronous state that owns no children drains its owner Execution as soon as its own
-        // terminal lands; notify the owner so its own handler walks the drain.
+        // terminal lands; run the inline reaction so the owner's own drain walks up.
         let owner = ctx
             .storage
             .get_activity(&activity)
@@ -51,10 +51,7 @@ impl CompleteStateHandler {
                     .expect("an owned activity has an owner")
             });
         if let Some(owner) = owner {
-            out.emit_command(crate::types::command::Command::ProcessChildCompleted {
-                owner,
-                child: activity,
-            });
+            super::child_completed::child_settled(ctx, out, owner, activity).await;
         }
     }
 }
@@ -74,7 +71,7 @@ impl CommandHandler for CompleteStateHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CompleteState {
             activity,
             output: raw_result,
@@ -120,7 +117,8 @@ impl CommandHandler for CompleteStateHandler {
                     activity_value.status = ActivityStatus::Terminated(reason.clone());
                     out.emit_event(crate::types::event::Event::StateTerminated {
                         activity: activity_value,
-                    });
+                    })
+                    .await;
                 }
                 _ => return,
             }
@@ -210,10 +208,15 @@ impl CommandHandler for CompleteStateHandler {
         // command). This keeps the ing uniform across states regardless of their output handling.
         out.emit_event(crate::types::event::Event::StateCompleting {
             activity: state_completing_value(&actx),
-        });
+        })
+        .await;
 
         match self.state_handlers.get(&std::mem::discriminant(state_def)) {
-            Some(handler) => handler.complete(ctx.env, out, activity.clone(), &actx, state_def),
+            Some(handler) => {
+                handler
+                    .complete(ctx.env, out, activity.clone(), &actx, state_def)
+                    .await
+            }
             None => out.terminate(
                 Some(activity.clone()),
                 scope_ref.clone(),

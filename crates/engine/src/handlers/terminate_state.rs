@@ -8,8 +8,7 @@ use crate::types::meta::ObjectKind;
 /// Handles `Command::TerminateState`: the abnormal finish of the activity bound to it, with
 /// `reason`. Emits `StateTerminating`, sweeps the activity's owned children (M1: only timers —
 /// e.g. a Wait cancelled mid-flight), and emits `StateTerminated{reason}` immediately when the
-/// activity is childless; otherwise the ed is emitted by [`super::cascade_up`] as the last child
-/// terminates. A terminating activity's terminal ed then drains its parent (via cascade_up).
+/// activity is childless, then runs the inline child-settled reaction so its parent drains.
 #[derive(Default)]
 pub struct TerminateStateHandler;
 
@@ -22,7 +21,7 @@ impl CommandHandler for TerminateStateHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::TerminateState { activity, reason } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -52,22 +51,25 @@ impl CommandHandler for TerminateStateHandler {
             S::Terminated(ref reason) => {
                 // Re-emit the terminal ed with the recorded reason (ignore the incoming duplicate
                 // reason — it arrived later and is the parent's copy). The projection absorbs the
-                // duplicate; the owned parent then reacts via `ProcessChildCompleted` (activity already
-                // drained from its snapshot) and advances the parent's deferred terminations.
+                // duplicate; the owned parent then reacts via the inline child-settled cascade
+                // (activity already drained from its snapshot) and advances the parent's finish.
                 let mut activity_value = act.value();
                 activity_value.status = S::Terminated(reason.clone());
                 out.emit_event(crate::types::event::Event::StateTerminated {
                     activity: activity_value,
-                });
-                out.emit_command(Command::ProcessChildCompleted {
-                    owner: act
-                        .value
+                })
+                .await;
+                super::child_completed::child_settled(
+                    ctx,
+                    out,
+                    act.value
                         .meta
                         .owner
                         .clone()
                         .expect("an owned activity has an owner"),
-                    child: activity.clone(),
-                });
+                    activity.clone(),
+                )
+                .await;
                 return;
             }
             S::Completed => {
@@ -84,7 +86,8 @@ impl CommandHandler for TerminateStateHandler {
         terminating_activity.status = S::Terminating(reason.clone());
         out.emit_event(Event::StateTerminating {
             activity: terminating_activity,
-        });
+        })
+        .await;
 
         // M1 sweeps the full materialized child set here. TODO(termination+batching): if this ever
         // chunks the sweep Zeebe-style (a partition-scanned `(parent, index)` resume with follow-up
@@ -147,16 +150,19 @@ impl CommandHandler for TerminateStateHandler {
             terminated_activity.status = S::Terminated(reason.clone());
             out.emit_event(Event::StateTerminated {
                 activity: terminated_activity,
-            });
-            out.emit_command(Command::ProcessChildCompleted {
-                owner: act
-                    .value
+            })
+            .await;
+            super::child_completed::child_settled(
+                ctx,
+                out,
+                act.value
                     .meta
                     .owner
                     .clone()
                     .expect("an owned activity has an owner"),
-                child: activity.clone(),
-            });
+                activity.clone(),
+            )
+            .await;
         } else {
             tracing::debug!(
                 activity = %activity,

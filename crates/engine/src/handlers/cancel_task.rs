@@ -22,7 +22,7 @@ impl CommandHandler for CancelTaskHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::CancelTask { task } = cmd else {
             unreachable!(
                 "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
@@ -44,14 +44,15 @@ impl CommandHandler for CancelTaskHandler {
                 // Stamp the cancel moment; `created_at` is carried forward by the explicit `meta`
                 // reading `task_value.meta.created_at` (the `..task_value` spread still fills the
                 // remaining fields).
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     task_value.meta.uid,
-                    task_value.meta.created_at,
-                    crate::log::Timestamp::now(),
-                ),
+                )
+                .timestamps(task_value.meta.created_at, crate::log::Timestamp::now())
+                .build(),
                 ..task_value
             },
-        });
+        })
+        .await;
     }
 }

@@ -25,12 +25,15 @@ impl EventApplier for TaskActivatedApplier {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         }
     }
@@ -52,6 +55,7 @@ impl EventApplier for TaskActivatedApplier {
         // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_task(row).await?;
+        super::bump_generated_seq(ctx.storage, &task.reference().name).await?;
         ctx.storage
             .add_child(
                 task.meta

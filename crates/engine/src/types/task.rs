@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_with::skip_serializing_none;
 
 use crate::log::Timestamp;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
@@ -48,15 +49,11 @@ impl RetryPolicy {
     pub fn resolve(retrier: &spica_asl::Retrier) -> Self {
         Self {
             error_equals: retrier.error_equals.clone(),
-            interval_seconds: retrier
-                .interval_seconds
-                .unwrap_or(DEFAULT_RETRY_INTERVAL_SECONDS),
-            max_attempts: retrier.max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
-            backoff_rate: retrier
-                .backoff_rate
-                .as_ref()
-                .and_then(|n| n.as_f64())
-                .unwrap_or(DEFAULT_RETRY_BACKOFF_RATE),
+            // The accessors own the spec defaults, so the frozen plan carries no None (and the
+            // engine never needs to know which default a field's absence implies).
+            interval_seconds: retrier.interval_seconds(),
+            max_attempts: retrier.max_attempts(),
+            backoff_rate: retrier.backoff_rate(),
             max_delay_seconds: retrier.max_delay_seconds,
         }
     }
@@ -93,11 +90,6 @@ pub struct RetryState {
     /// backoff. A task's poll/assign gates on it; `None` = immediately eligible or already claimed.
     pub next_available_at: Option<Timestamp>,
 }
-
-/// ASL `Retry` default for a `Retrier` that omits the optional fields (per the spec).
-const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 1;
-const DEFAULT_RETRY_MAX_ATTEMPTS: i64 = 3;
-const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
 
 /// Lifecycle status of a Task (the spica name for what Zeebe calls a *job*). Like `TimerStatus`, a
 /// task is a leaf side-effect node: it never initiates its own completion — it is either claimed
@@ -151,6 +143,7 @@ impl TaskStatus {
 /// a connected `Resource` with projected `arguments` as input. The value carries the task's own
 /// domain facts; storage may wrap it so the domain/projection boundary stays explicit, just as it
 /// does for `Activity` and `Timer`.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     /// Shared identity + timing metadata. The domain `created_at`/`updated_at` (stamped at each

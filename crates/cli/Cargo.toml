@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 # spica is a PURE-REMOTE client: the engine it drives lives in `spica-server`, reached over gRPC
-# (CreateFlow → StartExecution → poll GetExecution) — via the `spica-client` transport face, not by
+# (CreateFlow → StartExecution → poll Query GetObject) — via the `spica-client` transport face, not by
 # depending on the engine or on the wire contract/transport directly. See `src/main.rs`.
 [dependencies]
 anyhow.workspace = true

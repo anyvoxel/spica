@@ -44,10 +44,10 @@ impl StateHandler for ParallelStateHandler {
         })
     }
 
-    fn activate(
+    async fn activate(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -57,7 +57,7 @@ impl StateHandler for ParallelStateHandler {
                 "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        activate_parallel(env, out, activity, actx, s);
+        activate_parallel(env, out, activity, actx, s).await;
     }
 
     // A `Parallel` never completes through the shared `CompleteState` path: it is an async
@@ -65,17 +65,18 @@ impl StateHandler for ParallelStateHandler {
     // normal flow (nothing throws `CompleteState` on it). This arm stays as a defensive fallback —
     // if it is ever dispatched, there is nothing meaningful to project, so it routes the current
     // input onward to avoid wedging the state machine.
-    fn complete(
+    async fn complete(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
     ) {
         out.emit_event(Event::StateCompleted {
-            activity: state_completed_value(actx, actx.activity.input.clone()),
-        });
+            activity: state_completed_value(actx, actx.activity.raw_input.clone()),
+        })
+        .await;
         emit_transition(
             out,
             actx.activity.execution.clone(),
@@ -86,14 +87,16 @@ impl StateHandler for ParallelStateHandler {
                 .expect("an owned activity has an owner"),
             activity,
             actx.state_path(),
-            &actx.activity.input,
+            &actx.activity.raw_input,
             None,
             Some(true),
-        );
+        )
+        .await;
     }
 
-    /// The **replenish** hook, resumed by `ProcessChildCompleted`'s Running arm once the last branch
-    /// has settled and drained this activity's `active_children`. With every branch terminal:
+    /// The **replenish** hook, dispatched by the inline child-settled reaction's Running arm once the
+    /// last branch has settled and drained this activity's `active_children`. With every branch
+    /// terminal:
     ///
     /// - if **any** branch failed, fail the whole `Parallel` (mirroring `fail.rs`, whose own
     ///   TerminateState + TerminateExecution sweep cancels the surviving sibling branches);
@@ -102,7 +105,7 @@ impl StateHandler for ParallelStateHandler {
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,
@@ -119,10 +122,10 @@ impl StateHandler for ParallelStateHandler {
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
         };
-        // `ProcessChildCompleted` now dispatches a `Running` activity's `child_completed` on *every*
-        // child settle (so a `Map` can replenish one slot at a time). A `Parallel` fans every branch
-        // out up front, so it must not try to converge mid-flight: it only owns its convergence once
-        // the *last* branch has drained `active_children`. Any earlier invocation (other siblings
+        // The inline child-settled reaction dispatches a `Running` activity's `child_completed` on
+        // *every* child settle (so a `Map` can replenish one slot at a time). A `Parallel` fans every
+        // branch out up front, so it must not try to converge mid-flight: it only owns its convergence
+        // once the *last* branch has drained `active_children`. Any earlier invocation (other siblings
         // still in flight) is a no-op here.
         if !act.active_children.is_empty() {
             return; // sibling branches still in flight — not converged yet.
@@ -134,7 +137,7 @@ impl StateHandler for ParallelStateHandler {
         // branch index so the aggregated output array matches the declared `Branches` order.
         // A non-`Parallel` repository here is an internal fault (a Parallel always fans out while
         // still `Running`); nothing to aggregate — defer.
-        let ActivityState::Parallel(progress) = &act.value.activity_state else {
+        let Some(ActivityState::Parallel(progress)) = act.value.activity_state.as_ref() else {
             return;
         };
         let mut entries: Vec<(usize, crate::types::meta::ObjectReference)> = progress
@@ -161,7 +164,7 @@ impl StateHandler for ParallelStateHandler {
                         "branch {child_scope_ref}"
                     ))),
                 };
-                fail_parallel(out, activity, actx, reason);
+                fail_parallel(out, activity, actx, reason).await;
                 return;
             };
             if let Some(reason) = child.termination_reason() {
@@ -169,7 +172,7 @@ impl StateHandler for ParallelStateHandler {
                 // branch fails, the entire Parallel state fails and all branches are stopped"). The
                 // recorded `reason` becomes the Parallel's own termination reason; the
                 // `TerminateExecution` sweep then stops the surviving sibling branches.
-                fail_parallel(out, activity, actx, reason.clone());
+                fail_parallel(out, activity, actx, reason.clone()).await;
                 return;
             }
             if child.is_terminal() {
@@ -177,20 +180,20 @@ impl StateHandler for ParallelStateHandler {
             } else {
                 // A non-terminal branch (still Running/Completing yet drained empty) is an internal
                 // fault; fail the Parallel rather than aggregate a partial result.
-                fail_parallel(out, activity, actx, TerminationReason::Cancelled);
+                fail_parallel(out, activity, actx, TerminationReason::Cancelled).await;
                 return;
             }
         }
 
         // All branches succeeded: the state's result is the ordered array of branch outputs.
         let aggregated = Value::Array(outputs);
-        finish_parallel(ctx.env, out, activity, actx, s, aggregated);
+        finish_parallel(ctx.env, out, activity, actx, s, aggregated).await;
     }
 }
 
-fn activate_parallel(
+async fn activate_parallel(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ParallelState,
@@ -199,12 +202,12 @@ fn activate_parallel(
     // result until its branches settle) and `assign_ctx = None`. A JSONata `Arguments` expression
     // may reference `$states.input` and in-scope variables.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.attempts,
+        actx.activity.retry_count(),
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -222,7 +225,7 @@ fn activate_parallel(
                 .expect("an owned activity has an owner"),
             env.eval_json(arguments, &states, &actx.variables)
         ),
-        None => actx.activity.input.clone(),
+        None => actx.activity.raw_input.clone(),
     };
 
     // Fan out each branch as a child Thread. Each child inherits `actx.activity.execution` (the flat
@@ -252,7 +255,8 @@ fn activate_parallel(
             arguments.clone(),
             Some(ActivityState::Parallel(Default::default())),
         ),
-    });
+    })
+    .await;
 }
 
 /// Build a child execution's `state_path` for branch `index` of `parallel_name`: the owning
@@ -286,18 +290,20 @@ fn child_pointer(actx: &ActivityCtx, index: usize) -> jsonptr::PointerBuf {
 /// activity's failure ed and throws `TerminateExecution` on the owning execution from the same step,
 /// mirroring `fail.rs::complete_fail`; the sweep then stops the surviving sibling branches (once the
 /// `TerminateState` sweep handles its `Execution` children).
-fn fail_parallel(
-    out: &mut Collector,
+async fn fail_parallel(
+    out: &mut Collector<'_>,
     _activity: ObjectReference,
     actx: &ActivityCtx,
     reason: TerminationReason,
 ) {
     out.emit_event(Event::StateTerminating {
         activity: state_terminating_value(actx, reason.clone()),
-    });
+    })
+    .await;
     out.emit_event(Event::StateTerminated {
         activity: state_terminated_value(actx, reason.clone()),
-    });
+    })
+    .await;
     super::super::emit_scope_termination(
         out,
         actx.activity
@@ -316,21 +322,21 @@ fn fail_parallel(
 /// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
 /// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the success
 /// finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing uniform.
-fn finish_parallel(
+async fn finish_parallel(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &ParallelState,
     aggregated: Value,
 ) {
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         Some(&aggregated), // `$states.result` = the ordered branch outputs
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // success path — no Catch `errorOutput`
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -362,7 +368,8 @@ fn finish_parallel(
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {
@@ -400,10 +407,12 @@ fn finish_parallel(
 
     out.emit_event(Event::StateCompleting {
         activity: state_completing_value(actx),
-    });
+    })
+    .await;
     out.emit_event(Event::StateCompleted {
         activity: state_completed_value(actx, output_value.clone()),
-    });
+    })
+    .await;
     emit_transition(
         out,
         actx.activity.execution.clone(),
@@ -417,5 +426,6 @@ fn finish_parallel(
         &output_value,
         state.next.as_deref(),
         state.end,
-    );
+    )
+    .await;
 }

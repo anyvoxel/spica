@@ -1,28 +1,29 @@
-//! The M1 in-memory implementation of [`Scheduler`](spica_engine::Scheduler).
+//! The M1 in-memory implementation of the [`Scheduler`] contract.
 //!
 //! The armed timers are recorded in the stream as durable facts (`TimerActivated`); this runtime is
 //! the *physical* wall-clock side effect driven by those facts. It receives `schedule`/`cancel`
-//! calls from the engine's run loop, tracks pending timers in a single long-lived [`DelayQueue`],
-//! and on expiry pushes the resumption command (`Command::TriggerTimer`) back to the engine through
-//! the [`TimerSink`](spica_engine::TimerSink) the engine injects at boot — never writing to the log
-//! itself, so the engine keeps its write/validation boundary.
+//! calls from the consumer (which re-derives them from the durable timer events), tracks pending
+//! timers in a single long-lived [`DelayQueue`], and on expiry pushes the resumption command
+//! (`Command::TriggerTimer`) back to the engine through the injected [`TimerSink`] — never writing to
+//! the log itself, so the engine keeps its write/validation boundary.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use spica_engine::{EntryId, ObjectReference, Scheduler, TimerSink, Timestamp};
+use spica_engine::{ObjectReference, Timestamp};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::time::DelayQueue;
 use tokio_util::time::delay_queue::Key;
 
-/// A message the engine pushes into the scheduler's inbox.
+use crate::{Scheduler, TimerSink};
+
+/// A message the consumer pushes into the scheduler's inbox.
 enum SchedulerInput {
     /// Arm a timer to fire `TriggerTimer` at the absolute `deadline`.
     Schedule {
         timer: ObjectReference,
         deadline: Timestamp,
-        cause_id: EntryId,
     },
     /// Cancel a previously-armed timer (a `TimerCancelled` event was applied).
     Cancel { timer: ObjectReference },
@@ -32,26 +33,24 @@ enum SchedulerInput {
 #[derive(Debug, Clone)]
 struct PendingTimer {
     timer: ObjectReference,
-    /// Causal link back to the `TimerActivated` entry that armed it.
-    cause_id: EntryId,
 }
 
 /// The M1 in-process [`Scheduler`]: a single long-lived [`DelayQueue`] loop that arms/cancels
-/// timers off an inbox and, on expiry, calls the engine-injected [`TimerSink`] to append the
+/// timers off an inbox and, on expiry, calls the consumer-injected [`TimerSink`] to append the
 /// `TriggerTimer` resumption command.
 ///
-/// The **push is into the engine**, not a pull the engine performs: the engine injects an
-/// `Arc<dyn spica_engine::TimerSink>` via [`Scheduler::attach_sink`] at boot, and this impl calls
+/// The **push is into the engine**, not a pull the engine performs: the consumer injects an
+/// `Arc<dyn TimerSink>` via [`Scheduler::attach_sink`] after construction, and this impl calls
 /// `sink.trigger` on expiry. That keeps the contract a single injectable value
-/// (`Arc<dyn spica_engine::Scheduler>`), exactly the shape the storage split established — and
-/// mirrors what a distributed executor (a service that already owns its own transport) would look
-/// like behind the same trait.
+/// (`Arc<dyn Scheduler>`), exactly the shape the storage split established — and mirrors what a
+/// distributed executor (a service that already owns its own transport) would look like behind the
+/// same trait.
 pub struct InMemoryScheduler {
-    /// Inbox for `schedule`/`cancel`, produced by the engine clones.
+    /// Inbox for `schedule`/`cancel`, produced by the consumer.
     tx: mpsc::UnboundedSender<SchedulerInput>,
-    /// The engine-injected write entry, called on expiry. `None` until the engine boots — but the
-    /// engine attaches it *before* the run loop arms any timer, so a fire with no sink is a wiring
-    /// bug (logged and skipped rather than writing to the log raw, which the engine owns).
+    /// The consumer-injected write entry, called on expiry. `None` until the consumer attaches it —
+    /// which happens *before* any timer is armed, so a fire with no sink is a wiring bug (logged and
+    /// skipped rather than writing to the log raw, which the engine owns).
     sink: Arc<std::sync::RwLock<Option<Arc<dyn TimerSink>>>>,
 }
 
@@ -83,7 +82,7 @@ impl InMemoryScheduler {
                             break;
                         };
                         match input {
-                            SchedulerInput::Schedule { timer, deadline, cause_id } => {
+                            SchedulerInput::Schedule { timer, deadline } => {
                                 // Replace any prior arm for the same reference (defensive; arms are
                                 // unique).
                                 if let Some(old) = by_id.remove(&timer) {
@@ -96,7 +95,7 @@ impl InMemoryScheduler {
                                 // cancellation key recorded in `by_id` (ObjectReference, unlike the
                                 // former Copy TimerId, is not Copy).
                                 let key = queue.insert(
-                                    PendingTimer { timer: timer.clone(), cause_id },
+                                    PendingTimer { timer: timer.clone() },
                                     wait,
                                 );
                                 by_id.insert(timer, key);
@@ -109,7 +108,7 @@ impl InMemoryScheduler {
                         }
                     }
                     Some(expiration) = queue.next() => {
-                        let PendingTimer { timer, cause_id } = expiration.into_inner();
+                        let PendingTimer { timer } = expiration.into_inner();
                         by_id.remove(&timer);
                         // Push the fired timer's resumption into the engine's controlled write entry
                         // (the engine validates + appends the `TriggerTimer`). Clone the sink out of
@@ -120,7 +119,7 @@ impl InMemoryScheduler {
                             .expect("scheduler sink lock is not poisoned")
                             .clone();
                         match sink {
-                            Some(sink) => sink.trigger(&timer, cause_id).await,
+                            Some(sink) => sink.trigger(&timer).await,
                             None => {
                                 // The engine should always attach a sink before arming a timer; a
                                 // fire here means the wiring is broken. We must NOT write to the log
@@ -149,11 +148,10 @@ impl Scheduler for InMemoryScheduler {
             .expect("scheduler sink lock is not poisoned") = Some(sink);
     }
 
-    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp, cause_id: EntryId) {
+    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp) {
         let _ = self.tx.send(SchedulerInput::Schedule {
             timer: timer.clone(),
             deadline,
-            cause_id,
         });
     }
 
@@ -167,14 +165,21 @@ impl Scheduler for InMemoryScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine::ObjectKind;
+    use spica_engine::{ObjectKind, PlainName};
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::time::sleep;
     use ulid::Ulid;
 
     fn timer() -> ObjectReference {
-        ObjectReference::for_uid(ObjectKind::Timer, Ulid::new())
+        let uid = Ulid::new();
+        ObjectReference::new(
+            ObjectKind::Timer,
+            PlainName::new("child")
+                .expect("static literal is a valid segment")
+                .generated_from_key(uid.0 as u64),
+            uid,
+        )
     }
 
     /// An absolute deadline `from` now by `offset`.
@@ -190,26 +195,23 @@ mod tests {
     /// observe the expiry callback without a real log. Mirrors how the engine connects its sink.
     #[derive(Clone, Default)]
     struct RecordingSink {
-        triggered: Arc<Mutex<Vec<(ObjectReference, EntryId)>>>,
+        triggered: Arc<Mutex<Vec<ObjectReference>>>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self::default()
         }
-        /// Snapshot of every `(timer, cause_id)` this sink has been asked to trigger.
-        fn snaps(&self) -> Vec<(ObjectReference, EntryId)> {
+        /// Snapshot of every timer this sink has been asked to trigger.
+        fn snaps(&self) -> Vec<ObjectReference> {
             self.triggered.lock().unwrap().clone()
         }
     }
 
     #[async_trait::async_trait]
     impl TimerSink for RecordingSink {
-        async fn trigger(&self, timer: &ObjectReference, cause_id: EntryId) {
-            self.triggered
-                .lock()
-                .unwrap()
-                .push((timer.clone(), cause_id));
+        async fn trigger(&self, timer: &ObjectReference) {
+            self.triggered.lock().unwrap().push(timer.clone());
         }
     }
 
@@ -220,22 +222,20 @@ mod tests {
         s.attach_sink(Arc::new(sink.clone()));
 
         let timer = timer();
-        let cause = EntryId::new(1);
-        s.schedule(&timer, deadline_after(Duration::from_millis(30)), cause);
+        s.schedule(&timer, deadline_after(Duration::from_millis(30)));
 
         // Poll the recording sink until the trigger lands (it arrives on a background loop).
         let fired = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some((t, c)) = sink.snaps().into_iter().next() {
-                    return (t, c);
+                if let Some(t) = sink.snaps().into_iter().next() {
+                    return t;
                 }
                 sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("a fired timer reaches the sink");
-        assert_eq!(fired.1, cause);
-        assert_eq!(fired.0, timer);
+        assert_eq!(fired, timer);
     }
 
     #[tokio::test]
@@ -245,11 +245,7 @@ mod tests {
         s.attach_sink(Arc::new(sink.clone()));
 
         let timer = timer();
-        s.schedule(
-            &timer,
-            deadline_after(Duration::from_millis(15)),
-            EntryId::new(2),
-        );
+        s.schedule(&timer, deadline_after(Duration::from_millis(15)));
         s.cancel(&timer);
 
         // Allow enough time that a leaked arm would definitely have fired, then assert silence.

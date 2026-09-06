@@ -22,11 +22,12 @@ impl EventApplier for ThreadCreatedApplier {
                 status: ThreadStatus::Running,
                 input: Default::default(),
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Thread,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -71,9 +72,10 @@ impl EventApplier for ThreadCreatedApplier {
             }
         }
         ctx.storage.put_thread(row).await?;
+        super::bump_generated_seq(ctx.storage, &thread.reference().name).await?;
         // A thread is always a fan-out child, owned by its container Activity. It is added to that
         // owner's `active_children` so the owner drains (Completing/Terminating) waits on it via the
-        // shared cascade, and `ProcessChildCompleted` notices it as in-flight.
+        // shared cascade, and the inline drain reaction notices it as in-flight.
         if let Some(owner) = thread.meta.owner.clone() {
             ctx.storage
                 .add_child(owner.clone(), thread.reference())
@@ -82,31 +84,28 @@ impl EventApplier for ThreadCreatedApplier {
             // `Parallel`/`Map` aggregates branch/item outputs in declaration order at its
             // convergence. Dispatching on the container's existing `ActivityState`: an existing
             // `Map` repository collects item children; anything else is a `Parallel` (entered as
-            // `Leaf`, upgraded on the first spawn). Because the ordinal is part of the Thread's own
-            // identity, this projection needs no separate fan-out event.
+            // `None`, materialized on the first spawn). Because the ordinal is part of the Thread's
+            // own identity, this projection needs no separate fan-out event.
             if let Some(mut act) = ctx.storage.get_activity(&owner).await? {
                 match &mut act.value.activity_state {
-                    ActivityState::Map(progress) => {
+                    Some(ActivityState::Map(progress)) => {
                         progress.children.insert(thread.index, thread.reference());
                     }
-                    _ => {
-                        let progress = match &mut act.value.activity_state {
-                            ActivityState::Parallel(progress) => progress,
-                            _ => {
-                                act.value.activity_state =
-                                    ActivityState::Parallel(Default::default());
-                                let ActivityState::Parallel(progress) =
-                                    &mut act.value.activity_state
-                                else {
-                                    unreachable!()
-                                };
-                                progress
-                            }
+                    Some(ActivityState::Parallel(progress)) => {
+                        progress.branches.insert(thread.index, thread.reference());
+                    }
+                    None => {
+                        let ActivityState::Parallel(progress) = act
+                            .value
+                            .activity_state
+                            .insert(ActivityState::Parallel(Default::default()))
+                        else {
+                            unreachable!()
                         };
                         progress.branches.insert(thread.index, thread.reference());
                     }
                 }
-                act.touch(ctx.timestamp);
+                act.with_update_at(ctx.timestamp);
                 ctx.storage.put_activity(act).await?;
             }
         }

@@ -42,11 +42,63 @@ pub struct Retrier {
     pub jitter_strategy: Option<String>,
 }
 
+impl Retrier {
+    // Spec-default values for the optional `interval_seconds`/`max_attempts`/`backoff_rate` fields,
+    // kept private so consumers never pick a default themselves — they read the value through the
+    // accessors below, which apply the default and return a non-`Option` (the engine's frozen
+    // `RetryPolicy` then needs no further `unwrap_or`).
+    const DEFAULT_INTERVAL_SECONDS: i64 = 1;
+    const DEFAULT_MAX_ATTEMPTS: i64 = 3;
+    const DEFAULT_BACKOFF_RATE: f64 = 2.0;
+
+    /// `interval_seconds`, or the spec default (1) when the definition omits it.
+    pub fn interval_seconds(&self) -> i64 {
+        self.interval_seconds
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECONDS)
+    }
+
+    /// `max_attempts`, or the spec default (3) when the definition omits it.
+    pub fn max_attempts(&self) -> i64 {
+        self.max_attempts.unwrap_or(Self::DEFAULT_MAX_ATTEMPTS)
+    }
+
+    /// `backoff_rate` as an `f64`, or the spec default (2.0) when the definition omits it.
+    pub fn backoff_rate(&self) -> f64 {
+        self.backoff_rate
+            .as_ref()
+            .and_then(|n| n.as_f64())
+            .unwrap_or(Self::DEFAULT_BACKOFF_RATE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
     use crate::Retrier;
+
+    /// The defaulting accessors: an omitted optional field reads as the spec default, an explicit
+    /// value is honored as-is. This is the contract the engine's frozen `RetryPolicy` relies on —
+    /// the model, not the consumer, owns "which default applies."
+    #[test]
+    fn defaulting_accessors_apply_spec_defaults() -> Result<(), Box<dyn Error>> {
+        let minimal: Retrier = serde_json::from_str(r#"{"ErrorEquals":["States.ALL"]}"#)?;
+        assert_eq!(minimal.interval_seconds(), 1);
+        assert_eq!(minimal.max_attempts(), 3);
+        assert_eq!(minimal.backoff_rate(), 2.0);
+
+        let explicit: Retrier = serde_json::from_str(
+            r#"{"ErrorEquals":["States.ALL"],"IntervalSeconds":5,"MaxAttempts":7,"BackoffRate":3}"#,
+        )?;
+        assert_eq!(explicit.interval_seconds(), 5);
+        assert_eq!(explicit.max_attempts(), 7);
+        assert_eq!(explicit.backoff_rate(), 3.0);
+
+        // The accessors do not mutate the model: the raw optional fields are untouched.
+        assert_eq!(minimal.interval_seconds, None);
+        assert_eq!(explicit.interval_seconds, Some(5));
+        Ok(())
+    }
 
     #[test]
     fn test_retrier_minimal() -> Result<(), Box<dyn Error>> {

@@ -14,7 +14,7 @@
 use spica_engine::{ActivatedTask, ObjectName, RuntimeError};
 use spica_proto::v1::{
     CompleteTaskRequest, CompleteTaskResponse, FailTaskRequest, FailTaskResponse, PollTasksRequest,
-    PollTasksResponse, task_server::Task as TaskService,
+    PollTasksResponse, task_service_server::TaskService as TaskServiceTrait,
 };
 use tonic::{Request, Response, Status};
 
@@ -42,9 +42,9 @@ fn parse_task_name(s: &str, what: &str) -> Result<ObjectName, Status> {
 }
 
 #[tonic::async_trait]
-impl TaskService for Svc {
+impl TaskServiceTrait for Svc {
     /// Claim up to `max_tasks` available tasks of `resource` for `worker_id`, leasing each
-    /// `lease_seconds`. A non-blocking, point-in-time discovery read (mirroring `GetExecution`): it
+    /// `lease_seconds`. A non-blocking, point-in-time discovery read (like the Query reads): it
     /// returns whatever is claimable now — possibly empty — and the worker polls at its own cadence.
     async fn poll_tasks(
         &self,
@@ -58,8 +58,7 @@ impl TaskService for Svc {
             "PollTasks"
         );
         let tasks = self
-            .engine
-            .task_api()
+            .facade
             .poll_tasks(
                 &req.worker_id,
                 &req.resource,
@@ -89,8 +88,7 @@ impl TaskService for Svc {
             .map_err(|e| Status::invalid_argument(format!("output is not valid JSON: {e}")))?;
 
         tracing::debug!(task = %task, "CompleteTask");
-        self.engine
-            .task_api()
+        self.facade
             .complete(&req.worker_id, task, request_id, output)
             .await
             .map_err(to_status)?;
@@ -121,8 +119,7 @@ impl TaskService for Svc {
         };
 
         tracing::debug!(task = %task, "FailTask");
-        self.engine
-            .task_api()
+        self.facade
             .fail(
                 &req.worker_id,
                 task,
@@ -148,7 +145,7 @@ mod tests {
         GrpcTaskApi, InMemoryTaskService, TaskFailure, TaskHandler, TaskService,
     };
     use spica_engine::{EngineBuilder, EntryPayload, FlowName, StateMachine};
-    use spica_proto::v1::task_server::TaskServer;
+    use spica_proto::v1::task_service_server::TaskServiceServer;
     use spica_scheduler::InMemoryScheduler;
     use spica_storage::InMemoryStorage;
     use tokio_util::sync::CancellationToken;
@@ -174,16 +171,21 @@ mod tests {
     #[tokio::test]
     async fn remote_worker_claims_and_completes_task_over_grpc() {
         // An in-memory engine is enough — the point is the network boundary, not the storage backend.
+        let ack = std::sync::Arc::new(crate::consumer::AckHook::new());
+        let (hook, engine_slot) =
+            crate::consumer::build_observer(ack.clone(), InMemoryScheduler::spawn());
         let engine = Arc::new(
             EngineBuilder::with_backends(
                 Box::new(spica_engine::InMemoryLogStream::<EntryPayload>::new()),
                 Box::new(InMemoryStorage::new()),
             )
-            .with_scheduler(InMemoryScheduler::spawn())
+            .with_hook(hook)
             .start()
             .await
             .expect("engine boots"),
         );
+        *engine_slot.lock().await = Some(Arc::downgrade(&engine));
+        let facade = crate::consumer::Facade::new(engine.clone(), ack);
 
         // Serve the `Task` service on a loopback port, holding the server for the test's duration.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -192,10 +194,11 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
         let svc = Svc {
             engine: engine.clone(),
+            facade: facade.clone(),
         };
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(TaskServer::new(svc))
+                .add_service(TaskServiceServer::new(svc))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .expect("serve Task");
@@ -232,17 +235,15 @@ mod tests {
         }))
         .expect("parse state machine");
         let flow = FlowName::new(&format!("grpc_{}", ulid::Ulid::new())).expect("valid name");
-        let fvid = engine
+        let fvid = facade
             .create_flow(flow, &serde_json::to_string(&sm).unwrap())
             .await
             .expect("create flow");
-        let execution_id = engine
+        let execution_id = facade
             .start_for_revision(
-                spica_engine::ObjectName::generated_with_suffix(
-                    "exec",
-                    &ulid::Ulid::new().to_string(),
-                )
-                .expect("a ULID-suffixed generated name is always valid"),
+                spica_engine::PlainName::new("exec")
+                    .expect("static literal is a valid segment")
+                    .generated_from_key(ulid::Ulid::new().0 as u64),
                 fvid,
                 Value::Null,
             )

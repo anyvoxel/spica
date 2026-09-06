@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
+use crate::{Activity, ActivityStatus, ApplierContext, EventApplier};
 
 use crate::types::meta::ObjectKind;
 
@@ -19,16 +19,17 @@ impl EventApplier for StateCompletedApplier {
                 state_path: jsonptr::PointerBuf::new(),
                 status: ActivityStatus::Completed,
                 raw_input: Default::default(),
-                input: Default::default(),
+                input: None,
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
                     crate::types::id::ActivityId::nil().into(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -66,7 +67,7 @@ impl EventApplier for StateCompletedApplier {
                 // terminal `ed`, so later activation/termination logic never treats a finished state
                 // as still in flight.
                 exec.current_activity = None;
-                exec.touch(ctx.timestamp);
+                exec.with_update_at(ctx.timestamp);
                 ctx.storage.put_execution(exec).await?;
             }
         }

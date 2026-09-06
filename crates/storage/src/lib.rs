@@ -17,7 +17,7 @@ mod key;
 mod memory;
 mod rocks;
 
-pub use key::{KeyBuilder, Scope};
+pub use key::{KeyBuilder, Kind, Scope};
 pub use memory::InMemoryStorage;
 pub use rocks::RocksStorage;
 

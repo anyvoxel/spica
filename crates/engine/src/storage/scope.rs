@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::storage::Storage;
+use crate::storage::ReadonlyStorageTxn;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::id::ActivityId;
 use crate::types::meta::{ObjectKind, ObjectReference};
@@ -130,8 +130,8 @@ impl ScopeRecord {
 /// branch point. A non-scope kind (Flow / FlowVersion / Activity / Timer / Task) is **silently**
 /// dropped (resolves to `None`): per the removal of the former `NodeId` role guard, a parent that is
 /// not a scope is ignored rather than panicked.
-pub async fn load_scope(
-    storage: &dyn Storage,
+pub async fn load_scope<S: ReadonlyStorageTxn + ?Sized>(
+    storage: &S,
     reference: &ObjectReference,
 ) -> Result<Option<ScopeRecord>, ExecutionError> {
     match reference.kind {
@@ -150,8 +150,8 @@ pub async fn load_scope(
 
 /// Resolve a scope from a bare [`ObjectReference`] (the owner-style form used on
 /// [`ObjectMeta::owner`] / Activity's `execution`), dispatching on its structural kind.
-pub async fn load_scope_ref(
-    storage: &dyn Storage,
+pub async fn load_scope_ref<S: ReadonlyStorageTxn + ?Sized>(
+    storage: &S,
     reference: &ObjectReference,
 ) -> Result<Option<ScopeRecord>, ExecutionError> {
     load_scope(storage, reference).await
@@ -163,8 +163,8 @@ pub async fn load_scope_ref(
 /// thread never stores its own copy (see [`crate::types::thread::Thread`]). Returns an
 /// `InvalidDefinition` error if the owning execution is gone, which can only mean the tree is being
 /// torn down.
-pub async fn resolve_scope_flow_version(
-    storage: &dyn Storage,
+pub async fn resolve_scope_flow_version<S: ReadonlyStorageTxn + ?Sized>(
+    storage: &S,
     scope: &ScopeRecord,
 ) -> Result<ObjectReference, ExecutionError> {
     match scope {

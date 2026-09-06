@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::{Map, Value};
 use spica_asl::{FailState, State};
 
@@ -14,15 +15,16 @@ use crate::types::meta::ObjectReference;
 
 pub struct FailStateHandler;
 
+#[async_trait]
 impl StateHandler for FailStateHandler {
     fn state(&self) -> State {
         State::Fail(FailState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
@@ -35,20 +37,21 @@ impl StateHandler for FailStateHandler {
         // `complete`), which is a structural-symmetry trade-off against the failure semantics the
         // framework's `StateCompleting` marker implies.
         out.emit_event(crate::types::event::Event::StateActivated {
-            activity: state_activated_value(actx, actx.activity.input.clone(), None),
-        });
+            activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
+        })
+        .await;
         out.emit_command(crate::types::command::Command::CompleteState {
             activity,
             // A Fail routes through the success-finish framework; its raw result is the processed
             // input (the actual `Error`/`Cause` failure projection happens in `complete`).
-            output: actx.activity.input.clone(),
+            output: actx.activity.raw_input.clone(),
         });
     }
 
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -58,7 +61,7 @@ impl StateHandler for FailStateHandler {
                 "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        complete_fail(env, out, activity, actx, s);
+        complete_fail(env, out, activity, actx, s).await;
     }
 }
 
@@ -67,9 +70,9 @@ impl StateHandler for FailStateHandler {
 // step so the state's terminal ed and the execution's terminating ed are produced in the same causal
 // chain. This mirrors Pass: Pass emits `StateCompleted` and routes to `CompleteExecution` / the
 // successor; Fail emits the failure ed and routes to `TerminateExecution` / the successor.
-fn complete_fail(
+async fn complete_fail(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &FailState,
@@ -77,12 +80,12 @@ fn complete_fail(
     // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed) — however late an
     // `Assign` is applied, derived values read consistently with the scope already folded.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // no Catch `errorOutput` in the fail path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -131,10 +134,12 @@ fn complete_fail(
     // `CompleteExecution` Pass would throw.
     out.emit_event(crate::types::event::Event::StateTerminating {
         activity: state_terminating_value(actx, reason.clone()),
-    });
+    })
+    .await;
     out.emit_event(crate::types::event::Event::StateTerminated {
         activity: state_terminated_value(actx, reason.clone()),
-    });
+    })
+    .await;
     // Route the terminal failure to the *owning scope*. A top-level run is an `Execution` (reached
     // via name-addressed `TerminateExecution`); a `Fail` inside a `Parallel` branch / `Map` item is
     // owned by a `Thread`, which lives in *thread* storage and is only reachable via the

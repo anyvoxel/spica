@@ -3,28 +3,32 @@
 //! This crate is the one place that knows the transport. It dials an endpoint, owns the `spica-proto`
 //! wire contract, and exposes two module-scoped faces:
 //!
-//! - the **control plane** — the thin [`Client`], whose methods return plain wire data (`String` ids,
-//!   [`ExecutionSnapshot`], [`ClaimedTask`]) and are the raw surface the `spica` CLI binds to;
+//! - the **control plane** — the thin [`Client`], whose write/action methods return plain wire data
+//!   (`String` ids, [`ClaimedTask`], [`ObjectReference`]), and whose **read** methods
+//!   ([`Client::get_object`] / [`Client::list_objects`]) return the wire `spica_proto::v1::Object`
+//!   mirror directly — the k8s-style Query API is a generic read over any kind, so the one wire type
+//!   covers every object and needs no per-kind client-side shadow;
 //! - the **worker** ([`worker`]) — the task *consumer* (Zeebe's job worker), typed in its own parsed
 //!   forms (JSON `Value`s) rather than the client's opaque `Vec<u8>`, and engine-free.
 //!
-//! Neither face returns tonic/prost types or `spica-engine` domain types, so cross-cutting transport
-//! concerns (retry, auth, timeouts, load balancing) have exactly one place to land: here.
+//! Cross-cutting transport concerns (retry, auth, timeouts, load balancing) have exactly one place to
+//! land: here.
 //!
 //! # Why not depend on `spica-engine`?
 //!
 //! The `spica` CLI is a *pure-remote* client — it must not transitively link the engine. Had
 //! [`Client`] returned engine types, every consumer (CLI included) would carry the engine in. So this
-//! crate stops at plain wire types, and the *names* stay transport-scoped too: `arguments`/`output`/
-//! `error` travel as opaque JSON `Vec<u8>` exactly as the wire does, while the [`worker`] module
-//! parses those bytes into `Value`-carrying types it owns (deliberately same-named, distinguished by
-//! module — [`worker::ClaimedTask`] holds JSON, [`ClaimedTask`] holds bytes).
+//! crate stops at plain wire / proto types — engine types never cross its boundary. The one carve-out
+//! is the Query read face, which returns the `spica_proto::v1::Object` mirror verbatim (the user's
+//! explicit call): mirroring all seven kinds by hand would duplicate the proto contract for no
+//! consumer benefit, and the CLI reads by matching one kind out of the generic `Object`.
 
 use spica_proto::v1::{
-    CompleteTaskRequest, CreateFlowRequest, FailTaskRequest, GetExecutionRequest, PollTasksRequest,
-    ResolveFlowVersionRequest, StartExecutionRequest, StopExecutionRequest,
-    execution_client::ExecutionClient, start_execution_request::Target as WireTarget,
-    task_client::TaskClient, workflow_client::WorkflowClient,
+    CompleteTaskRequest, CreateFlowRequest, FailTaskRequest, GetObjectRequest, ListObjectsRequest,
+    PollTasksRequest, ResolveFlowVersionRequest, StartExecutionRequest, StopExecutionRequest,
+    execution_service_client::ExecutionServiceClient, query_client::QueryClient,
+    start_execution_request::Target as WireTarget, task_service_client::TaskServiceClient,
+    workflow_service_client::WorkflowServiceClient,
 };
 use tonic::transport::{Channel, Endpoint};
 
@@ -33,13 +37,15 @@ use tonic::transport::{Channel, Endpoint};
 pub mod worker;
 
 // Re-exported so consumers need not depend on `tonic`/`transport` themselves — the error types a
-// client call produces are part of this crate's public surface.
-pub use tonic::Status;
+// client call produces, and the gRPC code used to branch on them (e.g. `NotFound` from a Query read),
+// are part of this crate's public surface.
 /// The error returned when [`Client::connect`] fails to dial the endpoint.
 pub use tonic::transport::Error as ConnectError;
+pub use tonic::{Code, Status};
 
-/// The engine-side lifecycle state, collapsed to the coarse wire states a client settles on.
-/// (`UNSPECIFIED` on the wire is folded into [`ExecutionState::Active`] — still in flight.)
+/// The coarse lifecycle state a client settles on, collapsed from a wire `Execution`.
+/// (Wire `UNSPECIFIED`/`RUNNING`/`COMPLETING`/`TERMINATING` all fold into [`ExecutionState::Active`]
+/// — still in flight.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionState {
     /// Still in flight (Running / Completing / Terminating).
@@ -48,11 +54,11 @@ pub enum ExecutionState {
     Completed,
     /// Settled abnormally; `error_name` / `error_output` describe the failure.
     Terminated,
-    /// No projection exists for the requested id (never created or GC'd).
-    NotFound,
 }
 
-/// A point-in-time snapshot of one execution (the client-side form of `GetExecutionResponse`).
+/// The client-side interpretation of a wire `Execution` mirror — produced by
+/// [`Client::get_execution`] from a Query read. `state` is the coarse lifecycle; `output` /
+/// `error_name` / `error_output` carry the terminal facts.
 pub struct ExecutionSnapshot {
     pub state: ExecutionState,
     /// Terminal output (JSON bytes), present once `state == Completed`.
@@ -61,6 +67,14 @@ pub struct ExecutionSnapshot {
     pub error_name: String,
     /// Error output (JSON bytes), present once `state == Terminated`.
     pub error_output: Vec<u8>,
+}
+
+/// A page of `ListObjects` results — the wire `Object` mirrors plus the opaque resume token.
+pub struct ListObjectsPage {
+    /// The page of objects, in storage key order (at most the requested `limit`).
+    pub objects: Vec<spica_proto::v1::Object>,
+    /// Non-empty when more rows remain; pass it back as the next request's `continue_token`.
+    pub continue_token: String,
 }
 
 /// A structured reference to a flow version (mirrors the wire `ObjectReference`): the `kind`
@@ -147,9 +161,10 @@ pub struct TaskFailure {
 /// shared `Channel`, cheaply `Clone`-able too (a worker's own transport is just a channel clone).
 #[derive(Clone)]
 pub struct Client {
-    workflow: WorkflowClient<Channel>,
-    execution: ExecutionClient<Channel>,
-    task: TaskClient<Channel>,
+    workflow: WorkflowServiceClient<Channel>,
+    execution: ExecutionServiceClient<Channel>,
+    task: TaskServiceClient<Channel>,
+    query: QueryClient<Channel>,
 }
 
 // The RPC methods deliberately return `tonic::Status` (re-exported above) so callers can branch on
@@ -173,9 +188,10 @@ impl Client {
     /// dialed channel construct every service client on the one connection.
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            workflow: WorkflowClient::new(channel.clone()),
-            execution: ExecutionClient::new(channel.clone()),
-            task: TaskClient::new(channel),
+            workflow: WorkflowServiceClient::new(channel.clone()),
+            execution: ExecutionServiceClient::new(channel.clone()),
+            task: TaskServiceClient::new(channel.clone()),
+            query: QueryClient::new(channel),
         }
     }
 
@@ -265,24 +281,62 @@ impl Client {
         }
     }
 
-    /// Read a point-in-time status snapshot of one execution, addressed by its user-supplied `name`
-    /// (non-blocking).
-    pub async fn get_execution(&self, name: &str) -> Result<ExecutionSnapshot, Status> {
-        let mut client = self.execution.clone();
+    /// Read one persisted object of `kind` by `name` — the k8s-style Query `GetObject`, non-blocking.
+    /// Returns the wire `Object` mirror for that `(kind, name)`; a missing row surfaces as a non-ok
+    /// `Status` with gRPC code `NotFound`.
+    pub async fn get_object(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<spica_proto::v1::Object, Status> {
+        let mut client = self.query.clone();
         let resp = client
-            .get_execution(GetExecutionRequest {
+            .get_object(GetObjectRequest {
+                kind: kind.to_string(),
                 name: name.to_string(),
             })
             .await?
             .into_inner();
-        let state = spica_proto::v1::ExecutionState::try_from(resp.state)
-            .unwrap_or(spica_proto::v1::ExecutionState::Active);
-        Ok(ExecutionSnapshot {
-            state: map_state(state),
-            output: resp.output,
-            error_name: resp.error_name,
-            error_output: resp.error_output,
+        resp.object
+            .ok_or_else(|| Status::internal("GetObject response missing object"))
+    }
+
+    /// List a page of one `kind` within the current scope — the k8s-style Query `ListObjects`:
+    /// `limit` (0 = server default) rows plus the opaque `continue_token` to resume from (empty =
+    /// first page).
+    pub async fn list_objects(
+        &self,
+        kind: &str,
+        limit: u32,
+        continue_token: &str,
+    ) -> Result<ListObjectsPage, Status> {
+        let mut client = self.query.clone();
+        let resp = client
+            .list_objects(ListObjectsRequest {
+                kind: kind.to_string(),
+                limit,
+                continue_token: continue_token.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(ListObjectsPage {
+            objects: resp.objects,
+            continue_token: resp.continue_token,
         })
+    }
+
+    /// Read a point-in-time status snapshot of one execution, addressed by its user-supplied `name`
+    /// (non-blocking). Thin wrapper over [`Client::get_object`] on kind `execution` that pulls the
+    /// `Execution` out of the generic `Object` and collapses it — kept for the CLI's convenience; a
+    /// missing execution surfaces as a non-ok `Status` with gRPC code `NotFound`.
+    pub async fn get_execution(&self, name: &str) -> Result<ExecutionSnapshot, Status> {
+        match self.get_object("execution", name).await?.object {
+            Some(spica_proto::v1::object::Object::Execution(e)) => Ok(interpret_execution(&e)),
+            Some(_) => Err(Status::internal(
+                "GetObject kind=execution returned a non-execution",
+            )),
+            None => Err(Status::internal("GetObject returned an empty object")),
+        }
     }
 
     /// Abort a running execution by `name` (with an optional `uid` incarnation guard — `None` skips
@@ -378,13 +432,26 @@ impl Client {
     }
 }
 
-/// Collapse the wire `ExecutionState` onto this crate's client-facing enum; `UNSPECIFIED`/`ACTIVE`
-/// are both "still in flight" from the client's perspective.
-fn map_state(s: spica_proto::v1::ExecutionState) -> ExecutionState {
-    match s {
-        spica_proto::v1::ExecutionState::Completed => ExecutionState::Completed,
-        spica_proto::v1::ExecutionState::Terminated => ExecutionState::Terminated,
-        spica_proto::v1::ExecutionState::NotFound => ExecutionState::NotFound,
+/// Collapse a wire `Execution` mirror onto this crate's client-facing snapshot. Wire
+/// `UNSPECIFIED`/`RUNNING`/`COMPLETING`/`TERMINATING` are all "still in flight" from the client's
+/// perspective (`Active`); `COMPLETED` carries `output`; `TERMINATED` carries the ASL `error_name` /
+/// `error_output` from the termination reason.
+pub fn interpret_execution(e: &spica_proto::v1::Execution) -> ExecutionSnapshot {
+    let state = match spica_proto::v1::ExecutionStatus::try_from(e.status) {
+        Ok(spica_proto::v1::ExecutionStatus::Completed) => ExecutionState::Completed,
+        Ok(spica_proto::v1::ExecutionStatus::Terminated) => ExecutionState::Terminated,
         _ => ExecutionState::Active,
+    };
+    let (error_name, error_output) = match &e.termination_reason {
+        Some(spica_proto::v1::TerminationReason {
+            failed: Some(f), ..
+        }) => (f.error_name.clone(), f.output.clone()),
+        _ => (String::new(), Vec::new()),
+    };
+    ExecutionSnapshot {
+        state,
+        output: e.output.clone(),
+        error_name,
+        error_output,
     }
 }

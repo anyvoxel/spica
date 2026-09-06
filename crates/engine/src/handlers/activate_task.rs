@@ -35,7 +35,7 @@ impl CommandHandler for ActivateTaskHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, _ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, _ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         let Command::ActivateTask {
             execution,
             owner,
@@ -66,14 +66,16 @@ impl CommandHandler for ActivateTaskHandler {
                 // carried from the command's task reference (already execution-based per finding
                 // #13), not re-derived as `child-<uid>`; the owner is the invoking activity carried
                 // on the command, converted to the meta owner reference.
-                meta: crate::types::meta::ObjectMeta::born_named(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
-                    task.name.clone(),
                     task.uid,
-                    crate::log::Timestamp::now(),
                 )
+                .name(task.name.clone())
+                .at(crate::log::Timestamp::now())
+                .build()
                 .with_owner(owner.clone()),
             },
-        });
+        })
+        .await;
     }
 }

@@ -3,11 +3,9 @@
 // unused-import (re-export) warnings are expected.
 
 mod assign;
-mod branch;
 mod catch;
 mod choice;
 mod fail;
-mod item_processor;
 mod map;
 mod parallel;
 mod pass;
@@ -22,15 +20,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub use assign::AssignObject;
-pub use branch::Branch;
 pub use catch::Catcher;
 pub use choice::{ChoiceCondition, ChoiceRule, ChoiceState};
 pub use fail::FailState;
-pub use item_processor::ItemProcessor;
 pub use map::{
-    MapItems, MapMaxConcurrency, MapState, MapToleratedFailureCount, MapToleratedFailurePercentage,
+    ItemProcessor, MapItems, MapMaxConcurrency, MapState, MapToleratedFailureCount,
+    MapToleratedFailurePercentage,
 };
-pub use parallel::ParallelState;
+pub use parallel::{Branch, ParallelState};
 pub use pass::PassState;
 pub use retry::Retrier;
 pub use succeed::SucceedState;

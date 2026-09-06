@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
@@ -60,6 +61,7 @@ impl ThreadStatus {
 /// It carries only durable identity/lifecycle facts; runtime conveniences (variable scope, in-flight
 /// children) live on the storage projection `crate::storage::ThreadRecord`, mirroring
 /// `ExecutionRecord`.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     /// Object identity + shared metadata. **`meta.uid` IS the thread's never-reused identity ulid**

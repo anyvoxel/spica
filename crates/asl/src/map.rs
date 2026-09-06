@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    AssignObject, Catcher, ItemProcessor, Retrier,
+    AssignObject, Catcher, Retrier, State,
     utils::{IntOrExpr, JsonataExpr, parse_non_negative_int_or_expr},
 };
 
@@ -172,6 +174,32 @@ where
     }
 }
 
+/// The item processor defines the state machine that processes each item (or batch of items) of
+/// a `Map` state's input array. It is referenced by a `Map` state's `item_processor` field.
+///
+/// Per the Amazon States Language, an item processor has `StartAt` (required) and `States`
+/// (required). Unlike the top-level `StateMachine`, it does not allow `Comment`, `Version`,
+/// `TimeoutSeconds`, or `QueryLanguage`.
+///
+/// This learning subset is **Inline-only**: the AWS-specific `ProcessorConfig` (Distributed
+/// mode, execution type) is not modeled.
+///
+/// See:
+/// - https://states-language.net/spec.html#map-state
+/// - https://docs.aws.amazon.com/step-functions/latest/dg/state-map.html
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct ItemProcessor {
+    /// Required. A string that must exactly match (case sensitive) the name of one of the state
+    /// objects in `states`. This is the state executed first for each iteration.
+    pub start_at: String,
+
+    /// Required. An object containing the set of states for this item processor. States can
+    /// occur in any order; their `Next`/`End` transitions determine the run order.
+    pub states: HashMap<String, State>,
+}
+
 /// A `Map` state (`"Type": "Map"`) runs a set of workflow steps for each item in a dataset
 /// (by default a JSON array in the input). Iterations run in parallel up to `max_concurrency`,
 /// and each iteration applies the same item processor to a different input element. The state's
@@ -273,6 +301,43 @@ pub struct MapState {
     pub catch: Option<Vec<Catcher>>,
 }
 
+impl MapState {
+    // Spec-default values for the optional `max_concurrency`/`tolerated_failure_*` fields, kept
+    // private so consumers never pick a default themselves — they read through the accessors below,
+    // which fold an omitted field into its literal default. The types are expression-capable
+    // (`IntOrExpr` / `MapToleratedFailurePercentage`), so an accessor returns the defaulted enum,
+    // not a pre-resolved scalar: a JSONata value still needs runtime evaluation.
+    const DEFAULT_MAX_CONCURRENCY: i64 = 0;
+    const DEFAULT_TOLERATED_FAILURE_COUNT: i64 = 0;
+    const DEFAULT_TOLERATED_FAILURE_PERCENTAGE: f64 = 0.0;
+
+    /// `max_concurrency`, or the spec default (0 = unlimited) when the definition omits it.
+    pub fn max_concurrency(&self) -> IntOrExpr {
+        self.max_concurrency
+            .clone()
+            .unwrap_or(IntOrExpr::Int(Self::DEFAULT_MAX_CONCURRENCY))
+    }
+
+    /// `tolerated_failure_count`, or the spec default (0) when the definition omits it.
+    pub fn tolerated_failure_count(&self) -> IntOrExpr {
+        self.tolerated_failure_count
+            .clone()
+            .unwrap_or(IntOrExpr::Int(Self::DEFAULT_TOLERATED_FAILURE_COUNT))
+    }
+
+    /// `tolerated_failure_percentage`, or the spec default (0) when the definition omits it.
+    pub fn tolerated_failure_percentage(&self) -> MapToleratedFailurePercentage {
+        self.tolerated_failure_percentage
+            .clone()
+            .unwrap_or_else(|| {
+                MapToleratedFailurePercentage::Number(
+                    serde_json::Number::from_f64(Self::DEFAULT_TOLERATED_FAILURE_PERCENTAGE)
+                        .expect("0.0 is representable"),
+                )
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -369,6 +434,41 @@ mod tests {
         let reparsed: State = serde_json::from_str(&reserialized)?;
         assert_eq!(value, reparsed);
 
+        Ok(())
+    }
+
+    /// The defaulting accessors: an omitted optional field reads as the spec default, an explicit
+    /// value is honored as-is, and the raw optional fields stay untouched (fidelity preserved).
+    #[test]
+    fn defaulting_accessors_apply_spec_defaults() -> Result<(), Box<dyn Error>> {
+        use crate::utils::IntOrExpr;
+
+        let s: State = serde_json::from_str(r#"{"Type":"Map","End":true}"#)?;
+        let State::Map(map) = s else {
+            panic!("expected a Map state");
+        };
+        assert_eq!(map.max_concurrency(), IntOrExpr::Int(0));
+        assert_eq!(map.tolerated_failure_count(), IntOrExpr::Int(0));
+        assert_eq!(
+            map.tolerated_failure_percentage(),
+            MapToleratedFailurePercentage::Number(serde_json::Number::from_f64(0.0).unwrap())
+        );
+        assert_eq!(map.max_concurrency, None);
+        assert_eq!(map.tolerated_failure_count, None);
+        assert_eq!(map.tolerated_failure_percentage, None);
+
+        let s: State = serde_json::from_str(
+            r#"{"Type":"Map","End":true,"MaxConcurrency":5,"ToleratedFailureCount":2,"ToleratedFailurePercentage":50}"#,
+        )?;
+        let State::Map(map) = s else {
+            panic!("expected a Map state");
+        };
+        assert_eq!(map.max_concurrency(), IntOrExpr::Int(5));
+        assert_eq!(map.tolerated_failure_count(), IntOrExpr::Int(2));
+        assert_eq!(
+            map.tolerated_failure_percentage(),
+            MapToleratedFailurePercentage::Number(serde_json::Number::from(50))
+        );
         Ok(())
     }
 

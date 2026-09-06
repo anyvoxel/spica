@@ -1,4 +1,7 @@
-//! `TimerActivated` event projection: folds the `Event::TimerActivated` into Storage.
+//! `TimerActivated` event projection: folds the `Event::TimerActivated` into Storage. The durable
+//! event carries the timer's absolute `deadline`; a consumer (via the injected `Hook`) re-derives the
+//! physical deadline arm from that persisted moment — a replayed projection re-derives the same wait
+//! rather than a fresh relative count.
 
 use async_trait::async_trait;
 
@@ -10,10 +13,9 @@ use crate::TimerStatus;
 use crate::log::Timestamp;
 use crate::types::command::TimerPurpose;
 
-/// `TimerActivated` folds the timer row into Storage **and** arms the physical deadline in the
-/// scheduler. The durable stream carries the logical "armed" fact plus its absolute `deadline`;
-/// the scheduler derives the wall-clock wait (`deadline - now`) from it. A replayed projection
-/// re-derives the same wait from the persisted absolute moment rather than a fresh relative count.
+/// `TimerActivated` folds the timer row into Storage **and** declares the physical deadline arm as an
+/// [`Effect`] for the caller to execute. The applier performs no external side effect itself — the
+/// arm is applied against the real scheduler only once the producing fold's transaction is durable.
 #[derive(Default)]
 pub(crate) struct TimerActivatedApplier;
 #[async_trait]
@@ -25,12 +27,12 @@ impl EventApplier for TimerActivatedApplier {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Timer,
                     ulid::Ulid::nil(),
-                    Timestamp::from_millis(0),
-                    Timestamp::from_millis(0),
-                ),
+                )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -49,6 +51,7 @@ impl EventApplier for TimerActivatedApplier {
         // Birth: `created_at`/`updated_at` stamped with the `TimerActivated` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_timer(row).await?;
+        super::bump_generated_seq(ctx.storage, &timer.reference().name).await?;
         ctx.storage
             .add_child(
                 timer
@@ -59,14 +62,8 @@ impl EventApplier for TimerActivatedApplier {
                 timer.reference(),
             )
             .await?;
-        // Schedule the physical deadline (the storage fold is pure; this is the side effect).
-        // The scheduler needs the owning entry's causal identity to re-envelope the `TriggerTimer`
-        // it fires on expiry; the StreamProcessor supplies it via the context. (There is no per-execution
-        // stream — a LogStream is one stream, so stream identity lives on the log, not here.)
-        // The wait duration is derived from the persisted absolute `deadline`: already-past
-        // fire immediately (saturating to zero).
-        ctx.scheduler
-            .schedule(&timer.reference(), timer.deadline, ctx.cause_id);
+        // The physical deadline arm is not folded here — a consumer re-derives `schedule` from the
+        // durable `TimerActivated` event (which carries the absolute `deadline`) once it is committed.
         Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{IntOrExpr, State, WaitState, WaitTimestamp};
 
@@ -16,15 +17,16 @@ const MAX_WAIT_SECONDS: i64 = 99_999_999;
 
 pub struct WaitStateHandler;
 
+#[async_trait]
 impl StateHandler for WaitStateHandler {
     fn state(&self) -> State {
         State::Wait(WaitState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -34,15 +36,15 @@ impl StateHandler for WaitStateHandler {
                 "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        activate_wait(env, out, activity, actx, s);
+        activate_wait(env, out, activity, actx, s).await;
     }
 
     /// Resumed by `CompleteState` after the Wait's timer (`WaitResume`) has fired. Projects
     /// `Assign`/`Output` against the stored input and routes to `Next`/`End`.
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -61,15 +63,16 @@ impl StateHandler for WaitStateHandler {
             s.output.as_ref(),
             s.next.as_deref(),
             s.end,
-            actx.activity.retry_state.attempts,
+            actx.activity.retry_count(),
             None, // Wait has no Catch `errorOutput`
-        );
+        )
+        .await;
     }
 }
 
-fn activate_wait(
+async fn activate_wait(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &WaitState,
@@ -79,12 +82,12 @@ fn activate_wait(
     // applied). A JSONata `Seconds`/`Timestamp` expression may reference `$states.input` and any
     // in-scope variables.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.attempts,
+        actx.activity.retry_count(),
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -289,8 +292,9 @@ fn activate_wait(
     // activation-complete ed, then arm the resume timer as the transition's side effect, inlined into
     // this batch so no separate command round-trips the arm.
     out.emit_event(crate::types::event::Event::StateActivated {
-        activity: state_activated_value(actx, actx.activity.input.clone(), None),
-    });
+        activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
+    })
+    .await;
     emit_timer(
         out,
         // The timer's `execution` anchor is the flat top-level run (`activity.execution`), not the
@@ -300,5 +304,6 @@ fn activate_wait(
         activity,
         TimerPurpose::WaitResume,
         deadline,
-    );
+    )
+    .await;
 }

@@ -15,6 +15,7 @@ pub(crate) struct TasksClaimedApplier;
 impl EventApplier for TasksClaimedApplier {
     fn event(&self) -> Event {
         Event::TasksClaimed {
+            request_id: crate::types::id::RequestId::nil(),
             tasks: vec![Task {
                 execution: crate::types::meta::ObjectReference::nil(),
                 resource: String::new(),
@@ -25,12 +26,15 @@ impl EventApplier for TasksClaimedApplier {
                 lease_until: Some(crate::log::Timestamp::from_millis(0)),
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             }],
         }
     }
@@ -40,7 +44,11 @@ impl EventApplier for TasksClaimedApplier {
         ctx: &mut ApplierContext<'_>,
         event: &Event,
     ) -> Result<(), ExecutionError> {
-        let Event::TasksClaimed { tasks } = event else {
+        let Event::TasksClaimed {
+            request_id: _,
+            tasks,
+        } = event
+        else {
             unreachable!(
                 "event dispatch guarantees the applier receives its own variant; got {event:?}"
             );
@@ -62,8 +70,8 @@ impl EventApplier for TasksClaimedApplier {
                 // Claimed — clear the retry backoff gate (see `Task::next_available_at`).
                 t.retry_state.next_available_at = task.retry_state.next_available_at;
                 // Sync the domain value's transition stamp from the event (see task_completed.rs).
-                t.value.meta.touch(task.meta.updated_at);
-                t.touch(ctx.timestamp);
+                t.value.meta.with_update_at(task.meta.updated_at);
+                t.with_update_at(ctx.timestamp);
                 ctx.storage.put_task(t).await?;
             }
         }

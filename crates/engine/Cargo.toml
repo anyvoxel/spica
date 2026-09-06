@@ -8,11 +8,13 @@ publish.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 auto_impl.workspace = true
+crc.workspace = true
 derive_more.workspace = true
 jsonata-core.workspace = true
 jsonptr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 spica-asl.workspace = true
 spica-logstream = { workspace = true }
 spica-machinery.workspace = true

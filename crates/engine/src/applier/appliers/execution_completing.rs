@@ -20,11 +20,12 @@ impl EventApplier for ExecutionCompletingApplier {
                 status: ExecutionStatus::Completing,
                 input: Default::default(),
                 output: Some(Default::default()),
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Execution,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -46,7 +47,7 @@ impl EventApplier for ExecutionCompletingApplier {
             // handler stamped at construction); the record's own `updated_at` is separately touched
             // from the entry timestamp below.
             exec.value.meta.updated_at = execution.meta.updated_at;
-            exec.touch(ctx.timestamp);
+            exec.with_update_at(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
@@ -62,6 +63,7 @@ impl ExecutionStatus {
 /// `root_execution` (it is its own root — its `reference()` IS the flat query anchor). Removing those
 /// two fields is exactly what makes the type self-describing: no consumer must inspect fields to
 /// decide whether an `Execution` is a root or a branch, because it is always a root.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Execution {
     /// The object identity + shared metadata (k8s-style `ObjectMeta` reuse). **`meta.uid` IS the

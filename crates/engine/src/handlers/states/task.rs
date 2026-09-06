@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{State, TaskState};
 
@@ -12,15 +13,16 @@ use crate::types::meta::ObjectReference;
 
 pub struct TaskStateHandler;
 
+#[async_trait]
 impl StateHandler for TaskStateHandler {
     fn state(&self) -> State {
         State::Task(TaskState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -30,17 +32,17 @@ impl StateHandler for TaskStateHandler {
                 "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        activate_task(env, out, activity, actx, s);
+        activate_task(env, out, activity, actx, s).await;
     }
 
     /// Resumed by `CompleteTask`'s `CompleteState` after the external call settles with `Ok`. Runs
     /// the state's `complete` step: projects `Assign`/`Output` against the stored processed input
     /// (`$states.input`) and raw task result (`$states.result`), then routes to `Next`/`End` (the
     /// shared success finish — identical to `Wait`'s `complete`).
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -59,9 +61,10 @@ impl StateHandler for TaskStateHandler {
             s.output.as_ref(),
             s.next.as_deref(),
             s.end,
-            actx.activity.retry_state.attempts,
+            actx.activity.retry_count(),
             None, // success path — no Catch `errorOutput`
-        );
+        )
+        .await;
     }
 }
 
@@ -74,9 +77,9 @@ impl StateHandler for TaskStateHandler {
 /// `resource` is static text (per ASL, the `Resource` URI); `arguments` may embed JSONata. The
 /// `timeout_seconds`/`heartbeat_seconds`/`retry`/`catch` fields are not implemented yet — a task
 /// that specifies them structurally is out of scope until their milestone.
-fn activate_task(
+async fn activate_task(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &TaskState,
@@ -86,12 +89,12 @@ fn activate_task(
     // complete step later projects against). `assign_ctx = None`: the state's own `Assign` has not
     // yet been applied.
     let states = build_states(
-        &actx.activity.input,
+        &actx.activity.raw_input,
         None,
         &actx.state_name(),
         &actx.exec_input,
         None,
-        actx.activity.retry_state.attempts,
+        actx.activity.retry_count(),
         None,
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -110,7 +113,7 @@ fn activate_task(
                 .expect("an owned activity has an owner"),
             env.eval_json(arguments, &states, &actx.variables)
         ),
-        None => actx.activity.input.clone(),
+        None => actx.activity.raw_input.clone(),
     };
 
     // TODO(M2): the remaining Task field not yet fully acted on is `heartbeat_seconds`
@@ -144,11 +147,17 @@ fn activate_task(
     // task still names its root run; the suffix (random, `PlainName::to_generated`) is decoupled
     // from the task's own `uid`. Minted once and reused for both the command's reference and the
     // serialized `meta.name` (storage lookups are keyed by the reference's name).
-    let task_name = actx.activity.execution.name.base().to_generated();
+    let task_name = actx
+        .activity
+        .execution
+        .name
+        .base()
+        .generated_from_key(out.next_generated_seq().await);
     let task_ref = ObjectReference::new(crate::types::meta::ObjectKind::Task, task_name, task_uid);
     out.emit_event(Event::StateActivated {
         activity: state_activated_value(actx, arguments.clone(), None),
-    });
+    })
+    .await;
     out.emit_command(Command::ActivateTask {
         execution: actx.activity.execution.clone(),
         owner: activity.clone(),
@@ -177,7 +186,8 @@ fn activate_task(
             activity,
             crate::types::command::TimerPurpose::TaskTimeout,
             deadline,
-        );
+        )
+        .await;
     }
 }
 
@@ -185,7 +195,7 @@ fn activate_task(
 /// definition error (invalid value, eval failure, or overflow). The activity's terminate path
 /// drives the failure up through the cascade.
 fn emit_timeout_definition_failure(
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     execution: crate::types::meta::ObjectReference,
     error: crate::types::error::ExecutionError,
@@ -204,7 +214,7 @@ fn emit_timeout_definition_failure(
 /// On an invalid/out-of-range value, emits the failure and returns `None`.
 fn resolve_task_deadline(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     states: &Value,

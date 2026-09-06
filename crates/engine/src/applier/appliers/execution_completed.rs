@@ -20,11 +20,12 @@ impl EventApplier for ExecutionCompletedApplier {
                 status: ExecutionStatus::Completed,
                 input: Default::default(),
                 output: Some(Default::default()),
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Execution,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -47,7 +48,7 @@ impl EventApplier for ExecutionCompletedApplier {
             // A terminal execution cannot still own an in-flight state activation cursor.
             exec.current_activity = None;
             let parent = exec.value.meta.owner.clone();
-            exec.touch(ctx.timestamp);
+            exec.with_update_at(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
             if let Some(owner) = parent {
                 ctx.storage

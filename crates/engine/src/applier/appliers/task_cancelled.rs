@@ -24,12 +24,15 @@ impl EventApplier for TaskCancelledApplier {
                 lease_until: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::placeholder_with_times(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Task,
                     ulid::Ulid::nil(),
+                )
+                .timestamps(
                     crate::log::Timestamp::from_millis(0),
                     crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .build(),
             },
         }
     }
@@ -55,8 +58,8 @@ impl EventApplier for TaskCancelledApplier {
                 .expect("an owned task always has an owner");
             t.status = TaskStatus::Cancelled;
             // Sync the domain value's transition stamp from the event (see task_completed.rs).
-            t.value.meta.touch(task.meta.updated_at);
-            t.touch(ctx.timestamp);
+            t.value.meta.with_update_at(task.meta.updated_at);
+            t.with_update_at(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             ctx.storage.remove_child(parent, task.reference()).await?;
         }

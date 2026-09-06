@@ -3,10 +3,14 @@
 //! Storage is a pure fold of the [`Event`] stream; the [`StreamProcessor`](crate::StreamProcessor) rebuilds the
 //! execution tree by applying each event. Mirroring the [`CommandHandler`](crate::CommandHandler)
 //! design, projection is split into per-`Event` applier implementations (each in
-//! [`appliers`]), keeping each event's fold rule local and — because some events carry *side
-//! effects* (arming a timer schedules a physical deadline; cancelling one deschedules it) — the
-//! applier context hands each impl a [`ApplierContext`] through which it can both mutate the store
-//! and drive the timer [`Scheduler`](crate::scheduler::Scheduler).
+//! [`appliers`]), keeping each event's fold rule local.
+//!
+//! An applier is a **pure function of the fold**: it mutates the store only. External side effects are
+//! *derived* elsewhere from the durable event itself — e.g. a `TimerActivated` event carries the
+//! absolute `deadline`, so a consumer (via the injected [`Hook`](crate::Hook) observer) re-derives the
+//! physical timer arm from the event without the engine knowing a scheduler. Keeping the fold free of
+//! any environment (no scheduler handle, no log) makes the same fold safe on both the pre-append work
+//! transaction and post-commit recovery replay alike.
 //!
 //! A storage implementation needs only supply the read/mutate primitives ([`Storage`](crate::Storage));
 //! the applier table is shared and constructed once per StreamProcessor.
@@ -40,8 +44,9 @@ macro_rules! event_applier_entry {
     ($map:expr) => {};
 }
 
-/// An `EventApplier` receives one `Event` plus context and mutates Storage (and optionally the
-/// scheduler). Table-driven like [`CommandHandler`](crate::CommandHandler).
+/// An `EventApplier` receives one `Event` plus context, mutates Storage, and returns nothing — the
+/// projection is a pure fold (an applier never performs external side effects itself). Table-driven
+/// like [`CommandHandler`](crate::CommandHandler).
 #[async_trait::async_trait]
 pub trait EventApplier: Send + Sync {
     /// The [`Event`] variant this applier folds, identified by a `Default` placeholder instance
@@ -59,16 +64,12 @@ pub trait EventApplier: Send + Sync {
     ) -> Result<(), crate::types::error::ExecutionError>;
 }
 
-/// Context handed to a single `EventApplier::apply` call: mutable access to the store and a handle
-/// to the timer scheduler (for `TimerActivated` / `TimerCancelled` scheduling), plus the envelope
-/// identity `cause_id` and the **`timestamp`** of the entry currently being applied. The scheduler
-/// needs `cause_id` to later re-envelope the resumption command it fires (there is no per-execution
-/// stream — a LogStream is one stream, so stream identity lives on the log, not the context);
-/// `timestamp` is the single deterministic source for the projection's `created_at`/`updated_at`
-/// facts — it is the value frozen in the log record, so every replica replaying the same entries
-/// computes identical times (see `storage::*::created_at`). Appliers must use this value and
-/// **never** call `Timestamp::now()` locally, which would make the fold non-deterministic across
-/// replicas.
+/// Context handed to a single `EventApplier::apply` call: mutable access to the store, plus the
+/// **`timestamp`** of the entry currently being applied — the single deterministic source for the
+/// projection's `created_at`/`updated_at` facts; it is the value frozen in the log record, so every
+/// replica replaying the same entries computes identical times (see `storage::*::created_at`).
+/// Appliers must use this value and **never** call `Timestamp::now()` locally, which would make the
+/// fold non-deterministic across replicas.
 ///
 /// M1→M2 note: there is **no** task service on the context. Applying `TaskActivated` used to invoke
 /// the handler in-process as a side effect; now it only makes the task *claimable* — a worker pulls
@@ -79,14 +80,10 @@ pub struct ApplierContext<'a> {
     /// raw [`Storage`](crate::storage::Storage): the applier can fold rows but cannot commit (which
     /// consumes the `Box`) nor move the resume watermark — atomicity is *type-enforced*.
     pub storage: &'a mut dyn crate::storage::StorageTxn,
-    pub scheduler: &'a dyn crate::scheduler::Scheduler,
-    pub cause_id: crate::types::id::EntryId,
     pub timestamp: Timestamp,
 }
 
 /// Consume the collector's accumulated entries and route them to the applier table.
-///
-/// Returns nothing; each applier mutates Storage/Scheduler directly.
 pub struct EventDispatcher {
     handlers: HashMap<std::mem::Discriminant<Event>, Box<dyn EventApplier>>,
 }
@@ -103,7 +100,6 @@ impl EventDispatcher {
             ExecutionTerminatedApplier,
             FlowCreatedApplier,
             FlowVersionCreatedApplier,
-            ProcessChildCompletedHandledApplier,
             StateActivatingApplier,
             StateActivatedApplier,
             StateCompletingApplier,

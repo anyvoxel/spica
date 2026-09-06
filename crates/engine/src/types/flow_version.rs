@@ -1,6 +1,7 @@
 //! The persisted definition entity: one immutable published version of a flow.
 
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use crate::types::id::FlowName;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
@@ -26,6 +27,7 @@ use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
 /// Its identity is a k8s-style `meta.name` (`{flow_name}-{version}`, the **storage key**) plus a
 /// `meta.uid` (the version's never-reused ulid) — [`Self::reference`] bundles them into an
 /// [`ObjectReference`] that any consumer can address it by.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlowVersion {
     /// Shared identity + timing metadata. **`meta.name` IS the version's addressing key**:
@@ -40,6 +42,11 @@ pub struct FlowVersion {
     /// Stored as a string so the durable record is the exact definition the user submitted; it is
     /// parsed into a `StateMachine` where an execution needs it ([`HandlerContext::machine`]).
     pub definition: String,
+    /// CRC-64/ECMA checksum of `definition`'s bytes — a cheap way to detect whether two versions
+    /// hold byte-identical content without comparing the (possibly large) raw strings. See
+    /// [`Self::definition_checksum`].
+    #[serde(default)]
+    pub checksum: u64,
 }
 
 impl FlowVersion {
@@ -50,8 +57,7 @@ impl FlowVersion {
     /// `version` field, never by key order. Version 0 is the reserved "latest" sentinel in
     /// resolution, so ordinal 0 names never occur in storage.
     pub fn version_name(flow: &FlowName, version: u32) -> ObjectName {
-        ObjectName::generated_with_suffix(flow.as_str(), &version.to_string())
-            .expect("a FlowName + decimal version ordinal is always a valid generated name")
+        flow.generated_from_key(u64::from(version))
     }
 
     /// This version's canonical [`ObjectReference`] — the `(name, uid)` pair a consumer uses to
@@ -69,7 +75,16 @@ impl FlowVersion {
     /// a version constructed without an owner (the applier's dispatch placeholder); a **persisted**
     /// version always carries one (set in `create_flow`), so storage keys on it with `expect`.
     pub fn flow_name(&self) -> Option<FlowName> {
-        self.meta.owner.as_ref()?.name.as_flow_name()
+        self.meta.owner.as_ref()?.name.as_plain().cloned()
+    }
+
+    /// A CRC-64/ECMA checksum of the raw definition bytes, as its native 64-bit value. A content
+    /// fingerprint for consistency/identity checks: identical definitions checksum identically, and a
+    /// change to any byte flips the value with overwhelming probability (2^-64 collision odds, fine
+    /// for detecting drift between versions; not a security boundary).
+    pub fn definition_checksum(definition: &str) -> u64 {
+        let crc = crc::Crc::<u64>::new(&crc::CRC_64_ECMA_182);
+        crc.checksum(definition.as_bytes())
     }
 }
 
@@ -99,19 +114,18 @@ mod tests {
         let flow_uid = ulid::Ulid::new();
         let uid = ulid::Ulid::new();
         let version = FlowVersion {
-            meta: ObjectMeta::born_named(
-                ObjectKind::FlowVersion,
-                FlowVersion::version_name(&flow, 1),
-                uid,
-                Timestamp::from_millis(0),
-            )
-            .with_owner(OwnerReference::new(
-                ObjectKind::Flow,
-                ObjectName::plain("order").unwrap(),
-                flow_uid,
-            )),
+            meta: ObjectMeta::builder(ObjectKind::FlowVersion, uid)
+                .name(FlowVersion::version_name(&flow, 1))
+                .at(Timestamp::from_millis(0))
+                .build()
+                .with_owner(OwnerReference::new(
+                    ObjectKind::Flow,
+                    ObjectName::plain("order").unwrap(),
+                    flow_uid,
+                )),
             version: 1,
             definition: String::new(),
+            checksum: FlowVersion::definition_checksum(""),
         };
         let r = version.reference();
         assert_eq!(r.kind, ObjectKind::FlowVersion);
@@ -119,5 +133,19 @@ mod tests {
         assert_eq!(r.uid, uid);
         // flow_name derives from the owner reference, not the version's own name.
         assert_eq!(version.flow_name(), Some(flow));
+    }
+
+    #[test]
+    fn definition_checksum_is_stable_and_content_sensitive() {
+        // Identical content fingerprints identically (stable across calls and processes).
+        assert_eq!(
+            FlowVersion::definition_checksum("{\"StartAt\":\"A\"}"),
+            FlowVersion::definition_checksum("{\"StartAt\":\"A\"}")
+        );
+        // A one-byte change flips the checksum.
+        assert_ne!(
+            FlowVersion::definition_checksum("{\"StartAt\":\"A\"}"),
+            FlowVersion::definition_checksum("{\"StartAt\":\"B\"}")
+        );
     }
 }

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{PassState, State};
 
@@ -12,15 +13,16 @@ use crate::types::meta::ObjectReference;
 
 pub struct PassStateHandler;
 
+#[async_trait]
 impl StateHandler for PassStateHandler {
     fn state(&self) -> State {
         State::Pass(PassState::default())
     }
 
-    fn activate(
+    async fn activate(
         &self,
         _env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         _state: &State,
@@ -29,20 +31,21 @@ impl StateHandler for PassStateHandler {
         // the complete step in the very next Command. Emit the activation-complete ed first, then
         // the transition command.
         out.emit_event(crate::types::event::Event::StateActivated {
-            activity: state_activated_value(actx, actx.activity.input.clone(), None),
-        });
+            activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
+        })
+        .await;
         out.emit_command(crate::types::command::Command::CompleteState {
             activity,
             // A Pass's raw result is its processed input (no distinct raw output); the complete step
             // projects any `Output` template from it.
-            output: actx.activity.input.clone(),
+            output: actx.activity.raw_input.clone(),
         });
     }
 
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -55,7 +58,7 @@ impl StateHandler for PassStateHandler {
                 "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
             );
         };
-        complete_pass(env, out, activity, actx, s);
+        complete_pass(env, out, activity, actx, s).await;
     }
 }
 
@@ -65,20 +68,20 @@ impl StateHandler for PassStateHandler {
 // execution scope, emitted as `VariablesAssigned`) then `Output` (defaults to the input) — is the
 // canonical ASL success projection, kept here as the reference implementation the other complete
 // paths mirror.
-fn complete_pass(
+async fn complete_pass(
     env: &mut EvalEnv,
-    out: &mut Collector,
+    out: &mut Collector<'_>,
     activity: ObjectReference,
     actx: &ActivityCtx,
     state: &PassState,
 ) {
     let states = build_states(
-        &actx.activity.input,
-        Some(&actx.activity.input),
+        &actx.activity.raw_input,
+        Some(&actx.activity.raw_input),
         &actx.state_name(),
         &actx.exec_input,
-        Some(&actx.activity.input),
-        actx.activity.retry_state.attempts,
+        Some(&actx.activity.raw_input),
+        actx.activity.retry_count(),
         None, // no Catch `errorOutput` in the success path
         None, // not a Map item — no `context.Map.Item` binding
     );
@@ -110,7 +113,8 @@ fn complete_pass(
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {
@@ -141,12 +145,13 @@ fn complete_pass(
                 .expect("an owned activity has an owner"),
             env.eval_json(o, &states, &local_scope)
         ),
-        None => actx.activity.input.clone(),
+        None => actx.activity.raw_input.clone(),
     };
 
     out.emit_event(Event::StateCompleted {
         activity: state_completed_value(actx, output_value.clone()),
-    });
+    })
+    .await;
     emit_transition(
         out,
         actx.activity.execution.clone(),
@@ -160,5 +165,6 @@ fn complete_pass(
         &output_value,
         state.next.as_deref(),
         state.end,
-    );
+    )
+    .await;
 }

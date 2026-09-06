@@ -35,7 +35,6 @@ pub(crate) fn state_label(state: ExecutionState) -> &'static str {
     match state {
         ExecutionState::Completed => "COMPLETED",
         ExecutionState::Terminated => "TERMINATED",
-        ExecutionState::NotFound => "NOT_FOUND",
         ExecutionState::Active => "ACTIVE",
     }
 }

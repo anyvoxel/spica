@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::{Activity, ActivityState, ActivityStatus, ApplierContext, EventApplier, RetryState};
+use crate::{Activity, ActivityStatus, ApplierContext, EventApplier};
 
 use crate::storage::ActivityRecord;
 
@@ -19,16 +19,17 @@ impl EventApplier for StateActivatingApplier {
                 state_path: jsonptr::PointerBuf::new(),
                 status: ActivityStatus::Running,
                 raw_input: Default::default(),
-                input: Default::default(),
+                input: None,
                 raw_output: None,
-                activity_state: ActivityState::Leaf,
-                retry_state: RetryState::default(),
+                activity_state: None,
+                retry_state: None,
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
                     crate::types::id::ActivityId::nil().into(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -51,6 +52,7 @@ impl EventApplier for StateActivatingApplier {
         // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_activity(row).await?;
+        super::bump_generated_seq(ctx.storage, &activity.reference().name).await?;
         ctx.storage
             .add_child(
                 activity
@@ -76,14 +78,14 @@ impl EventApplier for StateActivatingApplier {
             crate::types::meta::ObjectKind::Execution => {
                 if let Some(mut exec) = ctx.storage.get_execution(&ownership).await? {
                     exec.current_activity = Some(uid.into());
-                    exec.touch(ctx.timestamp);
+                    exec.with_update_at(ctx.timestamp);
                     ctx.storage.put_execution(exec).await?;
                 }
             }
             crate::types::meta::ObjectKind::Thread => {
                 if let Some(mut thread) = ctx.storage.get_thread(&ownership).await? {
                     thread.current_activity = Some(uid.into());
-                    thread.touch(ctx.timestamp);
+                    thread.with_update_at(ctx.timestamp);
                     ctx.storage.put_thread(thread).await?;
                 }
             }

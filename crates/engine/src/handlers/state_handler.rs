@@ -37,10 +37,10 @@ pub trait StateHandler: Send + Sync {
     /// Enter the state. Emits the `StateActivated` ed once the input is processed, then either
     /// self-terminates (fully-synchronous variants) or arms a side effect and returns (asynchronous
     /// ones).
-    fn activate(
+    async fn activate(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
@@ -48,17 +48,17 @@ pub trait StateHandler: Send + Sync {
 
     /// Finish the state successfully. The shared [`super::complete_activity`] projection covers the
     /// common case; a state with a custom finish (`Pass`, `Succeed`, `Fail`) overrides it.
-    fn complete(
+    async fn complete(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: &ActivityCtx,
         state: &State,
     );
 
     /// A child node of this state reached a terminal state while the state is `Running` — the
-    /// **replenish** half of `ProcessChildCompleted` (see that handler's docs for the drain-vs-
+    /// **replenish** half of the child-settled reaction (see `child_completed`'s docs for the drain-vs-
     /// replenish split). Only a container state (M3 `Parallel`) implements this: it owns child
     /// executions while `Running` and reacts here as each settles — e.g. a `Parallel` emits its
     /// deferred completion once its last branch converges, or fails once a branch fails. Leaf / M1
@@ -68,13 +68,12 @@ pub trait StateHandler: Send + Sync {
     /// the container decide to do nothing rather than fabricate a context.
     ///
     /// TODO(recovery): like `complete`, this runs from the shared cascade and must stay
-    /// deterministic + idempotent for a cause-based replay (see `Command::ProcessChildCompleted`'s
-    /// TODO). Default stays a safe no-op — the state must emit a causal outcome for every
-    /// replenish it runs under.
+    /// deterministic + idempotent for a cause-based replay (see `child_completed`'s TODO). Default
+    /// stays a safe no-op — the state must emit a causal outcome for every replenish it runs under.
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
-        out: &mut Collector,
+        out: &mut Collector<'_>,
         activity: ObjectReference,
         actx: Option<&ActivityCtx>,
         state: &State,

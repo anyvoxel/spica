@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use crate::log::Timestamp;
 use crate::types::command::TimerPurpose;
@@ -30,6 +31,7 @@ impl TimerStatus {
 /// `Activity` (`WaitResume` / task retry / task timeout). The value carries only the timer's own
 /// domain facts — storage may wrap it to keep the domain/projection boundary explicit, just as it
 /// does for `Activity`.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timer {
     /// Shared identity + timing metadata. `meta.uid` is the timer's stable identity; the domain

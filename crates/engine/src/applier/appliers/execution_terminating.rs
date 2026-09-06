@@ -21,11 +21,12 @@ impl EventApplier for ExecutionTerminatingApplier {
                 ),
                 input: Default::default(),
                 output: None,
-                meta: crate::types::meta::ObjectMeta::born_placeholder(
+                meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Execution,
                     ulid::Ulid::nil(),
-                    crate::log::Timestamp::from_millis(0),
-                ),
+                )
+                .at(crate::log::Timestamp::from_millis(0))
+                .build(),
             },
         }
     }
@@ -43,7 +44,7 @@ impl EventApplier for ExecutionTerminatingApplier {
         if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
             exec.status = execution.status.clone();
             exec.value.meta.updated_at = execution.meta.updated_at;
-            exec.touch(ctx.timestamp);
+            exec.with_update_at(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

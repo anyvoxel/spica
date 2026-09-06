@@ -46,7 +46,9 @@
 //! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
 //! by the `version` field, never by key order.
 
-use spica_engine::{ExecutionError, FlowName, ObjectName, ObjectReference, RuntimeError};
+use spica_engine::{
+    ExecutionError, FlowName, ObjectKind, ObjectName, ObjectReference, RuntimeError,
+};
 
 /// The two fixed scope segments of every key (tenant + namespace).
 ///
@@ -146,6 +148,21 @@ impl Kind {
             Kind::FlowVersion => "flowversion",
         }
     }
+
+    /// The storage kind for an engine [`ObjectKind`] — the reverse of the entity reference's kind.
+    /// Every entity kind maps onto an exactly-one storage row kind (see the module's key table), so
+    /// the Query `ListObjects` facade can derive the scan prefix from an `ObjectKind` alone.
+    pub fn from_object(kind: ObjectKind) -> Kind {
+        match kind {
+            ObjectKind::Execution => Kind::Execution,
+            ObjectKind::Thread => Kind::Thread,
+            ObjectKind::Activity => Kind::Activity,
+            ObjectKind::Timer => Kind::Timer,
+            ObjectKind::Task => Kind::Task,
+            ObjectKind::Flow => Kind::Flow,
+            ObjectKind::FlowVersion => Kind::FlowVersion,
+        }
+    }
 }
 
 /// Builds the canonical key for every storage row / index under one [`Scope`].
@@ -220,6 +237,19 @@ impl KeyBuilder {
         ])
     }
 
+    /// The generic range-start for a forward scan over **every row of one kind** in this scope:
+    /// `/<t>/<ns>/<kind.segment()>/`. The trailing `/` binds the scan to exactly that kind — the
+    /// Query `ListObjects` read facade enumerates a kind by ranging this prefix (k8s-style LIST in
+    /// storage-key order). Distinct from [`Self::task_prefix`] only in that it takes any [`Kind`].
+    pub fn kind_prefix(&self, kind: Kind) -> Vec<u8> {
+        join(&[
+            self.scope.tenant(),
+            self.scope.namespace(),
+            kind.segment(),
+            "",
+        ])
+    }
+
     /// Flow row: `/<t>/<ns>/flow/<flow_name>` — the name *is* the primary key, so the identifier
     /// segment is the name verbatim. `FlowName`'s `[A-Za-z0-9_]` charset already excludes `/`, making
     /// it a safe segment.
@@ -258,6 +288,21 @@ impl KeyBuilder {
             "last_processed_position",
         ])
     }
+
+    /// Partition-local monotonic counter for generated-object names:
+    /// `/<t>/<ns>/_global/next_generated_seq`. One scalar per processing partition (bound to this
+    /// key's scope), so a generated name's suffix is unique **within the partition with zero
+    /// cross-partition coordination** (Zeebe's per-partition key generator). It is rebuilt by
+    /// re-folding the create events on replay, so it needs no separate log entry. Never global —
+    /// a global counter would force cross-partition synchronization.
+    pub fn next_generated_seq(&self) -> Vec<u8> {
+        join(&[
+            self.scope.tenant(),
+            self.scope.namespace(),
+            "_global",
+            "next_generated_seq",
+        ])
+    }
 }
 
 /// Join segments with `/`, prefixed by a leading `/` (so the key is fully self-delimiting).
@@ -273,7 +318,7 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine::ObjectKind;
+    use spica_engine::{ObjectKind, PlainName};
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
@@ -285,7 +330,9 @@ mod tests {
     fn exec_ref(uid: Ulid) -> ObjectReference {
         ObjectReference::new(
             ObjectKind::Execution,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -295,7 +342,9 @@ mod tests {
     fn act_ref(uid: Ulid) -> ObjectReference {
         ObjectReference::new(
             ObjectKind::Activity,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -305,7 +354,9 @@ mod tests {
     fn task_ref(uid: Ulid) -> ObjectReference {
         ObjectReference::new(
             ObjectKind::Task,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -315,7 +366,9 @@ mod tests {
     fn timer_ref(uid: Ulid) -> ObjectReference {
         ObjectReference::new(
             ObjectKind::Timer,
-            ObjectName::generated_with_suffix("child", &uid.to_string()).unwrap(),
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
             uid,
         )
     }
@@ -327,7 +380,7 @@ mod tests {
         let act = act_ref(Ulid::new());
         let tim = timer_ref(Ulid::new());
         let task = task_ref(Ulid::new());
-        let vname = ObjectName::generated_with_suffix("order", "00000001").unwrap();
+        let vname = PlainName::new("order").unwrap().generated_from_key(1);
         let name = FlowName::new("order").unwrap();
 
         let exec_key = String::from_utf8(kb.execution(&exec)).unwrap();
@@ -368,7 +421,7 @@ mod tests {
         // Same raw ULID under different kinds must not collide.
         let act = String::from_utf8(kb.activity(&act_ref(id))).unwrap();
         let fv = String::from_utf8(
-            kb.flow_version(&ObjectName::generated_with_suffix("order", "00000001").unwrap()),
+            kb.flow_version(&PlainName::new("order").unwrap().generated_from_key(1)),
         )
         .unwrap();
         assert_ne!(exec, act);
@@ -422,7 +475,7 @@ mod tests {
                 KeyBuilder::new(Scope::default_scope()).execution(&exec_ref(Ulid::nil()))
             )
             .unwrap(),
-            "/_/default/execution/child-00000000000000000000000000"
+            "/_/default/execution/child-0"
         );
     }
 }

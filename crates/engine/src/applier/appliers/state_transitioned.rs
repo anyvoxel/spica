@@ -18,7 +18,7 @@ impl EventApplier for StateTransitionedApplier {
     fn event(&self) -> Event {
         Event::StateTransitioned {
             activity: ObjectReference::nil(),
-            next: String::new(),
+            next: jsonptr::PointerBuf::new(),
         }
     }
 

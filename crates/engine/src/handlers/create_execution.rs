@@ -25,7 +25,7 @@ impl CommandHandler for CreateExecutionHandler {
         }
     }
 
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector) {
+    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
         // `request_id` is the awaiting caller's correlation key — echoed onto `ExecutionCreated` so
         // the StreamProcessor's request-ack correlator wakes the awaiting `start` operation with the fact
         // that this execution was durably created (see `Event::ExecutionCreated`). The handler
@@ -75,11 +75,8 @@ impl CommandHandler for CreateExecutionHandler {
         // from Storage into the cache. If the version is missing (definition GC'd), the execution
         // cannot run and fails before any state is entered.
         let sm = fail_or!(out, None, id.clone(), ctx.machine(flow_version).await);
-        // Build the real birth event once and reuse it for both the durable emit and the ack echo —
-        // `deliver_matching_acks` matches the declared ack by event *variant* + echoed `request_id`
-        // only, never by value, and delivers the applied event back to the caller (see `AckRouter`),
-        // so the echo carrying the same real value is behavior-identical to a placeholder (this is the
-        // same `create_flow` idiom).
+        // Build the birth event once and emit it; an injected `Hook` observer wakes the awaiting `start`
+        // caller from this same event (the `request_id` it echoes), so no separate ack echo is needed.
         let created_event = Event::ExecutionCreated {
             request_id: *request_id,
             execution: crate::Execution {
@@ -91,20 +88,17 @@ impl CommandHandler for CreateExecutionHandler {
                 status: crate::ExecutionStatus::Running,
                 input: input.clone(),
                 output: None,
-                meta: ObjectMeta::born_named(
-                    ObjectKind::Execution,
-                    name.clone(),
-                    uid,
-                    Timestamp::now(),
-                ),
+                meta: ObjectMeta::builder(ObjectKind::Execution, uid)
+                    .name(name.clone())
+                    .at(Timestamp::now())
+                    .build(),
             },
         };
-        // Declare the *birth* acknowledgement for the awaiting `start` caller: the StreamProcessor
-        // wakes it (delivering the applied event) once this `ExecutionCreated` lands on Storage — see
-        // `Engine::start_for_revision`, which returns the execution id at that point, leaving the
-        // terminal settle to `wait_for_execution`.
-        out.ack_request(*request_id, created_event.clone());
-        out.emit_event(created_event);
+        // The birth `ExecutionCreated` echoes the awaiting `start` caller's request id; the `AckHook`
+        // observer wakes it once the engine reports this event applied (see `Engine::start_for_revision`,
+        // which returns the execution id at that point, leaving the terminal settle to
+        // `wait_for_execution`).
+        out.emit_event(created_event).await;
 
         if let Some(secs) = sm.timeout_seconds
             && secs > 0
@@ -148,21 +142,22 @@ impl CommandHandler for CreateExecutionHandler {
                     return;
                 }
             };
-            let name = base.to_generated();
+            // The suffix is this partition's local generated-name counter (see `Storage::next_generated_seq`),
+            // read via the working overlay so a sibling minted earlier in the same batch is visible; the
+            // `TimerActivated` applier bumps the counter past it in the same fold.
+            let name = base.generated_from_key(out.next_generated_seq().await);
             let timer = crate::Timer {
-                meta: crate::types::meta::ObjectMeta::born_named(
-                    ObjectKind::Timer,
-                    name,
-                    uid,
-                    Timestamp::now(),
-                )
-                .with_owner(id.clone()),
+                meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, uid)
+                    .name(name)
+                    .at(Timestamp::now())
+                    .build()
+                    .with_owner(id.clone()),
                 execution: id.clone(),
                 purpose: TimerPurpose::ExecutionTimeout,
                 status: crate::TimerStatus::Active,
                 deadline,
             };
-            out.emit_event(Event::TimerActivated { timer });
+            out.emit_event(Event::TimerActivated { timer }).await;
         }
 
         let start = sm.start_at.clone();

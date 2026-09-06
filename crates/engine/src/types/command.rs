@@ -110,9 +110,8 @@ pub enum Command {
     /// (`ExecutionTimeout`, emitted inline).
     CreateExecution {
         /// Correlation key for the awaiting caller (Zeebe's `requestId`). The acknowledgement for a
-        /// `CreateExecution` is the execution's *terminal* event, produced much later by a different
-        /// handler, so the StreamProcessor remembers `execution → request_id` when it dispatches this
-        /// command and routes the terminal event back through that id (see `Engine::AckRouter`).
+        /// `CreateExecution` is the execution's birth `ExecutionCreated`, which echoes this id; the
+        /// `AckHook` observer wakes the caller with it once the event is applied (see the engine's injected Hook consumer).
         request_id: RequestId,
         /// The execution's **user-supplied addressing name** (validated at the public boundary via
         /// `ObjectName::plain`). The execution's durable `uid` is not carried here: the handler mints
@@ -129,7 +128,7 @@ pub enum Command {
     /// tree, inheriting the top-level run's id as its flat query anchor, and pointing its
     /// `state_path` at the branch's `states` table within the shared machine) followed by an
     /// `ActivateState` entering the branch's `StartAt` state. The child runs as a self-contained
-    /// sub-state-machine; its terminal hop cascades back to `owner` via `ProcessChildCompleted`.
+    /// sub-state-machine; its terminal hop runs the inline child-settled reaction back to `owner`.
     ///
     /// `owner` is the `Parallel` activity that owns the branch, `execution` the top-level run
     /// (carried verbatim through every nesting level), `state_path` the resolved JSON Pointer to
@@ -186,7 +185,7 @@ pub enum Command {
     ///
     /// Produces `ThreadCompleting`, cancels the branch's sm-timers, and `ThreadCompleted` once
     /// drained — mirroring `CompleteExecution`'s cascade but resolved against thread storage and
-    /// cascading its settle back to the owning container via `ProcessChildCompleted`.
+    /// running the inline child-settled reaction back to the owning container.
     CompleteThread {
         thread: ObjectReference,
         output: Value,
@@ -213,7 +212,7 @@ pub enum Command {
     ///
     /// Produces `ThreadTerminating`, sweeps owned children, and `ThreadTerminated{reason}` once
     /// drained — mirroring `TerminateExecution`'s cascade, but resolved against thread storage and
-    /// cascading its settle back to the owning container via `ProcessChildCompleted`.
+    /// running the inline child-settled reaction back to the owning container.
     TerminateThread {
         thread: ObjectReference,
         reason: TerminationReason,
@@ -313,7 +312,7 @@ pub enum Command {
     /// acknowledgment channel (`AckOutcome::Granted`). Allocation stays in the StreamProcessor's
     /// serialized, lock-holding dispatch, so the grant is decided where the projection is read.
     /// `request_id` correlates the caller's `poll_tasks` with the returned task list (the
-    /// `TasksClaimed` events themselves carry no request id).
+    /// `TasksClaimed` event echoes it back).
     ClaimTasks {
         request_id: RequestId,
         worker_id: String,
@@ -356,43 +355,19 @@ pub enum Command {
     /// in flight). Idempotent — a no-op if the task already settled.
     CancelTask { task: ObjectReference },
 
-    // ── Coordination (cross-entity relay) ────────────────────────────────────
-    /// A child reached a terminal state; notify `owner` so *it* can decide what to do next.
-    ///
-    /// The child never knows whether its settle drains the owner (was it the last child?) nor
-    /// whether the owner should replenish a work slot (Map/Parallel concurrency) — those are the
-    /// owner's own decisions. This command hands that decision to [`ProcessChildCompletedHandler`]
-    /// (crate::handlers::ProcessChildCompletedHandler), which runs on the *next* dispatch round after the
-    /// child's terminal event was applied, so it sees `owner`'s real post-drain `active_children`.
-    ///
-    /// `owner` is carried in the command (rather than re-derived from storage) because by the time
-    /// this command is dispatched, the child may have been removed from `owner`'s snapshot or,
-    /// in the re-entry path, swept from the tree entirely — the child's own terminal path reads the
-    /// owner link before that. `child` is retained for logging / debugging and for the M2/M3
-    /// Map/Parallel replenish logic.
-    ///
-    /// TODO(recovery + design): this command's handling is unfinished for the container states and
-    /// for cause-based recovery. The following design work is deferred:
-    ///
-    /// - **Cause-based recovery must stay decidable.** On restart, a command is re-dispatched iff it
-    ///   has no causal follow-up event. Currently this command's silent branches (parent not draining,
-    ///   parent already terminal, Timer/Task targets) produce **zero events** — so those outcomes are
-    ///   indistinguishable from "never processed" and would be re-run. Worse, any branch that emits a
-    ///   parent terminal event would be re-emitted on a spurious re-run. Once durable recovery lands,
-    ///   every outcome must have a deterministic, logged, idempotent causal product — either the high-
-    ///   value parent terminal event, or an idempotent "handled/rejected" confirmation event (mirroring
-    ///   Zeebe's `COMMAND_REJECTED`, which is always written, never silent).
-    ///
-    /// - **`StateHandler` needs a `child_completed` hook** (default `unreachable!` only *while* no
-    ///   container state exists): dispatched from here when `parent` is a `Running` Activity, it lets a
-    ///   Map/Parallel container decide replenish-vs-drain. But `unreachable!` is **unsafe under
-    ///   recovery replay**, where a panic would keep the restarted service from booting — so the
-    ///   unreachable default is only valid while there are no container states (M1/M2), and must be
-    ///   replaced (by the idempotent confirmation path above) before Map/Parallel + recovery coexist.
-    ProcessChildCompleted {
-        owner: ObjectReference,
-        child: ObjectReference,
-    },
+    /// Continue a drained-and-finishing `owner`'s **success** drain on a later round. Issued by the
+    /// one-hop child-settled reactor (see `handlers::child_completed`) the moment it observes the
+    /// `owner` is `Completing` with no remaining children; the [`ContinueCompleteHandler`] emits the
+    /// owner's terminal next round and issues a follow-up Continue for *its* owner. Replaces the old
+    /// inline recursive cascade with one hop per round (Zeebe's `COMPLETE_ELEMENT` decoupling), so
+    /// convergence no longer recurses up the owner chain on the call stack.
+    ContinueComplete { owner: ObjectReference },
+
+    /// Continue a drained-and-finishing `owner`'s **failure** drain on a later round — the
+    /// `Terminating` analogue of [`ContinueComplete`](Command::ContinueComplete). The `reason` is
+    /// recovered from the `owner`'s `Terminating(reason)` status at drain time (single source of
+    /// truth), so it is deliberately not carried.
+    ContinueTerminate { owner: ObjectReference },
 }
 
 /// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s dispatch and is a
