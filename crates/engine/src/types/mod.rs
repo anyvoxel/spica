@@ -19,7 +19,6 @@ pub mod id;
 #[allow(dead_code)]
 pub mod meta;
 pub mod reject;
-pub mod result;
 pub mod task;
 pub mod thread;
 pub mod timer;

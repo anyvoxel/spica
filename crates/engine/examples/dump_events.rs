@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_client::worker::{InMemoryTaskService, TaskFailure, TaskHandler, TaskService};
 use spica_engine::{
-    EngineBuilder, Entry, EntryId, EntryPayload, ExecutionResult, InMemoryLogStream, LogStream,
+    EngineBuilder, Entry, EntryId, EntryPayload, ExecutionStatus, InMemoryLogStream, LogStream,
     StreamId,
 };
 use spica_storage::InMemoryStorage;
@@ -246,9 +246,18 @@ async fn run_tree(title: &str, sm_def: &str, input: Value) -> Value {
         .await
         .expect("start execution");
 
-    // Await the terminal outcome (Completed => Ok; a Fail run => Err with the StateFailed reason).
+    // Await the terminal snapshot; settling (Completed vs Terminated) is read off the returned value.
     let result = match engine.wait_for_execution(&execution).await {
-        Ok(ExecutionResult { output }) => json!({ "output": output }),
+        Ok(exec) => match exec.status {
+            ExecutionStatus::Completed => {
+                json!({ "output": exec.output.unwrap_or(serde_json::Value::Null) })
+            }
+            ExecutionStatus::Terminated(reason) => {
+                json!({ "error": reason.to_execution_error().to_string() })
+            }
+            // wait_for_execution only returns once terminal; a live non-terminal arm is unreachable.
+            other => json!({ "status": format!("{:?}", other) }),
+        },
         Err(e) => json!({ "error": e.to_string() }),
     };
 

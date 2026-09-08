@@ -26,7 +26,7 @@ impl EventApplier for StateCompletedApplier {
                 output: None,
                 meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
-                    crate::types::id::ActivityId::nil().into(),
+                    ulid::Ulid::nil(),
                 )
                 .at(crate::log::Timestamp::from_millis(0))
                 .build(),

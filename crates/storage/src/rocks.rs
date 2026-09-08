@@ -736,8 +736,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timer, TimerId,
-        TimerPurpose, TimerStatus, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timer, TimerPurpose,
+        TimerStatus, Timestamp, Variables,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
@@ -868,8 +868,7 @@ mod tests {
                 .await
                 .unwrap();
             // A timer under the same numeric-ish space is a distinct key namespace.
-            let timer_uid = TimerId::new();
-            let uid: ulid::Ulid = timer_uid.into();
+            let uid: ulid::Ulid = ulid::Ulid::new();
             let timer_ref = ObjectReference::new(
                 ObjectKind::Timer,
                 PlainName::new("child")
@@ -882,13 +881,10 @@ mod tests {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
-                meta: spica_engine::ObjectMeta::builder(
-                    spica_engine::ObjectKind::Timer,
-                    timer_uid.into(),
-                )
-                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                .build()
-                .with_owner(id.clone()),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build()
+                    .with_owner(id.clone()),
             });
             store.put_timer(t.clone()).await.unwrap();
             assert_eq!(

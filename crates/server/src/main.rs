@@ -16,8 +16,8 @@
 //! "Wait" RPC on the wire, and no per-kind snapshot RPC.
 
 mod common;
-mod consumer;
 mod execution;
+mod gateway;
 mod query;
 mod task;
 mod workflow;
@@ -82,13 +82,14 @@ async fn main() -> anyhow::Result<()> {
         Box::new(RocksLogStream::<EntryPayload>::open(&log_dir)?);
     let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir)?);
     let scheduler: Arc<dyn Scheduler> = InMemoryScheduler::spawn();
-    // The consumer layer: an `AckHook` observer injected into the engine correlates awaited commands'
-    // outcomes to their callers; the `Facade` wraps engine + ack to expose the blocking convenience API.
-    // Timer scheduling is consumer-owned: `build_observer` composes the ack correlation with a hook that
-    // re-derives physical timer arms from durable events, and returns the engine slot the booted engine
-    // fills in for the sink (see `spica_server::consumer`).
-    let ack = Arc::new(consumer::AckHook::new());
-    let (hook, engine_slot) = consumer::build_observer(ack.clone(), scheduler);
+    // The application layer: an `AckHook` observer injected into the engine correlates awaited commands'
+    // outcomes to their callers; the `Gateway` wraps engine + ack to expose the blocking request/response
+    // API (the entry point future auth / backpressure run through). Timer scheduling is gateway-owned:
+    // `build_observer` composes the ack correlation with a hook that re-derives physical timer arms from
+    // durable events, and returns the engine slot the booted engine fills in for the sink
+    // (see `spica_server::gateway`).
+    let ack = Arc::new(gateway::AckHook::new());
+    let (hook, engine_slot) = gateway::build_observer(ack.clone(), scheduler);
     let engine = EngineBuilder::with_backends(log, storage)
         .with_hook(hook)
         .start()
@@ -98,8 +99,8 @@ async fn main() -> anyhow::Result<()> {
     *engine_slot.lock().await = Some(Arc::downgrade(&engine));
     tracing::info!(listen = %args.listen, "spica-server listening");
 
-    let facade = consumer::Facade::new(engine.clone(), ack);
-    let svc = Svc { engine, facade };
+    let gateway = gateway::Gateway::new(engine.clone(), ack);
+    let svc = Svc { engine, gateway };
     tonic::transport::Server::builder()
         .add_service(WorkflowServiceServer::new(svc.clone()))
         .add_service(ExecutionServiceServer::new(svc.clone()))
@@ -146,8 +147,8 @@ mod tests {
         let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir).unwrap());
         let scheduler: std::sync::Arc<dyn Scheduler> = InMemoryScheduler::spawn();
         // No task worker is attached (as in the real server); see main().
-        let ack = std::sync::Arc::new(super::consumer::AckHook::new());
-        let (hook, engine_slot) = super::consumer::build_observer(ack.clone(), scheduler);
+        let ack = std::sync::Arc::new(super::gateway::AckHook::new());
+        let (hook, engine_slot) = super::gateway::build_observer(ack.clone(), scheduler);
         let engine = std::sync::Arc::new(
             EngineBuilder::with_backends(log, storage)
                 .with_hook(hook)
@@ -156,11 +157,11 @@ mod tests {
                 .unwrap(),
         );
         *engine_slot.lock().await = Some(std::sync::Arc::downgrade(&engine));
-        let facade = super::consumer::Facade::new(engine.clone(), ack);
+        let gateway = super::gateway::Gateway::new(engine.clone(), ack);
         let name = FlowName::new("test").unwrap();
         let definition = serde_json::to_string(&sm).unwrap();
-        let flow_version = facade.create_flow(name, &definition).await.unwrap();
-        let execution_id = facade
+        let flow_version = gateway.create_flow(name, &definition).await.unwrap();
+        let execution_id = gateway
             .start_for_revision(
                 spica_engine::PlainName::new("exec")
                     .expect("static literal is a valid segment")
@@ -171,9 +172,60 @@ mod tests {
             .await
             .unwrap();
         let result = engine.wait_for_execution(&execution_id).await.unwrap();
-        assert_eq!(result.output, Value::Null);
+        assert_eq!(result.output.unwrap_or(Value::Null), Value::Null);
 
         // Drop the engine (releasing its DB handles) before removing the directories.
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// The `create_flow` pre-checks now live in the engine: both a malformed definition and a
+    /// duplicate name are rejected with `InvalidDefinition` before anything is appended to the log.
+    #[tokio::test]
+    async fn create_flow_rejects_malformed_and_duplicate() {
+        let log_dir = temp_path("log2");
+        let storage_dir = temp_path("storage2");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let log: Box<dyn LogStream<EntryPayload>> =
+            Box::new(RocksLogStream::<EntryPayload>::open(&log_dir).unwrap());
+        let storage: Box<dyn Storage> = Box::new(RocksStorage::open(&storage_dir).unwrap());
+        let scheduler: std::sync::Arc<dyn Scheduler> = InMemoryScheduler::spawn();
+        let ack = std::sync::Arc::new(super::gateway::AckHook::new());
+        let (hook, engine_slot) = super::gateway::build_observer(ack.clone(), scheduler);
+        let engine = std::sync::Arc::new(
+            EngineBuilder::with_backends(log, storage)
+                .with_hook(hook)
+                .start()
+                .await
+                .unwrap(),
+        );
+        *engine_slot.lock().await = Some(std::sync::Arc::downgrade(&engine));
+        let gateway = super::gateway::Gateway::new(engine.clone(), ack);
+
+        let name = FlowName::new("probe").unwrap();
+        let ok_def = r#"{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}}"#;
+
+        // Malformed: does not parse as a StateMachine → InvalidDefinition before append.
+        let err = gateway
+            .create_flow(name.clone(), "{ not json")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            spica_engine::ExecutionError::Runtime(spica_engine::RuntimeError::InvalidDefinition(_))
+        ));
+
+        // Duplicate: the first create succeeds; the second rejects before append.
+        gateway.create_flow(name.clone(), ok_def).await.unwrap();
+        let err = gateway.create_flow(name, ok_def).await.unwrap_err();
+        assert!(matches!(
+            err,
+            spica_engine::ExecutionError::Runtime(spica_engine::RuntimeError::InvalidDefinition(_))
+        ));
+
         drop(engine);
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&storage_dir);

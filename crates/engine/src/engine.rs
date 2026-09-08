@@ -6,15 +6,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::hook::Hook;
-use crate::log::{Entry, EntryPayload, LogStream, Timestamp};
+use crate::log::{Entry, EntryPayload, LogStream, NoopTerminatedLogStream, Timestamp};
 use crate::query::{QueryListPage, QueryObject, ref_for};
 use crate::storage::Storage;
 use crate::stream_processor::StreamProcessor;
-use crate::types::command::Command;
+use crate::types::command::{Command, TerminationReason};
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::id::{EntryId, FlowName, StreamId};
+use crate::types::execution::Execution;
+use crate::types::id::{EntryId, FlowName, RequestId, StreamId};
 use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
-use crate::types::result::ExecutionResult;
 use crate::types::task::Task;
 
 /// Executes ASL state machines via the CCES architecture (Causal Command Event Sourcing).
@@ -153,6 +153,10 @@ impl EngineBuilder {
     /// fabricates concrete backends itself, so it has no dependency on the implementation crates
     /// (keeping `storage → engine`, not the reverse, acyclic — see `crate::storage`).
     pub fn with_backends(log: Box<dyn LogStream<EntryPayload>>, storage: Box<dyn Storage>) -> Self {
+        // Wrap the caller's log so every atomic append is Noop-terminated (defensive; a bare Command
+        // gains an inert trailing Noop). See `NoopTerminatedLogStream`. The StreamProcessor's own
+        // causal-batch terminator is unaffected.
+        let log = Box::new(NoopTerminatedLogStream::new(log)) as Box<dyn LogStream<EntryPayload>>;
         Self {
             log: Arc::new(log),
             storage: Arc::new(Mutex::new(storage)),
@@ -298,41 +302,32 @@ impl EngineInner {
         name: ObjectName,
         uid: Option<ulid::Ulid>,
     ) -> Result<(), ExecutionError> {
-        // The handler ignores which stream the command lands on, resolving the execution by name (and
-        // its optional incarnation guard); the log stamps its own stream id and entry position at append.
-        self.log
-            .append(vec![Entry {
-                stream_id: StreamId::nil(),
-                entry_id: crate::types::id::EntryId::nil(),
-                cause_id: None,
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::Command(Command::TerminateExecution {
-                    name,
-                    uid,
-                    reason: crate::types::command::TerminationReason::Cancelled,
-                }),
-            }])
-            .await?;
-        Ok(())
+        // A fire-and-forget bare Command, like every other public write: `append_command` is the
+        // single bare-append path (placeholders + `cause_id: None`; the handler resolves the
+        // execution by name and its optional incarnation guard, ignoring which stream it lands on).
+        self.append_command(Command::TerminateExecution {
+            name,
+            uid,
+            reason: TerminationReason::Cancelled,
+        })
+        .await
     }
 
     /// Wait for the execution started by [`start_for_revision`](Self::start_for_revision) to reach a
-    /// terminal state, returning its success output or, if it failed, the failure [`ExecutionError`].
+    /// terminal state, returning its **terminal [`Execution`] snapshot** — for both success
+    /// (`Completed`) and failure (`Terminated(reason)`) alike. Settling is left to the caller:
+    /// inspect `status`/`output` on the returned value rather than treating failure as an error.
     ///
     /// Reads only the persisted Storage projection, so it never awaits a live ack: it works whether
     /// or not the original caller is still alive, and even across an Engine restart. Polls at a
-    /// fixed interval (no overall timeout) until the execution lands in a terminal status:
+    /// fixed interval (no overall timeout) until the execution lands in a terminal status.
     ///
-    /// - `Completed` → the decided [`ExecutionResult`](crate::types::result::ExecutionResult).
-    /// - `Terminated(reason)` → `Err(reason.to_execution_error())`.
-    /// - `Running`/`Completing`/`Terminating` → keep polling.
-    ///
-    /// If the execution id is unknown to Storage (never created, or its projection was GC'd) this
-    /// returns [`ExecutionError`] immediately rather than polling forever.
+    /// `Err` is reserved for a genuine fault — the execution id is unknown to Storage (never created,
+    /// or its projection was GC'd), or a storage failure — never for a failed execution.
     pub async fn wait_for_execution(
         &self,
         execution: &ObjectReference,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<Execution, ExecutionError> {
         // Poll the durable projection. The interval keeps contention on the shared Storage lock low
         // (the StreamProcessor releases it between entries — see the `storage` field doc — so this read
         // interleaves cleanly) while still surfacing settlement promptly; a real service would tune
@@ -341,24 +336,18 @@ impl EngineInner {
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         loop {
             let storage = self.storage.lock().await;
-            let exec = storage.get_execution(execution).await?.ok_or_else(|| {
+            let record = storage.get_execution(execution).await?.ok_or_else(|| {
                 ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                     "execution {execution} has no projection to await (never created or GC'd)"
                 )))
             })?;
             drop(storage);
-            match &exec.status {
-                crate::ExecutionStatus::Completed => {
-                    return Ok(ExecutionResult {
-                        output: exec.output.clone().unwrap_or(serde_json::Value::Null),
-                    });
-                }
-                crate::ExecutionStatus::Terminated(reason) => {
-                    return Err(reason.to_execution_error());
-                }
-                // Still in flight — poll again after a short pause.
-                _ => tokio::time::sleep(POLL_INTERVAL).await,
+            // Hand back the whole terminal snapshot; `is_terminal` covers both `Completed` and
+            // `Terminated(_)`, so success and failure both resolve here and the caller reads the status.
+            if record.value.is_terminal() {
+                return Ok(record.value);
             }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -472,6 +461,127 @@ impl EngineInner {
             .into_iter()
             .map(|r| r.value)
             .collect())
+    }
+
+    /// Validate + pre-check + append a `CreateFlow` for a new flow version. Append-and-return (no ack
+    /// wait): the caller correlates the outcome event via its injected `Hook` by the echoed
+    /// `request_id`. The handler re-checks name uniqueness atomically at dispatch; these gates are
+    /// optimistic fail-fast — a malformed definition never enters the log, a duplicate skips the append.
+    pub async fn create_flow(
+        &self,
+        request_id: RequestId,
+        name: FlowName,
+        definition: &str,
+    ) -> Result<(), ExecutionError> {
+        if serde_json::from_str::<spica_asl::StateMachine>(definition).is_err() {
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                "malformed flow definition: does not parse as a StateMachine".to_string(),
+            )));
+        }
+        if self
+            .get_object(ObjectKind::Flow, &ObjectName::Plain(name.clone()))
+            .await?
+            .is_some()
+        {
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                format!("flow {name} already exists"),
+            )));
+        }
+        self.append_command(Command::CreateFlow {
+            request_id,
+            name,
+            definition: definition.to_owned(),
+        })
+        .await
+    }
+
+    /// Append a `FailTask` for `task` as `worker_id`. The worker addresses a task by its canonical
+    /// name; the `uid` is nil by convention (the lookup is name-keyed). Append-and-return — unlike
+    /// `complete`, settlement is reported fire-and-forget, with no awaited outcome, so no `request_id`.
+    pub async fn fail_task(
+        &self,
+        worker_id: &str,
+        task: ObjectName,
+        error: ExecutionError,
+    ) -> Result<(), ExecutionError> {
+        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        self.append_command(Command::FailTask {
+            task: task_ref,
+            worker_id: worker_id.to_string(),
+            error,
+        })
+        .await
+    }
+
+    /// Append a `CompleteTask` for `task` as `worker_id` producing `output`. Name-keyed lookup (the
+    /// `uid` is nil by convention, matching [`Engine::fail_task`]). Append-and-return; the caller
+    /// correlates durability via the injected `Hook` on the echoed `request_id`.
+    pub async fn complete_task(
+        &self,
+        worker_id: &str,
+        task: ObjectName,
+        request_id: RequestId,
+        output: serde_json::Value,
+    ) -> Result<(), ExecutionError> {
+        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        self.append_command(Command::CompleteTask {
+            request_id,
+            task: task_ref,
+            worker_id: worker_id.to_string(),
+            output,
+        })
+        .await
+    }
+
+    /// Validate + pre-check + append a `CreateExecution` binding `name` to `flow_version` with `input`.
+    /// The execution name is the storage primary key (per-scope unique); we pre-check it optimistically
+    /// (the handler re-checks atomically at dispatch — the authoritative point). Append-and-return; the
+    /// caller correlates the created execution via the injected `Hook` on the echoed `request_id`.
+    pub async fn create_execution(
+        &self,
+        request_id: RequestId,
+        name: ObjectName,
+        flow_version: ObjectReference,
+        input: serde_json::Value,
+    ) -> Result<(), ExecutionError> {
+        if self
+            .get_object(ObjectKind::Execution, &name)
+            .await?
+            .is_some()
+        {
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                format!("execution {name} already exists"),
+            )));
+        }
+        self.append_command(Command::CreateExecution {
+            request_id,
+            name,
+            flow_version,
+            input,
+        })
+        .await
+    }
+
+    /// Append a `ClaimTasks` lease of up to `max_tasks` of `resource` for `worker_id`.
+    /// Append-and-return; the granted set is correlated by the caller via the injected `Hook` on the
+    /// echoed `request_id` (a `Grant` resolves to the durable `TasksClaimed` — the exact set decided
+    /// at dispatch, not a storage re-read).
+    pub async fn claim_tasks(
+        &self,
+        request_id: RequestId,
+        worker_id: &str,
+        resource: &str,
+        max_tasks: usize,
+        lease_seconds: u64,
+    ) -> Result<(), ExecutionError> {
+        self.append_command(Command::ClaimTasks {
+            request_id,
+            worker_id: worker_id.to_string(),
+            resource: resource.to_string(),
+            max_tasks,
+            lease_seconds,
+        })
+        .await
     }
 }
 

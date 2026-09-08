@@ -25,7 +25,7 @@ pub struct ThreadRecord {
     pub variables: Variables,
     /// The activity currently in flight for this thread (projection convenience; single-active-state
     /// cursor, derivable from activity rows).
-    pub current_activity: Option<crate::types::id::ActivityId>,
+    pub current_activity: Option<ObjectReference>,
     /// Owned nodes still in flight (active activities / timers / child threads). A completing or
     /// terminating thread waits for this projection-only set to drain before its terminal `ed`.
     pub active_children: HashSet<ObjectReference>,

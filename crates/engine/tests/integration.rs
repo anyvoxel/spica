@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_client::worker::{TaskFailure, TaskService};
 use spica_engine::{
-    Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, ExecutionError, FlowName,
-    InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId, TaskApi,
+    Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionError,
+    ExecutionStatus, FlowName, InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId,
+    TaskApi,
 };
 use spica_logstream::LogError;
 use spica_storage::InMemoryStorage;
@@ -45,12 +46,24 @@ fn parse_sm(definition: &str) -> StateMachine {
     serde_json::from_str(definition).expect("state machine should parse")
 }
 
+/// Re-derive the test-friendly `Result<Value, ExecutionError>` from the terminal [`Execution`]
+/// snapshot `wait_for_execution` now returns: a `Completed` run's output, or the terminal failure as
+/// an error. (`wait_for_execution` itself leaves settling to the caller — see the engine contract;
+/// these ASL-semantics tests just want the outcome in one value.)
+fn outcome(exec: Execution) -> Result<Value, ExecutionError> {
+    match exec.status {
+        ExecutionStatus::Completed => Ok(exec.output.unwrap_or(Value::Null)),
+        ExecutionStatus::Terminated(reason) => Err(reason.to_execution_error()),
+        // `wait_for_execution` only returns terminal snapshots.
+        other => unreachable!("wait_for_execution returned a non-terminal status {other:?}"),
+    }
+}
+
 /// One-shot try: create an anonymous flow and run it once, returning the output. This is the explicit
 /// lifecycle the removed `Engine::run` used to sugar (see `tests/common`).
 async fn run(sm: &StateMachine, input: Value) -> Result<Value, ExecutionError> {
-    common::create_and_run(common::in_memory_builder(), sm.clone(), input)
-        .await
-        .map(|r| r.output)
+    let exec = common::create_and_run(common::in_memory_builder(), sm.clone(), input).await?;
+    outcome(exec)
 }
 #[tokio::test]
 async fn activity_name_derives_from_execution_name_base() {
@@ -874,9 +887,14 @@ async fn run_task(
         "arn:aws:states:::lambda:invoke".to_string(),
         std::sync::Arc::from(handler),
     );
-    common::create_and_run_with_handlers(common::in_memory_builder(), sm.clone(), input, handlers)
-        .await
-        .map(|r| r.output)
+    let exec = common::create_and_run_with_handlers(
+        common::in_memory_builder(),
+        sm.clone(),
+        input,
+        handlers,
+    )
+    .await?;
+    outcome(exec)
 }
 
 #[tokio::test]

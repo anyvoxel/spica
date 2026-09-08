@@ -59,7 +59,7 @@ impl CommandHandler for ActivateStateHandler {
         // the command, and not by the preceding `StateTransitioned` marker, which names only the
         // target state's path — see its doc). Minting via the collector keeps it deterministic within
         // the same atomic batch.
-        let activity_uid: ulid::Ulid = out.next_activity().into();
+        let activity_uid: ulid::Ulid = ulid::Ulid::new();
         // Name the activity as a child of its owning execution (finding #3): the generated name's
         // plain base is the execution's name (carried verbatim through every nesting level, so a
         // branch activity still names its root run). The suffix is an independently minted random

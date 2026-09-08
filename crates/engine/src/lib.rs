@@ -87,14 +87,11 @@ pub use types::event::Event;
 pub use types::execution::{Execution, ExecutionStatus};
 pub use types::flow::{Flow, FlowStatus};
 pub use types::flow_version::FlowVersion;
-pub use types::id::{
-    ActivityId, EntryId, ExecutionId, FlowName, RequestId, StreamId, ThreadId, TimerId,
-};
+pub use types::id::{EntryId, FlowName, RequestId, StreamId};
 pub use types::meta::{
     ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName, ScopeName,
 };
 pub use types::reject::{Reject, RejectionType};
-pub use types::result::ExecutionResult;
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
 pub use types::thread::{Thread, ThreadStatus};
 pub use types::timer::{Timer, TimerStatus};

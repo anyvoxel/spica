@@ -9,7 +9,7 @@ use crate::types::meta::PlainName;
 // exact types the log produces/consumes.
 pub use spica_logstream::{EntryId, StreamId};
 
-/// Defines a ULID-backed identifier newtype (e.g. [`ExecutionId`], [`ActivityId`], [`TimerId`]) with
+/// Defines a ULID-backed identifier newtype (e.g. [`RequestId`]) with
 /// the conventional derives and constructors, collapsing the per-type boilerplate into one macro.
 ///
 /// The `#[doc = $doc]` attribute carries the type's own documentation. `From`/`Into` (derive_more)
@@ -67,66 +67,11 @@ macro_rules! ulid_id_type {
     };
 }
 
-ulid_id_type!(
-    ExecutionId,
-    "Identifies one execution of a state machine within a stream. Uses a ULID rather than a \
-     monotonic counter so an id can be minted anywhere; the durable `Command::CreateExecution` owns \
-     it and the projected `Event::ExecutionCreated` / storage row inherit it. Serialization uses \
-     ULID's canonical 26-char string form via the `serde` feature on the `ulid` crate."
-);
-
-ulid_id_type!(
-    ActivityId,
-    "Identifies the execution of a single state within the execution tree, entered deep inside \
-     state handlers and the transition cascade. The durable ordering of activities (which state \
-     follows which) is the log's causal `entry_id`, not a numeric activity counter, so a ULID \
-     minted in place via `Collector::next_activity` is unambiguous."
-);
-
-ulid_id_type!(
-    ThreadId,
-    "Identifies one scoped sub-run of the shared machine — a `Thread` spawned for a `Parallel` \
-     branch or `Map` item. Threads are ULIDs minted in place via `Collector::next_thread` (like \
-     executions/activities); the durable causal (`entry_id`) ordering and the owning-edge topology \
-     come from the log, not a numeric thread counter."
-);
-
-ulid_id_type!(
-    TimerId,
-    "Identifies a timer scheduled by the Engine (an execution `TimeoutSeconds` or a Wait's \
-     `Seconds`). Timers are ULIDs minted in place via `Collector::next_timer`; the durable clock for \
-     *which* deadline and causal (`entry_id`) ordering comes from the log itself, not a numeric timer \
-     counter."
-);
-
-// NOTE: there is deliberately **no** `TaskId`. A Task's internal `uid` is a plain `ulid::Ulid`
-// minted via `Collector::next_task` (see `ActivatedTask` / the worker bridge), and the worker
-// addresses a task by its **canonical name** (`ObjectName`) — cards, claims and settlements carry
-// the name, not a uid — so no separate external id type is needed (finding #13 follow-up).
-
 /// A user-supplied, **immutable** name identifying a logical flow — the identity under which
 /// [`Flow`](crate::Flow)s are addressed (creating the same name again appends a new
-/// [`FlowVersion`](crate::FlowVersion) to the same flow). This is the human-readable alias external
-/// actors use to address a flow; internal execution references never use it directly — they bind to
-/// a version's `ObjectReference` instead, so a name that is later deleted + re-created (a fresh flow
-/// incarnation) can never alias an in-flight execution onto the wrong definition.
-///
-/// # Validation
-///
-/// A name is accepted iff:
-/// - it is **non-empty** and at most **64** characters;
-/// - the first character is an ASCII letter or digit, and every subsequent character is an ASCII
-///   letter, digit, or `_`;
-/// - it is **case-sensitive** (`Checkout` ≠ `checkout`), and `-`/whitespace are **not** allowed.
-///
-/// Validation runs in the constructor so an invalid name fails fast at the API boundary
-/// ([`Engine::create_flow`](crate::Engine::create_flow)) and never enters a Command, log, or
-/// storage key. `Deserialize` is derived verbatim (no re-validation) for replay convenience; the
-/// boundary guarantee is what prevents invalid names from being persisted in the first place.
-/// `FlowName` is a **type alias of [`PlainName`]**: a flow's name obeys exactly the same user-name
-/// rules (4..=64, ASCII alnum/`_`, no `-`), so instead of a duplicate
-/// newtype with its own validation we reuse [`PlainName`] wholesale — the alias keeps the readable,
-/// semantic `FlowName` spelling at call sites while sharing one validation / serde / `as_str`.
+/// [`FlowVersion`](crate::FlowVersion) to the same flow). A **type alias of [`PlainName`]**: a flow
+/// name obeys exactly the same rules (4..=64 ASCII alnum/`_`, no `-`) and shares its validation,
+/// serde and `as_str`, so there is no duplicate newtype.
 pub type FlowName = PlainName;
 
 ulid_id_type!(
@@ -135,35 +80,10 @@ ulid_id_type!(
      never-reused id minted per operation (e.g. `Engine::create_flow` or `Engine::start_for_revision`), \
      carried on the initiating Command and on the outcome Event that resolves it, so the StreamProcessor can \
      route the acknowledgement back to exactly that caller. It is deliberately **not** a target entity \
-     id (`ExecutionId`): a single flow or execution can be the target of many concurrent \
+     id: a single flow or execution (addressed by a raw `ulid::Ulid`) can be the target of many concurrent \
      requests, so acks are correlated per-*request*, never per-entity, to avoid aliasing them."
 );
 
-// A node in the execution tree is addressed directly by its [`ObjectReference`]: the reference
-// carries the object's [`ObjectKind`] (Execution / Thread / Activity / Timer / Task), which is
-// exactly the role the former `NodeId`/`NodeKind` enums re-encoded by hand. Consumers dispatch on
-// `reference.kind` when they need to branch by node type; the reference itself is the uniform
-// handle the storage layer, the cleanup sweep, and the cascade use to address any node. A non-node
-// kind (Flow / FlowVersion) simply resolves to nothing at scope/child lookups — it is silent, never
-// a panic.
-//
-// (The `*Id` newtypes above remain the *monotonic-identity* forms minted by the collector and
-// stored as `uid`s; `ObjectReference` is the *referencing* form used on `ObjectMeta::owner`, in
-// `active_children`, and in command/event payloads.)
-
-/// Monotonic source for identifier kinds. One source is threaded through a single execution
-/// (and its StreamProcessor). Each kind has its **own counter** so that, in particular, [`EntryId`]s are
-/// contiguous within a stream (1, 2, 3, …) — matching BookKeeper's per-ledger entryId.
-///
-/// Recovery does not re-run handlers (their output is already in the LogStream), so identifier
-/// generation only ever runs once per entry — non-determinism across replays is not a concern.
-///
-/// Note: [`ExecutionId`], [`TimerId`], and [`ActivityId`] are *not* counted here — they are ULIDs
-/// minted in place ([`ExecutionId::new`], `TimerId::new`, `ActivityId::new`) where no shared counter
-/// is needed. [`EntryId`] is **not** minted here either — the LogStream assigns
-/// positions at `append` time from its own counter. There is no stream counter: a LogStream is a
-/// single stream, so its identity ([`StreamId`]) is a property of the log itself, stamped (and for a
-/// durable log persisted) by the log — never minted by the engine.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,15 +93,9 @@ mod tests {
         // Each ULID id type wraps a raw Ulid; `From` builds it and the reverse `From`/`Into`
         // unwraps it back (the `get()`-free way to access the underlying Ulid).
         let raw = ulid::Ulid::new();
-        let exec: ExecutionId = raw.into();
-        let activity: ActivityId = raw.into();
-        let timer: TimerId = raw.into();
-        let back_exec: ulid::Ulid = exec.into();
-        let back_activity: ulid::Ulid = activity.into();
-        let back_timer: ulid::Ulid = timer.into();
-        assert_eq!(back_exec, raw);
-        assert_eq!(back_activity, raw);
-        assert_eq!(back_timer, raw);
+        let request: RequestId = raw.into();
+        let back_request: ulid::Ulid = request.into();
+        assert_eq!(back_request, raw);
     }
 
     #[test]

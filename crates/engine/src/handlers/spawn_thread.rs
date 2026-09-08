@@ -98,8 +98,7 @@ impl CommandHandler for SpawnThreadHandler {
         // Mint the child's uid and its stable ObjectReference up front: the child `Thread` row is
         // keyed by that reference, and the sibling `ActivateState` entry must name the same run
         // before the `ThreadCreated` applier builds the entity.
-        let id = out.next_execution();
-        let uid: ulid::Ulid = id.into();
+        let uid: ulid::Ulid = ulid::Ulid::new();
         // Name the thread as a child of its owning execution (the #3/#11/#13 convention, applied to
         // threads): the generated name's plain base is the owning execution's name, inherited
         // verbatim through every nesting level — so a branch thread still names its root run — and

@@ -1,18 +1,19 @@
-//! The engine's **consumer layer** in spica-server.
+//! The server's **application layer** in front of the engine.
 //!
-//! The engine is append + observe only ([`Engine::append_command`] + an injected [`Hook`]); the
-//! blocking request/response convenience API — `create_flow`, `start_for_revision`, and the task
-//! `poll_tasks`/`complete`/`fail` — lives here as a consumer. [`AckHook`] is the [`Hook`] the server
-//! injects at boot: it correlates an awaited command's outcome to its awaiting caller via the echoed
-//! `request_id` (Zeebe's `requestId` → future model, owned by the consumer rather than the engine).
-//! [`Facade`] wraps the engine + [`AckHook`] and exposes the same shapes the engine's blocking API
-//! used to, so the tonic service handlers are thin forwarders.
+//! The engine is append + observe only ([`Engine::append_command`] + an injected [`Hook`]); everything
+//! a request passes through between the tonic wire and the engine lives here — the blocking
+//! request/response API (`create_flow`, `start_for_revision`, `poll_tasks`/`complete`/`fail`) and the
+//! acknowledged correlation machinery. [`AckHook`] is the [`Hook`] the server injects at boot: it
+//! correlates an awaited command's outcome to its awaiting caller via the echoed `request_id` (Zeebe's
+//! `requestId` → future model, owned here rather than by the engine). [`Gateway`] wraps the engine +
+//! [`AckHook`] and exposes the shapes the handlers call — the single entry point through which
+//! future cross-cutting concerns (authentication, backpressure) will also run.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_engine::{
-    ActivatedTask, Command, Engine, Event, ExecutionError, FlowName, Hook, ObjectKind, ObjectName,
+    ActivatedTask, Command, Engine, Event, ExecutionError, FlowName, Hook, ObjectName,
     ObjectReference, Reject, RequestId, RuntimeError, Task, Timestamp,
 };
 use spica_scheduler::{Scheduler, TimerSink};
@@ -145,11 +146,12 @@ impl Hook for AckHook {
     }
 }
 
-/// The blocking convenience facade over an [`Engine`] — the consumer that owns acknowledgement
-/// correlation and the request/response shapes removed from the engine. Every write funnels through
-/// [`Engine::append_command`]; the engine stays the single writer.
+/// The server's application service in front of an [`Engine`] — owns acknowledgement correlation and
+/// the blocking request/response shapes; the single entry point through which cross-cutting concerns
+/// (authentication, backpressure) will run before a request reaches the engine. Every write funnels
+/// through [`Engine::append_command`]; the engine stays the single writer.
 #[derive(Clone)]
-pub(crate) struct Facade {
+pub(crate) struct Gateway {
     engine: Arc<Engine>,
     ack: Arc<AckHook>,
 }
@@ -160,7 +162,7 @@ pub(crate) struct Facade {
 type EngineSlot = Arc<Mutex<Option<std::sync::Weak<Engine>>>>;
 
 /// Build the composite [`Hook`] injected at boot and the sink slot the booted engine fills in. The
-/// engine no longer holds a scheduler — timer scheduling is consumer-owned: the hook re-derives
+/// engine no longer holds a scheduler — timer scheduling is gateway-owned: the hook re-derives
 /// physical arms/cancels from durable `TimerActivated`/`TimerCancelled` events, and the attached
 /// [`TimerSink`] routes an expired timer's `TriggerTimer` back through the engine's append path (the
 /// slot closes the boot-time cycle: the sink needs the engine, the engine needs the hook).
@@ -220,7 +222,7 @@ impl TimerSink for EngineTimerSink {
         else {
             return; // engine not booted or already dropped; nothing to resume.
         };
-        // Fire-and-forget: a dropped append (engine shutting down) is not this consumer's fault.
+        // Fire-and-forget: a dropped append (engine shutting down) is not the gateway's fault.
         let _ = engine
             .append_command(Command::TriggerTimer {
                 timer: timer.clone(),
@@ -229,7 +231,7 @@ impl TimerSink for EngineTimerSink {
     }
 }
 
-impl Facade {
+impl Gateway {
     pub(crate) fn new(engine: Arc<Engine>, ack: Arc<AckHook>) -> Self {
         Self { engine, ack }
     }
@@ -275,40 +277,23 @@ impl Facade {
     }
 
     /// Create a new flow version from `definition` and return its created version's [`ObjectReference`].
-    /// Reproduces the engine's former boundary: definition validated up front, duplicate name pre-checked
-    /// (the handler re-checks atomically at dispatch — the authoritative, serialized point).
+    /// Validation, duplicate pre-check and command assembly live in
+    /// [`Engine::create_flow`](spica_engine::Engine::create_flow); this side owns only the
+    /// request/response correlation (register before append, await the ack).
     pub(crate) async fn create_flow(
         &self,
         name: FlowName,
         definition: &str,
     ) -> Result<ObjectReference, ExecutionError> {
-        // Fail fast: a definition that doesn't parse can never enter the log or Storage.
-        if serde_json::from_str::<spica_engine::StateMachine>(definition).is_err() {
-            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                "malformed flow definition: does not parse as a StateMachine".to_string(),
-            )));
-        }
-        if self
-            .engine
-            .get_object(ObjectKind::Flow, &ObjectName::Plain(name.clone()))
-            .await?
-            .is_some()
-        {
-            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                format!("flow {name} already exists"),
-            )));
-        }
         let request_id = RequestId::new();
         let rx = self
             .ack
             .register(request_id, AckTarget::FlowVersionCreated)
             .await;
+        // `name` is moved into the engine; keep a copy for the ack log line.
+        let name_log = name.clone();
         self.engine
-            .append_command(Command::CreateFlow {
-                request_id,
-                name: name.clone(),
-                definition: definition.to_owned(),
-            })
+            .create_flow(request_id, name, definition)
             .await?;
         let event = match Self::await_event(rx).await {
             Ok(ev) => *ev,
@@ -319,42 +304,27 @@ impl Facade {
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        tracing::info!(name = %name, flow_version = %flow_version.reference(), version = flow_version.version, "flow created, acked");
+        tracing::info!(name = %name_log, flow_version = %flow_version.reference(), version = flow_version.version, "flow created, acked");
         Ok(flow_version.reference())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id **at birth** (settling
-    /// is observed by polling the projection, never by blocking here).
+    /// is observed by polling the projection, never by blocking here). Duplicate pre-check and command
+    /// assembly live in [`Engine::create_execution`](spica_engine::Engine::create_execution); this side
+    /// owns the ack correlation (register before append, await the `ExecutionCreated`).
     pub(crate) async fn start_for_revision(
         &self,
         name: ObjectName,
         flow_version: ObjectReference,
         input: serde_json::Value,
     ) -> Result<ObjectReference, ExecutionError> {
-        // Boundary pre-check: the name is the execution's storage primary key (per-scope unique); the
-        // handler re-checks atomically at dispatch (authoritative).
-        if self
-            .engine
-            .get_object(ObjectKind::Execution, &name)
-            .await?
-            .is_some()
-        {
-            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                format!("execution {name} already exists"),
-            )));
-        }
         let request_id = RequestId::new();
         let rx = self
             .ack
             .register(request_id, AckTarget::ExecutionCreated)
             .await;
         self.engine
-            .append_command(Command::CreateExecution {
-                request_id,
-                name,
-                flow_version,
-                input,
-            })
+            .create_execution(request_id, name, flow_version, input)
             .await?;
         let event = match Self::await_event(rx).await {
             Ok(ev) => *ev,
@@ -393,13 +363,7 @@ impl Facade {
         let request_id = RequestId::new();
         let rx = self.ack.register(request_id, AckTarget::Grant).await;
         self.engine
-            .append_command(Command::ClaimTasks {
-                request_id,
-                worker_id: worker_id.to_string(),
-                resource: resource.to_string(),
-                max_tasks,
-                lease_seconds,
-            })
+            .claim_tasks(request_id, worker_id, resource, max_tasks, lease_seconds)
             .await?;
         match Self::await_tasks(rx).await {
             Ok(tasks) => Ok(tasks),
@@ -407,7 +371,9 @@ impl Facade {
         }
     }
 
-    /// Report a task completed with `output`; returns when the settlement's outcome is durable.
+    /// Report a task completed with `output`; returns when the settlement's outcome is durable. Command
+    /// assembly lives in [`Engine::complete_task`](spica_engine::Engine::complete_task); this side owns
+    /// the ack correlation (register before append, await the `TaskCompleted`).
     pub(crate) async fn complete(
         &self,
         worker_id: &str,
@@ -419,16 +385,8 @@ impl Facade {
             .ack
             .register(request_id, AckTarget::TaskCompleted)
             .await;
-        // The worker addresses a task by its canonical name; the `uid` is nil by convention (the
-        // lookup is name-keyed).
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
         self.engine
-            .append_command(Command::CompleteTask {
-                request_id,
-                task: task_ref,
-                worker_id: worker_id.to_string(),
-                output,
-            })
+            .complete_task(worker_id, task, request_id, output)
             .await?;
         match Self::await_event(rx).await {
             // The awaited `TaskCompleted` was applied — the settlement is durable.
@@ -437,20 +395,14 @@ impl Facade {
         }
     }
 
-    /// Report a task failed with `error`. Mirrors `complete`'s name→`ObjectReference` bridge.
+    /// Report a task failed with `error`. No ack is awaited (fire-and-forget append): the whole body
+    /// is the engine's [`Engine::fail_task`](spica_engine::Engine::fail_task).
     pub(crate) async fn fail(
         &self,
         worker_id: &str,
         task: ObjectName,
         error: ExecutionError,
     ) -> Result<(), ExecutionError> {
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
-        self.engine
-            .append_command(Command::FailTask {
-                task: task_ref,
-                worker_id: worker_id.to_string(),
-                error,
-            })
-            .await
+        self.engine.fail_task(worker_id, task, error).await
     }
 }

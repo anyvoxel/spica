@@ -58,7 +58,7 @@ impl TaskServiceTrait for Svc {
             "PollTasks"
         );
         let tasks = self
-            .facade
+            .gateway
             .poll_tasks(
                 &req.worker_id,
                 &req.resource,
@@ -88,7 +88,7 @@ impl TaskServiceTrait for Svc {
             .map_err(|e| Status::invalid_argument(format!("output is not valid JSON: {e}")))?;
 
         tracing::debug!(task = %task, "CompleteTask");
-        self.facade
+        self.gateway
             .complete(&req.worker_id, task, request_id, output)
             .await
             .map_err(to_status)?;
@@ -119,7 +119,7 @@ impl TaskServiceTrait for Svc {
         };
 
         tracing::debug!(task = %task, "FailTask");
-        self.facade
+        self.gateway
             .fail(
                 &req.worker_id,
                 task,
@@ -171,9 +171,9 @@ mod tests {
     #[tokio::test]
     async fn remote_worker_claims_and_completes_task_over_grpc() {
         // An in-memory engine is enough — the point is the network boundary, not the storage backend.
-        let ack = std::sync::Arc::new(crate::consumer::AckHook::new());
+        let ack = std::sync::Arc::new(crate::gateway::AckHook::new());
         let (hook, engine_slot) =
-            crate::consumer::build_observer(ack.clone(), InMemoryScheduler::spawn());
+            crate::gateway::build_observer(ack.clone(), InMemoryScheduler::spawn());
         let engine = Arc::new(
             EngineBuilder::with_backends(
                 Box::new(spica_engine::InMemoryLogStream::<EntryPayload>::new()),
@@ -185,7 +185,7 @@ mod tests {
             .expect("engine boots"),
         );
         *engine_slot.lock().await = Some(Arc::downgrade(&engine));
-        let facade = crate::consumer::Facade::new(engine.clone(), ack);
+        let gateway = crate::gateway::Gateway::new(engine.clone(), ack);
 
         // Serve the `Task` service on a loopback port, holding the server for the test's duration.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -194,7 +194,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
         let svc = Svc {
             engine: engine.clone(),
-            facade: facade.clone(),
+            gateway: gateway.clone(),
         };
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -235,11 +235,11 @@ mod tests {
         }))
         .expect("parse state machine");
         let flow = FlowName::new(&format!("grpc_{}", ulid::Ulid::new())).expect("valid name");
-        let fvid = facade
+        let fvid = gateway
             .create_flow(flow, &serde_json::to_string(&sm).unwrap())
             .await
             .expect("create flow");
-        let execution_id = facade
+        let execution_id = gateway
             .start_for_revision(
                 spica_engine::PlainName::new("exec")
                     .expect("static literal is a valid segment")
@@ -256,7 +256,7 @@ mod tests {
             .wait_for_execution(&execution_id)
             .await
             .expect("execution completes");
-        assert_eq!(result.output, json!({ "message": "hello" }));
+        assert_eq!(result.output, Some(json!({ "message": "hello" })));
 
         // Tear down the worker before the engine drops, then the server.
         cancel.cancel();

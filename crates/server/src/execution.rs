@@ -3,7 +3,6 @@
 //! Settlement (and any point-in-time snapshot) is read through the Query API, not a dedicated
 //! per-kind `GetExecution` RPC.
 
-use spica_engine::ExecutionId;
 use spica_proto::v1::{
     StartExecutionRequest, StartExecutionResponse, StopExecutionRequest, StopExecutionResponse,
     execution_service_server::ExecutionService as ExecutionServiceTrait,
@@ -51,7 +50,7 @@ impl ExecutionServiceTrait for Svc {
         let name = spica_engine::ObjectName::plain(&req.name)
             .map_err(|e| Status::invalid_argument(format!("invalid execution name: {e}")))?;
         let execution_id = self
-            .facade
+            .gateway
             .start_for_revision(name, flow_version, input)
             .await
             .map_err(to_status)?;
@@ -82,7 +81,7 @@ impl ExecutionServiceTrait for Svc {
         let uid = if req.uid.is_empty() {
             None
         } else {
-            Some(parse_ulid::<ExecutionId>(&req.uid, "uid")?.into())
+            Some(parse_ulid::<ulid::Ulid>(&req.uid, "uid")?)
         };
 
         tracing::debug!(name = %name, "StopExecution");
