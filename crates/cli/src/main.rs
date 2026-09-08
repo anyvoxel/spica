@@ -12,7 +12,7 @@
 //!     create <DEFINITION> --name NAME            persist a new flow version -> ObjectReference
 //!     get <FLOW_NAME> [--version N]              resolve a name(+version) -> ObjectReference
 //!   executions (exec)
-//!     start [--flow-version-id ID | --name NAME [--version N]] [INPUT]   start -> ExecutionId (at birth)
+//!     start [--flow-version-id ID | --name NAME [--version N]] [INPUT]   start -> execution id (at birth)
 //!     stop <EXECUTION_ID>                          abort a running execution (non-blocking)
 //!     get <EXECUTION_ID>                         one non-blocking status snapshot
 //!     wait <EXECUTION_ID> [--poll-ms MS]         poll until terminal; exit 0 on success, 1 on failure

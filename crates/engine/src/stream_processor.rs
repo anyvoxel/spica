@@ -802,7 +802,7 @@ mod tests {
     use crate::types::command::Command;
     use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
-    use crate::types::id::{FlowName, RequestId, TimerId};
+    use crate::types::id::{FlowName, RequestId};
     use crate::types::meta::ObjectReference;
 
     use super::*;
@@ -1163,7 +1163,7 @@ mod tests {
         // whose eager-apply never committed before the crash — the O the storage still says 0.
         let log = InMemoryLogStream::<EntryPayload>::default();
         let (ts, ev) = flow_version_event();
-        let residual_uid: ulid::Ulid = TimerId::new().into();
+        let residual_uid: ulid::Ulid = ulid::Ulid::new();
         let residual_timer = crate::types::meta::ObjectReference::new(
             crate::types::meta::ObjectKind::Timer,
             crate::types::meta::PlainName::new("child")
@@ -1173,7 +1173,7 @@ mod tests {
         );
         log.append(vec![
             // The residual Command: recovery must skip it — re-dispatching would re-append a duplicate
-            // batch. `CancelTimer` needs only a TimerId, so it's the cheapest Command to fabricate.
+            // batch. `CancelTimer` needs only a timer id, so it's the cheapest Command to fabricate.
             Entry {
                 stream_id: StreamId::nil(),
                 entry_id: EntryId::nil(),

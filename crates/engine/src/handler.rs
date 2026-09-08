@@ -15,7 +15,7 @@ use crate::types::activity::Activity;
 use crate::types::command::{Command, TerminationReason};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::id::{ActivityId, EntryId, ExecutionId, RequestId, StreamId, TimerId};
+use crate::types::id::{EntryId, RequestId, StreamId};
 use crate::types::meta::ObjectReference;
 use crate::types::reject::{Reject, RejectionType};
 use crate::types::variables::Variables;
@@ -23,8 +23,7 @@ use crate::working::WorkingState;
 
 /// Collects the [`Entry`]s a handler emits while handling one Command, enveloping each with the
 /// call's `cause_id` / `stream_id` / `timestamp` and a placeholder `entry_id` (the log assigns the
-/// position). It is also the source of fresh [`ActivityId`] / [`TimerId`] for entities the handler
-/// creates.
+/// position). It is also the source of fresh ids for entities the handler creates.
 ///
 /// This is the handler's single output + id channel, replacing a returned `Produced` value plus a
 /// separate envelope step: the handler emits raw [`Event`]s / [`Command`]s via
@@ -128,35 +127,6 @@ impl<'a> Collector<'a> {
 
     fn push(&mut self, payload: EntryPayload) {
         self.entries.push(self.build(payload));
-    }
-
-    /// Allocate a fresh [`ActivityId`] (for a new [`Command::ActivateState`]). Activities are ULIDs
-    /// minted in place — no shared counter needed, since the log's causal `entry_id` carries the
-    /// ordering of activities.
-    pub fn next_activity(&mut self) -> ActivityId {
-        ActivityId::new()
-    }
-
-    /// Allocate a fresh [`TimerId`] (for a timer armed inline via `emit_timer`). Timers are ULIDs
-    /// minted in place — no shared counter needed, since the log carries the causal/`entry_id`
-    /// ordering.
-    pub fn next_timer(&mut self) -> TimerId {
-        TimerId::new()
-    }
-
-    /// Allocate a fresh [`ExecutionId`] (for a child execution spawned by a `Parallel` branch).
-    /// Executions are ULIDs minted in place — the log's causal `entry_id`/`root_execution` carry the
-    /// ordering/ownership, so no shared counter is needed.
-    pub fn next_execution(&mut self) -> ExecutionId {
-        ExecutionId::new()
-    }
-
-    /// Allocate a fresh task uid ([`ulid::Ulid`], for a [`Command::ActivateTask`]). The task's
-    /// internal `uid` is a ULID minted in place (no shared counter — the log carries the causal
-    /// `entry_id` ordering). The worker addresses a task by its **canonical name**, not this uid
-    /// (see `task_api::ActivatedTask`), so the uid never leaves the engine over the worker protocol.
-    pub fn next_task(&mut self) -> ulid::Ulid {
-        ulid::Ulid::new()
     }
 
     /// Emit a definitive failure: `TerminateState` (if the failing context is a state) plus

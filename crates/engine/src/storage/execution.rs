@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::Execution;
 use crate::log::Timestamp;
-use crate::types::id::ActivityId;
 use crate::types::meta::ObjectReference;
 use crate::types::variables::Variables;
 
@@ -33,7 +32,7 @@ pub struct ExecutionRecord {
     /// The activity currently in flight for this execution. This is a projection convenience used
     /// by handlers for single-active-state invariants; it is derivable from activity rows and does
     /// not belong in the event-carried execution entity.
-    pub current_activity: Option<ActivityId>,
+    pub current_activity: Option<ObjectReference>,
     /// Owned nodes still in flight (active activities / timers / child executions). Completing or
     /// terminating waits for this projection-only set to drain before the terminal `ed` is emitted.
     pub active_children: HashSet<ObjectReference>,

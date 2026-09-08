@@ -26,7 +26,7 @@ impl EventApplier for StateActivatingApplier {
                 output: None,
                 meta: crate::types::meta::ObjectMeta::builder(
                     crate::types::meta::ObjectKind::Activity,
-                    crate::types::id::ActivityId::nil().into(),
+                    ulid::Ulid::nil(),
                 )
                 .at(crate::log::Timestamp::from_millis(0))
                 .build(),
@@ -73,18 +73,18 @@ impl EventApplier for StateActivatingApplier {
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        let uid = activity.reference().uid;
+        let reference = activity.reference();
         match ownership.kind {
             crate::types::meta::ObjectKind::Execution => {
                 if let Some(mut exec) = ctx.storage.get_execution(&ownership).await? {
-                    exec.current_activity = Some(uid.into());
+                    exec.current_activity = Some(reference.clone());
                     exec.with_update_at(ctx.timestamp);
                     ctx.storage.put_execution(exec).await?;
                 }
             }
             crate::types::meta::ObjectKind::Thread => {
                 if let Some(mut thread) = ctx.storage.get_thread(&ownership).await? {
-                    thread.current_activity = Some(uid.into());
+                    thread.current_activity = Some(reference.clone());
                     thread.with_update_at(ctx.timestamp);
                     ctx.storage.put_thread(thread).await?;
                 }

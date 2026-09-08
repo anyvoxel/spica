@@ -26,7 +26,7 @@ impl WorkflowServiceTrait for Svc {
 
         tracing::debug!(flow = %name, bytes = req.definition.len(), "CreateFlow");
         let flow = self
-            .facade
+            .gateway
             .create_flow(name, definition)
             .await
             .map_err(to_status)?;

@@ -136,7 +136,7 @@ async fn activate_task(
         .map(|retriers| retriers.iter().map(crate::RetryPolicy::resolve).collect())
         .unwrap_or_default();
 
-    let task_uid = out.next_task();
+    let task_uid = ulid::Ulid::new();
     // The activation work (projecting `Arguments`) is done: emit the activation-complete ed, then
     // throw the invocation as the transition's side effect. The `parent` links the task to the
     // owning activity so a later termination sweeps it.

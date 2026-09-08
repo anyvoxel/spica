@@ -68,7 +68,7 @@ impl CommandHandler for CreateExecutionHandler {
         // The uid is NOT carried in the command — replay stays deterministic because the produced
         // `ExecutionCreated` lands in the same atomic batch as this command (committed ⇒ conclusive,
         // never re-dispatched), so a re-dispatch mints a fresh consistent uid.
-        let uid: ulid::Ulid = out.next_execution().into();
+        let uid: ulid::Ulid = ulid::Ulid::new();
         let id = ObjectReference::new(ObjectKind::Execution, name.clone(), uid);
         // Resolve the machine this execution binds to. This is the first use of the version in a
         // fresh StreamProcessor — it loads the definition (keyed by the version's object reference)
@@ -124,7 +124,7 @@ impl CommandHandler for CreateExecutionHandler {
             // `uid`, and must be carried forward by later timer events, so TimerActivated children
             // stay resolvable (see `TimerTriggered`/`TimerCancelled`, which preserve the row's meta
             // rather than re-deriving the name).
-            let uid: ulid::Ulid = out.next_timer().into();
+            let uid: ulid::Ulid = ulid::Ulid::new();
             // A generated child's base is the execution's own name, which is user-supplied (`Plain`)
             // by construction; unwrap it to derive the timer's `{name}-{8-char}` handle. The
             // `Generated` arm is unreachable for a CreateExecution name but kept explicit so a future

@@ -559,7 +559,7 @@ pub(super) async fn emit_transition(
     }
 }
 
-/// Mint and arm a timer inline: allocate its uid (`out.next_timer()`) and derive a generated name
+/// Mint and arm a timer inline: allocate its uid (a raw `ulid::Ulid`) and derive a generated name
 /// (`{execution.name}-{8-char-suffix}`) from the owning execution, then emit `Event::TimerActivated`
 /// — the fact that both folds the timer row and arms the physical deadline (see
 /// `TimerActivatedApplier`). Inlined rather than a `Command` so the arm lands in the same causal
@@ -574,7 +574,7 @@ pub(super) async fn emit_timer(
     purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
-    let timer_uid: ulid::Ulid = out.next_timer().into();
+    let timer_uid: ulid::Ulid = ulid::Ulid::new();
     let timer_name = execution
         .name
         .base()

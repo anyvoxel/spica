@@ -15,7 +15,6 @@ use serde_json::Value;
 
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::id::ActivityId;
 use crate::types::meta::{ObjectKind, ObjectReference};
 use crate::types::variables::Variables;
 use crate::{ExecutionRecord, ThreadRecord};
@@ -70,7 +69,7 @@ impl ScopeRecord {
     }
 
     /// The single in-flight state cursor (projection-only).
-    pub fn current_activity(&self) -> &Option<ActivityId> {
+    pub fn current_activity(&self) -> &Option<ObjectReference> {
         match self {
             ScopeRecord::Execution(e) => &e.current_activity,
             ScopeRecord::Thread(t) => &t.current_activity,

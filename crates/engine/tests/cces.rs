@@ -7,11 +7,11 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    Activity, ActivityId, ActivityStatus, Command, Entry, EntryId, EntryPayload, Event, Execution,
-    ExecutionError, ExecutionId, ExecutionStatus, Flow, FlowName, FlowStatus, FlowVersion,
-    InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId, RetryPolicy,
-    RetryState, RuntimeError, Storage, StreamProcessor, Task, TaskStatus, TerminationReason,
-    Thread, ThreadStatus, Timer, TimerId, TimerPurpose, TimerStatus, Timestamp, Variables,
+    Activity, ActivityStatus, Command, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionError, ExecutionStatus, Flow, FlowName, FlowStatus, FlowVersion, InMemoryLogStream,
+    LogStream, ObjectReference, RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError,
+    Storage, StreamProcessor, Task, TaskStatus, TerminationReason, Thread, ThreadStatus, Timer,
+    TimerPurpose, TimerStatus, Timestamp, Variables,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -24,7 +24,7 @@ fn parse_sm(definition: &str) -> StateMachine {
 /// Build a distinct execution [`ObjectReference`] shaped exactly like `Execution::reference()`
 /// (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
 fn exec_ref() -> spica_engine::ObjectReference {
-    let uid: ulid::Ulid = ExecutionId::new().into();
+    let uid: ulid::Ulid = ulid::Ulid::new();
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Execution,
         spica_engine::PlainName::new("child")
@@ -37,7 +37,7 @@ fn exec_ref() -> spica_engine::ObjectReference {
 /// Build a distinct activity [`ObjectReference`] shaped exactly like `Activity::reference()`
 /// (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
 fn act_ref() -> spica_engine::ObjectReference {
-    let uid: ulid::Ulid = ActivityId::new().into();
+    let uid: ulid::Ulid = ulid::Ulid::new();
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Activity,
         spica_engine::PlainName::new("child")
@@ -63,14 +63,13 @@ fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectReference {
 /// Build the timer [`ObjectReference`] for a timer's raw id, shaped exactly like
 /// `Timer::reference()` (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips
 /// by reference.
-fn timer_ref(timer: TimerId) -> spica_engine::ObjectReference {
-    let uid: ulid::Ulid = timer.into();
+fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectReference {
     spica_engine::ObjectReference::new(
         spica_engine::ObjectKind::Timer,
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
-            .generated_from_key(uid.0 as u64),
-        uid,
+            .generated_from_key(timer.0 as u64),
+        timer,
     )
 }
 
@@ -544,7 +543,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
 async fn leaf_domain_timestamps_follow_the_lifecycle() {
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = TimerId::new();
+    let timer = ulid::Ulid::new();
     let task = ulid::Ulid::new();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -608,7 +607,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         purpose: TimerPurpose::ExecutionTimeout,
         status: TimerStatus::Active,
         deadline: ts(500),
-        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer.0)
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
             .timestamps(ts(100), ts(100))
             .build()
             .with_owner(exec.clone()),
@@ -627,12 +626,9 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
             &Event::TimerTriggered {
                 timer: Timer {
                     status: TimerStatus::Completed,
-                    meta: spica_engine::ObjectMeta::builder(
-                        spica_engine::ObjectKind::Timer,
-                        timer.0,
-                    )
-                    .timestamps(ts(100), ts(150))
-                    .build(),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                        .timestamps(ts(100), ts(150))
+                        .build(),
                     ..timer_birth
                 },
             },
@@ -712,7 +708,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
 async fn projection_records_create_and_update_timestamps() {
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = TimerId::new();
+    let timer = ulid::Ulid::new();
     let task = ulid::Ulid::new();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -831,13 +827,10 @@ async fn projection_records_create_and_update_timestamps() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Active,
                     deadline: t(500),
-                    meta: spica_engine::ObjectMeta::builder(
-                        spica_engine::ObjectKind::Timer,
-                        timer.0,
-                    )
-                    .timestamps(t(400), t(400))
-                    .build()
-                    .with_owner(exec.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                        .timestamps(t(400), t(400))
+                        .build()
+                        .with_owner(exec.clone()),
                 },
             },
             t(400),
@@ -852,13 +845,10 @@ async fn projection_records_create_and_update_timestamps() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Completed,
                     deadline: t(500),
-                    meta: spica_engine::ObjectMeta::builder(
-                        spica_engine::ObjectKind::Timer,
-                        timer.0,
-                    )
-                    .timestamps(t(400), t(450))
-                    .build()
-                    .with_owner(exec.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                        .timestamps(t(400), t(450))
+                        .build()
+                        .with_owner(exec.clone()),
                 },
             },
             t(450),
@@ -1193,7 +1183,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
     // the children are terminal — and the cascade's emission order must be observable.
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = TimerId::new();
+    let timer = ulid::Ulid::new();
 
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -1270,7 +1260,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer.0)
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1359,7 +1349,7 @@ async fn late_trigger_timer_after_cancel_is_noop() {
     // An armed timer is cancelled in storage first; then a stale TriggerTimer arrives (a fire
     // that was already in flight). The handler must see the timer's terminal state and emit
     // nothing — no TimerTriggered, no TerminateExecution.
-    let timer = TimerId::new();
+    let timer = ulid::Ulid::new();
     let exec = exec_ref();
     // The payload type isn't pinned by later use here (the log is only constructed then dropped),
     // so name it explicitly.
@@ -1375,16 +1365,13 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Active,
                     deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::builder(
-                        spica_engine::ObjectKind::Timer,
-                        timer.0,
-                    )
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .build()
-                    .with_owner(exec.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                        .timestamps(
+                            spica_engine::Timestamp::from_millis(0),
+                            spica_engine::Timestamp::from_millis(0),
+                        )
+                        .build()
+                        .with_owner(exec.clone()),
                 },
             },
         )
@@ -1398,16 +1385,13 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                     purpose: TimerPurpose::ExecutionTimeout,
                     status: TimerStatus::Cancelled,
                     deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::builder(
-                        spica_engine::ObjectKind::Timer,
-                        timer.0,
-                    )
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .build()
-                    .with_owner(exec.clone()),
+                    meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                        .timestamps(
+                            spica_engine::Timestamp::from_millis(0),
+                            spica_engine::Timestamp::from_millis(0),
+                        )
+                        .build()
+                        .with_owner(exec.clone()),
                 },
             },
         )
@@ -1446,10 +1430,15 @@ async fn execution_timeout_terminates_pending_execution() {
         }"#,
     );
     // The 1s execution timeout fires while the Wait is still blocked (600s). The cascade produces
-    // ExecutionTerminated{Failed{TimedOut}} — not a hang on the 600s wait.
-    let err = common::create_and_run(common::in_memory_builder(), sm, Value::Null)
+    // ExecutionTerminated{Failed{TimedOut}} — not a hang on the 600s wait. The wait resolves to the
+    // terminal snapshot; the timeout is read off its `status`, not the call's error.
+    let exec = common::create_and_run(common::in_memory_builder(), sm, Value::Null)
         .await
-        .expect_err("execution should time out");
+        .expect("a timed-out execution still returns its terminal snapshot");
+    let err = match &exec.status {
+        ExecutionStatus::Terminated(TerminationReason::Failed { error }) => error,
+        other => panic!("expected Terminated(Failed), got {other:?}"),
+    };
     assert!(
         matches!(err, ExecutionError::Runtime(RuntimeError::TimedOut { .. })),
         "expected TimedOut, got {err:?}"
@@ -1475,7 +1464,7 @@ async fn engine_start_pass_with_assign_chain() {
             .await
             .unwrap()
     };
-    assert_eq!(result.output, json!("hi"));
+    assert_eq!(result.output, Some(json!("hi")));
 }
 
 #[tokio::test]
@@ -1483,16 +1472,16 @@ async fn engine_start_fail_produces_state_failed_error() {
     let sm = parse_sm(
         r#"{ "StartAt": "F", "States": { "F": { "Type": "Fail", "Error": "E1", "Cause": "boom" } } }"#,
     );
-    let err = common::create_and_run(common::in_memory_builder(), sm, Value::Null)
+    let exec = common::create_and_run(common::in_memory_builder(), sm, Value::Null)
         .await
-        .unwrap_err();
+        .expect("a failed run returns its terminal snapshot");
+    let err = match &exec.status {
+        ExecutionStatus::Terminated(TerminationReason::Failed { error }) => error,
+        other => panic!("expected Terminated(Failed), got {other:?}"),
+    };
     let err_name = err.error_name().to_string();
     match err {
-        ExecutionError::Runtime(RuntimeError::StateFailed {
-            ref error,
-            ref output,
-            ..
-        }) => {
+        ExecutionError::Runtime(RuntimeError::StateFailed { error, output, .. }) => {
             assert_eq!(error, "E1");
             assert_eq!(output.as_ref(), &json!({ "Error": "E1", "Cause": "boom" }));
         }
@@ -1589,7 +1578,7 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
 
     // Seed an existing execution named "dup_run" directly into storage — the same projection a prior
     // successful `CreateExecution` would have folded (the name is now the execution's primary key).
-    let uid: ulid::Ulid = ExecutionId::new().into();
+    let uid: ulid::Ulid = ulid::Ulid::new();
     let name = spica_engine::ObjectName::plain("dup_run").unwrap();
     let _id = ObjectReference::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
     storage
@@ -1692,8 +1681,8 @@ async fn terminate_execution_guards_and_rejects_problems() {
     use spica_engine::ObjectName as ON;
     let mut storage = InMemoryStorage::new();
     let mut processor = StreamProcessor::new();
-    let uid: ulid::Ulid = ExecutionId::new().into();
-    let other: ulid::Ulid = ExecutionId::new().into();
+    let uid: ulid::Ulid = ulid::Ulid::new();
+    let other: ulid::Ulid = ulid::Ulid::new();
 
     // Seed one running execution "guard_run" (known incarnation uid).
     seed_named_execution(
@@ -1791,7 +1780,7 @@ async fn terminate_execution_rejects_already_terminal() {
     use spica_engine::ObjectName as ON;
     let mut storage = InMemoryStorage::new();
     let mut processor = StreamProcessor::new();
-    let uid: ulid::Ulid = ExecutionId::new().into();
+    let uid: ulid::Ulid = ulid::Ulid::new();
 
     // Seed an already-terminated execution: a later Terminate cannot run — refuse with InvalidState.
     seed_named_execution(
@@ -1901,7 +1890,7 @@ async fn engine_explicit_lifecycle_runs_many_executions_on_one_processor() {
         .wait_for_execution(&execution_id)
         .await
         .expect("first execution should succeed");
-    assert_eq!(result.output, json!(7.0));
+    assert_eq!(result.output, Some(json!(7.0)));
     let execution_id = engine
         .start_for_revision(common::execution_name(), flow_version, json!({ "x": 9 }))
         .await
@@ -1910,7 +1899,7 @@ async fn engine_explicit_lifecycle_runs_many_executions_on_one_processor() {
         .wait_for_execution(&execution_id)
         .await
         .expect("second execution should succeed");
-    assert_eq!(result.output, json!(9.0));
+    assert_eq!(result.output, Some(json!(9.0)));
     // Clean shutdown: cancels the internal StreamProcessor and awaits it.
     engine.stop().await;
 }
@@ -1945,12 +1934,14 @@ async fn start_returns_id_before_terminal_and_wait_resolves_output() {
         .wait_for_execution(&execution_id)
         .await
         .expect("a Pass execution completes");
-    assert_eq!(result.output, json!(42.0));
+    assert_eq!(result.output, Some(json!(42.0)));
     engine.stop().await;
 }
 
-/// `wait_for_execution` surfaces a *failure* as an [`ExecutionError`] — the same mapping the old
-/// terminal-ack block returned — but via a poll of the projection rather than a live ack channel.
+/// `wait_for_execution` returns the **terminal [`Execution`] snapshot even for a failed run** — it
+/// does not convert failure into an error. The caller reads the failure off `status`:
+/// `Terminated(reason)` for a `Fail`-terminated execution, in contrast to the old contract that
+/// surfaced the failure as the call's `Err`.
 #[tokio::test]
 async fn wait_for_execution_surfaces_failure_reason() {
     let sm = parse_sm(
@@ -1969,15 +1960,15 @@ async fn wait_for_execution_surfaces_failure_reason() {
         .start_for_revision(common::execution_name(), flow_version, Value::Null)
         .await
         .expect("start should return the id even for a failing flow");
-    let err = engine
+    let exec = engine
         .wait_for_execution(&execution_id)
         .await
-        .expect_err("a Fail state must surface as an execution error");
-    match err {
-        ExecutionError::Runtime(RuntimeError::StateFailed { ref error, .. }) => {
-            assert_eq!(error, "E1")
+        .expect("a failed run still returns its terminal Execution to inspect");
+    match &exec.status {
+        ExecutionStatus::Terminated(TerminationReason::Failed { error }) => {
+            assert_eq!(error.error_name(), "E1")
         }
-        other => panic!("expected StateFailed, got {other:?}"),
+        other => panic!("expected Terminated(Failed), got {other:?}"),
     }
     engine.stop().await;
 }
@@ -2015,8 +2006,20 @@ async fn many_waiters_resolve_the_same_execution() {
         engine.wait_for_execution(&execution_id),
         engine.wait_for_execution(&execution_id)
     );
-    assert!(r1.expect("waiter 1 succeeds").output.is_null());
-    assert!(r2.expect("waiter 2 succeeds").output.is_null());
+    assert!(
+        r1.expect("waiter 1 succeeds")
+            .output
+            .as_ref()
+            .unwrap()
+            .is_null()
+    );
+    assert!(
+        r2.expect("waiter 2 succeeds")
+            .output
+            .as_ref()
+            .unwrap()
+            .is_null()
+    );
     engine.stop().await;
 }
 

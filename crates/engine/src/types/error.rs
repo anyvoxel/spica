@@ -11,9 +11,12 @@ use crate::types::reject::Reject;
 /// — `error_name`/`error_output`, Retry/Catch matching — does so over a small, cohesive set instead
 /// of an umbrella that also carries infrastructure and command-layer concerns.
 ///
-/// The `Ok` branch of execution (via `Engine::wait_for_execution`) is reserved for successful
-/// executions; every domain failure from a `Fail` state, an unhandled runtime error, a timeout, a
-/// cancel, or a structural problem with the definition is reported through this type.
+/// These are the domain failures a `Fail` state, an unhandled runtime error, a timeout, or a cancel
+/// produce; a terminated execution carries one as `TerminationReason::Failed { error }`.
+///
+/// Note: `Engine::wait_for_execution` returns the whole terminal [`Execution`](crate::Execution) for
+/// the caller to inspect, so a domain failure surfaces there as `status == Terminated`, not as the
+/// wait call's error value.
 #[derive(Debug, Clone, PartialEq, Error, Serialize, Deserialize)]
 pub enum RuntimeError {
     /// A state referenced by `StartAt`/`Next`/`Default` is not present in `States`.

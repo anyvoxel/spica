@@ -20,9 +20,9 @@ use spica_client::worker::{
     TaskHandler, TaskService,
 };
 use spica_engine::{
-    ActivatedTask, Command, Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event,
-    ExecutionError, ExecutionResult, FlowName, Hook, LogStream, ObjectKind, ObjectName,
-    ObjectReference, PlainName, Reject, RequestId, RuntimeError, StreamId, Task, Timestamp,
+    ActivatedTask, Command, Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionError, FlowName, Hook, LogStream, ObjectKind, ObjectName, ObjectReference, PlainName,
+    Reject, RequestId, RuntimeError, StreamId, Task, Timestamp,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -179,7 +179,7 @@ pub async fn create_and_run(
     builder: EngineBuilder,
     sm: StateMachine,
     input: Value,
-) -> Result<ExecutionResult, ExecutionError> {
+) -> Result<Execution, ExecutionError> {
     create_and_run_with_handlers(builder, sm, input, HashMap::new()).await
 }
 
@@ -190,7 +190,7 @@ pub async fn create_and_run_with_handlers(
     sm: StateMachine,
     input: Value,
     task_handlers: HashMap<String, Arc<dyn TaskHandler>>,
-) -> Result<ExecutionResult, ExecutionError> {
+) -> Result<Execution, ExecutionError> {
     // `LocalClient::start` injects a local `AckHook` (so the blocking calls below can await their
     // outcomes) and boots the single long-lived StreamProcessor.
     let client = LocalClient::start(builder).await?;

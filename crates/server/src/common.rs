@@ -8,16 +8,16 @@ use spica_engine::{
 };
 use tonic::Status;
 
-use crate::consumer::Facade;
+use crate::gateway::Gateway;
 
 /// Shared service state: the one [`Engine`] — the single authority for every RPC — plus the
-/// [`Facade`] consumer that owns the blocking request/response API.
+/// [`Gateway`] application layer that owns the blocking request/response API.
 ///
 /// There is intentionally **no outer mutex**: `Engine` is internally synchronized. Every public
 /// method the RPCs touch (`get_object`, `list_objects`, `cancel_execution`, `resolve_version_id`)
 /// takes `&self` and guards its mutable state behind per-field `tokio::sync::Mutex`s, so an
 /// `Arc<Engine>` shared across the tonic services is `Sync` and safe to call concurrently; the
-/// [`Facade`] wraps it and the shared [`AckHook`](crate::consumer::AckHook). Only `Engine::start` —
+/// [`Gateway`] wraps it and the shared [`AckHook`](crate::gateway::AckHook). Only `Engine::start` —
 /// which boots the StreamProcessor — takes `&mut self`, and the server calls it on the owned Engine
 /// before wrapping it in the `Arc` (see `main`). Awaits (birth of an execution / creation of a flow)
 /// do not block on settlement, so the server stays responsive to concurrent Query reads.
@@ -28,9 +28,9 @@ pub(crate) struct Svc {
     /// service modules ([`crate::workflow`], [`crate::execution`], [`crate::task`]) can access
     /// `self.engine`.
     pub(crate) engine: Arc<Engine>,
-    /// The consumer facade (blocking convenience API over `engine`) the request/response handlers
-    /// forward to: `create_flow`, `start_for_revision`, and the task claim/settle API.
-    pub(crate) facade: Facade,
+    /// The application layer (blocking request/response API over `engine`) the request/response
+    /// handlers forward to: `create_flow`, `start_for_revision`, and the task claim/settle API.
+    pub(crate) gateway: Gateway,
 }
 
 /// Parse a ULID-string handle into a typed engine id, failing the RPC as `INVALID_ARGUMENT`.
