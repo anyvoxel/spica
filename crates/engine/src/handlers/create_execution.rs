@@ -1,12 +1,11 @@
-use async_trait::async_trait;
-
 use crate::RejectionType;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::{Command, TimerPurpose};
+use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
+use crate::types::event::{Event, ExecutionCreated};
+use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::state_path::StatePath;
 
 /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
 /// arms the state-machine `TimeoutSeconds` timer if configured. Immediately enters the start state
@@ -14,33 +13,23 @@ use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
 #[derive(Default)]
 pub struct CreateExecutionHandler;
 
-#[async_trait]
-impl CommandHandler for CreateExecutionHandler {
-    fn command(&self) -> Command {
-        Command::CreateExecution {
-            request_id: crate::types::id::RequestId::nil(),
-            name: ObjectName::plain("default").expect("static placeholder name is valid"),
-            flow_version: crate::types::meta::ObjectReference::nil(),
-            input: Default::default(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
+impl CreateExecutionHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &CreateExecution,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         // `request_id` is the awaiting caller's correlation key — echoed onto `ExecutionCreated` so
         // the StreamProcessor's request-ack correlator wakes the awaiting `start` operation with the fact
         // that this execution was durably created (see `Event::ExecutionCreated`). The handler
         // otherwise ignores it.
-        let Command::CreateExecution {
+        let CreateExecution {
             request_id,
             name,
             flow_version,
             input,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
         // `CreateExecution` creates only new names: the name is the execution's storage primary key
         // (per-scope unique), so a second run under an already-live name must be **rejected** — the
         // authoritative serialized point the StreamProcessor reaches in strict log order — never
@@ -77,7 +66,7 @@ impl CommandHandler for CreateExecutionHandler {
         let sm = fail_or!(out, None, id.clone(), ctx.machine(flow_version).await);
         // Build the birth event once and emit it; an injected `Hook` observer wakes the awaiting `start`
         // caller from this same event (the `request_id` it echoes), so no separate ack echo is needed.
-        let created_event = Event::ExecutionCreated {
+        let created_event = Event::ExecutionCreated(ExecutionCreated {
             request_id: *request_id,
             execution: crate::Execution {
                 // The version this run executes against — every nested Thread inherits it.
@@ -93,12 +82,12 @@ impl CommandHandler for CreateExecutionHandler {
                     .at(Timestamp::now())
                     .build(),
             },
-        };
+        });
         // The birth `ExecutionCreated` echoes the awaiting `start` caller's request id; the `AckHook`
         // observer wakes it once the engine reports this event applied (see `Engine::start_for_revision`,
         // which returns the execution id at that point, leaving the terminal settle to
         // `wait_for_execution`).
-        out.emit_event(created_event).await;
+        out.append_event(created_event).await;
 
         if let Some(secs) = sm.timeout_seconds
             && secs > 0
@@ -157,20 +146,50 @@ impl CommandHandler for CreateExecutionHandler {
                 status: crate::TimerStatus::Active,
                 deadline,
             };
-            out.emit_event(Event::TimerActivated { timer }).await;
+            out.append_event(Event::TimerActivated { timer }).await;
         }
+
+        // Derive the execution's single root Thread — the top-level owner of every state, standing in
+        // for a whole top-level run the way a Process has one main Thread. It is owned by the
+        // Execution (so the `ThreadCreated` applier never aggregates its placeholder index 0 into a
+        // container fan-out map) and carries the empty pointer `/`, which `resolve_states_map`
+        // resolves back to the machine's top-level `states`. Its completion/termination bridges back
+        // to the Execution (see `complete_thread`/`terminate_thread`), so the externally-addressed
+        // root still settles through `wait_for_execution`.
+        let root_uid: ulid::Ulid = ulid::Ulid::new();
+        let root_name = id
+            .name
+            .base()
+            .generated_from_key(out.next_generated_seq().await);
+        let root_thread = ObjectReference::new(ObjectKind::Thread, root_name.clone(), root_uid);
+        out.append_event(Event::ThreadCreated {
+            thread: crate::Thread {
+                meta: ObjectMeta::builder(ObjectKind::Thread, root_uid)
+                    .name(root_name)
+                    .at(Timestamp::now())
+                    .build()
+                    .with_owner(id.clone()),
+                execution: id.clone(),
+                state_path: StatePath::from(jsonptr::PointerBuf::new()),
+                index: 0,
+                status: crate::ThreadStatus::Running,
+                input: input.clone(),
+                output: None,
+            },
+        })
+        .await;
 
         let start = sm.start_at.clone();
         // The start state's path under the machine's top-level `states` table.
         let mut start_path = jsonptr::PointerBuf::new();
         start_path.push_back("states");
         start_path.push_back(start.as_str());
-        out.emit_command(Command::ActivateState {
-            // Top-level: the execution is its own anchor AND its own owner (no surrounding thread).
+        out.append_command(Command::ActivateState(ActivateState {
+            // The top-level state is owned by the derived root Thread, not the Execution.
             execution: id.clone(),
-            owner: id.clone(),
-            state_path: start_path,
+            owner: root_thread,
+            state_path: StatePath::from(start_path),
             input: input.clone(),
-        });
+        }));
     }
 }

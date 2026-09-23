@@ -7,11 +7,14 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    Activity, ActivityStatus, Command, Entry, EntryId, EntryPayload, Event, Execution,
-    ExecutionError, ExecutionStatus, Flow, FlowName, FlowStatus, FlowVersion, InMemoryLogStream,
-    LogStream, ObjectReference, RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError,
-    Storage, StreamProcessor, Task, TaskStatus, TerminationReason, Thread, ThreadStatus, Timer,
-    TimerPurpose, TimerStatus, Timestamp, Variables,
+    Activity, ActivityStatus, ClaimTasks, Command, CompleteState, CompleteTask, CreateExecution,
+    CreateFlow, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
+    ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus, FlowVersion,
+    FlowVersionCreated, InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId,
+    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Storage, StreamProcessor, Task,
+    TaskCompleted, TaskFailed, TaskStatus, TasksClaimed, TerminateExecution, TerminationReason,
+    Thread, ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables,
+    VariablesAssigned,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -133,18 +136,14 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
     )
 }
 
-/// Applies events to storage through the real [`EventDispatcher`], mirroring the event path of
+/// Applies events to storage through [`dispatch_event`](spica_engine::dispatch_event), mirroring the event path of
 /// `StreamProcessor::run`. Projection tests only fold state and never wait on a fired timer, so any
 /// applier-declared timer effects are discarded here (unlike `collect_events`, which routes them).
-struct Projector {
-    dispatcher: spica_engine::EventDispatcher,
-}
+struct Projector;
 
 impl Projector {
     fn new() -> Self {
-        Self {
-            dispatcher: spica_engine::EventDispatcher::new(),
-        }
+        Self
     }
 
     async fn apply(&self, storage: &mut InMemoryStorage, event: &Event) {
@@ -170,7 +169,7 @@ impl Projector {
                 storage: &mut *txn,
                 timestamp,
             };
-            self.dispatcher.apply(&mut ctx, event).await.unwrap();
+            spica_engine::dispatch_event(&mut ctx, event).await.unwrap();
         }
         txn.commit(None).unwrap();
     }
@@ -240,7 +239,6 @@ async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
         .unwrap();
 
     let mut processor = StreamProcessor::new();
-    let dispatcher = spica_engine::EventDispatcher::new();
     // Self-contained in-memory scheduler + task service, wired the same way `StreamProcessor::run` wires
     // them. Fired timers are pushed back onto this log via the injected [`AppendingSink`]; settled
     // commands are pulled from the task service via `next_settled`.
@@ -276,7 +274,7 @@ async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
                                 storage: &mut *txn,
                                 timestamp: entry.timestamp,
                             };
-                            dispatcher.apply(&mut ctx, &event).await.unwrap();
+                            spica_engine::dispatch_event(&mut ctx, &event).await.unwrap();
                         }
                         txn.commit(None).unwrap();
                         // Re-derive any physical schedule from the durable event (no effects in band).
@@ -309,9 +307,9 @@ async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
 /// Stable orderable prefix of each event's Debug form, for asserting on emission order.
 fn kind_prefix(e: &Event) -> &'static str {
     match e {
-        Event::FlowCreated { .. } => "FlowCreated",
-        Event::FlowVersionCreated { .. } => "FlowVersionCreated",
-        Event::ExecutionCreated { .. } => "ExecutionCreated",
+        Event::FlowCreated(FlowCreated { .. }) => "FlowCreated",
+        Event::FlowVersionCreated(FlowVersionCreated { .. }) => "FlowVersionCreated",
+        Event::ExecutionCreated(ExecutionCreated { .. }) => "ExecutionCreated",
         Event::ExecutionCompleting { .. } => "ExecutionCompleting",
         Event::ExecutionCompleted { .. } => "ExecutionCompleted",
         Event::ExecutionTerminating { .. } => "ExecutionTerminating",
@@ -331,13 +329,13 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::TimerTriggered { .. } => "TimerTriggered",
         Event::TimerCancelled { .. } => "TimerCancelled",
         Event::TaskActivated { .. } => "TaskActivated",
-        Event::TasksClaimed { .. } => "TasksClaimed",
+        Event::TasksClaimed(TasksClaimed { .. }) => "TasksClaimed",
         Event::TaskLeaseExpired { .. } => "TaskLeaseExpired",
-        Event::TaskCompleted { .. } => "TaskCompleted",
-        Event::TaskFailed { .. } => "TaskFailed",
+        Event::TaskCompleted(TaskCompleted { .. }) => "TaskCompleted",
+        Event::TaskFailed(TaskFailed { .. }) => "TaskFailed",
         Event::TaskCancelled { .. } => "TaskCancelled",
-        Event::VariablesAssigned { .. } => "VariablesAssigned",
-        Event::StateTransitioned { .. } => "StateTransitioned",
+        Event::VariablesAssigned(VariablesAssigned { .. }) => "VariablesAssigned",
+        Event::StateTransitioned(StateTransitioned { .. }) => "StateTransitioned",
     }
 }
 
@@ -365,7 +363,7 @@ async fn storage_projects_execution_and_activity_state() {
     projector
         .apply(
             &mut storage,
-            &Event::ExecutionCreated {
+            &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     flow_version: ObjectReference::nil(),
@@ -382,7 +380,7 @@ async fn storage_projects_execution_and_activity_state() {
                     )
                     .build(),
                 },
-            },
+            }),
         )
         .await;
     projector
@@ -391,7 +389,7 @@ async fn storage_projects_execution_and_activity_state() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
+                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({ "x": 1 }),
                     input: Some(json!({ "x": 1 })),
@@ -416,10 +414,10 @@ async fn storage_projects_execution_and_activity_state() {
     projector
         .apply(
             &mut storage,
-            &Event::VariablesAssigned {
+            &Event::VariablesAssigned(VariablesAssigned {
                 scope: exec.clone(),
                 variables: Variables::from([("g".to_string(), json!("hi"))]),
-            },
+            }),
         )
         .await;
     projector
@@ -465,7 +463,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
     projector
         .apply(
             &mut storage,
-            &Event::ExecutionCreated {
+            &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     flow_version: ObjectReference::nil(),
@@ -482,7 +480,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                     )
                     .build(),
                 },
-            },
+            }),
         )
         .await;
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
@@ -551,7 +549,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
 
     let act_birth = |at: u64| Activity {
         execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
+        state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
         status: ActivityStatus::Running,
         raw_input: json!({}),
         input: Some(json!({})),
@@ -673,7 +671,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
     projector
         .apply(
             &mut storage,
-            &Event::TaskCompleted {
+            &Event::TaskCompleted(TaskCompleted {
                 request_id: spica_engine::RequestId::nil(),
                 task: Task {
                     status: TaskStatus::Completed,
@@ -685,7 +683,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     ..task_birth
                 },
                 output: Value::Null,
-            },
+            }),
         )
         .await;
     let tk = storage.get_task(&task_ref(task)).await.unwrap().unwrap();
@@ -718,7 +716,7 @@ async fn projection_records_create_and_update_timestamps() {
     projector
         .apply_at(
             &mut storage,
-            &Event::ExecutionCreated {
+            &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     flow_version: ObjectReference::nil(),
@@ -735,7 +733,7 @@ async fn projection_records_create_and_update_timestamps() {
                     )
                     .build(),
                 },
-            },
+            }),
             t(100),
         )
         .await;
@@ -747,10 +745,10 @@ async fn projection_records_create_and_update_timestamps() {
     projector
         .apply_at(
             &mut storage,
-            &Event::VariablesAssigned {
+            &Event::VariablesAssigned(VariablesAssigned {
                 scope: exec.clone(),
                 variables: Variables::from([("k".to_string(), json!(1))]),
-            },
+            }),
             t(200),
         )
         .await;
@@ -766,7 +764,7 @@ async fn projection_records_create_and_update_timestamps() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
+                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -792,7 +790,7 @@ async fn projection_records_create_and_update_timestamps() {
             &Event::StateCompleted {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap(),
+                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
                     status: ActivityStatus::Completed,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -886,7 +884,7 @@ async fn projection_records_create_and_update_timestamps() {
     projector
         .apply_at(
             &mut storage,
-            &Event::TaskFailed {
+            &Event::TaskFailed(TaskFailed {
                 task: Task {
                     execution: spica_engine::ObjectReference::nil(),
                     resource: "urn:svc".to_string(),
@@ -907,7 +905,7 @@ async fn projection_records_create_and_update_timestamps() {
                     error: "boom".to_string(),
                     output: Box::new(Value::Null),
                 }),
-            },
+            }),
             t(650),
         )
         .await;
@@ -1044,7 +1042,9 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     let activity = act_ref();
     let thread = Thread {
         execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/states/P/branches/0/states").unwrap(),
+        state_path: jsonptr::PointerBuf::parse("/states/P/branches/0/states")
+            .unwrap()
+            .into(),
         index: 0,
         status: ThreadStatus::Running,
         input: json!({}),
@@ -1065,7 +1065,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     projector
         .apply(
             &mut storage,
-            &Event::ExecutionCreated {
+            &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     flow_version: ObjectReference::nil(),
@@ -1082,16 +1082,16 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                     )
                     .build(),
                 },
-            },
+            }),
         )
         .await;
     projector
         .apply(
             &mut storage,
-            &Event::VariablesAssigned {
+            &Event::VariablesAssigned(VariablesAssigned {
                 scope: exec.clone(),
                 variables: Variables::from([("g".to_string(), json!("hi"))]),
-            },
+            }),
         )
         .await;
     // The spawning container Activity owned by that Execution.
@@ -1101,7 +1101,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/P").unwrap(),
+                    state_path: jsonptr::PointerBuf::parse("/states/P").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -1142,10 +1142,10 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     projector
         .apply(
             &mut storage,
-            &Event::VariablesAssigned {
+            &Event::VariablesAssigned(VariablesAssigned {
                 scope: thread_ref.clone(),
                 variables: Variables::from([("x".to_string(), json!(1))]),
-            },
+            }),
         )
         .await;
     let row = storage.get_thread(&thread_ref).await.unwrap().unwrap();
@@ -1190,7 +1190,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
     // Apply the full set-up via the real ing events so `active_children`/`parent` links are
     // projected by the same fold handlers running on the production path use.
     for ev in &[
-        Event::ExecutionCreated {
+        Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
             execution: Execution {
                 flow_version: ObjectReference::nil(),
@@ -1207,11 +1207,11 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 )
                 .build(),
             },
-        },
+        }),
         Event::StateActivating {
             activity: Activity {
                 execution: exec.clone(),
-                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap(),
+                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap().into(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
                 input: Some(Value::Null),
@@ -1234,7 +1234,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
         Event::StateActivated {
             activity: Activity {
                 execution: exec.clone(),
-                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap(),
+                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap().into(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
                 input: Some(Value::Null),
@@ -1280,11 +1280,11 @@ async fn terminate_execution_cancels_wait_and_drains() {
     let cause = spica_engine::EntryId::new(1);
     let entries = processor
         .dispatch(
-            &Command::TerminateExecution {
+            &Command::TerminateExecution(TerminateExecution {
                 name: exec.name.clone(),
                 uid: Some(exec.uid),
                 reason: TerminationReason::Cancelled,
-            },
+            }),
             &storage,
             cause,
         )
@@ -1536,11 +1536,11 @@ async fn create_flow_handler_rejects_existing_name_as_reject_record() {
     // record (the durable response entry for the refused command), never a silent empty emit.
     let entries = processor
         .dispatch(
-            &Command::CreateFlow {
+            &Command::CreateFlow(CreateFlow {
                 request_id: RequestId::new(),
                 name: FlowName::new("test_flow").unwrap(),
                 definition: serde_json::to_string(&sm).unwrap(),
-            },
+            }),
             &storage,
             EntryId::new(2),
         )
@@ -1608,12 +1608,12 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
     // `Reject` record — never a duplicate `ExecutionCreated` that would clobber the first row.
     let entries = processor
         .dispatch(
-            &Command::CreateExecution {
+            &Command::CreateExecution(CreateExecution {
                 request_id: RequestId::new(),
                 name,
                 flow_version: ObjectReference::nil(),
                 input: Value::Null,
-            },
+            }),
             &storage,
             EntryId::new(2),
         )
@@ -1696,11 +1696,11 @@ async fn terminate_execution_guards_and_rejects_problems() {
     // (a) uid mismatch → a single StateConflict Reject, never a termination.
     let entries = processor
         .dispatch(
-            &Command::TerminateExecution {
+            &Command::TerminateExecution(TerminateExecution {
                 name: ON::plain("guard_run").unwrap(),
                 uid: Some(other),
                 reason: TerminationReason::Cancelled,
-            },
+            }),
             &storage,
             EntryId::new(2),
         )
@@ -1725,11 +1725,11 @@ async fn terminate_execution_guards_and_rejects_problems() {
     // (b) unknown name → a single NotFound Reject.
     let entries = processor
         .dispatch(
-            &Command::TerminateExecution {
+            &Command::TerminateExecution(TerminateExecution {
                 name: ON::plain("ghost").unwrap(),
                 uid: None,
                 reason: TerminationReason::Cancelled,
-            },
+            }),
             &storage,
             EntryId::new(3),
         )
@@ -1750,11 +1750,11 @@ async fn terminate_execution_guards_and_rejects_problems() {
     // (c) matching uid → proceeds: emits ExecutionTerminating (then the terminal ed), no Reject.
     let entries = processor
         .dispatch(
-            &Command::TerminateExecution {
+            &Command::TerminateExecution(TerminateExecution {
                 name: ON::plain("guard_run").unwrap(),
                 uid: Some(uid),
                 reason: TerminationReason::Cancelled,
-            },
+            }),
             &storage,
             EntryId::new(4),
         )
@@ -1792,11 +1792,11 @@ async fn terminate_execution_rejects_already_terminal() {
     .await;
     let entries = processor
         .dispatch(
-            &Command::TerminateExecution {
+            &Command::TerminateExecution(TerminateExecution {
                 name: ON::plain("done_run").unwrap(),
                 uid: Some(uid),
                 reason: TerminationReason::Cancelled,
-            },
+            }),
             &storage,
             EntryId::new(2),
         )
@@ -1826,11 +1826,11 @@ async fn create_flow_handler_rejects_malformed_definition_as_reject_record() {
     // `return` — emitting no entry at all.
     let entries = processor
         .dispatch(
-            &Command::CreateFlow {
+            &Command::CreateFlow(CreateFlow {
                 request_id: RequestId::new(),
                 name: FlowName::new("bad_flow").unwrap(),
                 definition: "not a state machine".to_string(),
-            },
+            }),
             &storage,
             EntryId::new(1),
         )
@@ -2173,19 +2173,21 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
 
     let entries = dispatch_command(
         &storage,
-        Command::ClaimTasks {
+        Command::ClaimTasks(ClaimTasks {
             request_id: RequestId::new(),
             worker_id: "w2".into(),
             resource: "r".into(),
             max_tasks: 10,
             lease_seconds: 60,
-        },
+        }),
     )
     .await;
     let leased: Vec<_> = entries
         .iter()
         .filter_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TasksClaimed { tasks, .. }) => Some(tasks.iter()),
+            EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) => {
+                Some(tasks.iter())
+            }
             _ => None,
         })
         .flatten()
@@ -2235,19 +2237,21 @@ async fn poll_tasks_respects_max_tasks() {
     }
     let entries = dispatch_command(
         &storage,
-        Command::ClaimTasks {
+        Command::ClaimTasks(ClaimTasks {
             request_id: RequestId::new(),
             worker_id: "w".into(),
             resource: "r".into(),
             max_tasks: 2,
             lease_seconds: 60,
-        },
+        }),
     )
     .await;
     let leased = entries
         .iter()
         .filter_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TasksClaimed { tasks, .. }) => Some(tasks.len()),
+            EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) => {
+                Some(tasks.len())
+            }
             _ => None,
         })
         .sum::<usize>();
@@ -2274,7 +2278,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
     projector
         .apply(
             &mut storage,
-            &Event::TasksClaimed {
+            &Event::TasksClaimed(TasksClaimed {
                 request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
                     execution: spica_engine::ObjectReference::nil(),
@@ -2297,7 +2301,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                     .build()
                     .with_owner(act_ref()),
                 }],
-            },
+            }),
         )
         .await;
     let t = storage.get_task(&task_ref(running)).await.unwrap().unwrap();
@@ -2318,7 +2322,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
     projector
         .apply(
             &mut storage,
-            &Event::TasksClaimed {
+            &Event::TasksClaimed(TasksClaimed {
                 request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
                     execution: spica_engine::ObjectReference::nil(),
@@ -2338,7 +2342,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                         .build()
                         .with_owner(act_ref()),
                 }],
-            },
+            }),
         )
         .await;
     let t = storage.get_task(&task_ref(done)).await.unwrap().unwrap();
@@ -2363,12 +2367,12 @@ async fn complete_by_foreign_worker_is_rejected() {
     .await;
     let entries = dispatch_command(
         &storage,
-        Command::CompleteTask {
+        Command::CompleteTask(CompleteTask {
             task: task_ref(task),
             worker_id: "w2".into(),
             output: json!({ "ok": true }),
             request_id: spica_engine::RequestId::nil(),
-        },
+        }),
     )
     .await;
     // A foreign worker's complete is a request/response refusal: the hander emits a `Reject`
@@ -2407,22 +2411,22 @@ async fn leasing_worker_complete_settles_task() {
     let request_id = spica_engine::RequestId::new();
     let entries = dispatch_command(
         &storage,
-        Command::CompleteTask {
+        Command::CompleteTask(CompleteTask {
             task: task_ref(task),
             worker_id: "w1".into(),
             output: json!({ "ok": true }),
             request_id,
-        },
+        }),
     )
     .await;
     let completed = entries
         .iter()
         .find_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TaskCompleted {
+            EntryPayload::Event(Event::TaskCompleted(TaskCompleted {
                 request_id: echoed,
                 task,
                 ..
-            }) => {
+            })) => {
                 // The success event echoes the worker's own request id back — the correlation key the
                 // request/response ack routes on.
                 assert_eq!(*echoed, request_id);
@@ -2438,7 +2442,7 @@ async fn leasing_worker_complete_settles_task() {
     assert!(
         entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Command(Command::CompleteState { .. })
+            EntryPayload::Command(Command::CompleteState(CompleteState { .. }))
         )),
         "a settled task should resume its state"
     );
@@ -2452,12 +2456,12 @@ async fn late_complete_after_release_or_cancel_is_refused() {
     async fn assert_refused(storage: &InMemoryStorage, task: ulid::Ulid) {
         let entries = dispatch_command(
             storage,
-            Command::CompleteTask {
+            Command::CompleteTask(CompleteTask {
                 task: task_ref(task),
                 worker_id: "w1".into(),
                 output: json!(1),
                 request_id: spica_engine::RequestId::nil(),
-            },
+            }),
         )
         .await;
         let rejects: Vec<_> = entries
@@ -2525,19 +2529,19 @@ async fn release_requeues_task_for_a_fresh_claim() {
         .await;
     let entries = dispatch_command(
         &storage,
-        Command::ClaimTasks {
+        Command::ClaimTasks(ClaimTasks {
             request_id: RequestId::new(),
             worker_id: "w2".into(),
             resource: "r".into(),
             max_tasks: 10,
             lease_seconds: 30,
-        },
+        }),
     )
     .await;
     assert!(
         entries
             .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks, .. }) if !tasks.is_empty())),
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) if !tasks.is_empty())),
         "a re-queued task can be claimed by a fresh worker: {entries:?}"
     );
 }
@@ -2557,13 +2561,13 @@ async fn fail_settlement_requires_lease_or_engine_authority() {
     .await;
     let entries = dispatch_command(
         &storage,
-        Command::FailTask {
+        Command::FailTask(FailTask {
             task: task_ref(foreign),
             worker_id: "w2".into(),
             error: ExecutionError::Runtime(RuntimeError::TimedOut {
                 message: "x".into(),
             }),
-        },
+        }),
     )
     .await;
     assert!(
@@ -2584,19 +2588,20 @@ async fn fail_settlement_requires_lease_or_engine_authority() {
     .await;
     let entries = dispatch_command(
         &storage,
-        Command::FailTask {
+        Command::FailTask(FailTask {
             task: task_ref(stalled),
             worker_id: String::new(),
             error: ExecutionError::Runtime(RuntimeError::TimedOut {
                 message: "deadline".into(),
             }),
-        },
+        }),
     )
     .await;
     assert!(
-        entries
-            .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskFailed { .. }))),
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TaskFailed(TaskFailed { .. }))
+        )),
         "the engine backstop fail should settle the task: {entries:?}"
     );
 }
@@ -2640,7 +2645,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
 
     let entries = dispatch_command(
         &storage,
-        Command::FailTask {
+        Command::FailTask(FailTask {
             task: task_ref(task),
             worker_id: "w1".into(),
             error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2648,13 +2653,13 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
                 error: "boom".to_string(),
                 output: Box::new(Value::Null),
             }),
-        },
+        }),
     )
     .await;
     let failed = entries
         .iter()
         .find_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TaskFailed { task, .. }) => Some(task),
+            EntryPayload::Event(Event::TaskFailed(TaskFailed { task, .. })) => Some(task),
             _ => None,
         })
         .expect("a matching retrier should emit TaskFailed (retry scheduled)");
@@ -2720,19 +2725,19 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
 
     let entries = dispatch_command(
         &storage,
-        Command::ClaimTasks {
+        Command::ClaimTasks(ClaimTasks {
             request_id: RequestId::new(),
             worker_id: "w1".into(),
             resource: "r".into(),
             max_tasks: 10,
             lease_seconds: 60,
-        },
+        }),
     )
     .await;
     assert!(
         !entries
             .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed { tasks, .. }) if !tasks.is_empty())),
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) if !tasks.is_empty())),
         "a retrying task whose backoff gate has not lapsed must not be claimable: {entries:?}"
     );
 }

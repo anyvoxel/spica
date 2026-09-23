@@ -9,12 +9,12 @@
 //! than a call stack (Zeebe's `COMPLETE_ELEMENT` decoupling — see `crates/engine/src/types/command.rs`).
 //!
 //! **Why this is clean:** the collector folds each emitted `Event` eagerly into the working overlay at
-//! `emit_event` time, so `parent`'s `active_children` is the real post-drain projection when this
+//! `append_event` time, so `parent`'s `active_children` is the real post-drain projection when this
 //! reactor reads it — no deferred flush, no snapshot arithmetic, and the guard "only issue a Continue
 //! when the owner is provably drained-and-finishing" means every issued command does real work on its
 //! round (never a silent no-op that would need a marker event).
 
-use crate::handler::{ActivityCtx, Collector, CtxKind, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::types::command::Command;
 use crate::types::meta::{ObjectKind, ObjectReference};
 use crate::types::thread::ThreadStatus;
@@ -55,10 +55,10 @@ async fn execution_child_settled(
     }
     match &exec.status {
         ExecutionStatus::Completing => {
-            out.emit_command(Command::ContinueComplete { owner: parent })
+            out.append_command(Command::ContinueComplete { owner: parent })
         }
         ExecutionStatus::Terminating(_) => {
-            out.emit_command(Command::ContinueTerminate { owner: parent })
+            out.append_command(Command::ContinueTerminate { owner: parent })
         }
         // Running + children: no state-specific replenish hook for an Execution yet.
         // TODO(Map/Parallel): dispatch replenish via the state table for Executions too.
@@ -81,9 +81,9 @@ async fn thread_child_settled(
         return; // not drained yet — some other child owns the thread's finish.
     }
     match &thread.status {
-        ThreadStatus::Completing => out.emit_command(Command::ContinueComplete { owner: parent }),
+        ThreadStatus::Completing => out.append_command(Command::ContinueComplete { owner: parent }),
         ThreadStatus::Terminating(_) => {
-            out.emit_command(Command::ContinueTerminate { owner: parent })
+            out.append_command(Command::ContinueTerminate { owner: parent })
         }
         _ => {}
     }
@@ -105,10 +105,10 @@ async fn activity_child_settled(
     };
     match act.value.status {
         ActivityStatus::Completing if act.active_children.is_empty() => {
-            out.emit_command(Command::ContinueComplete { owner: parent });
+            out.append_command(Command::ContinueComplete { owner: parent });
         }
         ActivityStatus::Terminating(_) if act.active_children.is_empty() => {
-            out.emit_command(Command::ContinueTerminate { owner: parent });
+            out.append_command(Command::ContinueTerminate { owner: parent });
         }
         // Running + children: the **replenish** half (state-specific). Dispatched on *every*
         // settled child (not just when `active_children` is empty), so a `Map` refills a
@@ -121,10 +121,10 @@ async fn activity_child_settled(
     }
 }
 
-/// The **replenish** half of a `Running` activity whose child settled: build an `ActivityCtx` for
-/// the activity and dispatch to its `StateHandler::child_completed` so the state itself decides the
-/// next move (for a Map: refill a `MaxConcurrency` slot or converge/fail; for a Parallel: aggregate
-/// and complete or fail). Mirrors how `CompleteStateHandler` constructs a ctx for `complete`.
+/// The **replenish** half of a `Running` activity whose child settled: pass the activity value and
+/// its scope's variables to the state's `StateHandler::child_completed` so the state itself decides
+/// the next move (for a Map: refill a `MaxConcurrency` slot or converge/fail; for a Parallel:
+/// aggregate and complete or fail).
 async fn dispatch_child_completed(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
@@ -146,33 +146,21 @@ async fn dispatch_child_completed(
         Ok(s) => s,
         Err(_) => return, // definition gone — nothing to decide.
     };
-    let state_def = match super::resolve_state_for(
-        &sm,
-        &scope,
-        &crate::handlers::state_name_from_path(act.value.state_path.as_ptr()),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(_) => return, // definition gone — nothing to decide.
-    };
-    let actx = ActivityCtx {
-        activity: act.value(),
-        execution_state_path: scope.state_path().cloned(),
-        exec_input: scope.input().clone(),
-        variables: scope.variables().clone(),
-        kind: CtxKind::Complete,
-    };
-    match ctx.state_handlers.get(&std::mem::discriminant(state_def)) {
-        Some(handler) => {
-            handler
-                .child_completed(ctx, out, activity, Some(&actx), state_def, child)
-                .await;
-        }
-        None => {
-            // A non-container state owning children while Running is an internal fault; nothing to
-            // do (the activity stays Running, but no container logic runs).
-            tracing::warn!(activity = %activity, "no container child_completed for state");
-        }
-    }
+    let state_def =
+        match super::resolve_state_for(&sm, &scope, &act.value.state_path.state_name()).await {
+            Ok(s) => s,
+            Err(_) => return, // definition gone — nothing to decide.
+        };
+    let activity_value = act.value();
+    let variables = scope.variables().clone();
+    // Every `State` variant has a registered factory (see `build_state_handlers` + the
+    // `registry.len() == 8` coverage test), so a miss here is an engine regression — fail loud
+    // rather than leave the container stuck Running without its logic.
+    let handler = ctx
+        .state_handlers
+        .create(state_def)
+        .expect("state type has no registered handler: engine regression, not a flow error");
+    handler
+        .child_completed(ctx, out, activity, &activity_value, &variables, child)
+        .await;
 }

@@ -7,11 +7,8 @@
 //! its terminal, then hand the settled owner up to *its* owner via a follow-up Continue — exactly one
 //! hop, never recursion, so stack depth is independent of owner-chain depth.
 
-use async_trait::async_trait;
-
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::Command;
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, ObjectReference};
 
@@ -58,7 +55,7 @@ async fn finish_activity(
             let mut activity_value = act.value();
             activity_value.status = ActivityStatus::Completed;
             activity_value.output = Some(output.clone());
-            out.emit_event(Event::StateCompleted {
+            out.append_event(Event::StateCompleted {
                 activity: activity_value,
             })
             .await;
@@ -66,7 +63,7 @@ async fn finish_activity(
         ActivityStatus::Terminating(reason) => {
             let mut activity_value = act.value();
             activity_value.status = ActivityStatus::Terminated(reason.clone());
-            out.emit_event(Event::StateTerminated {
+            out.append_event(Event::StateTerminated {
                 activity: activity_value,
             })
             .await;
@@ -103,7 +100,7 @@ async fn finish_thread(
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output);
             completed_thread.meta.with_update_at(Timestamp::now());
-            out.emit_event(Event::ThreadCompleted {
+            out.append_event(Event::ThreadCompleted {
                 thread: completed_thread,
             })
             .await;
@@ -112,7 +109,7 @@ async fn finish_thread(
             let mut terminated_thread = thread.value();
             terminated_thread.status = ThreadStatus::Terminated(reason.clone());
             terminated_thread.meta.with_update_at(Timestamp::now());
-            out.emit_event(Event::ThreadTerminated {
+            out.append_event(Event::ThreadTerminated {
                 thread: terminated_thread,
             })
             .await;
@@ -149,7 +146,7 @@ async fn finish_execution(
             completed_execution.status = ExecutionStatus::Completed;
             completed_execution.output = Some(output.clone());
             completed_execution.meta.with_update_at(Timestamp::now());
-            out.emit_event(Event::ExecutionCompleted {
+            out.append_event(Event::ExecutionCompleted {
                 execution: completed_execution,
             })
             .await;
@@ -158,7 +155,7 @@ async fn finish_execution(
             let mut terminated_execution = exec.value();
             terminated_execution.status = ExecutionStatus::Terminated(reason.clone());
             terminated_execution.meta.with_update_at(Timestamp::now());
-            out.emit_event(Event::ExecutionTerminated {
+            out.append_event(Event::ExecutionTerminated {
                 execution: terminated_execution,
             })
             .await;
@@ -181,20 +178,13 @@ async fn finish_execution(
 #[derive(Default)]
 pub struct ContinueCompleteHandler;
 
-#[async_trait]
-impl CommandHandler for ContinueCompleteHandler {
-    fn command(&self) -> Command {
-        Command::ContinueComplete {
-            owner: ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::ContinueComplete { owner } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl ContinueCompleteHandler {
+    pub(crate) async fn handle(
+        &self,
+        owner: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         finish_node(ctx, out, owner).await;
     }
 }
@@ -203,20 +193,13 @@ impl CommandHandler for ContinueCompleteHandler {
 #[derive(Default)]
 pub struct ContinueTerminateHandler;
 
-#[async_trait]
-impl CommandHandler for ContinueTerminateHandler {
-    fn command(&self) -> Command {
-        Command::ContinueTerminate {
-            owner: ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::ContinueTerminate { owner } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl ContinueTerminateHandler {
+    pub(crate) async fn handle(
+        &self,
+        owner: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         finish_node(ctx, out, owner).await;
     }
 }

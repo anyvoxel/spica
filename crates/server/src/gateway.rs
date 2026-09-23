@@ -13,8 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_engine::{
-    ActivatedTask, Command, Engine, Event, ExecutionError, FlowName, Hook, ObjectName,
-    ObjectReference, Reject, RequestId, RuntimeError, Task, Timestamp,
+    ActivatedTask, Command, Engine, Event, ExecutionCreated, ExecutionError, FlowName,
+    FlowVersionCreated, Hook, ObjectName, ObjectReference, Reject, RequestId, RuntimeError, Task,
+    TaskCompleted, TasksClaimed, Timestamp,
 };
 use spica_scheduler::{Scheduler, TimerSink};
 use tokio::sync::{Mutex, oneshot};
@@ -82,16 +83,18 @@ impl AckHook {
     /// **not** an awaited target.
     fn resolves(event: &Event) -> Option<(RequestId, AckTarget)> {
         match event {
-            Event::FlowVersionCreated { request_id, .. } => {
+            Event::FlowVersionCreated(FlowVersionCreated { request_id, .. }) => {
                 Some((*request_id, AckTarget::FlowVersionCreated))
             }
-            Event::ExecutionCreated { request_id, .. } => {
+            Event::ExecutionCreated(ExecutionCreated { request_id, .. }) => {
                 Some((*request_id, AckTarget::ExecutionCreated))
             }
-            Event::TaskCompleted { request_id, .. } => {
+            Event::TaskCompleted(TaskCompleted { request_id, .. }) => {
                 Some((*request_id, AckTarget::TaskCompleted))
             }
-            Event::TasksClaimed { request_id, .. } => Some((*request_id, AckTarget::Grant)),
+            Event::TasksClaimed(TasksClaimed { request_id, .. }) => {
+                Some((*request_id, AckTarget::Grant))
+            }
             _ => None,
         }
     }
@@ -130,7 +133,9 @@ impl Hook for AckHook {
         // ever aligns with a `TasksClaimed` — anything else is a wiring mismatch, dropped.
         let outcome = match target {
             AckTarget::Grant => match event {
-                Event::TasksClaimed { tasks, .. } => AckOutcome::Granted(Self::granted_from(tasks)),
+                Event::TasksClaimed(TasksClaimed { tasks, .. }) => {
+                    AckOutcome::Granted(Self::granted_from(tasks))
+                }
                 _ => return,
             },
             _ => AckOutcome::Applied(Box::new(event.clone())),
@@ -299,7 +304,7 @@ impl Gateway {
             Ok(ev) => *ev,
             Err(failure) => return Err(Self::ack_failure_error(failure)),
         };
-        let Event::FlowVersionCreated { flow_version, .. } = event else {
+        let Event::FlowVersionCreated(FlowVersionCreated { flow_version, .. }) = event else {
             unreachable!(
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
@@ -331,7 +336,9 @@ impl Gateway {
             Err(failure) => return Err(Self::ack_failure_error(failure)),
         };
         match event {
-            Event::ExecutionCreated { execution, .. } => Ok(execution.reference()),
+            Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
+                Ok(execution.reference())
+            }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }
     }

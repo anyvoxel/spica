@@ -1,9 +1,7 @@
-use async_trait::async_trait;
-
 use crate::TaskStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
+use crate::handler::{Collector, HandlerContext};
 use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 
 /// Handles `ReleaseTaskLease`: a claimed task's `DeliveryLease` deadline elapsed without a settlement
 /// (Zeebe activation timeout / worker unavailability), so the task is re-queued for another worker.
@@ -17,21 +15,13 @@ use crate::types::event::Event;
 #[derive(Default)]
 pub struct ReleaseTaskLeaseHandler;
 
-#[async_trait]
-impl CommandHandler for ReleaseTaskLeaseHandler {
-    fn command(&self) -> Command {
-        Command::ReleaseTaskLease {
-            task: crate::types::meta::ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::ReleaseTaskLease { task } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
-
+impl ReleaseTaskLeaseHandler {
+    pub(crate) async fn handle(
+        &self,
+        task: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         let act = match ctx.storage.get_task(task).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return, // task gone; nothing to release.
@@ -53,7 +43,7 @@ impl CommandHandler for ReleaseTaskLeaseHandler {
         task_value.retry_state.next_available_at = None;
         // Stamp the re-queue moment; `created_at` is already carried on `task_value`.
         task_value.meta.with_update_at(crate::log::Timestamp::now());
-        out.emit_event(Event::TaskLeaseExpired { task: task_value })
+        out.append_event(Event::TaskLeaseExpired { task: task_value })
             .await;
     }
 }

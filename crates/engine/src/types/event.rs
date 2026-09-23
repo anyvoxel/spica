@@ -13,6 +13,63 @@ use crate::types::thread::Thread;
 use crate::types::timer::Timer;
 use crate::types::variables::Variables;
 
+/// Payload of [`Event::FlowCreated`] — the durable birth record plus the creation's correlation key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowCreated {
+    pub request_id: RequestId,
+    pub flow: Flow,
+}
+
+/// Payload of [`Event::FlowVersionCreated`] — a new immutable version plus its correlation key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowVersionCreated {
+    pub request_id: RequestId,
+    pub flow_version: FlowVersion,
+}
+
+/// Payload of [`Event::ExecutionCreated`] — a top-level run's birth plus its correlation key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionCreated {
+    pub request_id: RequestId,
+    pub execution: Execution,
+}
+
+/// Payload of [`Event::VariablesAssigned`] — the post-assign variable snapshot and its scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariablesAssigned {
+    pub scope: ObjectReference,
+    pub variables: Variables,
+}
+
+/// Payload of [`Event::StateTransitioned`] — the resolved routing target and its result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateTransitioned {
+    pub activity: ObjectReference,
+    pub next: jsonptr::PointerBuf,
+}
+
+/// Payload of [`Event::TasksClaimed`] — a worker's granted batch plus its correlation key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TasksClaimed {
+    pub request_id: RequestId,
+    pub tasks: Vec<Task>,
+}
+
+/// Payload of [`Event::TaskCompleted`] — the settled task, its output, and correlation key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskCompleted {
+    pub request_id: RequestId,
+    pub task: Task,
+    pub output: Value,
+}
+
+/// Payload of [`Event::TaskFailed`] — the settled task and the error driving its catch decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskFailed {
+    pub task: Task,
+    pub error: ExecutionError,
+}
+
 /// The result of executing a [`Command`](crate::Command). Events are appended to the
 /// [`LogStream`](crate::LogStream) alongside Commands; the [`StreamProcessor`](crate::StreamProcessor) applies
 /// each to [`Storage`](crate::Storage) to materialize the execution tree.
@@ -42,7 +99,7 @@ pub enum Event {
     /// command carried — the awaiting operation's correlation key. The StreamProcessor routes the create
     /// ack on `FlowVersionCreated` (which always fires), so this event's `request_id` is carried for
     /// correlation/symmetry but does not itself resolve the ack.
-    FlowCreated { request_id: RequestId, flow: Flow },
+    FlowCreated(FlowCreated),
 
     /// `FlowVersionCreated` — a new immutable version of a flow was created, carrying the full
     /// [`FlowVersion`](crate::FlowVersion) value. This is the **durable definition record**: it is
@@ -58,10 +115,7 @@ pub enum Event {
     ///
     /// `request_id` echoes the originating command's [`RequestId`]; the StreamProcessor completes the
     /// awaiting `create_flow` ack on this event and routes back the version's `ObjectReference`.
-    FlowVersionCreated {
-        request_id: RequestId,
-        flow_version: FlowVersion,
-    },
+    FlowVersionCreated(FlowVersionCreated),
 
     /// Result of `Command::CreateExecution` — a **top-level run**'s single creation record. A
     /// top-level `Execution` is its own flat query anchor: it has no `parent`, no `root_execution`
@@ -72,10 +126,7 @@ pub enum Event {
     /// `request_id` is the echoing correlate for the `CreateExecution` command: it carries the
     /// command's `request_id` back so the awaiting `start` operation is acknowledged by request id
     /// (the same model as `FlowCreated`) once the execution is durably created.
-    ExecutionCreated {
-        request_id: RequestId,
-        execution: Execution,
-    },
+    ExecutionCreated(ExecutionCreated),
 
     /// Success path began on the execution. Carries the same execution entity with
     /// `status = Completing` and its decided success `output` fixed.
@@ -122,7 +173,7 @@ pub enum Event {
     /// same activity domain state from the event stream alone, while storage remains free to keep its
     /// own fold-only metadata alongside it.
     StateActivating { activity: Activity },
-    /// The state finished activating — emitted by the `StateHandler::activate` **only after** it has
+    /// The state finished activating — emitted by the `BoundStateHandler::activate` **only after** it has
     /// processed the state's input. It is the ed of `StateActivating` and precedes the state's own
     /// follow-up: a `CompleteState`/`TerminateState` sequence or an armed side-effect (e.g. a Wait
     /// resume timer). Full per-entry chain: `StateActivating → StateActivated → …`.
@@ -160,10 +211,7 @@ pub enum Event {
     /// need to re-merge per-key diffs. The scope is addressed structurally: a top-level state assigns
     /// into the `Execution`, a `Parallel`/`Map` branch state into its branch `Thread` — the applier
     /// dispatches on the reference's kind (see `VariablesAssignedApplier`).
-    VariablesAssigned {
-        scope: ObjectReference,
-        variables: Variables,
-    },
+    VariablesAssigned(VariablesAssigned),
 
     /// The state finished successfully and routed to its successor — `next` is the resolved
     /// transition **target path** (the JSON Pointer into the shared machine doc, self-locating);
@@ -175,10 +223,7 @@ pub enum Event {
     /// throwing code (`Command::ActivateState` allocates the successor's id internally, so routing
     /// names the target path but not the new activity). The foldable data (`output`, `next`) lives on
     /// the following command's bookkeeping; the applier is a no-op, mirroring `StateActivated`.
-    StateTransitioned {
-        activity: ObjectReference,
-        next: jsonptr::PointerBuf,
-    },
+    StateTransitioned(StateTransitioned),
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────
     /// A `Task` state invoked its `Resource` and the lifecycle stream records the full event-carried
@@ -198,10 +243,7 @@ pub enum Event {
     /// `request_id` echoes the poll it answers, so the awaiting caller's grant is resolved from this
     /// durable record. Emitted even for an empty claim (a poll that crossed the read-first gate but
     /// raced to nothing) so every appended `ClaimTasks` has a response entry.
-    TasksClaimed {
-        request_id: RequestId,
-        tasks: Vec<Task>,
-    },
+    TasksClaimed(TasksClaimed),
     /// The claimed task's lease elapsed before a settle (`ReleaseTaskLease`): `status` returns to
     /// `Pending` and `worker_id`/`lease_until` are cleared, so the task is re-claimable by any worker
     /// (or the same one, if it stalled then recovered — Zeebe's activation-timeout re-queue).
@@ -213,18 +255,14 @@ pub enum Event {
     /// `request_id` echoes the completing worker's own correlation key (the one its `CompleteTask`
     /// carried) so the StreamProcessor can resolve the awaiting `TaskApi::complete` — the request/response
     /// contract that makes a task settlement report its actual outcome instead of being fire-and-forget.
-    TaskCompleted {
-        request_id: RequestId,
-        task: Task,
-        output: Value,
-    },
+    TaskCompleted(TaskCompleted),
     /// The task settled **abnormally**. Carries the same task entity; its `status` is the outcome:
     /// `Pending` means a `Retry` was scheduled (the task re-queues, claimable no earlier than
     /// `next_available_at`, with the per-retrier attempt counters advanced) — the retry bookkeeping
     /// is folded from the entity, so no separate event is needed; `Failed` (terminal) means the retry
     /// budget is exhausted and `error` drives the owning state's `Catch`/terminate decision rather
     /// than being stored on the task row.
-    TaskFailed { task: Task, error: ExecutionError },
+    TaskFailed(TaskFailed),
     /// The task was cancelled before settling (e.g. the owning activity/execution was terminated
     /// while the call was in flight). Carries the same task entity with `status = Cancelled`.
     TaskCancelled { task: Task },

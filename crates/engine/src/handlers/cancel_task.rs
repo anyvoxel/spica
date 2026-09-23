@@ -1,9 +1,7 @@
-use async_trait::async_trait;
-
 use crate::TaskStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
+use crate::handler::{Collector, HandlerContext};
 use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 
 /// Handles `CancelTask`: an in-flight `Task` is cancelled because its owning activity/execution is
 /// being torn down. Emits only `TaskCancelled`, which marks the task `Cancelled` in storage and
@@ -14,20 +12,13 @@ use crate::types::event::Event;
 #[derive(Default)]
 pub struct CancelTaskHandler;
 
-#[async_trait]
-impl CommandHandler for CancelTaskHandler {
-    fn command(&self) -> Command {
-        Command::CancelTask {
-            task: crate::types::meta::ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CancelTask { task } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl CancelTaskHandler {
+    pub(crate) async fn handle(
+        &self,
+        task: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         let Some(task_value) = ctx
             .storage
             .get_task(task)
@@ -38,7 +29,7 @@ impl CommandHandler for CancelTaskHandler {
         else {
             return;
         };
-        out.emit_event(Event::TaskCancelled {
+        out.append_event(Event::TaskCancelled {
             task: crate::Task {
                 status: TaskStatus::Cancelled,
                 // Stamp the cancel moment; `created_at` is carried forward by the explicit `meta`

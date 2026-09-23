@@ -1,11 +1,10 @@
-use async_trait::async_trait;
 use spica_asl::State;
 
-use crate::handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::{Command, TerminationReason};
-use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
+use crate::types::command::{FailTask, TerminationReason};
+use crate::types::error::ExecutionError;
+use crate::types::event::{Event, TaskFailed};
 use crate::types::meta::ObjectKind;
 use crate::{ActivityStatus, RetrierAttemptState, TaskStatus};
 
@@ -27,27 +26,18 @@ use crate::{ActivityStatus, RetrierAttemptState, TaskStatus};
 #[derive(Default)]
 pub struct FailTaskHandler;
 
-#[async_trait]
-impl CommandHandler for FailTaskHandler {
-    fn command(&self) -> Command {
-        Command::FailTask {
-            task: crate::types::meta::ObjectReference::nil(),
-            worker_id: String::new(),
-            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(String::new())),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::FailTask {
+impl FailTaskHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &FailTask,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let FailTask {
             task,
             worker_id,
             error,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
 
         let act = match ctx.storage.get_task(task).await {
             Ok(Some(t)) => t,
@@ -131,10 +121,10 @@ impl CommandHandler for FailTaskHandler {
                 task_value.retry_state.attempts += 1;
                 task_value.status = TaskStatus::Pending;
                 task_value.retry_state.next_available_at = Some(next_available_at);
-                out.emit_event(Event::TaskFailed {
+                out.append_event(Event::TaskFailed(TaskFailed {
                     task: task_value,
                     error: error.clone(),
-                })
+                }))
                 .await;
                 // Sweep the failed attempt's `DeliveryLease`/`TaskTimeout` children (a settled task
                 // leaves no live child behind). No retry timer is armed — `next_available_at` is the
@@ -149,10 +139,10 @@ impl CommandHandler for FailTaskHandler {
         // ── Terminal failure → route to Catch / Terminate ──────────────────────────────────────
         task_value.status = TaskStatus::Failed;
         task_value.retry_state.next_available_at = None;
-        out.emit_event(Event::TaskFailed {
+        out.append_event(Event::TaskFailed(TaskFailed {
             task: task_value,
             error: error.clone(),
-        })
+        }))
         .await;
         // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // so a settled task leaves no live child behind; a terminal fail is then free to
@@ -212,20 +202,17 @@ impl FailTaskHandler {
                 return;
             }
         };
-        let state_def = match super::resolve_state_for(
-            &sm,
-            &scope,
-            &crate::handlers::state_name_from_path(activity.value.state_path.as_ptr()),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(_) => {
-                // Definition no longer resolvable — nothing left to consult; terminate.
-                self.terminate_failure(ctx, out, activity_id, error).await;
-                return;
-            }
-        };
+        let state_def =
+            match super::resolve_state_for(&sm, &scope, &activity.value.state_path.state_name())
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    // Definition no longer resolvable — nothing left to consult; terminate.
+                    self.terminate_failure(ctx, out, activity_id, error).await;
+                    return;
+                }
+            };
         let State::Task(task_state) = state_def else {
             // A non-Task activity settling a failure can't consult a Task catch; terminate.
             self.terminate_failure(ctx, out, activity_id, error).await;
@@ -254,15 +241,10 @@ impl FailTaskHandler {
                 }
                 _ => return,
             };
-            let actx = ActivityCtx {
-                // Catch handling reuses the same entity-shaped activity value lifecycle events carry,
-                // so the success-style completion path sees the canonical domain payload.
-                activity: activity.value(),
-                execution_state_path: catch_scope.state_path().cloned(),
-                exec_input: catch_scope.input().clone(),
-                variables: catch_scope.variables().clone(),
-                kind: CtxKind::Complete,
-            };
+            // Catch handling reuses the same entity-shaped activity value lifecycle events carry,
+            // so the success-style completion path sees the canonical domain payload.
+            let activity_value = activity.value();
+            let variables = catch_scope.variables().clone();
             // Bind `$states.errorOutput` (the error-output object) for the catcher's `Assign`/
             // `Output`, then complete the activity as a successful finish routed to the catcher's
             // `Next` — the catcher's `Assign`/`Output` project against the error output.
@@ -271,7 +253,8 @@ impl FailTaskHandler {
                 ctx.env,
                 out,
                 activity_id,
-                &actx,
+                &activity_value,
+                &variables,
                 catcher.assign.as_ref(),
                 catcher.output.as_ref(),
                 Some(&catcher.next),
@@ -307,13 +290,13 @@ impl FailTaskHandler {
         };
         let mut terminating_activity = activity.value();
         terminating_activity.status = ActivityStatus::Terminating(reason.clone());
-        out.emit_event(Event::StateTerminating {
+        out.append_event(Event::StateTerminating {
             activity: terminating_activity,
         })
         .await;
         let mut terminated_activity = activity.value();
         terminated_activity.status = ActivityStatus::Terminated(reason.clone());
-        out.emit_event(Event::StateTerminated {
+        out.append_event(Event::StateTerminated {
             activity: terminated_activity,
         })
         .await;

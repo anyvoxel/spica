@@ -203,8 +203,8 @@ async fn generated_names_do_not_collide_across_restart() {
     let first = thread_suffixes(&log_path).await;
     assert_eq!(
         first.len(),
-        2,
-        "one Parallel with 2 branches spawns 2 threads per run"
+        3,
+        "one Parallel with 2 branches spawns 2 thread children plus the execution's root thread per run"
     );
 
     run_parallel_execution(&log_path, &storage_path).await;

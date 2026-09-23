@@ -1,53 +1,19 @@
 //! `TaskActivated` event projection: folds the `Event::TaskActivated` into Storage, making the task
 //! **available** (`Pending`) for a worker to claim.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
 
-use crate::{RetryState, Task, TaskStatus};
+use crate::Task;
 
 #[derive(Default)]
 pub(crate) struct TaskActivatedApplier;
-#[async_trait]
-impl EventApplier for TaskActivatedApplier {
-    fn event(&self) -> Event {
-        Event::TaskActivated {
-            task: Task {
-                execution: crate::types::meta::ObjectReference::nil(),
-                resource: String::new(),
-                arguments: Default::default(),
-                status: TaskStatus::Pending,
-                deadline: None,
-                worker_id: None,
-                lease_until: None,
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Task,
-                    ulid::Ulid::nil(),
-                )
-                .timestamps(
-                    crate::log::Timestamp::from_millis(0),
-                    crate::log::Timestamp::from_millis(0),
-                )
-                .build(),
-            },
-        }
-    }
-
-    async fn apply(
+impl TaskActivatedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        task: &Task,
     ) -> Result<(), ExecutionError> {
-        let Event::TaskActivated { task } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
         // Fold the invocation as a durable fact: an `Pending` (available) task row owned by the
         // invoking activity. `deadline` is `None` in M1 (no `TimeoutSeconds` support yet), and
         // `worker_id`/`lease_until` are `None` until a worker claims it.

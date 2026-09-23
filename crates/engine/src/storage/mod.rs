@@ -38,10 +38,10 @@ pub use timer::TimerRecord;
 /// Persistent projection of the execution tree, rebuilt by applying the [`Event`](crate::Event) stream.
 ///
 /// This is the **read** interface used by handlers and the cascade (they observe snapshots and never
-/// mutate). The actual projection of events is performed by [`EventApplier`](crate::applier::EventApplier)
+/// mutate). The actual projection of events is performed by [`dispatch_event`](crate::applier::dispatch_event)
 /// implementations, which mutate this store through the `put_*` / `remove_child` methods below —
-/// mirroring how [`CommandHandler`](crate::CommandHandler) implementations observe Storage but
-/// delegate their output to the [`Collector`](crate::Collector).
+/// mirroring how command handlers observe Storage but delegate their output to the
+/// [`Collector`](crate::Collector).
 /// `#[auto_impl(Box)]` mechanically generates `impl<T: Storage + ?Sized> Storage for Box<T>` — so a
 /// `Box<dyn Storage>` is itself a *Sized* implementor and the generic [`StreamProcessor::run`] (whose
 /// `S: Storage` bound stays `Sized`) accepts config-selected trait objects directly.
@@ -106,7 +106,7 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Upsert an `ExecutionRecord` record (read-modify-write by an `EventApplier`).
+    /// Upsert an `ExecutionRecord` record (read-modify-write by an event applier).
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError>;
     /// Upsert a `ThreadRecord` record (a scoped sub-run's projection row).
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError>;
@@ -164,7 +164,7 @@ pub trait Storage: Send + Sync {
     /// lifetime-bound to this store — so the StreamProcessor may hold it across multiple log entries
     /// (a follower opens one at its batch's first Event and commits at the Noop) without keeping a
     /// borrow of the store. The StreamProcessor keeps sole ownership of the `Box<dyn StorageTxn>`;
-    /// it hands `EventApplier`s only a `&mut dyn StorageTxn`, which structurally *cannot* begin a
+    /// it hands appliers only a `&mut dyn StorageTxn`, which structurally *cannot* begin a
     /// nested transaction nor commit, because commit consumes the `Box` ([`StorageTxn::commit`]).
     /// Aborting = dropping the handle without committing, which discards the pending writes (safe: a
     /// discarded fold is never written). The transaction keeps its DB reachable itself (each backend
@@ -192,7 +192,7 @@ pub trait Storage: Send + Sync {
     async fn next_generated_seq(&self) -> Result<i64, ExecutionError>;
 }
 
-/// A write-scoped, **owned** projection transaction, handed to an [`EventApplier`]
+/// A write-scoped, **owned** projection transaction, handed to an event applier
 /// (crate::applier) during exactly one Event fold.
 ///
 /// It is created by [`Storage::begin_txn`] and returned as a `Box<dyn StorageTxn>`. It exposes
@@ -202,7 +202,7 @@ pub trait Storage: Send + Sync {
 ///
 /// The key structural guarantee is the *receiver* of the commit method, not its absence:
 /// [`StorageTxn::commit`] takes `self: Box<Self>`, so only the caller **owning** the `Box` — the
-/// StreamProcessor — can commit. An `EventApplier` is handed a mere `&mut dyn StorageTxn`, which cannot
+/// StreamProcessor — can commit. An applier is handed a mere `&mut dyn StorageTxn`, which cannot
 /// move the `Box`; it can therefore neither begin/commit/abort the outer transaction nor touch the
 /// watermark. The atomicity of a fold is thus *type-enforced* (a method the applier cannot invoke),
 /// not a convention appliers are trusted to respect.
@@ -311,7 +311,7 @@ pub trait StorageTxn: Send {
 }
 
 /// The **read-only** face of a working [`StorageTxn`]: the row/flow reads plus the work-pull scan,
-/// all `&self`. A [`CommandHandler`](crate::CommandHandler) reads state through this — it can never
+/// all `&self`. A command handler reads state through this — it can never
 /// write, commit, or move the watermark — while the same underlying txn is mutated by the
 /// applier/collector. `Storage` is also one (see the blanket below), so helpers that only need to
 /// read stay generic over this narrower contract instead of the full `Storage`.

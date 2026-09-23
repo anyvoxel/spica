@@ -1,35 +1,33 @@
-//! The **leader** role of [`ProcessingStateMachine`](crate::processing::ProcessingStateMachine): full
+//! The **leader** role of the engine's [`StateMachine`](crate::processing::StateMachine): full
 //! processing — dispatch a [`Command`] into Events, fold each [`Event`] into the projection, advance
 //! the resume watermark, and deliver acknowledgements.
 //!
 //! This is a faithful port of the processing that used to live inline in
 //! [`StreamProcessor::run`](crate::StreamProcessor::run): the per-entry arms are now methods on this
-//! type, reached through the role-aware [`ProcessingStateMachine`](crate::processing::ProcessingStateMachine)
-//! trait so the single driver can later run a **follower** (replicate-only) role instead — the seam a
+//! type, reached through the [`StateMachine::Leader`](crate::processing::StateMachine::Leader) variant
+//! so the single driver can later run a **follower** (replicate-only) role instead — the seam a
 //! distributed deployment needs for failover. See [`StreamProcessor`](crate::StreamProcessor) for the
 //! driver side. Transactions are **driver-owned**: the leader folds the Events of a produced batch
 //! (or a recovery residue) into a `StorageTxn` the driver opens and commits, then lets the driver's
 //! `after_commit` drain the correlated acks — the leader never calls `begin_txn`/`commit` itself.
 //!
-//! TODO(multi-node): a `Follower` implementing the same trait, which appends replicated entries
+//! TODO(multi-node): a `Follower` sibling under `StateMachine`, which appends replicated entries
 //! without dispatching Commands or folding the projection, and advances the resume watermark from the
 //! leader's commit index rather than at fold time. Not part of the single-node milestone.
 
 use std::collections::HashMap;
-use std::mem::discriminant;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use spica_asl::{State, StateMachine};
+use spica_asl::StateMachine;
 use tracing::debug;
 
-use crate::applier::{ApplierContext, EventDispatcher};
+use crate::applier::{ApplierContext, dispatch_event};
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, CommandHandler, HandlerContext, OverlaySink};
-use crate::handlers::build_state_handlers;
-use crate::handlers::state_handler::StateHandler;
+use crate::handler::{Collector, HandlerContext, OverlaySink};
+use crate::handlers::state_handler::StateHandlerRegistry;
+use crate::handlers::{build_state_handlers, dispatch_command};
 use crate::log::{Entry, EntryPayload, Timestamp};
-use crate::processing::{CommandProcessed, ProcessingHandles, ProcessingStateMachine, Role};
+use crate::processing::{CommandProcessed, ProcessingHandles};
 use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
@@ -38,43 +36,34 @@ use crate::types::id::EntryId;
 use crate::types::meta::ObjectReference;
 use crate::working::WorkingState;
 
-/// The leader processing state machine: owns the command dispatch table, the per-version machine
-/// cache, the eval environment, the event applier, the resume watermark, and the deferred
-/// acknowledgement queue. All of it is leader-private — a follower holds none of it.
+/// The leader processing state machine: owns the per-version machine cache, the eval environment, the
+/// event applier, the resume watermark, and the deferred acknowledgement queue. All of it is
+/// leader-private — a follower holds none of it.
 pub(crate) struct Leader {
-    /// Dispatch table mapping each [`Command`] variant (by [`std::mem::Discriminant`]) to its handler.
-    /// Built once in [`StreamProcessor::new`](crate::StreamProcessor::new) and moved in here.
-    handlers: HashMap<std::mem::Discriminant<Command>, Box<dyn CommandHandler + Send + Sync>>,
     /// Lazily-populated per-version machine cache (see [`handler::HandlerContext::machine`]).
     definitions: HashMap<ObjectReference, Arc<StateMachine>>,
     /// Shared eval environment; wrapped once (unlike the old `StreamProcessor`, which wrapped it per
     /// `run`), so both `process_command` and the single-shot `dispatch` lock it the same way.
     env: Arc<tokio::sync::Mutex<EvalEnv>>,
-    /// Table-driven event applier (fold an [`Event`] into [`Storage`]).
-    dispatcher: EventDispatcher,
-    /// Shared `State` → `StateHandler` table, threaded into every handler context so the inline
-    /// child-settled cascade can replenish a `Running` container (see [`HandlerContext`]).
-    state_handlers: HashMap<std::mem::Discriminant<State>, Box<dyn StateHandler>>,
+    /// Shared `State` → [`StateHandlerFactory`] dispatch table, threaded into every handler context so
+    /// the inline child-settled cascade can replenish a `Running` container (see [`HandlerContext`]).
+    state_handlers: StateHandlerRegistry,
     /// Resume watermark — the highest fully-applied Command position, advanced at commit time.
     watermark: i64,
     /// The Events the driver just committed in the fold it owns — set by `process_command` / `apply_event`
-    /// and consumed by [`ProcessingStateMachine::after_commit`] to report each as a `Hook` fact once
-    /// it is durable (the Zeebe post-commit model).
+    /// and consumed by `after_commit` to report each as a `Hook` fact once it is durable (the Zeebe
+    /// post-commit model).
     last_applied: Vec<Event>,
 }
 
 impl Leader {
-    /// Build the leader around an already-populated command-handler table. The machinery cache, eval
-    /// environment, and dispatcher start empty/fresh; the resume watermark is installed later, when
-    /// the driver reads it from [`Storage`] at boot (`set_resume_position`).
-    pub(crate) fn new(
-        handlers: HashMap<std::mem::Discriminant<Command>, Box<dyn CommandHandler + Send + Sync>>,
-    ) -> Self {
+    /// Build the leader. The machinery cache, eval environment, and state-handler registry start
+    /// empty/fresh; the resume watermark is installed later, when the driver reads it from [`Storage`]
+    /// at boot (`set_resume_position`).
+    pub(crate) fn new() -> Self {
         Self {
-            handlers,
             definitions: HashMap::new(),
             env: Arc::new(tokio::sync::Mutex::new(EvalEnv::new())),
-            dispatcher: EventDispatcher::new(),
             state_handlers: build_state_handlers(),
             watermark: 0,
             last_applied: Vec::new(),
@@ -96,10 +85,10 @@ impl Leader {
         cause_id: EntryId,
     ) -> Result<Vec<Entry>, ExecutionError> {
         // Open an ephemeral working overlay so an inline cascade reads its own writes; the emitted
-        // events are folded into it eagerly at `emit_event` time, and the overlay is dropped (aborted)
+        // events are folded into it eagerly at `append_event` time, and the overlay is dropped (aborted)
         // at command end. There is no durable fold on this path; `run` commits a real batch instead.
         let work = WorkingState::new(storage.begin_txn()?);
-        let overlay = OverlaySink::new(&work, &self.dispatcher);
+        let overlay = OverlaySink::new(&work);
         let mut out = Collector::new(cause_id, Some(overlay));
         let mut env_g = self.env.lock().await;
         let mut ctx = HandlerContext {
@@ -108,26 +97,20 @@ impl Leader {
             definitions: &mut self.definitions,
             state_handlers: &self.state_handlers,
         };
-        let handler = self
-            .handlers
-            .get(&discriminant(command))
-            .expect("a handler is registered for every Command variant");
-        handler.handle(command, &mut ctx, &mut out).await;
+        dispatch_command(command, &mut ctx, &mut out).await;
         Ok(out.into_entries())
     }
 }
 
-#[async_trait]
-impl ProcessingStateMachine for Leader {
-    fn role(&self) -> Role {
-        Role::Leader
-    }
-
-    fn set_resume_position(&mut self, position: i64) {
+impl Leader {
+    /// Install the resume position read from [`Storage`] at boot — the last position whose effects
+    /// are durable, so the driver resumes the log tail from `position + 1`. The leader advances it at
+    /// fold time (a follower advances it from each Noop instead).
+    pub(crate) fn set_resume_position(&mut self, position: i64) {
         self.watermark = position;
     }
 
-    async fn process_command(
+    pub(crate) async fn process_command(
         &mut self,
         entry_id: EntryId,
         command: &Command,
@@ -145,7 +128,7 @@ impl ProcessingStateMachine for Leader {
             let storage_guard = handles.storage.lock().await;
             let mut env_g = self.env.lock().await;
             let work = WorkingState::new((**storage_guard).begin_txn()?);
-            let overlay = OverlaySink::new(&work, &self.dispatcher);
+            let overlay = OverlaySink::new(&work);
             let mut out = Collector::new(entry_id, Some(overlay));
             let mut ctx = HandlerContext {
                 env: &mut env_g,
@@ -153,15 +136,11 @@ impl ProcessingStateMachine for Leader {
                 definitions: &mut self.definitions,
                 state_handlers: &self.state_handlers,
             };
-            let handler = self
-                .handlers
-                .get(&discriminant(command))
-                .expect("a handler is registered for every Command variant");
-            handler.handle(command, &mut ctx, &mut out).await;
+            dispatch_command(command, &mut ctx, &mut out).await;
             let entries = out.into_parts();
             // Record the produced Events for the driver's `after_commit` once this batch is durable
             // (the Zeebe post-commit report). Set here rather than in `apply_batch` (which no longer
-            // exists on the live path): the fold happened eagerly at `emit_event` time.
+            // exists on the live path): the fold happened eagerly at `append_event` time.
             self.last_applied = entries
                 .iter()
                 .filter_map(|e| match &e.payload {
@@ -174,10 +153,9 @@ impl ProcessingStateMachine for Leader {
         Ok(CommandProcessed { entries, work })
     }
 
-    async fn apply_event(
+    pub(crate) async fn apply_event(
         &mut self,
         txn: &mut dyn StorageTxn,
-        _entry_id: EntryId,
         timestamp: Timestamp,
         cause_id: Option<EntryId>,
         event: &Event,
@@ -201,7 +179,7 @@ impl ProcessingStateMachine for Leader {
                 // `created_at`/`updated_at`; see `ApplierContext::timestamp`.
                 timestamp,
             };
-            self.dispatcher.apply(&mut ctx, event).await?;
+            dispatch_event(&mut ctx, event).await?;
         } // the write handle drops here; the transaction stays open until the driver commits.
 
         // Advance the resume watermark once this event's fold is durable, keeping it
@@ -225,26 +203,14 @@ impl ProcessingStateMachine for Leader {
         Ok(advanced)
     }
 
-    fn is_already_applied(&self, entry_id: EntryId) -> bool {
+    pub(crate) fn is_already_applied(&self, entry_id: EntryId) -> bool {
         // Everything at or below the watermark was folded eagerly at production (the work txn), so a
         // read-back Event at that position must be skipped rather than folded twice — only crash-residue
         // Events above it fall through to the recovery `apply_event`.
         entry_id.get() <= self.watermark
     }
 
-    async fn commit_at_noop(
-        &mut self,
-        _txn: &mut dyn StorageTxn,
-        _entry_id: EntryId,
-        _handles: &ProcessingHandles,
-    ) -> Result<Option<i64>, ExecutionError> {
-        // A Noop read back by the leader rounds off a batch it already applied eagerly at production
-        // time (the work txn), so there is nothing here to flush. The Noop is consumed for the log's
-        // structured batching, and by a follower closing its own atomic apply — not by the leader.
-        Ok(None)
-    }
-
-    async fn after_commit(&mut self, handles: &ProcessingHandles) {
+    pub(crate) async fn after_commit(&mut self, handles: &ProcessingHandles) {
         // Report the Events the driver just committed as `Hook` facts. In the driver-owned-txn model
         // the fold (which populated `last_applied`) and the leader-visible commit are separate, so
         // this is the driver's point to fire each durable event exactly once the commit lands — the

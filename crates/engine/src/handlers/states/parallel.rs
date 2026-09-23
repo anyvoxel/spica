@@ -2,19 +2,17 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{ParallelState, State};
 
-use super::super::state_handler::StateHandler;
-use super::super::{
-    emit_transition, state_activated_value, state_completed_value, state_completing_value,
-    state_terminated_value, state_terminating_value,
-};
-use crate::ActivityState;
+use super::super::emit_transition;
+use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::eval_env::EvalEnv;
-use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::types::command::{Command, TerminationReason};
-use crate::types::context::build_states;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::{Command, SpawnThread, TerminationReason};
+use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::{Activity, ActivityState, ActivityStatus, Variables};
+
 /// The `Parallel` state: runs several branch sub-state-machines concurrently, waits for all of them
 /// to reach a terminal state, then transitions — or fails the whole state if any branch fails.
 ///
@@ -24,10 +22,10 @@ use crate::types::meta::ObjectReference;
 /// own states within the single shared machine document without copying any definition. The
 /// `Parallel` activity stays `Running` owning those children; it completes only through
 /// `child_completed` once the last branch settles, or terminates on a branch failure.
-pub struct ParallelStateHandler;
+pub struct ParallelStateHandlerFactory;
 
 #[async_trait]
-impl StateHandler for ParallelStateHandler {
+impl StateHandlerFactory for ParallelStateHandlerFactory {
     fn state(&self) -> State {
         // Only the discriminant matters for the dispatch-table key; `ParallelState` has no `Default`
         // (its `branches` is mandatory), so construct a minimal stub that no real activity ever sees.
@@ -44,20 +42,74 @@ impl StateHandler for ParallelStateHandler {
         })
     }
 
-    async fn activate(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        actx: &ActivityCtx,
-        state: &State,
-    ) {
+    fn create<'a>(&self, state: &'a State) -> Box<dyn StateHandler + 'a> {
         let State::Parallel(s) = state else {
             unreachable!(
-                "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
+                "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        activate_parallel(env, out, activity, actx, s).await;
+        Box::new(ParallelStateHandler { state: s })
+    }
+}
+
+struct ParallelStateHandler<'a> {
+    state: &'a ParallelState,
+}
+
+#[async_trait]
+impl StateHandler for ParallelStateHandler<'_> {
+    // Seed the branch-plan container. The child refs are folded in by the SpawnThread/ThreadCreated
+    // applier, not here — only the (initially empty) map is definition-derived, unlike a Map's
+    // input-derived item plan which waits for `process_input`.
+    async fn initialize(&self, activity: &mut Activity) {
+        activity.activity_state = Some(ActivityState::Parallel(Default::default()));
+    }
+
+    // A Parallel's processed input is its projected `Arguments` — the input each branch receives
+    // (defaults to the state's input).
+    async fn process_input(
+        &self,
+        env: &mut EvalEnv,
+        activity: &mut Activity,
+        variables: &Variables,
+        states: &Value,
+    ) -> Result<Value, ExecutionError> {
+        match &self.state.arguments {
+            Some(arguments) => env.eval_json(arguments, states, variables),
+            None => Ok(activity.raw_input.clone()),
+        }
+    }
+
+    // Fan out each branch as a child Thread after `StateActivated`. Each child inherits
+    // `activity_value.execution` (the flat query anchor), is rooted under this activity (so the
+    // Parallel waits on all of them via `active_children`), and carries a state_path locating its
+    // branch's `states` table. The activity stays `Running`; it completes only via `child_completed`.
+    async fn after_activated(
+        &self,
+        _env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+        _states: &Value,
+    ) -> Result<(), ExecutionError> {
+        let activity = activity_value.reference();
+        let owner = activity.clone();
+        for (index, branch) in self.state.branches.iter().enumerate() {
+            let pointer = activity_value.state_path.branch(index);
+            out.append_command(Command::SpawnThread(SpawnThread {
+                owner: owner.clone(),
+                execution: activity_value.execution.clone(),
+                state_path: Some(pointer),
+                index,
+                start_at: branch.start_at.clone(),
+                input: activity_value.input.clone().unwrap_or_default(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn complete_directly(&self, _activity: &Activity) -> bool {
+        false
     }
 
     // A `Parallel` never completes through the shared `CompleteState` path: it is an async
@@ -65,29 +117,132 @@ impl StateHandler for ParallelStateHandler {
     // normal flow (nothing throws `CompleteState` on it). This arm stays as a defensive fallback —
     // if it is ever dispatched, there is nothing meaningful to project, so it routes the current
     // input onward to avoid wedging the state machine.
+    /// The `Command::CompleteState` finish — the shared orchestration (liveness/Terminating-race
+    /// guards, owning-scope resolution, activity and variables reconstruction) and this state's projection,
+    /// all inline.
     async fn complete(
         &self,
-        _env: &mut EvalEnv,
+        ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity: ObjectReference,
-        actx: &ActivityCtx,
-        _state: &State,
+        raw_result: Option<&Value>,
     ) {
-        out.emit_event(Event::StateCompleted {
-            activity: state_completed_value(actx, actx.activity.raw_input.clone()),
+        let act = match ctx.storage.get_activity(&activity).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "activity {activity}"
+                    ))),
+                );
+                return;
+            }
+            Err(e) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    e,
+                );
+                return;
+            }
+        };
+
+        // Race fix: a cancel already won on this activity. The drain that would have been emitted by
+        // the cancel side may have been missed because the ordering interleaved (e.g. timer-fired +
+        // cancel together). Re-emit the deferred termination ed so the parent finishes, reusing the
+        // reason embedded in the terminating status itself.
+        if act.value.status != ActivityStatus::Running {
+            match act.value.status {
+                ActivityStatus::Terminating(ref reason) => {
+                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
+                    // preserving every previously-folded domain field while only flipping the status
+                    // from `Terminating(reason)` to `Terminated(reason)`.
+                    let mut activity_value = act.value();
+                    activity_value.status = ActivityStatus::Terminated(reason.clone());
+                    out.append_event(crate::types::event::Event::StateTerminated {
+                        activity: activity_value,
+                    })
+                    .await;
+                }
+                _ => return,
+            }
+            // A synchronous state that owns no children drains its owner Execution as soon as its own
+            // terminal lands; run the inline reaction so the owner's own drain walks up.
+            let owner = act
+                .value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner");
+            if owner.kind == ObjectKind::Activity {
+                super::super::child_completed::child_settled(ctx, out, owner, activity.clone())
+                    .await;
+            }
+            return;
+        }
+        // Defensive: an activity with live children cannot enter success yet; its ed is deferred
+        // until drain.
+        if !act.active_children.is_empty() {
+            return;
+        }
+
+        // The activity's owner is its *scope* — resolved through the central Execution/Thread
+        // dispatch in storage, which silently ignores non-scope kinds.
+        let scope = match crate::storage::load_scope_ref(
+            ctx.storage,
+            &act.value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
+            Err(_) => return,
+        };
+        if !scope.is_running() {
+            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
+        }
+
+        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
+        // step observes the canonical domain payload rather than the projection-only row. The
+        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
+        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
+        // record the command-carried result.
+        let mut activity_value = act.value();
+        if let Some(result) = raw_result {
+            activity_value.raw_output = Some(result.clone());
+        }
+
+        activity_value
+            .meta
+            .with_update_at(crate::log::Timestamp::now());
+        activity_value.status = ActivityStatus::Completed;
+        activity_value.output = Some(activity_value.raw_input.clone());
+        if activity_value.raw_output.is_none() {
+            activity_value.raw_output = Some(activity_value.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleted {
+            activity: activity_value.clone(),
         })
         .await;
+
+        // TODO：为什么这里的 next 固定是 None?
         emit_transition(
             out,
-            actx.activity.execution.clone(),
-            actx.activity
+            activity_value.execution.clone(),
+            activity_value
                 .meta
                 .owner
                 .clone()
                 .expect("an owned activity has an owner"),
             activity,
-            actx.state_path(),
-            &actx.activity.raw_input,
+            &activity_value.state_path,
+            &activity_value.raw_input,
             None,
             Some(true),
         )
@@ -107,18 +262,10 @@ impl StateHandler for ParallelStateHandler {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity: ObjectReference,
-        actx: Option<&ActivityCtx>,
-        state: &State,
+        activity_value: &Activity,
+        variables: &Variables,
         _child: ObjectReference,
     ) {
-        let State::Parallel(s) = state else {
-            unreachable!(
-                "child_completed dispatch guarantees the state handler receives its own variant"
-            );
-        };
-        let Some(actx) = actx else {
-            return; // owning execution gone — nothing to converge.
-        };
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
         };
@@ -164,7 +311,7 @@ impl StateHandler for ParallelStateHandler {
                         "branch {child_scope_ref}"
                     ))),
                 };
-                fail_parallel(out, activity, actx, reason).await;
+                self.fail_parallel(out, activity_value, reason).await;
                 return;
             };
             if let Some(reason) = child.termination_reason() {
@@ -172,7 +319,8 @@ impl StateHandler for ParallelStateHandler {
                 // branch fails, the entire Parallel state fails and all branches are stopped"). The
                 // recorded `reason` becomes the Parallel's own termination reason; the
                 // `TerminateExecution` sweep then stops the surviving sibling branches.
-                fail_parallel(out, activity, actx, reason.clone()).await;
+                self.fail_parallel(out, activity_value, reason.clone())
+                    .await;
                 return;
             }
             if child.is_terminal() {
@@ -180,252 +328,157 @@ impl StateHandler for ParallelStateHandler {
             } else {
                 // A non-terminal branch (still Running/Completing yet drained empty) is an internal
                 // fault; fail the Parallel rather than aggregate a partial result.
-                fail_parallel(out, activity, actx, TerminationReason::Cancelled).await;
+                self.fail_parallel(out, activity_value, TerminationReason::Cancelled)
+                    .await;
                 return;
             }
         }
 
         // All branches succeeded: the state's result is the ordered array of branch outputs.
         let aggregated = Value::Array(outputs);
-        finish_parallel(ctx.env, out, activity, actx, s, aggregated).await;
+        self.finish_parallel(
+            ctx.env,
+            out,
+            activity,
+            activity_value,
+            variables,
+            aggregated,
+        )
+        .await;
     }
 }
 
-async fn activate_parallel(
-    env: &mut EvalEnv,
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    actx: &ActivityCtx,
-    state: &ParallelState,
-) {
-    // `$states` for the activate step, mirroring other states: `result` is null (a Parallel has no
-    // result until its branches settle) and `assign_ctx = None`. A JSONata `Arguments` expression
-    // may reference `$states.input` and in-scope variables.
-    let states = build_states(
-        &actx.activity.raw_input,
-        None,
-        &actx.state_name(),
-        &actx.exec_input,
-        None,
-        actx.activity.retry_count(),
-        None,
-        None, // not a Map item — no `context.Map.Item` binding
-    );
-
-    // Project `Arguments` — the input each branch receives (defaults to the state's input). This is
-    // the only per-state projection before fan-out.
-    let arguments = match &state.arguments {
-        Some(arguments) => fail_or!(
+impl ParallelStateHandler<'_> {
+    /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. Emits
+    /// the activity's failure ed and throws `TerminateExecution` on the owning execution from the same
+    /// step, mirroring `fail.rs`; the sweep then stops the surviving sibling branches (once the
+    /// `TerminateState` sweep handles its `Execution` children).
+    async fn fail_parallel(
+        &self,
+        out: &mut Collector<'_>,
+        activity: &Activity,
+        reason: TerminationReason,
+    ) {
+        // `fail_parallel` only borrows `activity`, so it advances a fresh copy in place through the
+        // terminating → terminated lifecycle moments — the reason is decided once here.
+        let mut terminated = activity.clone();
+        terminated.meta.with_update_at(crate::log::Timestamp::now());
+        terminated.status = ActivityStatus::Terminating(reason.clone());
+        out.append_event(Event::StateTerminating {
+            activity: terminated.clone(),
+        })
+        .await;
+        terminated.meta.with_update_at(crate::log::Timestamp::now());
+        terminated.status = ActivityStatus::Terminated(reason.clone());
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        super::super::emit_scope_termination(
             out,
-            Some(activity),
-            actx.activity
+            activity
                 .meta
                 .owner
-                .clone()
+                .as_ref()
                 .expect("an owned activity has an owner"),
-            env.eval_json(arguments, &states, &actx.variables)
-        ),
-        None => actx.activity.raw_input.clone(),
-    };
-
-    // Fan out each branch as a child Thread. Each child inherits `actx.activity.execution` (the flat
-    // query anchor), is rooted under this activity (`activity` — so the Parallel waits on all of them
-    // via `active_children`), and carries a `state_path` locating its branch's `states` table: the
-    // owning execution's pointer extended by `/states/<parallel>/branches/<index>/states` (the path
-    // `resolve_states_map` walks for arbitrary nesting).
-    let owner = activity.clone();
-    for (index, branch) in state.branches.iter().enumerate() {
-        let pointer = child_pointer(actx, index);
-        out.emit_command(Command::SpawnThread {
-            owner: owner.clone(),
-            execution: actx.activity.execution.clone(),
-            state_path: Some(pointer),
-            index,
-            start_at: branch.start_at.clone(),
-            input: arguments.clone(),
-        });
-    }
-
-    // The activation work (projecting `Arguments` + fanning out branches) is done: emit the
-    // activation-complete ed. No synchronous finish — the activity stays `Running` owning its child
-    // executions; it completes only when they all settle (via `child_completed`).
-    out.emit_event(Event::StateActivated {
-        activity: state_activated_value(
-            actx,
-            arguments.clone(),
-            Some(ActivityState::Parallel(Default::default())),
-        ),
-    })
-    .await;
-}
-
-/// Build a child execution's `state_path` for branch `index` of `parallel_name`: the owning
-/// execution's pointer extended by `/states/<parallel>/branches/<index>`. For a top-level `Parallel`
-/// the owner's pointer is `None`, so the result is `/states/<parallel>/branches/<index>`; for a
-/// `Parallel` nested inside a branch it extends that branch's pointer, so `resolve_states_map`
-/// descends the whole path in one walk.
-///
-/// Note the pointer names the branch's `states` table directly (ending *on* it), matching
-/// `resolve_states_map`'s walk — which consumes a `branches/<index>` step and returns that branch's
-/// `states` when the pointer ends right there. No trailing `/states` token.
-fn child_pointer(actx: &ActivityCtx, index: usize) -> jsonptr::PointerBuf {
-    // The owning execution's pointer extended by `/states/<parallel>/branches/<index>`, where
-    // `<parallel>` is this state's own name (the leaf of `actx.activity.state_path`). For a top-level
-    // `Parallel` the owner's pointer is `None`, so we build `/states/<parallel>/branches/ <index>`
-    // from scratch; otherwise we clone and append. `push_back` applies RFC 6901 escaping.
-    let mut pointer = match &actx.execution_state_path {
-        Some(base) => base.clone(),
-        None => jsonptr::PointerBuf::new(),
-    };
-    if actx.execution_state_path.is_none() {
-        pointer.push_back("states");
-    }
-    pointer.push_back(actx.state_name());
-    pointer.push_back("branches");
-    pointer.push_back(index);
-    pointer
-}
-
-/// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. Emits the
-/// activity's failure ed and throws `TerminateExecution` on the owning execution from the same step,
-/// mirroring `fail.rs::complete_fail`; the sweep then stops the surviving sibling branches (once the
-/// `TerminateState` sweep handles its `Execution` children).
-async fn fail_parallel(
-    out: &mut Collector<'_>,
-    _activity: ObjectReference,
-    actx: &ActivityCtx,
-    reason: TerminationReason,
-) {
-    out.emit_event(Event::StateTerminating {
-        activity: state_terminating_value(actx, reason.clone()),
-    })
-    .await;
-    out.emit_event(Event::StateTerminated {
-        activity: state_terminated_value(actx, reason.clone()),
-    })
-    .await;
-    super::super::emit_scope_termination(
-        out,
-        actx.activity
-            .meta
-            .owner
-            .as_ref()
-            .expect("an owned activity has an owner"),
-        reason,
-    );
-}
-
-/// The `Parallel`'s success finish: with all branches converged, project the state result — `$states`
-/// `.result` is the aggregated branch-output array, `Assign` mutates the scope, and `Output` defaults
-/// to that array — then emit the ed and route via the shared transition helper.
-///
-/// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
-/// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the success
-/// finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing uniform.
-async fn finish_parallel(
-    env: &mut EvalEnv,
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    actx: &ActivityCtx,
-    state: &ParallelState,
-    aggregated: Value,
-) {
-    let states = build_states(
-        &actx.activity.raw_input,
-        Some(&aggregated), // `$states.result` = the ordered branch outputs
-        &actx.state_name(),
-        &actx.exec_input,
-        Some(&actx.activity.raw_input),
-        actx.activity.retry_count(),
-        None, // success path — no Catch `errorOutput`
-        None, // not a Map item — no `context.Map.Item` binding
-    );
-    let mut local_scope = actx.variables.clone();
-
-    if let Some(assign_obj) = &state.assign {
-        let assign_value = Value::Object(assign_obj.0.clone());
-        let evaluated = fail_or!(
-            out,
-            Some(activity),
-            actx.activity
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-            env.eval_json(&assign_value, &states, &local_scope)
+            reason,
         );
-        match evaluated {
-            Value::Object(map) => {
-                if !map.is_empty() {
-                    for (k, v) in map {
-                        local_scope.insert(k, v);
-                    }
-                    out.emit_event(Event::VariablesAssigned {
-                        scope: actx
-                            .activity
-                            .meta
-                            .owner
-                            .clone()
-                            .expect("an owned activity has an owner"),
-                        variables: local_scope.clone(),
-                    })
-                    .await;
-                }
-            }
-            _ => {
-                out.terminate(
-                    Some(activity),
-                    actx.activity
-                        .meta
-                        .owner
-                        .clone()
-                        .expect("an owned activity has an owner"),
-                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "Assign must evaluate to a JSON object".to_string(),
-                    )),
-                );
-                return;
-            }
-        }
     }
 
-    // `Output`, when present, projects over the converged result (so a Parallel can reshape its
-    // branch-output array); when absent the state's result *is* the array.
-    let output_value = match &state.output {
-        Some(o) => fail_or!(
-            out,
-            Some(activity),
-            actx.activity
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-            env.eval_json(o, &states, &local_scope)
-        ),
-        None => aggregated,
-    };
+    /// The `Parallel`'s success finish: with all branches converged, project the state result —
+    /// `$states` `.result` is the aggregated branch-output array, `Assign` mutates the scope, and
+    /// `Output` defaults to that array — then emit the ed and route via the shared transition helper.
+    ///
+    /// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
+    /// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the
+    /// success finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing
+    /// uniform.
+    async fn finish_parallel(
+        &self,
+        env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity: ObjectReference,
+        activity_value: &Activity,
+        variables: &Variables,
+        aggregated: Value,
+    ) {
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&aggregated)) // `$states.result` = the ordered branch outputs
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
 
-    out.emit_event(Event::StateCompleting {
-        activity: state_completing_value(actx),
-    })
-    .await;
-    out.emit_event(Event::StateCompleted {
-        activity: state_completed_value(actx, output_value.clone()),
-    })
-    .await;
-    emit_transition(
-        out,
-        actx.activity.execution.clone(),
-        actx.activity
+        let owner = activity_value
             .meta
             .owner
             .clone()
-            .expect("an owned activity has an owner"),
-        activity,
-        actx.state_path(),
-        &output_value,
-        state.next.as_deref(),
-        state.end,
-    )
-    .await;
+            .expect("an owned activity has an owner");
+        let assigned = self
+            .apply_assign(
+                out,
+                env,
+                &owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
+            .await;
+        fail_or!(out, Some(activity), owner.clone(), assigned);
+
+        // `Output`, when present, projects over the converged result (so a Parallel can reshape its
+        // branch-output array); when absent the state's result *is* the array.
+        let output_value = fail_or!(
+            out,
+            Some(activity),
+            owner.clone(),
+            self.project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                aggregated,
+            )
+            .await
+        );
+
+        // `finish_parallel` only borrows `activity_value`, so it advances a fresh copy in place
+        // through the completing → completed lifecycle moments.
+        let mut finished = activity_value.clone();
+        finished.meta.with_update_at(crate::log::Timestamp::now());
+        finished.status = ActivityStatus::Completing;
+        if finished.raw_output.is_none() {
+            finished.raw_output = Some(finished.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleting {
+            activity: finished.clone(),
+        })
+        .await;
+        finished.meta.with_update_at(crate::log::Timestamp::now());
+        finished.status = ActivityStatus::Completed;
+        finished.output = Some(output_value.clone());
+        if finished.raw_output.is_none() {
+            finished.raw_output = Some(finished.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleted { activity: finished })
+            .await;
+        emit_transition(
+            out,
+            activity_value.execution.clone(),
+            activity_value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
+            activity,
+            &activity_value.state_path,
+            &output_value,
+            self.state.next.as_deref(),
+            self.state.end,
+        )
+        .await;
+    }
 }

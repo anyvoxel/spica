@@ -1,11 +1,9 @@
-use async_trait::async_trait;
-
 use crate::TimerStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::{Command, TerminationReason, TimerPurpose};
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::{Command, CompleteState, FailTask, TerminationReason, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectKind;
+use crate::types::meta::{ObjectKind, ObjectReference};
 
 /// Handles `TriggerTimer`: a timer's deadline elapsed. Idempotent (a no-op if the timer is gone or
 /// already terminal). Dispatches by `purpose`: `WaitResume` fires the owning state;
@@ -13,21 +11,13 @@ use crate::types::meta::ObjectKind;
 #[derive(Default)]
 pub struct TriggerTimerHandler;
 
-#[async_trait]
-impl CommandHandler for TriggerTimerHandler {
-    fn command(&self) -> Command {
-        Command::TriggerTimer {
-            timer: crate::types::meta::ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::TriggerTimer { timer } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
-
+impl TriggerTimerHandler {
+    pub(crate) async fn handle(
+        &self,
+        timer: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         let act = match ctx.storage.get_timer(timer).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return, // timer never armed; nothing to do.
@@ -36,7 +26,7 @@ impl CommandHandler for TriggerTimerHandler {
             return; // already completed/cancelled — a duplicate fire is a no-op.
         }
 
-        out.emit_event(Event::TimerTriggered {
+        out.append_event(Event::TimerTriggered {
             timer: crate::Timer {
                 execution: act.value.execution.clone(),
                 purpose: act.purpose,
@@ -74,10 +64,10 @@ impl CommandHandler for TriggerTimerHandler {
                     Ok(Some(act)) => act.value().input.clone().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null, // owner gone — the handler will no-op.
                 };
-                out.emit_command(Command::CompleteState {
+                out.append_command(Command::CompleteState(CompleteState {
                     activity: activity_id,
                     output: raw_result,
-                });
+                }));
             }
             TimerPurpose::TaskTimeout => {
                 // A Task state's `TimeoutSeconds` elapsed before the in-flight task settled. Fail
@@ -107,7 +97,7 @@ impl CommandHandler for TriggerTimerHandler {
                 // Fail the task with the engine-authoritative timeout: `worker_id` is empty (this is
                 // not a worker report, so no lease-match check applies — the deadline is the engine's
                 // own backstop). `FailTaskHandler` routes it through Retry/Catch/terminate.
-                out.emit_command(Command::FailTask {
+                out.append_command(Command::FailTask(FailTask {
                     task,
                     worker_id: String::new(),
                     error: ExecutionError::Runtime(RuntimeError::TimedOut {
@@ -116,7 +106,7 @@ impl CommandHandler for TriggerTimerHandler {
                             act.value.deadline.as_millis()
                         ),
                     }),
-                });
+                }));
             }
             TimerPurpose::DeliveryLease => {
                 // A claimed task's lease (Zeebe activation timeout) elapsed without a settle: re-queue
@@ -141,7 +131,7 @@ impl CommandHandler for TriggerTimerHandler {
                 let Some(task) = in_flight else {
                     return; // no in-flight task — the lease no longer applies.
                 };
-                out.emit_command(Command::ReleaseTaskLease { task });
+                out.append_command(Command::ReleaseTaskLease { task });
             }
             TimerPurpose::ExecutionTimeout => {
                 // The execution ran past its `TimeoutSeconds` deadline. Drive it to a `TimedOut`

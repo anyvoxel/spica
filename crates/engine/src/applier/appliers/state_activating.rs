@@ -1,49 +1,18 @@
 //! `StateActivating` event projection: folds the `Event::StateActivating` activity value into Storage.
 
-use async_trait::async_trait;
-
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{Activity, ActivityStatus, ApplierContext, EventApplier};
+use crate::{Activity, ApplierContext};
 
 use crate::storage::ActivityRecord;
 
 #[derive(Default)]
 pub(crate) struct StateActivatingApplier;
-#[async_trait]
-impl EventApplier for StateActivatingApplier {
-    fn event(&self) -> Event {
-        Event::StateActivating {
-            activity: Activity {
-                execution: crate::types::meta::ObjectReference::nil(),
-                state_path: jsonptr::PointerBuf::new(),
-                status: ActivityStatus::Running,
-                raw_input: Default::default(),
-                input: None,
-                raw_output: None,
-                activity_state: None,
-                retry_state: None,
-                output: None,
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Activity,
-                    ulid::Ulid::nil(),
-                )
-                .at(crate::log::Timestamp::from_millis(0))
-                .build(),
-            },
-        }
-    }
-
-    async fn apply(
+impl StateActivatingApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        activity: &Activity,
     ) -> Result<(), ExecutionError> {
-        let Event::StateActivating { activity } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
         // `StateActivating` is the creation moment of the projection row: the event already carries
         // the canonical domain entity, and storage only adds its projection-only `active_children`
         // bookkeeping alongside it.

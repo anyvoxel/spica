@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::{
+    Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
+};
 use crate::types::event::Event;
 use crate::types::meta::ObjectKind;
 
@@ -12,21 +12,14 @@ use crate::types::meta::ObjectKind;
 #[derive(Default)]
 pub struct TerminateStateHandler;
 
-#[async_trait]
-impl CommandHandler for TerminateStateHandler {
-    fn command(&self) -> Command {
-        Command::TerminateState {
-            activity: crate::types::meta::ObjectReference::nil(),
-            reason: crate::types::command::TerminationReason::Cancelled,
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::TerminateState { activity, reason } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl TerminateStateHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &TerminateState,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let TerminateState { activity, reason } = p;
         let act = match ctx.storage.get_activity(activity).await {
             Ok(Some(a)) => a,
             Ok(None) | Err(_) => return, // gone already; nothing to terminate.
@@ -40,13 +33,11 @@ impl CommandHandler for TerminateStateHandler {
         // (HashSet), so re-emitting the ed as a duplicate is safe AND is what drains the
         // Terminating execution that waited on us.
         use crate::ActivityStatus as S;
-        use crate::types::command::TerminationReason;
         match act.value.status {
             // Running, or Completing, are legitimate pre-failure states: a state can fail either
             // before the complete step opens (Running) or while it is in progress (Completing, since
-            // `StateCompleting` is emitted eagerly by `CompleteStateHandler` before the state's
-            // `complete` runs). Both must be redirected from success to failure — fall through to the
-            // normal terminate path.
+            // the state's `complete` opens with `StateCompleting` before it projects). Both must be
+            // redirected from success to failure — fall through to the normal terminate path.
             S::Running | S::Completing => {}
             S::Terminated(ref reason) => {
                 // Re-emit the terminal ed with the recorded reason (ignore the incoming duplicate
@@ -55,7 +46,7 @@ impl CommandHandler for TerminateStateHandler {
                 // (activity already drained from its snapshot) and advances the parent's finish.
                 let mut activity_value = act.value();
                 activity_value.status = S::Terminated(reason.clone());
-                out.emit_event(crate::types::event::Event::StateTerminated {
+                out.append_event(crate::types::event::Event::StateTerminated {
                     activity: activity_value,
                 })
                 .await;
@@ -84,7 +75,7 @@ impl CommandHandler for TerminateStateHandler {
 
         let mut terminating_activity = act.value();
         terminating_activity.status = S::Terminating(reason.clone());
-        out.emit_event(Event::StateTerminating {
+        out.append_event(Event::StateTerminating {
             activity: terminating_activity,
         })
         .await;
@@ -103,7 +94,7 @@ impl CommandHandler for TerminateStateHandler {
         for child in children {
             match child.kind {
                 ObjectKind::Timer => {
-                    out.emit_command(Command::CancelTimer { timer: child });
+                    out.append_command(Command::CancelTimer { timer: child });
                     pending += 1;
                 }
                 // A `Parallel` state's in-flight branches are child *executions* rooted under this
@@ -112,11 +103,11 @@ impl CommandHandler for TerminateStateHandler {
                 // letting this activity drain. M1 non-container states own no child executions, so
                 // the arm is inert there.
                 ObjectKind::Execution => {
-                    out.emit_command(Command::TerminateExecution {
+                    out.append_command(Command::TerminateExecution(TerminateExecution {
                         name: child.name.clone(),
                         uid: Some(child.uid),
                         reason: reason.clone(),
-                    });
+                    }));
                     pending += 1;
                 }
                 // The split's fan-out children (a `Parallel` branch / `Map` item) are **Threads**
@@ -124,10 +115,10 @@ impl CommandHandler for TerminateStateHandler {
                 // `TerminateThread` is reference-addressed (threads live in thread storage), unlike
                 // the name-addressed `TerminateExecution` above.
                 ObjectKind::Thread => {
-                    out.emit_command(Command::TerminateThread {
+                    out.append_command(Command::TerminateThread(TerminateThread {
                         thread: child.clone(),
                         reason: reason.clone(),
-                    });
+                    }));
                     pending += 1;
                 }
                 // A non-container activity owns no child activities (only `Parallel`/`Map` do, via
@@ -138,7 +129,7 @@ impl CommandHandler for TerminateStateHandler {
                 // it. The physical call is left running; a later `CompleteTask` is swallowed by the
                 // `CompleteTaskHandler`'s non-Running guard.
                 ObjectKind::Task => {
-                    out.emit_command(Command::CancelTask { task: child });
+                    out.append_command(Command::CancelTask { task: child });
                     pending += 1;
                 }
                 // A node container never owns a Flow/FlowVersion child (no such reachable tree edge).
@@ -148,7 +139,7 @@ impl CommandHandler for TerminateStateHandler {
         if pending == 0 {
             let mut terminated_activity = act.value();
             terminated_activity.status = S::Terminated(reason.clone());
-            out.emit_event(Event::StateTerminated {
+            out.append_event(Event::StateTerminated {
                 activity: terminated_activity,
             })
             .await;

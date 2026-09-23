@@ -1,10 +1,8 @@
-use async_trait::async_trait;
-
 use crate::ExecutionStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
 use crate::storage::ScopeRecord;
-use crate::types::command::Command;
+use crate::types::command::{Command, CompleteExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, ObjectReference};
@@ -20,21 +18,14 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 #[derive(Default)]
 pub struct CompleteExecutionHandler;
 
-#[async_trait]
-impl CommandHandler for CompleteExecutionHandler {
-    fn command(&self) -> Command {
-        Command::CompleteExecution {
-            execution: crate::types::meta::ObjectReference::nil(),
-            output: Default::default(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CompleteExecution { execution, output } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl CompleteExecutionHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &CompleteExecution,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let CompleteExecution { execution, output } = p;
         // The addressed run is a **top-level** `Execution`. Resolve its scope and classify it: the
         // scope wrapper is the uniform record for both kinds, but only `Execution` belongs here — a
         // `Thread` addressed to this handler is an internal fault (dispatch routes those to
@@ -72,7 +63,7 @@ impl CommandHandler for CompleteExecutionHandler {
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
         completing_execution.meta.with_update_at(Timestamp::now());
-        out.emit_event(Event::ExecutionCompleting {
+        out.append_event(Event::ExecutionCompleting {
             execution: completing_execution,
         })
         .await;
@@ -91,7 +82,7 @@ impl CommandHandler for CompleteExecutionHandler {
             let completed_event = Event::ExecutionCompleted {
                 execution: completed_execution,
             };
-            out.emit_event(completed_event).await;
+            out.append_event(completed_event).await;
             // The top-level run has no parent — `Engine::start` observes its `ExecutionCompleted`
             // directly — but a relayed finish (from a scope below) never arrives here, so no owner
             // relay is needed for a root execution.
@@ -115,7 +106,7 @@ pub(super) fn cancel_timers(
     let mut pending = 0usize;
     for child in children {
         if child.kind == ObjectKind::Timer {
-            out.emit_command(Command::CancelTimer { timer: child });
+            out.append_command(Command::CancelTimer { timer: child });
             pending += 1;
         }
     }

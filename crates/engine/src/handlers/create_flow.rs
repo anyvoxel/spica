@@ -1,16 +1,13 @@
 //! `CreateFlow` command handler: creates a **brand-new flow** with its first version.
 
-use async_trait::async_trait;
-
 use crate::RejectionType;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::Command;
-use crate::types::event::Event;
+use crate::types::command::CreateFlow;
+use crate::types::event::{Event, FlowCreated, FlowVersionCreated};
 use crate::types::flow::Flow;
 use crate::types::flow::FlowStatus;
 use crate::types::flow_version::FlowVersion;
-use crate::types::id::{FlowName, RequestId};
 
 /// Handles the creation of a new flow **definition** (a new [`FlowName`] with its first immutable
 /// version).
@@ -36,27 +33,18 @@ use crate::types::id::{FlowName, RequestId};
 #[derive(Default)]
 pub struct CreateFlowHandler;
 
-#[async_trait]
-impl CommandHandler for CreateFlowHandler {
-    fn command(&self) -> Command {
-        Command::CreateFlow {
-            request_id: RequestId::nil(),
-            name: FlowName::new("default").expect("static placeholder name is valid"),
-            definition: String::new(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CreateFlow {
+impl CreateFlowHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &CreateFlow,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let CreateFlow {
             request_id,
             name,
             definition,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
 
         // Defensive parse/validation before persisting: at the normal boundary the definition was
         // already validated by `Engine::create_flow`, but a replayed or forged command must not
@@ -109,7 +97,7 @@ impl CommandHandler for CreateFlowHandler {
 
         // Emit the flow's birth and its first version in one atomic batch (same cause/stream). The
         // StreamProcessor routes the caller's ack on `FlowVersionCreated` (see `Event::FlowVersionCreated`).
-        out.emit_event(Event::FlowCreated {
+        out.append_event(Event::FlowCreated(FlowCreated {
             request_id: *request_id,
             flow: Flow {
                 // The flow carries its real, user-supplied name (the primary key) plus a fresh
@@ -129,11 +117,11 @@ impl CommandHandler for CreateFlowHandler {
                 // this counter on later publishes.
                 latest_version: 1,
             },
-        })
+        }))
         .await;
         // The CreateFlow caller awaits the request echoed on this `FlowVersionCreated` (the version's
         // birth); an injected `Hook` observer wakes it as soon as the engine reports this event applied.
-        let version_event = Event::FlowVersionCreated {
+        let version_event = Event::FlowVersionCreated(FlowVersionCreated {
             request_id: *request_id,
             flow_version: FlowVersion {
                 // A flow version is owned by its flow: the meta carries an owner reference to the
@@ -157,7 +145,7 @@ impl CommandHandler for CreateFlowHandler {
                 // to storage unchanged (a version's content is immutable once created).
                 checksum: FlowVersion::definition_checksum(definition),
             },
-        };
-        out.emit_event(version_event).await;
+        });
+        out.append_event(version_event).await;
     }
 }

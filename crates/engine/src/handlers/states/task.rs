@@ -2,288 +2,361 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{State, TaskState};
 
-use super::super::state_handler::StateHandler;
-use super::super::{emit_timer, eval_string_or_expr, state_activated_value};
+use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use super::super::{emit_timer, emit_transition, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
-use crate::handler::{ActivityCtx, Collector};
-use crate::types::command::Command;
-use crate::types::context::build_states;
+use crate::handler::{Collector, HandlerContext};
+use crate::log::Timestamp;
+use crate::types::command::{ActivateTask, Command, TimerPurpose};
+use crate::types::context::States;
+use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::{Activity, ActivityStatus, Variables};
 
-pub struct TaskStateHandler;
+pub struct TaskStateHandlerFactory;
 
 #[async_trait]
-impl StateHandler for TaskStateHandler {
+impl StateHandlerFactory for TaskStateHandlerFactory {
     fn state(&self) -> State {
         State::Task(TaskState::default())
     }
 
-    async fn activate(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        actx: &ActivityCtx,
-        state: &State,
-    ) {
+    fn create<'a>(&self, state: &'a State) -> Box<dyn StateHandler + 'a> {
         let State::Task(s) = state else {
             unreachable!(
-                "activate dispatch guarantees the state handler receives its own variant; got {state:?}"
+                "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        activate_task(env, out, activity, actx, s).await;
-    }
-
-    /// Resumed by `CompleteTask`'s `CompleteState` after the external call settles with `Ok`. Runs
-    /// the state's `complete` step: projects `Assign`/`Output` against the stored processed input
-    /// (`$states.input`) and raw task result (`$states.result`), then routes to `Next`/`End` (the
-    /// shared success finish — identical to `Wait`'s `complete`).
-    async fn complete(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        actx: &ActivityCtx,
-        state: &State,
-    ) {
-        let State::Task(s) = state else {
-            unreachable!(
-                "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
-            );
-        };
-        super::super::complete_activity(
-            env,
-            out,
-            activity,
-            actx,
-            s.assign.as_ref(),
-            s.output.as_ref(),
-            s.next.as_deref(),
-            s.end,
-            actx.activity.retry_count(),
-            None, // success path — no Catch `errorOutput`
-        )
-        .await;
+        Box::new(TaskStateHandler { state: s })
     }
 }
 
-/// The `Task` state's `activate`: after the framework emits `StateActivating`, this projects
-/// `Arguments` (the `Args` / state's `arguments` with JSONata evaluated) and, once projected, emits
-/// `StateActivated` and throws `ActivateTask` to invoke the external call. The state then leaves the
-/// serial loop (like `Wait` arming its timer): it is resumed later via `CompleteTask` →
-/// `CompleteState` → `complete`.
-///
-/// `resource` is static text (per ASL, the `Resource` URI); `arguments` may embed JSONata. The
-/// `timeout_seconds`/`heartbeat_seconds`/`retry`/`catch` fields are not implemented yet — a task
-/// that specifies them structurally is out of scope until their milestone.
-async fn activate_task(
-    env: &mut EvalEnv,
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    actx: &ActivityCtx,
-    state: &TaskState,
-) {
-    // `$states` for the activate step: `result` is the task's output, which is unknown until the
-    // external call settles, so `result` is `None`/null here (it becomes the stored `input` the
-    // complete step later projects against). `assign_ctx = None`: the state's own `Assign` has not
-    // yet been applied.
-    let states = build_states(
-        &actx.activity.raw_input,
-        None,
-        &actx.state_name(),
-        &actx.exec_input,
-        None,
-        actx.activity.retry_count(),
-        None,
-        None, // not a Map item — no `context.Map.Item` binding
-    );
+struct TaskStateHandler<'a> {
+    state: &'a TaskState,
+}
 
-    // Project `Arguments`: it may be any JSON value, with strings inside `{% %}` evaluated as
-    // JSONata against the current scope. If absent, the task receives the state's input by default
-    // (matching ASL, where a Task's `Arguments` defaults to `$states.input`).
-    let arguments = match &state.arguments {
-        Some(arguments) => fail_or!(
-            out,
-            Some(activity),
-            actx.activity
+#[async_trait]
+impl StateHandler for TaskStateHandler<'_> {
+    // A Task's processed input is its projected `Arguments` (defaults to the state's input), which
+    // is what the external call receives.
+    async fn process_input(
+        &self,
+        env: &mut EvalEnv,
+        activity: &mut Activity,
+        variables: &Variables,
+        states: &Value,
+    ) -> Result<Value, ExecutionError> {
+        match &self.state.arguments {
+            Some(arguments) => env.eval_json(arguments, states, variables),
+            None => Ok(activity.raw_input.clone()),
+        }
+    }
+
+    // After `StateActivated` (carrying the projected arguments), throw the invocation: mint the
+    // task entity and emit `ActivateTask`, then arm the `TimeoutSeconds` deadline if present.
+    async fn after_activated(
+        &self,
+        env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+        states: &Value,
+    ) -> Result<(), ExecutionError> {
+        // Resolve the state's `Retry` array once into a frozen per-retrier plan baked onto the task,
+        // so the reused task decides its own retries without revisiting this definition. Empty = no
+        // retry. TODO(M2): on a retried attempt, re-arm `TaskTimeout` so it is also bounded.
+        let retry_plan = self
+            .state
+            .retry
+            .as_deref()
+            .map(|retriers| retriers.iter().map(crate::RetryPolicy::resolve).collect())
+            .unwrap_or_default();
+
+        let activity = activity_value.reference();
+        let task_uid = ulid::Ulid::new();
+        // The task's reference is minted with a name derived from the owning execution's plain base
+        // (finding #13), exactly like the activity (#3) and timer (#11) names — not the opaque
+        // `child-<uid>` handle. `execution` is the tree anchor, so a branch task still names its
+        // root run.
+        let task_name = activity_value
+            .execution
+            .name
+            .base()
+            .generated_from_key(out.next_generated_seq().await);
+        let task_ref = ObjectReference::new(ObjectKind::Task, task_name, task_uid);
+        out.append_command(Command::ActivateTask(ActivateTask {
+            execution: activity_value.execution.clone(),
+            owner: activity.clone(),
+            task: task_ref,
+            resource: self.state.resource.clone(),
+            arguments: activity_value.input.clone().unwrap_or_default(),
+            retry_plan,
+        }));
+
+        // Arm the Task's `TimeoutSeconds` deadline (a `TaskTimeout` timer parented on the activity,
+        // so it is swept when the activity terminates). On firing it fails the in-flight task with
+        // `States.Timeout`, then flows through the same `Retry`/`Catch` policy as any settle. A Task
+        // with no `TimeoutSeconds` is left to the external handler to settle; an invalid value is a
+        // definition error that terminates the activity via the base hook.
+        if let Some(timeout) = &self.state.timeout_seconds {
+            let deadline = self.resolve_task_deadline(env, variables, states, timeout)?;
+            emit_timer(
+                out,
+                // The timer's `execution` anchor is the flat top-level run (`activity.execution`),
+                // not the immediate owner scope — see `emit_timer`.
+                activity_value.execution.clone(),
+                activity,
+                TimerPurpose::TaskTimeout,
+                deadline,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    fn complete_directly(&self, _activity: &Activity) -> bool {
+        false
+    }
+
+    /// Resumed by `CompleteTask`'s `CompleteState` after the external call settles with `Ok` — the
+    /// shared success finish, identical to `Wait`'s `complete`.
+    /// The `Command::CompleteState` finish — the shared orchestration (liveness/Terminating-race
+    /// guards, owning-scope resolution, activity and variables reconstruction) and this state's projection,
+    /// all inline.
+    async fn complete(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity: ObjectReference,
+        raw_result: Option<&Value>,
+    ) {
+        let act = match ctx.storage.get_activity(&activity).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "activity {activity}"
+                    ))),
+                );
+                return;
+            }
+            Err(e) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    e,
+                );
+                return;
+            }
+        };
+
+        // Race fix: a cancel already won on this activity. The drain that would have been emitted by
+        // the cancel side may have been missed because the ordering interleaved (e.g. timer-fired +
+        // cancel together). Re-emit the deferred termination ed so the parent finishes, reusing the
+        // reason embedded in the terminating status itself.
+        if act.value.status != ActivityStatus::Running {
+            match act.value.status {
+                ActivityStatus::Terminating(ref reason) => {
+                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
+                    // preserving every previously-folded domain field while only flipping the status
+                    // from `Terminating(reason)` to `Terminated(reason)`.
+                    let mut activity_value = act.value();
+                    activity_value.status = ActivityStatus::Terminated(reason.clone());
+                    out.append_event(crate::types::event::Event::StateTerminated {
+                        activity: activity_value,
+                    })
+                    .await;
+                }
+                _ => return,
+            }
+            // A synchronous state that owns no children drains its owner Execution as soon as its own
+            // terminal lands; run the inline reaction so the owner's own drain walks up.
+            let owner = act
+                .value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner");
+            if owner.kind == ObjectKind::Activity {
+                super::super::child_completed::child_settled(ctx, out, owner, activity.clone())
+                    .await;
+            }
+            return;
+        }
+        // Defensive: an activity with live children cannot enter success yet; its ed is deferred
+        // until drain.
+        if !act.active_children.is_empty() {
+            return;
+        }
+
+        // The activity's owner is its *scope* — resolved through the central Execution/Thread
+        // dispatch in storage, which silently ignores non-scope kinds.
+        let scope = match crate::storage::load_scope_ref(
+            ctx.storage,
+            &act.value
                 .meta
                 .owner
                 .clone()
                 .expect("an owned activity has an owner"),
-            env.eval_json(arguments, &states, &actx.variables)
-        ),
-        None => actx.activity.raw_input.clone(),
-    };
-
-    // TODO(M2): the remaining Task field not yet fully acted on is `heartbeat_seconds`
-    // (`States.HeartbeatTimeout`): a heartbeat deadline driven by client keepalives, which the
-    // current `TaskHandler::run` interface cannot express. `timeout_seconds` and `retry`/`catch`
-    // are handled here (`resolve_task_deadline`) and in `fail_task.rs`'s task self-decision.
-    // A retry re-queues the same task entity back to `Pending` with a `next_available_at` gate (no
-    // re-invocation), so it does **not** re-arm a fresh `TimeoutSeconds` deadline — TODO(M2): on the
-    // re-claimed attempt, re-arm `TaskTimeout` so the retried attempt is also bounded (the first
-    // attempt's timeout has already fired or been swept by then).
-    // `resource` here is passed verbatim; `retry` is resolved once into the frozen `retry_plan` so
-    // the reused task decides its own retries without revisiting this definition.
-
-    // Resolve the state's `Retry` array once into a frozen per-retrier plan baked onto the task, so
-    // the reused task decides its own retries (matching, budget, backoff) without revisiting this
-    // definition — the self-containment a per-`resource` task partition needs. Empty = no retry.
-    let retry_plan = state
-        .retry
-        .as_deref()
-        .map(|retriers| retriers.iter().map(crate::RetryPolicy::resolve).collect())
-        .unwrap_or_default();
-
-    let task_uid = ulid::Ulid::new();
-    // The activation work (projecting `Arguments`) is done: emit the activation-complete ed, then
-    // throw the invocation as the transition's side effect. The `parent` links the task to the
-    // owning activity so a later termination sweeps it.
-    //
-    // The task's reference is minted with a name derived from the owning execution's plain base
-    // (finding #13), exactly like the activity (#3) and timer (#11) names, not the opaque
-    // `child-<uid>` handle. `execution` is the tree anchor (`actx.activity.execution`), so a branch
-    // task still names its root run; the suffix (random, `PlainName::to_generated`) is decoupled
-    // from the task's own `uid`. Minted once and reused for both the command's reference and the
-    // serialized `meta.name` (storage lookups are keyed by the reference's name).
-    let task_name = actx
-        .activity
-        .execution
-        .name
-        .base()
-        .generated_from_key(out.next_generated_seq().await);
-    let task_ref = ObjectReference::new(crate::types::meta::ObjectKind::Task, task_name, task_uid);
-    out.emit_event(Event::StateActivated {
-        activity: state_activated_value(actx, arguments.clone(), None),
-    })
-    .await;
-    out.emit_command(Command::ActivateTask {
-        execution: actx.activity.execution.clone(),
-        owner: activity.clone(),
-        task: task_ref,
-        resource: state.resource.clone(),
-        arguments,
-        retry_plan,
-    });
-
-    // Arm the Task's `TimeoutSeconds` deadline (a `TaskTimeout` timer parented on the activity, so
-    // it is swept when the activity terminates). On firing it fails the in-flight task with
-    // `States.Timeout`, which then flows through the same `Retry`/`Catch` policy as any settle.
-    // A Task with no `TimeoutSeconds` is left to the external handler to settle.
-    if let Some(timeout) = &state.timeout_seconds {
-        let deadline = resolve_task_deadline(env, out, activity.clone(), actx, &states, timeout);
-        let Some(deadline) = deadline else {
-            return; // timeout was invalid — `resolve_task_deadline` already emitted the failure.
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
+            Err(_) => return,
         };
-        emit_timer(
+        if !scope.is_running() {
+            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
+        }
+
+        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
+        // step observes the canonical domain payload rather than the projection-only row. The
+        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
+        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
+        // record the command-carried result.
+        let mut activity_value = act.value();
+        if let Some(result) = raw_result {
+            activity_value.raw_output = Some(result.clone());
+        }
+        let variables = scope.variables().clone();
+        let env = &mut *ctx.env;
+
+        // Advance the one activity value in place to the completing lifecycle moment — it stays the
+        // single source of truth for the rest of the complete step, so the completing status (and its
+        // re-stamped update time) carries forward instead of a stale copy held alongside.
+        activity_value
+            .meta
+            .with_update_at(crate::log::Timestamp::now());
+        activity_value.status = ActivityStatus::Completing;
+        if activity_value.raw_output.is_none() {
+            activity_value.raw_output = Some(activity_value.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleting {
+            activity: activity_value.clone(),
+        })
+        .await;
+        let raw_result = activity_value
+            .raw_output
+            .as_ref()
+            .unwrap_or(&activity_value.raw_input);
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(raw_result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+
+        let owner = activity_value
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner");
+        let assigned = self
+            .apply_assign(
+                out,
+                env,
+                &owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
+            .await;
+        fail_or!(out, Some(activity), owner.clone(), assigned);
+
+        let output_value = fail_or!(
             out,
-            // The timer's `execution` anchor is the flat top-level run (`activity.execution`), not
-            // the immediate owner scope — it drives `Timer::execution` and the timer's
-            // `{execution.name}-{suffix}` generated name, so a branch task's timeout still names its
-            // root run.
-            actx.activity.execution.clone(),
+            Some(activity),
+            owner.clone(),
+            self.project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                raw_result.clone(),
+            )
+            .await
+        );
+
+        // Advance the same value in place to the completed lifecycle moment (mirroring the completing
+        // step above): it stays the single source of truth, so the completed status and projected
+        // output carry forward into the transition that follows.
+        activity_value
+            .meta
+            .with_update_at(crate::log::Timestamp::now());
+        activity_value.status = ActivityStatus::Completed;
+        activity_value.output = Some(output_value.clone());
+        if activity_value.raw_output.is_none() {
+            activity_value.raw_output = Some(activity_value.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleted {
+            activity: activity_value.clone(),
+        })
+        .await;
+        emit_transition(
+            out,
+            activity_value.execution.clone(),
+            activity_value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
             activity,
-            crate::types::command::TimerPurpose::TaskTimeout,
-            deadline,
+            &activity_value.state_path,
+            &output_value,
+            self.state.next.as_deref(),
+            self.state.end,
         )
         .await;
     }
 }
 
-/// Emit a `TerminateState` failure for the activity — the shared tail for a `TimeoutSeconds`
-/// definition error (invalid value, eval failure, or overflow). The activity's terminate path
-/// drives the failure up through the cascade.
-fn emit_timeout_definition_failure(
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    execution: crate::types::meta::ObjectReference,
-    error: crate::types::error::ExecutionError,
-) {
-    use crate::types::command::TerminationReason;
-    out.emit_command(Command::TerminateState {
-        activity,
-        reason: TerminationReason::Failed { error },
-    });
-    // Unused in some callers (the execution id is currently only for clarity); keep the activity as
-    // the failure's site and let the terminate path decide the execution.
-    let _ = execution;
-}
-
-/// Resolve a Task state's `TimeoutSeconds` (`Int` or JSONata `Expr`) into an absolute deadline.
-/// On an invalid/out-of-range value, emits the failure and returns `None`.
-fn resolve_task_deadline(
-    env: &mut EvalEnv,
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    actx: &ActivityCtx,
-    states: &Value,
-    timeout: &spica_asl::IntOrExpr,
-) -> Option<crate::log::Timestamp> {
-    use crate::types::command::TerminationReason;
-    use crate::types::error::{ExecutionError, RuntimeError};
-    let seconds = match timeout {
-        // Literal `TimeoutSeconds`: a positive integer.
-        spica_asl::IntOrExpr::Int(n) => Some(*n),
-        // JSONata `TimeoutSeconds`: evaluate, require a non-negative integer result.
-        spica_asl::IntOrExpr::Expr(expr) => {
-            // Evaluate the JSONata `TimeoutSeconds`; on eval failure emit the failure and `None`.
-            let value = match eval_string_or_expr(env, expr.as_str(), states, &actx.variables) {
-                Ok(v) => v,
-                Err(e) => {
-                    emit_timeout_definition_failure(
-                        out,
-                        activity,
-                        actx.activity
-                            .meta
-                            .owner
-                            .clone()
-                            .expect("an owned activity has an owner"),
-                        e,
-                    );
-                    return None;
+impl TaskStateHandler<'_> {
+    /// Resolve a Task state's `TimeoutSeconds` (`Int` or JSONata `Expr`) into an absolute deadline. An
+    /// invalid/out-of-range value is a definition error that terminates the activity via the base hook.
+    fn resolve_task_deadline(
+        &self,
+        env: &mut EvalEnv,
+        variables: &Variables,
+        states: &Value,
+        timeout: &spica_asl::IntOrExpr,
+    ) -> Result<Timestamp, ExecutionError> {
+        let seconds = match timeout {
+            spica_asl::IntOrExpr::Int(n) if *n > 0 => Some(*n),
+            spica_asl::IntOrExpr::Expr(expr) => {
+                // `jsonata-core` yields every number as `f64`, so accept any unit-fraction non-negative
+                // value.
+                let value = eval_string_or_expr(env, expr.as_str(), states, variables)?;
+                match value {
+                    Value::Number(num) => num.as_f64().and_then(|f| {
+                        if f.fract() == 0.0 && f.is_finite() && f >= 0.0 {
+                            Some(f as i64)
+                        } else {
+                            None
+                        }
+                    }),
+                    _ => None,
                 }
-            };
-            match value {
-                Value::Number(num) => num.as_f64().and_then(|f| {
-                    if f.fract() == 0.0 && f.is_finite() && f >= 0.0 {
-                        Some(f as i64)
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
             }
-        }
-    };
-    let seconds = match seconds {
-        Some(n) if n > 0 => n,
-        _ => {
-            out.emit_command(Command::TerminateState {
-                activity,
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "Task TimeoutSeconds must be a positive integer".into(),
-                    )),
-                },
-            });
-            return None;
-        }
-    };
-    let deadline =
-        crate::log::Timestamp::now().checked_add(std::time::Duration::from_secs(seconds as u64));
-    match deadline {
-        Some(d) => Some(d),
-        None => {
-            out.emit_command(Command::TerminateState {
-                activity,
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "Task TimeoutSeconds overflows the absolute deadline".into(),
-                    )),
-                },
-            });
-            None
-        }
+            // A literal below/equal 0 (or an expression producing 0 / non-integer) is invalid.
+            _ => None,
+        };
+        let Some(seconds) = seconds.filter(|n| *n > 0) else {
+            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                "Task TimeoutSeconds must be a positive integer".to_string(),
+            )));
+        };
+        Timestamp::now()
+            .checked_add(std::time::Duration::from_secs(seconds as u64))
+            .ok_or_else(|| {
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    "Task TimeoutSeconds overflows the absolute deadline".to_string(),
+                ))
+            })
     }
 }

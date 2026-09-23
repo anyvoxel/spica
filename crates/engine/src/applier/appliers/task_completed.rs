@@ -1,60 +1,25 @@
 //! `TaskCompleted` event projection: folds the `Event::TaskCompleted` into Storage.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::types::event::TaskCompleted;
 
+use crate::TaskStatus;
 use crate::types::meta::ObjectKind;
-use crate::{RetryState, Task, TaskStatus};
 
 #[derive(Default)]
 pub(crate) struct TaskCompletedApplier;
-#[async_trait]
-impl EventApplier for TaskCompletedApplier {
-    fn event(&self) -> Event {
-        Event::TaskCompleted {
-            request_id: crate::types::id::RequestId::nil(),
-            task: Task {
-                execution: crate::types::meta::ObjectReference::nil(),
-                resource: String::new(),
-                arguments: Default::default(),
-                status: TaskStatus::Completed,
-                deadline: None,
-                worker_id: None,
-                lease_until: None,
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Task,
-                    ulid::Ulid::nil(),
-                )
-                .timestamps(
-                    crate::log::Timestamp::from_millis(0),
-                    crate::log::Timestamp::from_millis(0),
-                )
-                .build(),
-            },
-            output: Default::default(),
-        }
-    }
-
-    async fn apply(
+impl TaskCompletedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &TaskCompleted,
     ) -> Result<(), ExecutionError> {
-        let Event::TaskCompleted {
+        let TaskCompleted {
             request_id: _,
             task,
             output,
-        } = event
-        else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        } = event;
         // Mark the task Completed and drain it from its owning activity. The task's returned payload
         // is folded into the activity's `raw_output`: it is the state's raw result before the
         // complete step's `Output` projection, distinct from the immutable processed input recorded

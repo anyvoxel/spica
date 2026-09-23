@@ -1,12 +1,10 @@
-use async_trait::async_trait;
-
 use crate::ThreadStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
 use crate::storage::ScopeRecord;
-use crate::types::command::Command;
+use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::ObjectKind;
 
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
@@ -21,21 +19,14 @@ use crate::types::meta::ObjectReference;
 #[derive(Default)]
 pub struct CompleteThreadHandler;
 
-#[async_trait]
-impl CommandHandler for CompleteThreadHandler {
-    fn command(&self) -> Command {
-        Command::CompleteThread {
-            thread: ObjectReference::nil(),
-            output: Default::default(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CompleteThread { thread, output } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl CompleteThreadHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &CompleteThread,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let CompleteThread { thread, output } = p;
         // The addressed run is a fan-out `Thread`; any other kind is an internal fault (dispatch
         // routes top-level runs to `CompleteExecution`), so it is ignored rather than mis-completed.
         let scope = match crate::storage::load_scope_ref(ctx.storage, thread).await {
@@ -61,7 +52,7 @@ impl CommandHandler for CompleteThreadHandler {
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
         completing_thread.meta.with_update_at(Timestamp::now());
-        out.emit_event(Event::ThreadCompleting {
+        out.append_event(Event::ThreadCompleting {
             thread: completing_thread,
         })
         .await;
@@ -73,14 +64,25 @@ impl CommandHandler for CompleteThreadHandler {
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
             completed_thread.meta.with_update_at(Timestamp::now());
-            out.emit_event(Event::ThreadCompleted {
+            out.append_event(Event::ThreadCompleted {
                 thread: completed_thread,
             })
             .await;
-            // A fan-out thread is always owned by its container Activity; run the inline reaction so
-            // the parallel/map converges once its last branch/item drains.
             if let Some(owner) = thread_row.value.meta.owner.clone() {
-                super::child_completed::child_settled(ctx, out, owner, thread_ref.clone()).await;
+                if owner.kind == ObjectKind::Execution {
+                    // Root thread (owned by the Execution): its success *is* the run's success. The
+                    // `ThreadCompleted` applier has already drained the root thread from the
+                    // execution's `active_children`, so `CompleteExecution` now closes the run.
+                    out.append_command(Command::CompleteExecution(CompleteExecution {
+                        execution: owner,
+                        output: output.clone(),
+                    }));
+                } else {
+                    // A fan-out thread is owned by its container Activity; run the inline reaction
+                    // so the parallel/map converges once its last branch/item drains.
+                    super::child_completed::child_settled(ctx, out, owner, thread_ref.clone())
+                        .await;
+                }
             }
         } else {
             tracing::debug!(

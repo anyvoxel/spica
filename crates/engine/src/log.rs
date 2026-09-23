@@ -11,6 +11,7 @@ use tokio_stream::Stream;
 
 pub use crate::types::entry::{Entry, EntryPayload};
 use crate::types::id::{EntryId, StreamId};
+
 pub use spica_logstream::{InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
 
 /// A [`LogStream`] adapter that closes every atomic append with a [`Noop`](EntryPayload::Noop)

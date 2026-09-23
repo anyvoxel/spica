@@ -58,21 +58,25 @@ pub use terminate_state::TerminateStateHandler;
 pub use terminate_thread::TerminateThreadHandler;
 pub use trigger_timer::TriggerTimerHandler;
 
-pub(crate) use dispatch::build_state_handlers;
+pub(crate) use dispatch::{build_state_handlers, dispatch_command};
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 use spica_asl::{AssignObject, StateMachine};
 
+use crate::Variables;
 use crate::eval_env::EvalEnv;
-use crate::handler::{ActivityCtx, Collector, HandlerContext};
-use crate::types::command::{Command, TerminationReason};
-use crate::types::context::build_states;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::{
+    ActivateState, Command, CompleteThread, TerminateExecution, TerminateThread, TerminationReason,
+};
+use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
+use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::meta::{ObjectKind, ObjectReference};
-use crate::{Activity, ActivityState, ActivityStatus};
+use crate::types::state_path::StatePath;
+use crate::{Activity, ActivityStatus};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -232,14 +236,14 @@ pub(super) async fn resolve_state_for<'a>(
 /// container's `states` table, resolved via `resolve_states_map`.
 pub(crate) fn resolve_state_from_path<'a>(
     sm: &'a StateMachine,
-    state_path: &jsonptr::Pointer,
+    state_path: &StatePath,
 ) -> Result<&'a spica_asl::State, ExecutionError> {
-    let leaf = state_name_from_path(state_path);
+    let leaf = state_path.state_name();
     if state_path.tokens().count() == 2 {
         // `/states/<leaf>` — a top-level state, resolved against the machine's top-level `states`.
         return resolve_state(sm, &leaf);
     }
-    let mut parent = state_path.to_owned();
+    let mut parent = state_path.as_ptr().to_owned();
     parent.pop_back();
     let states = resolve_states_map(sm, parent.as_ptr())?;
     states
@@ -270,15 +274,17 @@ pub(super) fn emit_scope_termination(
     reason: TerminationReason,
 ) {
     match scope.kind {
-        ObjectKind::Execution => out.emit_command(Command::TerminateExecution {
-            name: scope.name.clone(),
-            uid: Some(scope.uid),
-            reason,
-        }),
-        ObjectKind::Thread => out.emit_command(Command::TerminateThread {
+        ObjectKind::Execution => {
+            out.append_command(Command::TerminateExecution(TerminateExecution {
+                name: scope.name.clone(),
+                uid: Some(scope.uid),
+                reason,
+            }))
+        }
+        ObjectKind::Thread => out.append_command(Command::TerminateThread(TerminateThread {
             thread: scope.clone(),
             reason,
-        }),
+        })),
         _ => {
             // An activity is always owned by a scope; terminating into any other owner is an
             // internal fault with nowhere to route — nothing to emit, the failure is dropped.
@@ -318,7 +324,7 @@ pub(super) async fn cancel_activity_timers(
         if t.value.status != crate::TimerStatus::Active {
             continue; // already terminal — a fired/cancelled timer is no longer a live child.
         }
-        out.emit_event(crate::types::event::Event::TimerCancelled {
+        out.append_event(crate::types::event::Event::TimerCancelled {
             timer: crate::Timer {
                 execution: t.value.execution.clone(),
                 purpose: t.value.purpose,
@@ -352,148 +358,6 @@ pub(super) fn eval_string_or_expr(
     }
 }
 
-/// The leaf name of the state a JSON Pointer locates — the pointer's final (decoded) token. For the
-/// `state_path` carried on an [`Activity`](crate::storage::ActivityRecord)/`ActivityCtx`, this is the state's
-/// name in its enclosing `states` table. Returns the empty string for an empty (document-root) path —
-/// a shape that should never reach a state handler, but kept total. `jsonptr`'s [`decoded`] API only
-/// yields a `Cow` tied to a transient token borrow, so we resolve the leaf to an owned `String` here —
-/// a direct derivation of the state name that used to be stored as its own field.
-///
-/// [`decoded`]: jsonptr::Token::decoded
-pub(crate) fn state_name_from_path(path: &jsonptr::Pointer) -> String {
-    path.last()
-        .map(|t| t.decoded().into_owned())
-        .unwrap_or_default()
-}
-
-/// Emits the [`crate::Event::StateActivating`] event for the activity being entered.
-///
-/// The event carries the full entity-shaped [`Activity`], not only ids/fields for the current
-/// step, so a follower can rebuild the same domain activity object from the stream alone. It does
-/// **not** carry the processed `input`: at the entering (`ing`) moment the state has only received
-/// its **raw** input (kept in `raw_input`), and the state's own activate — which emits
-/// The entering `StateActivating` event. The processed input isn't determined until the state
-/// finishes activating (`StateActivated` carries it), so `input` is left `None` here — the raw
-/// entry input (verbatim in `raw_input`) is all that's real.
-pub(super) fn state_activating(actx: &ActivityCtx, _activity: ObjectReference) -> Event {
-    Event::StateActivating {
-        activity: actx.activity.clone(),
-    }
-}
-
-/// Build a new [`Activity`] from the current context, replacing only the fields the lifecycle
-/// step just changed. This keeps every lifecycle emitter updating the same entity payload shape.
-pub(super) fn activity_value_with(
-    actx: &ActivityCtx,
-    status: Option<ActivityStatus>,
-    input: Option<Value>,
-    activity_state: Option<ActivityState>,
-    raw_output: Option<Option<Value>>,
-    output: Option<Option<Value>>,
-) -> Activity {
-    // Carry the activity's `meta` forward (its `created_at` = birth moment and `uid`) and
-    // re-stamp `updated_at` to the transition moment — the meta-level equivalent of the old
-    // `created_at` forward + `updated_at` re-stamp.
-    let mut meta = actx.activity.meta.clone();
-    meta.with_update_at(crate::log::Timestamp::now());
-    Activity {
-        meta,
-        execution: actx.activity.execution.clone(),
-        state_path: actx.activity.state_path.clone(),
-        status: status.unwrap_or_else(|| actx.activity.status.clone()),
-        raw_input: actx.activity.raw_input.clone(),
-        input: input.or_else(|| actx.activity.input.clone()),
-        raw_output: raw_output.unwrap_or_else(|| actx.activity.raw_output.clone()),
-        activity_state: activity_state.or(actx.activity.activity_state.clone()),
-        retry_state: actx.activity.retry_state.clone(),
-        output: output.unwrap_or_else(|| actx.activity.output.clone()),
-    }
-}
-
-/// Build the `StateActivated` payload by applying the activate step's processed input and optional
-/// `Map` activation plan onto the current activity value.
-pub(super) fn state_activated_value(
-    actx: &ActivityCtx,
-    input: Value,
-    activity_state: Option<ActivityState>,
-) -> Activity {
-    activity_value_with(actx, None, Some(input), activity_state, None, None)
-}
-
-/// Build the `StateCompleted` payload by fixing the final projected output on the activity value.
-/// The projected `output` travels on this event; `raw_output` (the pre-`Output` raw result) is
-/// written alongside it so the complete step carries both views and never drops one to `null`.
-pub(super) fn state_completed_value(actx: &ActivityCtx, output: Value) -> Activity {
-    activity_value_with(
-        actx,
-        Some(ActivityStatus::Completed),
-        None,
-        None,
-        Some(Some(state_raw_result(actx))),
-        Some(Some(output)),
-    )
-}
-
-/// Build the `StateTerminating` payload by embedding the final termination reason into the activity
-/// status.
-pub(super) fn state_terminating_value(
-    actx: &ActivityCtx,
-    reason: crate::types::command::TerminationReason,
-) -> Activity {
-    activity_value_with(
-        actx,
-        Some(ActivityStatus::Terminating(reason)),
-        None,
-        None,
-        None,
-        None,
-    )
-}
-
-/// Build the `StateTerminated` payload by embedding the terminal termination reason into the activity
-/// status.
-pub(super) fn state_terminated_value(
-    actx: &ActivityCtx,
-    reason: crate::types::command::TerminationReason,
-) -> Activity {
-    activity_value_with(
-        actx,
-        Some(ActivityStatus::Terminated(reason)),
-        None,
-        None,
-        None,
-        None,
-    )
-}
-
-/// The raw result a state produced before any complete-step `Output` projection — the canonical
-/// `$states.result`. For a state whose raw result *is* a distinct value (a Task's worker payload,
-/// kept in `raw_output`) that value wins; for a synchronous state with no distinct raw result it
-/// defaults to the processed input. This is exactly the derivation `complete_activity` uses, hoisted
-/// so the complete-step *events* (not the computation) can carry the same value.
-pub(crate) fn state_raw_result(actx: &ActivityCtx) -> Value {
-    actx.activity
-        .raw_output
-        .clone()
-        .unwrap_or_else(|| actx.activity.raw_input.clone())
-}
-
-/// Build the `StateCompleting` payload by flipping only the lifecycle status. Unlike the input side
-/// (`StateActivating` pins `input` to `Null` because the *processed* view isn't determined until
-/// `StateActivated`), `raw_output` is already known here — the raw result is derivable purely from
-/// the activity (`raw_output` else `input`) with no completion-time computation — so the entering
-/// event carries it rather than the logging-information hole the design review flagged.
-pub(super) fn state_completing_value(actx: &ActivityCtx) -> Activity {
-    activity_value_with(
-        actx,
-        Some(ActivityStatus::Completing),
-        None,
-        None,
-        Some(Some(state_raw_result(actx))),
-        None,
-    )
-}
-
 /// Records the successful state finish's routing — emitting the `StateTransitioned` marker that
 /// carries the resolved target **path** — then throws the transition [`Command`] that actually
 /// performs the hop. The marker is only emitted for a real State→State hop (`Command::ActivateState`):
@@ -508,48 +372,41 @@ pub(super) async fn emit_transition(
     execution: ObjectReference,
     owner: ObjectReference,
     activity: ObjectReference,
-    activity_state_path: &jsonptr::PointerBuf,
+    activity_state_path: &StatePath,
     output: &Value,
     next: Option<&str>,
     end: Option<bool>,
 ) {
     if end == Some(true) {
         // Terminal hop: no next state to route to, so there's no `StateTransitioned` marker — just
-        // fold the output and complete the *scope*. The scope kind decides the verb: a **branch's**
-        // terminal state completes its fan-out `Thread` (`CompleteThread`, converged by the owning
-        // container Activity), while a **top-level** state completes the `Execution`
-        // (`CompleteExecution`). Both are scoped, so they take the `owner`, not the top-level anchor.
-        if owner.kind == ObjectKind::Thread {
-            out.emit_command(Command::CompleteThread {
-                thread: owner,
-                output: output.clone(),
-            });
-        } else {
-            out.emit_command(Command::CompleteExecution {
-                execution: owner,
-                output: output.clone(),
-            });
-        }
+        // fold the output and complete the owning Thread. Every state's owner is a Thread (the
+        // derived root thread for a top-level run, or a fan-out thread for a branch/item); a root
+        // thread's success is bridged to its Execution in `complete_thread`, so no Execution/Thread
+        // dialect is needed here.
+        out.append_command(Command::CompleteThread(CompleteThread {
+            thread: owner,
+            output: output.clone(),
+        }));
     } else if let Some(next) = next {
         // The successor lives as a sibling of the completing state in the same enclosing `states`
         // table — that table is the completing activity's `state_path` minus its own leaf.
-        let mut next_path = activity_state_path.clone();
-        next_path.pop_back();
-        next_path.push_back(next);
+        let next_path = activity_state_path.sibling(next);
         // The marker carries the resolved target *path* (self-locating), not a bare name that would
         // need the completing activity's context to be reconstructed.
-        out.emit_event(crate::types::event::Event::StateTransitioned {
-            activity,
-            next: next_path.clone(),
-        })
+        out.append_event(crate::types::event::Event::StateTransitioned(
+            StateTransitioned {
+                activity,
+                next: next_path.as_ptr().to_owned(),
+            },
+        ))
         .await;
         // The successor's activity id is allocated inside the `ActivateState` handler (see its doc).
-        out.emit_command(Command::ActivateState {
+        out.append_command(Command::ActivateState(ActivateState {
             execution,
             owner,
             state_path: next_path,
             input: output.clone(),
-        });
+        }));
     } else {
         out.terminate(
             Some(activity),
@@ -579,7 +436,7 @@ pub(super) async fn emit_timer(
         .name
         .base()
         .generated_from_key(out.next_generated_seq().await);
-    out.emit_event(Event::TimerActivated {
+    out.append_event(Event::TimerActivated {
         timer: crate::Timer {
             execution,
             purpose,
@@ -599,9 +456,9 @@ pub(super) async fn emit_timer(
 /// own because their finish differs): evaluates `Assign` (emitting `VariablesAssigned`), evaluates
 /// `Output` (defaults to input), emits `StateCompleted`, then the routing via [`emit_transition`].
 ///
-/// `StateCompleting` is **not** emitted here — the `CompleteStateHandler` framework emits it when it
-/// opens the complete step (analogous to `StateActivating` opening activate), so any state's success
-/// finish emits the ing uniformly regardless of its own output handling.
+/// `StateCompleting` (the ing) is **not** emitted here — each state's `complete` opens the finish with
+/// it, so this helper only carries the successful projection tail for paths that already opened the
+/// complete step (the exiting `Catch` route).
 ///
 /// This runs only from the `complete` step (see [`state_handler::StateHandler::complete`]) — never
 /// from `activate`. Reads variable mutation from `Assign` into the local variables used for the output
@@ -611,7 +468,8 @@ pub(super) async fn complete_activity(
     env: &mut EvalEnv,
     out: &mut Collector<'_>,
     activity: ObjectReference,
-    actx: &ActivityCtx,
+    activity_value: &Activity,
+    variables: &Variables,
     assign: Option<&AssignObject>,
     output: Option<&Value>,
     next: Option<&str>,
@@ -623,31 +481,29 @@ pub(super) async fn complete_activity(
     // actually ran on, while `$states.result` is the raw result produced before any complete-step
     // `Output` projection. For states that produce no distinct raw result, the result defaults to the
     // processed input so the shared success semantics stay unchanged.
-    let raw_result = actx
-        .activity
+    let raw_result = activity_value
         .raw_output
         .as_ref()
-        .unwrap_or(&actx.activity.raw_input);
+        .unwrap_or(&activity_value.raw_input);
     // Activate-phase Assign was already applied (mutating scope); the output projection runs with
     // that updated scope so it can reference the Just-assigned variables.
-    let states = build_states(
-        &actx.activity.raw_input,
-        Some(raw_result),
-        &actx.state_name(),
-        &actx.exec_input,
-        Some(&actx.activity.raw_input),
+    let states = States::new(
+        &activity_value.raw_input,
+        &activity_value.state_path.state_name(),
         retry_count,
-        error_output,
-        None, // not a Map item — no `context.Map.Item` binding
-    );
-    let mut local_scope = actx.variables.clone();
+    )
+    .with_result(Some(raw_result))
+    .with_assign_ctx(Some(&activity_value.raw_input))
+    .with_error_output(error_output)
+    .build();
+    let mut local_scope = variables.clone();
 
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            actx.activity
+            activity_value
                 .meta
                 .owner
                 .clone()
@@ -660,22 +516,21 @@ pub(super) async fn complete_activity(
                     for (k, v) in map {
                         local_scope.insert(k, v);
                     }
-                    out.emit_event(Event::VariablesAssigned {
-                        scope: actx
-                            .activity
+                    out.append_event(Event::VariablesAssigned(VariablesAssigned {
+                        scope: activity_value
                             .meta
                             .owner
                             .clone()
                             .expect("an owned activity has an owner"),
                         variables: local_scope.clone(),
-                    })
+                    }))
                     .await;
                 }
             }
             _ => {
                 out.terminate(
                     Some(activity),
-                    actx.activity
+                    activity_value
                         .meta
                         .owner
                         .clone()
@@ -693,7 +548,7 @@ pub(super) async fn complete_activity(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            actx.activity
+            activity_value
                 .meta
                 .owner
                 .clone()
@@ -703,21 +558,30 @@ pub(super) async fn complete_activity(
         None => raw_result.clone(),
     };
 
-    out.emit_event(Event::StateCompleted {
-        activity: state_completed_value(actx, output_value.clone()),
+    // `complete_activity` only borrows `activity_value`, so the completed payload is a fresh copy
+    // advanced in place — `state_completed_value` was removed.
+    let mut completed = activity_value.clone();
+    completed.meta.with_update_at(crate::log::Timestamp::now());
+    completed.status = ActivityStatus::Completed;
+    completed.output = Some(output_value.clone());
+    if completed.raw_output.is_none() {
+        completed.raw_output = Some(completed.raw_input.clone());
+    }
+    out.append_event(Event::StateCompleted {
+        activity: completed,
     })
     .await;
 
     emit_transition(
         out,
-        actx.activity.execution.clone(),
-        actx.activity
+        activity_value.execution.clone(),
+        activity_value
             .meta
             .owner
             .clone()
             .expect("an owned activity has an owner"),
         activity,
-        actx.state_path(),
+        &activity_value.state_path,
         &output_value,
         next,
         end,

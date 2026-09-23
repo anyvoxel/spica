@@ -1,8 +1,6 @@
-use async_trait::async_trait;
-
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::Command;
+use crate::types::command::{ActivateState, Command, SpawnThread};
 use crate::types::event::Event;
 
 /// Handles `SpawnThread`: fans out one branch of a `Parallel` state — or one item of a `Map` state —
@@ -28,33 +26,21 @@ use crate::types::event::Event;
 #[derive(Default)]
 pub struct SpawnThreadHandler;
 
-#[async_trait]
-impl CommandHandler for SpawnThreadHandler {
-    fn command(&self) -> Command {
-        Command::SpawnThread {
-            owner: crate::types::meta::ObjectReference::nil(),
-            execution: crate::types::meta::ObjectReference::nil(),
-            state_path: None,
-            index: 0,
-            start_at: String::new(),
-            input: Default::default(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::SpawnThread {
+impl SpawnThreadHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &SpawnThread,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let SpawnThread {
             owner,
             execution,
             state_path,
             index,
             start_at,
             input,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
 
         // The `owner` Parallel activity must still be running (it may have since been terminated —
         // e.g. a sibling branch failed and drained the Parallel). If it is gone or no longer
@@ -123,7 +109,7 @@ impl CommandHandler for SpawnThreadHandler {
         // anchor shared by the whole tree); `state_path` lets the child resolve its own branch
         // states without querying its parent or the root — it already names the branch's `states`
         // table within the single shared machine document.
-        out.emit_event(Event::ThreadCreated {
+        out.append_event(Event::ThreadCreated {
             thread: crate::Thread {
                 execution: execution.clone(),
                 // A thread's `state_path` is its defining property — it always descends into the
@@ -160,11 +146,11 @@ impl CommandHandler for SpawnThreadHandler {
             .clone()
             .expect("a spawned thread always receives its state_path from the container");
         enter_path.push_back(start_at.as_str());
-        out.emit_command(Command::ActivateState {
+        out.append_command(Command::ActivateState(ActivateState {
             execution: root_execution,
             owner: reference,
             state_path: enter_path,
             input: input.clone(),
-        });
+        }));
     }
 }

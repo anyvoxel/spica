@@ -10,7 +10,10 @@ use crate::log::{Entry, EntryPayload, LogStream, NoopTerminatedLogStream, Timest
 use crate::query::{QueryListPage, QueryObject, ref_for};
 use crate::storage::Storage;
 use crate::stream_processor::StreamProcessor;
-use crate::types::command::{Command, TerminationReason};
+use crate::types::command::{
+    ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow, FailTask, TerminateExecution,
+    TerminationReason,
+};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::execution::Execution;
 use crate::types::id::{EntryId, FlowName, RequestId, StreamId};
@@ -305,11 +308,11 @@ impl EngineInner {
         // A fire-and-forget bare Command, like every other public write: `append_command` is the
         // single bare-append path (placeholders + `cause_id: None`; the handler resolves the
         // execution by name and its optional incarnation guard, ignoring which stream it lands on).
-        self.append_command(Command::TerminateExecution {
+        self.append_command(Command::TerminateExecution(TerminateExecution {
             name,
             uid,
             reason: TerminationReason::Cancelled,
-        })
+        }))
         .await
     }
 
@@ -487,11 +490,11 @@ impl EngineInner {
                 format!("flow {name} already exists"),
             )));
         }
-        self.append_command(Command::CreateFlow {
+        self.append_command(Command::CreateFlow(CreateFlow {
             request_id,
             name,
             definition: definition.to_owned(),
-        })
+        }))
         .await
     }
 
@@ -505,11 +508,11 @@ impl EngineInner {
         error: ExecutionError,
     ) -> Result<(), ExecutionError> {
         let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
-        self.append_command(Command::FailTask {
+        self.append_command(Command::FailTask(FailTask {
             task: task_ref,
             worker_id: worker_id.to_string(),
             error,
-        })
+        }))
         .await
     }
 
@@ -524,12 +527,12 @@ impl EngineInner {
         output: serde_json::Value,
     ) -> Result<(), ExecutionError> {
         let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
-        self.append_command(Command::CompleteTask {
+        self.append_command(Command::CompleteTask(CompleteTask {
             request_id,
             task: task_ref,
             worker_id: worker_id.to_string(),
             output,
-        })
+        }))
         .await
     }
 
@@ -553,12 +556,12 @@ impl EngineInner {
                 format!("execution {name} already exists"),
             )));
         }
-        self.append_command(Command::CreateExecution {
+        self.append_command(Command::CreateExecution(CreateExecution {
             request_id,
             name,
             flow_version,
             input,
-        })
+        }))
         .await
     }
 
@@ -574,13 +577,13 @@ impl EngineInner {
         max_tasks: usize,
         lease_seconds: u64,
     ) -> Result<(), ExecutionError> {
-        self.append_command(Command::ClaimTasks {
+        self.append_command(Command::ClaimTasks(ClaimTasks {
             request_id,
             worker_id: worker_id.to_string(),
             resource: resource.to_string(),
             max_tasks,
             lease_seconds,
-        })
+        }))
         .await
     }
 }

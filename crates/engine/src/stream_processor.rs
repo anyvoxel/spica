@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -8,105 +7,52 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::TaskStatus;
-use crate::handler::CommandHandler;
-use crate::handlers::{
-    ActivateStateHandler, ActivateTaskHandler, CancelTaskHandler, CancelTimerHandler,
-    ClaimTasksHandler, CompleteExecutionHandler, CompleteStateHandler, CompleteTaskHandler,
-    CompleteThreadHandler, ContinueCompleteHandler, ContinueTerminateHandler,
-    CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, ReleaseTaskLeaseHandler,
-    SpawnThreadHandler, TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler,
-    TriggerTimerHandler,
-};
+use crate::follower::Follower;
 use crate::hook::Hook;
 use crate::leader::Leader;
 use crate::log::{Entry, EntryPayload, LogStream, Timestamp};
-use crate::processing::{ProcessingHandles, ProcessingStateMachine, Role};
+use crate::processing::{ProcessingHandles, StateMachine};
 use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
+use crate::types::event::{
+    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
+    TaskFailed, TasksClaimed, VariablesAssigned,
+};
 use crate::types::id::{EntryId, StreamId};
 use crate::types::reject::Reject;
 
-/// Registers one or more [`CommandHandler`]s into a `Discriminant<Command>` dispatch map.
-///
-/// Each handler knows which [`Command`] variant it serves via [`CommandHandler::command`], which
-/// returns that variant as a `Default` placeholder (used only to read its discriminant — real
-/// commands are built by the state handlers). The handler type is therefore the single source of
-/// truth for its own key; there is no hand-written placeholder to keep in sync. `$handler` is
-/// captured as a `path` so it can serve both as a type (`<… as CommandHandler>`) and as a
-/// `Default`-constructible value (`<$handler>::default()`).
-///
-/// Recursive: `command_handler_entry!` handles the first handler and recurses into the
-/// `command_handler_entry!`-rest form; the tail emits nothing. The map key type is fixed by the
-/// map's declared type, so the macro doesn't need to name `Command`.
-macro_rules! command_handler_entry {
-    // A single entry: derive the key from the handler's own `command()`, then recurse on the rest.
-    ($map:expr, $handler:path $(, $rest:path)*) => {{
-        let sample = <$handler as CommandHandler>::command(&<$handler>::default());
-        $map.insert(std::mem::discriminant(&sample), Box::new(<$handler>::default()));
-        command_handler_entry!($map $(, $rest)*);
-    }};
-    ($map:expr) => {};
-}
-
 /// The **driver** of a single execution log: tails a [`LogStream`], routes each [`Entry`] by its
 /// [`EntryPayload`], appends produced entries back to the log, and emits the execution trace — but
-/// branches on the installed [`ProcessingStateMachine`] role (Zeebe's `ProcessingStateMachine` /
-/// `LeaderStateMachine` split) into a **leader** loop (write path: dispatch Commands, eager-apply
-/// them, deliver acks, skip its own read-back) or a **follower** loop (replicate-only: fold each
-/// batch into one held transaction, commit it atomically at its Noop).
+/// selects on the installed [`StateMachine`](crate::processing::StateMachine) role (Zeebe's
+/// `ProcessingStateMachine` / `LeaderStateMachine` split) into a **leader** loop (write path: dispatch
+/// Commands, eager-apply them, deliver acks, skip its own read-back) or a **follower** loop
+/// (replicate-only: fold each batch into one held transaction, commit it atomically at its Noop).
 ///
 /// The driver owns **every** transaction: it opens a [`StorageTxn`](crate::storage::StorageTxn) for a
 /// produced batch (leader) or an entire replicated batch (follower — opened at the first Event, held
 /// across the siblings, committed at the Noop), hands it to the role to fold into, and commits the
-/// returned watermark — only the driver, as the `Box` owner, may call
-/// [`StorageTxn::commit`](crate::storage::StorageTxn::commit). A `Follower` plugs into the same box,
-/// which is what a distributed deployment needs for failover. All the shared plumbing — reading /
-/// resuming the tail, appending, routing by variant, tracing — stays here, role-independent.
+/// returned watermark — only the driver, as the transaction's owner, may call
+/// [`StorageTxn::commit`](crate::storage::StorageTxn::commit). The `StateMachine` role selector is
+/// what a distributed deployment needs for failover. All the shared plumbing — reading / resuming the
+/// tail, appending, routing by variant, tracing — stays here, role-independent.
 ///
 /// Named *stream* processor (after the stream/ledger-processing role in CCES) to disambiguate it from
-/// future fan-out/worker types and from per-state [`CommandHandler`]s.
+/// future fan-out/worker types and from per-state command handlers.
 pub struct StreamProcessor {
     /// The installed processing role (a [`Leader`] in M1; `TODO(multi-node)` a `Follower`). The
-    /// driver branches on [`ProcessingStateMachine::role`] to pick its loop (`run_leader` /
+    /// driver matches on the [`StateMachine`] variant to pick its loop (`run_leader` /
     /// `run_follower`).
-    state_machine: Box<dyn ProcessingStateMachine>,
+    state_machine: StateMachine,
 }
 
 impl StreamProcessor {
-    /// Build a fresh StreamProcessor with the empty per-variant handler table, installed as a
-    /// [`Leader`] — the single-node default role.
+    /// Build a fresh StreamProcessor with an empty handler table, installed as a [`Leader`] — the
+    /// single-node default role. Command dispatch is a single exhaustive match (see
+    /// [`dispatch_command`](crate::handlers::dispatch_command)); no table is built.
     pub fn new() -> Self {
-        let mut handlers: HashMap<
-            std::mem::Discriminant<Command>,
-            Box<dyn crate::handler::CommandHandler + Send + Sync>,
-        > = HashMap::new();
-        command_handler_entry!(
-            handlers,
-            CreateFlowHandler,
-            CreateExecutionHandler,
-            CompleteExecutionHandler,
-            CompleteThreadHandler,
-            ContinueCompleteHandler,
-            ContinueTerminateHandler,
-            TerminateExecutionHandler,
-            ActivateStateHandler,
-            CompleteStateHandler,
-            TerminateStateHandler,
-            TriggerTimerHandler,
-            CancelTimerHandler,
-            ActivateTaskHandler,
-            ClaimTasksHandler,
-            CompleteTaskHandler,
-            FailTaskHandler,
-            ReleaseTaskLeaseHandler,
-            CancelTaskHandler,
-            SpawnThreadHandler,
-            TerminateThreadHandler
-        );
         StreamProcessor {
-            state_machine: Box::new(Leader::new(handlers)),
+            state_machine: StateMachine::Leader(Leader::new()),
         }
     }
 
@@ -154,7 +100,7 @@ impl StreamProcessor {
     ) -> Result<(), ExecutionError> {
         let handles = ProcessingHandles { storage, hook };
         tracing::debug!(
-            role = ?self.state_machine.role(),
+            role = self.state_machine.label(),
             "processing role installed"
         );
 
@@ -170,31 +116,30 @@ impl StreamProcessor {
             .last_processed_position()
             .await?;
         debug!(watermark, "resuming log stream");
-        self.state_machine.set_resume_position(watermark);
 
-        // Two per-role loops (`run_leader` / `run_follower`): the driver (not the role) opens and
-        // commits every transaction, because it alone owns the `Box<dyn StorageTxn>` and thus the
-        // only permitted `commit` (see `Storage::begin_txn`).
-        match self.state_machine.role() {
-            Role::Leader => {
+        // Select the per-role loop (`run_leader` / `run_follower`) and own every transaction from
+        // here out: the driver (not the role) opens and commits each, because it alone owns the
+        // `Box<dyn StorageTxn>` and thus the only permitted `commit` (see `Storage::begin_txn`).
+        match &mut self.state_machine {
+            StateMachine::Leader(leader) => {
+                leader.set_resume_position(watermark);
                 // Single-node recovery: fold any crash-residual batches (durably appended but not
                 // yet applied before the crash) above the watermark, **before** tailing. This is the
                 // only place the leader folds Events outside production; after it, every Event
                 // `run_leader` reads back is at/below the advanced watermark, so the loop never folds
                 // Events (its Event arm is a pure skip). Resuming from `w + 1` (the last durable
                 // Noop) picks up exactly where recovery left off.
-                let w = self.recover_leader(logstream, &handles, watermark).await?;
-                self.state_machine.set_resume_position(w);
+                let w = Self::recover_leader(leader, logstream, &handles, watermark).await?;
+                leader.set_resume_position(w);
                 let mut stream = logstream.stream_read(EntryId::new(w + 1));
-                self.run_leader(&handles, &mut stream, logstream, cancel)
-                    .await
+                Self::run_leader(leader, &handles, &mut stream, logstream, cancel).await
             }
-            Role::Follower => {
+            StateMachine::Follower(follower) => {
+                follower.set_resume_position(watermark);
                 // A follower never produces, so it has no residues to recover — it just starts
                 // tailing from the watermark and folds every replicated batch on read-back.
                 let mut stream = logstream.stream_read(EntryId::new(watermark + 1));
-                self.run_follower(&handles, &mut stream, logstream, cancel)
-                    .await
+                Self::run_follower(follower, &handles, &mut stream, logstream, cancel).await
             }
         }
     }
@@ -218,7 +163,7 @@ impl StreamProcessor {
     /// undelivered (c): the producing client may have left this node, so no `after_commit` — and on a
     /// fresh start the leader's deferred-ack queue is empty anyway.
     async fn recover_leader<L: LogStream<EntryPayload>>(
-        &mut self,
+        leader: &mut Leader,
         logstream: &L,
         handles: &ProcessingHandles,
         watermark: i64,
@@ -248,13 +193,12 @@ impl StreamProcessor {
                         inflight = Some(storage_guard.begin_txn()?);
                         drop(storage_guard); // txn is owned; no borrow left on the store
                     }
-                    // Fold into the held txn. The leader impl returns `Some(advanced)` (commit-now
-                    // semantics for its old read-back use); we ignore it and commit the whole batch
-                    // at its Noop instead, keeping the watermark on a batch boundary.
-                    self.state_machine
+                    // Fold into the held txn. The leader's `apply_event` returns `Some(advanced)`
+                    // (commit-now semantics for its old read-back use); we ignore it and commit the
+                    // whole batch at its Noop instead, keeping the watermark on a batch boundary.
+                    leader
                         .apply_event(
                             inflight.as_deref_mut().expect("opened at first event"),
-                            entry.entry_id,
                             entry.timestamp,
                             entry.cause_id,
                             &event,
@@ -312,7 +256,7 @@ impl StreamProcessor {
     /// read projection state, so holding it across dispatch would self-deadlock.
     #[instrument(skip_all)]
     async fn run_leader<L: LogStream<EntryPayload>>(
-        &mut self,
+        leader: &mut Leader,
         handles: &ProcessingHandles,
         stream: &mut Pin<Box<dyn Stream<Item = Entry> + Send + 'static>>,
         logstream: &L,
@@ -338,8 +282,7 @@ impl StreamProcessor {
                             ..
                         } => {
                             debug!(entry_id = %entry_id, command = ?command, "dispatching command");
-                            let produced = self
-                                .state_machine
+                            let produced = leader
                                 .process_command(entry_id, &command, handles)
                                 .await?;
                             debug!(entries = produced.entries.len(), "command produced entries");
@@ -361,9 +304,9 @@ impl StreamProcessor {
                                 // This is the single authoritative fold of the batch — no post-append
                                 // `apply_batch` re-fold exists on the live path.
                                 produced.work.commit(Some(last.get())).await?;
-                                self.state_machine.set_resume_position(last.get());
+                                leader.set_resume_position(last.get());
                                 // Post-commit: drain the deferred acks whose Event is now durable.
-                                self.state_machine.after_commit(handles).await;
+                                leader.after_commit(handles).await;
                             }
 
                             // Report durable rejections to the injected Hook. Rejections are decided at
@@ -395,7 +338,7 @@ impl StreamProcessor {
                             // `is_already_applied` only guards against a logic regression; folding is
                             // explicitly out of scope for the read-back arm.
                             debug_assert!(
-                                self.state_machine.is_already_applied(entry_id),
+                                leader.is_already_applied(entry_id),
                                 "leader read back an unapplied Event after recovery; not folding"
                             );
                             continue;
@@ -439,7 +382,7 @@ impl StreamProcessor {
     /// siblings applied (idempotent re-fold + one commit on restart).
     #[instrument(skip_all)]
     async fn run_follower<L: LogStream<EntryPayload>>(
-        &mut self,
+        follower: &mut Follower,
         handles: &ProcessingHandles,
         stream: &mut Pin<Box<dyn Stream<Item = Entry> + Send + 'static>>,
         _logstream: &L,
@@ -490,7 +433,7 @@ impl StreamProcessor {
                             }
                             // Fold this sibling into the held transaction; the follower returns `None`
                             // so nothing is committed until the batch's Noop rounds it off.
-                            self.state_machine
+                            follower
                                 .apply_event(
                                     inflight.as_deref_mut().expect("opened at first event"),
                                     entry_id,
@@ -513,8 +456,7 @@ impl StreamProcessor {
                                 debug!(entry_id = %entry_id, "follower noop without in-flight batch; skip");
                                 continue;
                             };
-                            let w = self
-                                .state_machine
+                            let w = follower
                                 .commit_at_noop(&mut *txn, entry_id, handles)
                                 .await?;
                             txn.commit(w)?;
@@ -549,13 +491,14 @@ impl StreamProcessor {
         storage: &S,
         cause_id: EntryId,
     ) -> Result<Vec<Entry>, ExecutionError> {
-        // `Any` downcast through the role seam: `dispatch` is leader-only, so reach the concrete
-        // `Leader` behind the boxed trait object.
-        let any: &mut dyn std::any::Any = &mut *self.state_machine;
-        let leader = any
-            .downcast_mut::<Leader>()
-            .expect("StreamProcessor::dispatch requires the leader role (M1's only role)");
-        leader.dispatch(command, storage, cause_id).await
+        // `dispatch` is leader-only: M1's only role is the leader, and only it produces entries (a
+        // follower has no dispatch to reach).
+        match &mut self.state_machine {
+            StateMachine::Leader(leader) => leader.dispatch(command, storage, cause_id).await,
+            StateMachine::Follower(_) => {
+                panic!("StreamProcessor::dispatch requires the leader role")
+            }
+        }
     }
 }
 
@@ -596,13 +539,13 @@ pub(crate) fn log_reject(reject: &Reject) {
 /// (activating/activated/completing/completed) and timers are `debug`; failures are `warn`.
 pub(crate) fn log_event(event: &Event) {
     match event {
-        Event::FlowCreated { flow, .. } => {
+        Event::FlowCreated(FlowCreated { flow, .. }) => {
             info!(
                 name = %flow.meta.name,
                 "flow created (brand-new name entered the system)"
             );
         }
-        Event::FlowVersionCreated { flow_version, .. } => {
+        Event::FlowVersionCreated(FlowVersionCreated { flow_version, .. }) => {
             info!(
                 flow_version = %flow_version.reference(),
                 name = ?flow_version.flow_name(),
@@ -610,7 +553,7 @@ pub(crate) fn log_event(event: &Event) {
                 "flow version created"
             );
         }
-        Event::ExecutionCreated { execution, .. } => {
+        Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
             info!(
                 execution = %execution.reference(),
                 input = %execution.input,
@@ -667,7 +610,7 @@ pub(crate) fn log_event(event: &Event) {
         Event::StateActivating { activity } => {
             info!(
                 activity = %activity.reference(),
-                state = %crate::handlers::state_name_from_path(activity.state_path.as_ptr()),
+                state = %activity.state_path.state_name(),
                 // `input` is pinned to Null on the entering event (the processed view lands only on
                 // `StateActivated`), so log the raw input — the meaningful value at this moment.
                 raw_input = %activity.raw_input,
@@ -736,10 +679,10 @@ pub(crate) fn log_event(event: &Event) {
                 "task activated"
             );
         }
-        Event::TasksClaimed {
+        Event::TasksClaimed(TasksClaimed {
             request_id: _,
             tasks,
-        } => {
+        }) => {
             debug!(
                 count = tasks.len(),
                 worker = ?tasks.first().and_then(|t| t.worker_id.as_deref()),
@@ -750,15 +693,15 @@ pub(crate) fn log_event(event: &Event) {
         Event::TaskLeaseExpired { task } => {
             debug!(task = %task.reference(), "task lease expired; re-queued");
         }
-        Event::TaskCompleted {
+        Event::TaskCompleted(TaskCompleted {
             request_id: _,
             task,
             output,
-        } => {
+        }) => {
             // A settled task (status Completed); `output` feeds the owning activity's raw_output.
             debug!(task = %task.reference(), output = %output, "task completed");
         }
-        Event::TaskFailed { task, error } => {
+        Event::TaskFailed(TaskFailed { task, error }) => {
             // The task entity's `status` distinguishes a scheduled retry (`Pending` — the task
             // re-queues, claimable after `next_available_at`) from a terminal failure (`Failed`).
             if task.status == TaskStatus::Pending {
@@ -776,11 +719,11 @@ pub(crate) fn log_event(event: &Event) {
         Event::TaskCancelled { task } => {
             debug!(task = %task.reference(), "task cancelled");
         }
-        Event::VariablesAssigned { variables, .. } => {
+        Event::VariablesAssigned(VariablesAssigned { variables, .. }) => {
             let keys: Vec<&String> = variables.keys().collect();
             debug!(keys = ?keys, "variables assigned");
         }
-        Event::StateTransitioned { activity, next, .. } => {
+        Event::StateTransitioned(StateTransitioned { activity, next, .. }) => {
             info!(activity = %activity, next = %next, "state routed to next");
         }
     }
@@ -799,7 +742,7 @@ mod tests {
     use crate::storage::{
         ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     };
-    use crate::types::command::Command;
+    use crate::types::command::CreateFlow;
     use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
@@ -1091,14 +1034,16 @@ mod tests {
             hook: Arc::clone(&hook) as Arc<dyn Hook>,
         };
         let request_id = RequestId::new();
-        let cmd = Command::CreateFlow {
+        let cmd = Command::CreateFlow(CreateFlow {
             request_id,
             name: FlowName::new("flow").expect("literal name is valid"),
             definition: r#"{ "StartAt": "A", "States": { "A": { "Type": "Succeed" } } }"#
                 .to_string(),
+        });
+        let StateMachine::Leader(leader) = &mut sp.state_machine else {
+            panic!("test requires the leader role")
         };
-        let produced = sp
-            .state_machine
+        let produced = leader
             .process_command(EntryId::new(1), &cmd, &handles)
             .await
             .unwrap();
@@ -1108,15 +1053,15 @@ mod tests {
         );
         // The driver commits the working txn, then `after_commit` reports the batch's events.
         produced.work.commit(Some(1)).await.unwrap();
-        sp.state_machine.after_commit(&handles).await;
+        leader.after_commit(&handles).await;
         let applied = hook.applied.lock().unwrap();
         assert!(
             applied.iter().any(|ev| matches!(
                 ev,
-                Event::FlowVersionCreated {
+                Event::FlowVersionCreated(FlowVersionCreated {
                     request_id: r,
                     ..
-                } if *r == request_id
+                }) if *r == request_id
             )),
             "expected the echoed FlowVersionCreated to be reported, got {applied:?}"
         );
@@ -1127,7 +1072,7 @@ mod tests {
     fn flow_version_event() -> (Timestamp, Event) {
         (
             Timestamp::now(),
-            Event::FlowVersionCreated {
+            Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
                     meta: crate::types::meta::ObjectMeta::builder(
@@ -1150,7 +1095,7 @@ mod tests {
                     definition: String::new(),
                     checksum: FlowVersion::definition_checksum(""),
                 },
-            },
+            }),
         )
     }
 
@@ -1212,8 +1157,13 @@ mod tests {
         let h = handles(storage);
 
         let mut sp = StreamProcessor::new();
+        let StateMachine::Leader(leader) = &mut sp.state_machine else {
+            panic!("test requires the leader role")
+        };
         // Watermark 0 = the store has processed nothing; the residue at 1..=3 is all above it.
-        let w = sp.recover_leader(&log, &h, 0).await.unwrap();
+        let w = StreamProcessor::recover_leader(leader, &log, &h, 0)
+            .await
+            .unwrap();
 
         // Folded exactly once (one projection write committed), watermark on the batch's Noop.
         assert_eq!(w, 3, "recovery resumes from the last durable Noop");
@@ -1234,7 +1184,9 @@ mod tests {
 
         // The residue is now at/below the watermark, so a subsequent `recover_leader` with the
         // advanced watermark sees nothing above it to fold — a second pass is idempotent.
-        let w2 = sp.recover_leader(&log, &h, w).await.unwrap();
+        let w2 = StreamProcessor::recover_leader(leader, &log, &h, w)
+            .await
+            .unwrap();
         assert_eq!(w2, 3, "idempotent across restarts");
         assert_eq!(state.lock().unwrap().committed_writes, 2, "no double fold");
     }

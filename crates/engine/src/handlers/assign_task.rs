@@ -1,13 +1,12 @@
-use async_trait::async_trait;
 use std::time::Duration;
 
 use super::emit_timer;
 use crate::Task;
 use crate::TaskStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::{Command, TimerPurpose};
-use crate::types::event::Event;
+use crate::types::command::{ClaimTasks, TimerPurpose};
+use crate::types::event::{Event, TasksClaimed};
 use crate::types::meta::{ObjectKind, ObjectReference};
 
 /// Handles `ClaimTasks` — the durable claim behind `TaskApi::poll_tasks` (Zeebe `ActivateJobs`).
@@ -28,41 +27,30 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 #[derive(Default)]
 pub struct ClaimTasksHandler;
 
-#[async_trait]
-impl CommandHandler for ClaimTasksHandler {
-    fn command(&self) -> Command {
-        Command::ClaimTasks {
-            request_id: crate::types::id::RequestId::nil(),
-            worker_id: String::new(),
-            resource: String::new(),
-            max_tasks: 0,
-            lease_seconds: 0,
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::ClaimTasks {
+impl ClaimTasksHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &ClaimTasks,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let ClaimTasks {
             request_id,
             worker_id,
             resource,
             max_tasks,
             lease_seconds,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
         // Lease horizon: `now + lease_seconds`, persisted as the absolute deadline so the paired
         // `DeliveryLease` timer (and a restarted engine) reconstruct the same window; a `None` on
         // overflow means we grant an empty set (a defensively-clamped `now` lease would fire
         // immediately — absurd for a pull).
         let Some(lease_until) = Timestamp::now().checked_add(Duration::from_secs(*lease_seconds))
         else {
-            out.emit_event(Event::TasksClaimed {
+            out.append_event(Event::TasksClaimed(TasksClaimed {
                 request_id: *request_id,
                 tasks: Vec::new(),
-            })
+            }))
             .await;
             return;
         };
@@ -73,10 +61,10 @@ impl CommandHandler for ClaimTasksHandler {
             // Discovery is a read; a failure here leaves the pull with nothing granted — the empty
             // debt is still answered, rather than failing the whole worker loop.
             Err(_) => {
-                out.emit_event(Event::TasksClaimed {
+                out.append_event(Event::TasksClaimed(TasksClaimed {
                     request_id: *request_id,
                     tasks: Vec::new(),
-                })
+                }))
                 .await;
                 return;
             }
@@ -116,10 +104,10 @@ impl CommandHandler for ClaimTasksHandler {
         // One batched claim fact for the whole poll — every appended `ClaimTasks` answers its awaiting
         // caller with a durable `TasksClaimed` (all entries share this single causal batch; the
         // per-task lease timers above are their own arming facts).
-        out.emit_event(Event::TasksClaimed {
+        out.append_event(Event::TasksClaimed(TasksClaimed {
             request_id: *request_id,
             tasks: claimed,
-        })
+        }))
         .await;
     }
 }

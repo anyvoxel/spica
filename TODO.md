@@ -237,3 +237,76 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 - 单节点:spica 本地 commit == durable,没有 ahead,三级读自然退化为一级,以上全部不适用。
 - 若 multi-node 采用链式方案:**「外部读 = base-only」由结构天然成立**(base ≡ 已提交),只需守住「Speculative 读的结果不得直接外发、必先转成 log 命令并 commit-gated」这一条纪律;这比 Zeebe「靠 exporter 另读模型」更省。
 - 若采用 Zeebe 原案(投影先进 DB):则外部一致视图必须复刻这三级读 + exporter committed 读模型,并接受「直接只读 API」这个坑(参照 QueryApi 被弃用)。
+
+## `fail_or!` / `terminate` 把错误通道压平:`InfraError` 被落成持久终止,领域错误绕过 Catch
+
+**状态:** 已识别,待设计收敛后再动手(不要未经评审直接改)。已从 camunda/camunda 源码(`ProcessingStateMachine`)走读确认 Zeebe 的分通道做法。
+
+### 问题
+
+`fail_or!`(crates/engine/src/handlers/mod.rs:5-15)把**一切 `Err` 一律定义为 `terminate`**(TerminateState+TerminateExecution,持久决议)+ `return`;散布在 22 处 `fail_or!` + 21 处 `.terminate()`。这把 Zeebe 用不同通道区分的四类错误塌缩成一个动作,「该重试 / 该 reject / 该 panic / 该终止」无法表达:
+
+| spica 错误 | Zeebe 对应 | 本应走的通道 | 现状 |
+|---|---|---|---|
+| `ExecutionError::Infra(InfraError::Log)`(瞬时 log/storage 故障) | `RecoverableException` | **重试**,不推进位置 | ❌ 被 `terminate` 落成持久终止 — **真 bug** |
+| `Runtime(RuntimeError)`(Jsonata/StateNotFound/StateFailed/TimedOut) | 领域 error-record + `Catch`/`Retry` 拦截 | 拦截不到才终止 | ⚠️ 被 `terminate` 绕过 Catch 直接终止 — **粒度过重** |
+| `Rejected(Reject)`(命令前置失败) | `COMMAND_REJECTION` | **reject** | ⚠️ 语义与 terminate 混用 |
+| 引擎不变量「不可能发生」 | 自举失败 | **panic** | ⚠️ 部分仍 terminate(已修 3 处 `create==None`) |
+
+- **自相矛盾的证据**:`crates/engine/src/types/error.rs` 对 `InfraError` 的注释自己写明应 "bubble … to the bug-facing config/retry path",而 `fail_or!` 却把它 terminate。
+- **Class A(真错,瞬时可重试被落成终止)——已核实会透出 `InfraError` 的位点**:
+  - `ctx.machine(...)`/`machine_for_scope(...)`:内部 `get_flow_version(...).await?`(handler.rs:239-243)透传存储读失败的 `InfraError` → `create_execution.rs:65`、`activate_state.rs:60`、`complete_state.rs:168`。
+  - `load_scope_ref(...)` 的 `Err(e)` 分支:`activate_state.rs:56`(最初发现处)、`state_handler.rs:207` 等。
+- **Class B(方向对、粒度过重)**:`fail_or!(evaluate...)` 返回 `RuntimeError::Jsonata`(pass/wait/task/choice/parallel/map/succeed/fail 等十余处),以及 `resolve_state_*` 的 `StateNotFound`/`InvalidDefinition` —— 这些本应先进 ASL `Retry`/`Catch` 按 `error_name` 拦截,现在被 `fail_or!` 无条件升级成终止。
+- **Class C(反了,该 panic)**:`complete_state.rs:124` 的 `InvalidDefinition("activity parent must be a scope")` 是对引擎结构假设的断言,应 `unreachable!` 而非 terminate。
+
+### 候选方案(已分析,未定案;建议分三小步收敛)
+
+核心:**把错误类一路保留到决策点,拆开 `fail_or!`/terminate 通道**,而非逐个改 43 处:
+
+1. **先盘点**:单独列一份「能透出 `InfraError` 的所有位点」清单(Class A),作为最小闭合块。
+2. **设计重试通道**:让 handler 层的可重试错误不是 `terminate`,而是「不产出 entries / 不推进位置 / 上交驱动」。驱动侧复用已有不变量——`CommandProcessed { entries, work }` 只在 append 成功后提交、失败 drop 回滚(processing.rs)——即 Zeebe 「提交才推进、失败重放同一条 command」的对应(可参考 `PROCESSING_RETRY_DELAY` 250ms + actor 一次性定时器的节奏)。
+3. **Catch 提到 terminate 前(Class B)**:领域错误先按 `error_name` 走 `Retry`/`Catch` 拦截,仅拦截不到才终止;同时把 `complete_state.rs:124` 这类结构断言改 `unreachable!`。
+
+### 注意
+
+- 判定每处到底「重试 / 拦截 / panic / 终止」,**依据是 `Err` 携带的 `ExecutionError` 变体**,不是调用点位置;`evaluate`/`resolve_state_*` 只返回 `RuntimeError`(永久),只有包了存储读取的 `machine*`/`load_scope_ref*` 才会透出 `InfraError`(瞬时)——这一步是清单的关键判据。
+- 未评估 `terminate` 现是否会先被某处的 Catch 消费;若引入重试通道,须保证「重试」不破坏 at-least-once(重放条目须幂等,与 ReleaseTaskLease 的幂等契约同一原则)。
+- TODO 内联注释系统(crates/engine/src/handlers/activate_state.rs:38 的 Scope/reject/retry 批注)与本条目同源,落地时一并收敛。
+
+## (设计参考)Reject / Incident / Resolve / SetVariables —— 引擎「不可遵循的命令」与「可恢复的暂停」如何分工、恢复
+
+**状态:** 设计参考,已从 camunda/camunda 源码走读消化;**spica 目前只有 Reject 半边,Incident/Resolve/SetVariables 未落地**。触发条件 = 需要「外部人工干预后让卡住的执行继续前进」的场景时再评估。
+
+### 三个概念的分工(先厘清,避免混淆)
+
+| | Reject(拒绝) | Incident(事件/钉住) | 外部变量修正 + Resolve(恢复) |
+|---|---|---|---|
+| 语义 | **命令自身不能被遵循**(前置不满足):被拒命令被丢弃,**引擎不再推进**,不产生事件投影 | **已接受的执行在某个转换处失败**,元素**暂停在原地(停在"ing"态)**,等外部干预 | 操作者**先修正外部条件,再发 `RESOLVE` 重试**那条失败的转换 |
+| 与 spica 现状 | ✅ `Reject` + `RejectionType` 已落地(types/reject.rs,COMMAND_REJECTION 的 CCES 对应) | ❌ 无 incident 实体 / `IncidentIntent` | ❌ 无 `Resolve` 命令、无运行期 `SetVariables`(只有定案期 `Assign`) |
+| 引擎侧是否重试 | **否**,reject 是终态(客户端收到 `COMMAND_REJECTION` 响应,自己决定怎么办) | **不确定**,等 `RESOLVE` 到来自行触发重放 | 是:`RESOLVE` 处理器按元素当前状态**反推并重发那条失败命令**,用新变量重算 |
+| 持久性 | `COMMAND_REJECTION` record,不进 state | `IncidentIntent.CREATED` 事件进 state,绑 processInstanceKey/elementInstanceKey/variableScopeKey/errorType/errorMessage | 失败命令以 `RetryTypedRecord` 重新入队重放 |
+
+### Zeebe 的失败→恢复链路(走读确认)
+
+1. **求值失败落入 incident,且分错误类型**:输入/变量映射失败 = `ErrorType.IO_MAPPING_ERROR`(`BpmnVariableMappingBehavior`);分支条件失败 = `CONDITION_ERROR`。这类可恢复领域错误走 `createIncident`(`BpmnStreamProcessor` 在 `afterActivating`/`onComplete` 的失败臂调 `incidentBehavior.createIncident(...)`,`IncidentIntent.CREATED`),**而不是 reject**。
+2. **元素停在"ing"态**:`ACTIVATE_ELEMENT`/`COMPLETE_ELEMENT` 的转换**没提交**,元素悬在 `ELEMENT_ACTIVATING`/`ELEMENT_COMPLETING`,等 `RESOLVE` 重来。
+3. **恢复顺序(关键):先改变量,再 RESOLVE**。操作者先通过 `SetVariables` 命令(`BrokerSetVariablesRequest`,写 `VariableIntent.UPDATED`)修正作用域变量;再发 `RESOLVE`。`IncidentResolveProcessor` 按当前状态反推要重发的命令:
+   ```java
+   case ELEMENT_ACTIVATING  -> ACTIVATE_ELEMENT;
+   case ELEMENT_COMPLETING  -> COMPLETE_ELEMENT;  // 多半是这条
+   case ELEMENT_TERMINATING -> TERMINATE_ELEMENT;
+   ```
+   (`IncidentResolveProcessor.java` 约 296–298 行,`RetryTypedRecord`)重发后**用当前(已修正)变量重新执行映射求值**,通过则元素继续走,随后 `IncidentIntent.RESOLVED` 收尾。
+4. **顺序颠倒的后果**:不改变量直接 `RESOLVE`,重放仍用旧变量、仍失败 → **又创建一个新 incident**,不会前进。因此 `RESOLVE` 只是"我已经修好了,请重试",引擎侧不做任何补齐。
+
+### 与既有 TODO 的联动
+
+- 与「`fail_or!` / `terminate` 把错误通道压平」条目同源互补:那条讲的是**把错误正确地分类**(重试 / 拦截 / panic / 终止);本条目讲的是**分类成 incident 之后如何恢复**(SetVariables + Resolve)。若落地 incident,`fail_or!` 的第一个分叉点应把「可恢复的领域求值失败(RuntimeError)」优先导向 createIncident(暂停 + 等 Resolve),而不是一律 terminate。
+
+### 注意(落地时须保留)
+
+- 分辨「reject vs incident」的判据是**已接受的执行 vs 尚未接受的命令**:`Reject` 拒绝的是"命令我不会执行";`Incident` 暂停的是"已执行的转换我卡住了"。二者分层不同,互不替代。
+- incident 必须持久(进 state),才能跨重启保留、才能让 `RESOLVE` 按元素状态重放;这与 spica 目前「Reject 不进 projection」是**有意为之**的差异。
+- 若引入运行期 `SetVariables`,需与定案期 `Assign` 明确作用域语义(SetVariables 用 `variableScopeKey` 定位,Assign 只写当前 activity 的 owner scope),避免两套写变量入口语义漂移。
+- `RESOLVE` 重放的是原命令,**必须幂等**(重放条目不得重复入账),与 `ReleaseTaskLease` 的幂等契约同一原则(at-least-once 安全)。

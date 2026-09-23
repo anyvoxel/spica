@@ -7,14 +7,14 @@ mod succeed;
 mod task;
 mod wait;
 
-pub use choice::ChoiceStateHandler;
-pub use fail::FailStateHandler;
-pub use map::MapStateHandler;
-pub use parallel::ParallelStateHandler;
-pub use pass::PassStateHandler;
-pub use succeed::SucceedStateHandler;
-pub use task::TaskStateHandler;
-pub use wait::WaitStateHandler;
+pub use choice::ChoiceStateHandlerFactory;
+pub use fail::FailStateHandlerFactory;
+pub use map::MapStateHandlerFactory;
+pub use parallel::ParallelStateHandlerFactory;
+pub use pass::PassStateHandlerFactory;
+pub use succeed::SucceedStateHandlerFactory;
+pub use task::TaskStateHandlerFactory;
+pub use wait::WaitStateHandlerFactory;
 
 // TODO(Map): M3 `Map` is implemented (activate → first batch fan-out → per-settle `child_completed`
 // replenish → converge/fail). Deferred: `ItemSelector` (per-item `$states.context.Map.Item`

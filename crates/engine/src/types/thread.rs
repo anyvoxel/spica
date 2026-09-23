@@ -4,6 +4,7 @@ use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::state_path::StatePath;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
 /// `Map` item executes.
@@ -86,17 +87,23 @@ pub struct Thread {
     pub execution: ObjectReference,
     /// A JSON Pointer (RFC 6901) into the single shared `StateMachine` document locating this
     /// thread's sub-`states` table, e.g. `/states/P1/branches/0/states/P2/item_processor/states`.
-    /// **Always present** — a thread's defining property is that it runs a non-top-level portion of
-    /// the shared machine, and `resolve_states_map` walks this pointer to resolve its states without
-    /// copying any definition. (This is the field that used to be `Option` on `Execution`; for a
-    /// `Thread` it is unconditional.)
-    pub state_path: jsonptr::PointerBuf,
+    /// **Always present** — a thread's defining property is that it runs a portion of the shared
+    /// machine, and `resolve_states_map` walks this pointer to resolve its states without copying
+    /// any definition. (This is the field that used to be `Option` on `Execution`; for a `Thread`
+    /// it is unconditional.) A **root** thread — the one an `Execution` derives to run its top-level
+    /// states — carries the empty pointer `/`, which `resolve_states_map` resolves back to the
+    /// machine's top-level `states`, so a root thread and a fan-out thread share one resolution path
+    /// rather than Execution's former `None` (top-level) special case.
+    pub state_path: StatePath,
     /// This thread's **ordinal** within its container Activity — the `Parallel` branch index or the
     /// `Map` item index (0-based, in declaration order). Part of the thread's own identity: a thread
     /// *is* "the i-th branch/item of its container", so the index lives here on the entity, and the
     /// container's ordered fan-out map is projected from it (see the `ThreadCreated` applier) — the
     /// container never re-derives or duplicates the ordinal. Always present: a thread exists only as
-    /// a fan-out child, so it never lacks an index.
+    /// a fan-out child, so it never lacks an index. A **root** thread stands in for a whole top-level
+    /// run, not a fan-out child, so its index is a harmless fixed `0` placeholder — the `ThreadCreated`
+    /// applier only folds the index into a container's ordered map when the owner is an Activity, and
+    /// a root thread's owner is its Execution, so the placeholder is never aggregated.
     pub index: usize,
     pub status: ThreadStatus,
     /// The original input this thread received (a `Parallel` branch's projected `Arguments`, or a

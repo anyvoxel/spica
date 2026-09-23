@@ -1,9 +1,7 @@
-use async_trait::async_trait;
-
 use crate::TimerStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
+use crate::handler::{Collector, HandlerContext};
 use crate::types::event::Event;
+use crate::types::meta::ObjectReference;
 
 /// Handles `CancelTimer`: marks an armed timer cancelled. Idempotent — a no-op for a timer that
 /// already fired or was already cancelled. After recording the timer's terminal state, runs the
@@ -12,20 +10,13 @@ use crate::types::event::Event;
 #[derive(Default)]
 pub struct CancelTimerHandler;
 
-#[async_trait]
-impl CommandHandler for CancelTimerHandler {
-    fn command(&self) -> Command {
-        Command::CancelTimer {
-            timer: crate::types::meta::ObjectReference::nil(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CancelTimer { timer } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl CancelTimerHandler {
+    pub(crate) async fn handle(
+        &self,
+        timer: &ObjectReference,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
         let act = match ctx.storage.get_timer(timer).await {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => return,
@@ -33,7 +24,7 @@ impl CommandHandler for CancelTimerHandler {
         if act.value.status != TimerStatus::Active {
             return; // already finished; duplicate cancel is a no-op.
         }
-        out.emit_event(Event::TimerCancelled {
+        out.append_event(Event::TimerCancelled {
             timer: crate::Timer {
                 execution: act.value.execution.clone(),
                 purpose: act.value.purpose,

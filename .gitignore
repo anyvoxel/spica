@@ -35,3 +35,6 @@ go.work.sum
 # Added by cargo
 
 /target
+
+# Third-party reference source (Zeebe) downloaded for offline analysis
+/third_party/

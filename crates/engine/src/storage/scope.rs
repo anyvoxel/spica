@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::state_path::StatePath;
 use crate::types::variables::Variables;
 use crate::{ExecutionRecord, ThreadRecord};
 
@@ -41,7 +42,7 @@ impl ScopeRecord {
     /// The JSON Pointer to this scope's sub-`states` table: `Some` for a `Thread` (its defining
     /// property — it always descends into the shared machine), `None` for a top-level `Execution`
     /// (it resolves against the machine's top-level `states`).
-    pub fn state_path(&self) -> Option<&jsonptr::PointerBuf> {
+    pub fn state_path(&self) -> Option<&StatePath> {
         match self {
             ScopeRecord::Execution(_) => None,
             ScopeRecord::Thread(t) => Some(&t.value.state_path),
