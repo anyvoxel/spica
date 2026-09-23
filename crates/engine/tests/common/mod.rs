@@ -20,9 +20,11 @@ use spica_client::worker::{
     TaskHandler, TaskService,
 };
 use spica_engine::{
-    ActivatedTask, Command, Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution,
-    ExecutionError, FlowName, Hook, LogStream, ObjectKind, ObjectName, ObjectReference, PlainName,
-    Reject, RequestId, RuntimeError, StreamId, Task, Timestamp,
+    ActivatedTask, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow, Engine,
+    EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
+    ExecutionError, FailTask, FlowName, FlowVersionCreated, Hook, LogStream, ObjectKind,
+    ObjectName, ObjectReference, PlainName, Reject, RequestId, RuntimeError, StreamId, Task,
+    TaskCompleted, TasksClaimed, Timestamp,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -157,14 +159,14 @@ pub async fn submit_seed(
             entry_id: EntryId::nil(),   // placeholder — the log assigns the position on append.
             cause_id: None,
             timestamp: Timestamp::now(),
-            payload: EntryPayload::Command(Command::CreateExecution {
+            payload: EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 // Seed is fire-and-forget: nothing awaits this execution's terminal ack, so we mint
                 // a throwaway request id (no registry entry routes to it).
                 request_id: RequestId::new(),
                 name,
                 flow_version,
                 input,
-            }),
+            })),
         }])
         .await?;
     Ok(())
@@ -299,16 +301,18 @@ impl AckHook {
     /// outcome. `FlowCreated` (same `CreateFlow` request_id) is deliberately not an awaited target.
     fn resolves(event: &Event) -> Option<(RequestId, AckTarget)> {
         match event {
-            Event::FlowVersionCreated { request_id, .. } => {
+            Event::FlowVersionCreated(FlowVersionCreated { request_id, .. }) => {
                 Some((*request_id, AckTarget::FlowVersionCreated))
             }
-            Event::ExecutionCreated { request_id, .. } => {
+            Event::ExecutionCreated(ExecutionCreated { request_id, .. }) => {
                 Some((*request_id, AckTarget::ExecutionCreated))
             }
-            Event::TaskCompleted { request_id, .. } => {
+            Event::TaskCompleted(TaskCompleted { request_id, .. }) => {
                 Some((*request_id, AckTarget::TaskCompleted))
             }
-            Event::TasksClaimed { request_id, .. } => Some((*request_id, AckTarget::Grant)),
+            Event::TasksClaimed(TasksClaimed { request_id, .. }) => {
+                Some((*request_id, AckTarget::Grant))
+            }
             _ => None,
         }
     }
@@ -343,7 +347,9 @@ impl Hook for AckHook {
         // Applied. A Grant target only ever aligns with a `TasksClaimed`.
         let outcome = match target {
             AckTarget::Grant => match event {
-                Event::TasksClaimed { tasks, .. } => AckOutcome::Granted(Self::granted_from(tasks)),
+                Event::TasksClaimed(TasksClaimed { tasks, .. }) => {
+                    AckOutcome::Granted(Self::granted_from(tasks))
+                }
                 _ => return,
             },
             _ => AckOutcome::Applied(Box::new(event.clone())),
@@ -544,17 +550,17 @@ impl LocalClient {
             .register(request_id, AckTarget::FlowVersionCreated)
             .await;
         self.engine
-            .append_command(Command::CreateFlow {
+            .append_command(Command::CreateFlow(CreateFlow {
                 request_id,
                 name: name.clone(),
                 definition: definition.to_owned(),
-            })
+            }))
             .await?;
         let event = match Self::await_event(rx).await {
             Ok(ev) => *ev,
             Err(failure) => return Err(Self::ack_failure_error(failure)),
         };
-        let Event::FlowVersionCreated { flow_version, .. } = event else {
+        let Event::FlowVersionCreated(FlowVersionCreated { flow_version, .. }) = event else {
             unreachable!(
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
@@ -586,19 +592,21 @@ impl LocalClient {
             .register(request_id, AckTarget::ExecutionCreated)
             .await;
         self.engine
-            .append_command(Command::CreateExecution {
+            .append_command(Command::CreateExecution(CreateExecution {
                 request_id,
                 name,
                 flow_version,
                 input,
-            })
+            }))
             .await?;
         let event = match Self::await_event(rx).await {
             Ok(ev) => *ev,
             Err(failure) => return Err(Self::ack_failure_error(failure)),
         };
         match event {
-            Event::ExecutionCreated { execution, .. } => Ok(execution.reference()),
+            Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
+                Ok(execution.reference())
+            }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }
     }
@@ -629,13 +637,13 @@ impl spica_engine::TaskApi for LocalClient {
         let request_id = RequestId::new();
         let rx = self.ack.register(request_id, AckTarget::Grant).await;
         self.engine
-            .append_command(Command::ClaimTasks {
+            .append_command(Command::ClaimTasks(ClaimTasks {
                 request_id,
                 worker_id: worker_id.to_string(),
                 resource: resource.to_string(),
                 max_tasks,
                 lease_seconds,
-            })
+            }))
             .await?;
         match Self::await_tasks(rx).await {
             Ok(tasks) => Ok(tasks),
@@ -656,12 +664,12 @@ impl spica_engine::TaskApi for LocalClient {
             .await;
         let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
         self.engine
-            .append_command(Command::CompleteTask {
+            .append_command(Command::CompleteTask(CompleteTask {
                 request_id,
                 task: task_ref,
                 worker_id: worker_id.to_string(),
                 output,
-            })
+            }))
             .await?;
         match Self::await_event(rx).await {
             Ok(_) => Ok(()),
@@ -677,11 +685,11 @@ impl spica_engine::TaskApi for LocalClient {
     ) -> Result<(), ExecutionError> {
         let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
         self.engine
-            .append_command(Command::FailTask {
+            .append_command(Command::FailTask(FailTask {
                 task: task_ref,
                 worker_id: worker_id.to_string(),
                 error,
-            })
+            }))
             .await
     }
 }

@@ -2,49 +2,21 @@
 //! descheduling is not folded here — a consumer re-derives `cancel` from the durable event via the
 //! injected `Hook`.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
+use crate::Timer;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
 
 use crate::TimerStatus;
 
 /// `TimerCancelled` folds the terminal status into Storage.
 #[derive(Default)]
 pub(crate) struct TimerCancelledApplier;
-#[async_trait]
-impl EventApplier for TimerCancelledApplier {
-    fn event(&self) -> Event {
-        Event::TimerCancelled {
-            timer: crate::Timer {
-                execution: crate::types::meta::ObjectReference::nil(),
-                purpose: crate::TimerPurpose::WaitResume,
-                status: TimerStatus::Cancelled,
-                deadline: crate::Timestamp::from_millis(0),
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Timer,
-                    ulid::Ulid::nil(),
-                )
-                .timestamps(
-                    crate::Timestamp::from_millis(0),
-                    crate::Timestamp::from_millis(0),
-                )
-                .build(),
-            },
-        }
-    }
-
-    async fn apply(
+impl TimerCancelledApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        timer: &Timer,
     ) -> Result<(), ExecutionError> {
-        let Event::TimerCancelled { timer } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
         if let Some(mut t) = ctx.storage.get_timer(&timer.reference()).await? {
             let parent = t
                 .value

@@ -1,10 +1,8 @@
-use async_trait::async_trait;
-
 use crate::RetryState;
 use crate::Task;
 use crate::TaskStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::ActivateTask;
 use crate::types::event::Event;
 
 /// The side-effect handler that invokes a `Task` state's `Resource`: emits only `TaskActivated`,
@@ -22,34 +20,22 @@ use crate::types::event::Event;
 #[derive(Default)]
 pub struct ActivateTaskHandler;
 
-#[async_trait]
-impl CommandHandler for ActivateTaskHandler {
-    fn command(&self) -> Command {
-        Command::ActivateTask {
-            execution: crate::types::meta::ObjectReference::nil(),
-            owner: crate::types::meta::ObjectReference::nil(),
-            task: crate::types::meta::ObjectReference::nil(),
-            resource: String::new(),
-            arguments: Default::default(),
-            retry_plan: Vec::new(),
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, _ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::ActivateTask {
+impl ActivateTaskHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &ActivateTask,
+        _ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let ActivateTask {
             execution,
             owner,
             task,
             resource,
             arguments,
             retry_plan,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
-        out.emit_event(Event::TaskActivated {
+        } = p;
+        out.append_event(Event::TaskActivated {
             task: Task {
                 // The execution anchor is carried from the command (finding #13), so the task is
                 // traceable to / nameable from its root run even in a branch.

@@ -1,47 +1,23 @@
 //! `FlowVersionCreated` event projection: folds a new flow version into Storage and advances the
 //! owning `Flow`'s `latest_version` counter.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
+use crate::types::event::FlowVersionCreated;
 use crate::types::flow::Flow;
 use crate::types::flow::FlowStatus;
-use crate::{ApplierContext, EventApplier};
 
 #[derive(Default)]
 pub(crate) struct FlowVersionCreatedApplier;
-#[async_trait]
-impl EventApplier for FlowVersionCreatedApplier {
-    fn event(&self) -> Event {
-        Event::FlowVersionCreated {
-            request_id: crate::types::id::RequestId::nil(),
-            flow_version: crate::types::flow_version::FlowVersion {
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::FlowVersion,
-                    ulid::Ulid::nil(),
-                )
-                .at(crate::log::Timestamp::from_millis(0))
-                .build(),
-                version: 0,
-                definition: String::new(),
-                checksum: crate::types::flow_version::FlowVersion::definition_checksum(""),
-            },
-        }
-    }
-
-    async fn apply(
+impl FlowVersionCreatedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &FlowVersionCreated,
     ) -> Result<(), ExecutionError> {
         // `request_id` is a routing-only correlation key (the awaiting caller's ack); the projection
         // only records the version + advances the flow pointer, so it is ignored here.
-        let Event::FlowVersionCreated { flow_version, .. } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        let FlowVersionCreated { flow_version, .. } = event;
 
         // Persist the version under its canonical object name (`{flow_name}-{version}`, executions
         // bind to its reference); the name-keyed row makes `flow_version_of` / a prefix scan resolve

@@ -8,8 +8,8 @@
 //! - [`Command`]s and [`Event`](crate::Event)s are appended to a durable, ordered
 //!   [`LogStream`]; each entry is causally linked (`cause_id`) to the Command that produced it,
 //!   and the Events + subsequent Commands produced by one Command are appended atomically.
-//! - A [`StreamProcessor`] reads entries in order: [`Command`]s are dispatched to [`CommandHandler`]s
-//!   (e.g. [`StateStreamProcessor`](crate::handlers)s), which produce more entries;
+//! - A [`StreamProcessor`] reads entries in order: [`Command`]s are dispatched exhaustively to their
+//!   typed handlers ([`handlers`](crate::handlers)), which produce more entries;
 //!   [`Event`](crate::Event)s are applied to [`Storage`] to materialize
 //!   [`Execution`]/[`Activity`] state.
 //! - [`Storage`] is a projection (fold) of the [`Event`](crate::Event) stream — any worker can
@@ -42,7 +42,7 @@
 //!   recovery path for the inline child-settled reaction over container (Map/Parallel) states;
 //!   `$states.context.StateMachine` stats.
 //!
-//! The CCES seams (LogStream/Storage/StreamProcessor/CommandHandler) are the foundation a distributed
+//! The CCES seams (LogStream/Storage/StreamProcessor) are the foundation a distributed
 //! deployment implements.
 //!
 //! ## Known limitation
@@ -67,9 +67,9 @@ mod task_api;
 mod types;
 mod working;
 
-pub use applier::{ApplierContext, EventApplier, EventDispatcher};
+pub use applier::{ApplierContext, dispatch_event};
 pub use engine::{Engine, EngineBuilder};
-pub use handler::{ActivityCtx, Collector, CommandHandler, CtxKind, HandlerContext};
+pub use handler::{Collector, HandlerContext};
 pub use hook::Hook;
 pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
 pub use query::{QueryListPage, QueryObject};
@@ -81,9 +81,16 @@ pub use task_api::{ActivatedTask, TaskApi};
 pub use types::activity::{
     Activity, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
 };
-pub use types::command::{Command, TerminationReason, TimerPurpose};
+pub use types::command::{
+    ActivateState, ActivateTask, ClaimTasks, Command, CompleteExecution, CompleteState,
+    CompleteTask, CompleteThread, CreateExecution, CreateFlow, FailTask, SpawnThread,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason, TimerPurpose,
+};
 pub use types::error::{ExecutionError, InfraError, RuntimeError};
-pub use types::event::Event;
+pub use types::event::{
+    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
+    TaskFailed, TasksClaimed, VariablesAssigned,
+};
 pub use types::execution::{Execution, ExecutionStatus};
 pub use types::flow::{Flow, FlowStatus};
 pub use types::flow_version::FlowVersion;

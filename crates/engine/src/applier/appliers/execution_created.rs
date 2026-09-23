@@ -1,46 +1,18 @@
 //! `ExecutionCreated` event projection: folds the `Event::ExecutionCreated` into Storage.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
-
-use crate::types::meta::ObjectReference;
-use crate::{Execution, ExecutionStatus};
+use crate::types::event::ExecutionCreated;
 
 #[derive(Default)]
 pub(crate) struct ExecutionCreatedApplier;
-#[async_trait]
-impl EventApplier for ExecutionCreatedApplier {
-    fn event(&self) -> Event {
-        Event::ExecutionCreated {
-            request_id: crate::types::id::RequestId::nil(),
-            execution: Execution {
-                flow_version: ObjectReference::nil(),
-                status: ExecutionStatus::Running,
-                input: Default::default(),
-                output: None,
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Execution,
-                    ulid::Ulid::nil(),
-                )
-                .at(crate::log::Timestamp::from_millis(0))
-                .build(),
-            },
-        }
-    }
-
-    async fn apply(
+impl ExecutionCreatedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &ExecutionCreated,
     ) -> Result<(), ExecutionError> {
-        let Event::ExecutionCreated { execution, .. } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        let ExecutionCreated { execution, .. } = event;
         let mut exec = crate::storage::ExecutionRecord::from_value(
             execution.clone(),
             std::collections::HashSet::new(),

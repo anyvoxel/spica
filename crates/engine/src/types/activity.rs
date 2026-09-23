@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
+use crate::types::command::TerminationReason;
+use crate::types::state_path::StatePath;
 use crate::types::task::RetryState;
 
 /// Lifecycle status of an Activity — the execution of a single state within an Execution.
@@ -131,7 +132,7 @@ pub struct Activity {
     /// enclosing `states` table) is **derived** as the pointer's last token, so it is not duplicated
     /// here. Carried on `Event::StateActivating` so a follower / recovered leader records exactly
     /// where the activity lives without re-deriving it from the machine + parent chain.
-    pub state_path: jsonptr::PointerBuf,
+    pub state_path: StatePath,
     pub status: ActivityStatus,
     /// The **raw** input this state received on entry — the value carried on `Event::StateActivating`.
     /// For a top-level start it is the execution's original input; on a State→State hop it is the
@@ -150,7 +151,7 @@ pub struct Activity {
     pub input: Option<Value>,
     /// The state's **raw result** before any complete-step `Output` projection. For a `Task` this is
     /// the `Resource`'s returned payload; for a synchronous state with no distinct raw result it is
-    /// the processed `input` (see [`state_raw_result`](crate::handlers::state_raw_result) — the same
+    /// the processed `input` — the same
     /// derivation `$states.result` uses). Unlike `input` (whose processed view isn't known at entry,
     /// so `StateActivating` pins it to `Null`), the raw result *is* derivable before the complete step
     /// runs, so both complete-phase events (`StateCompleting`/`StateCompleted`) carry it rather than a

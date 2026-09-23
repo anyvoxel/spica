@@ -1,33 +1,19 @@
 //! `VariablesAssigned` event projection: folds the `Event::VariablesAssigned` into Storage.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
+use crate::types::event::VariablesAssigned;
 use crate::types::meta::ObjectKind;
-use crate::{ApplierContext, EventApplier};
 
 #[derive(Default)]
 pub(crate) struct VariablesAssignedApplier;
-#[async_trait]
-impl EventApplier for VariablesAssignedApplier {
-    fn event(&self) -> Event {
-        Event::VariablesAssigned {
-            scope: crate::types::meta::ObjectReference::nil(),
-            variables: Default::default(),
-        }
-    }
-
-    async fn apply(
+impl VariablesAssignedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &VariablesAssigned,
     ) -> Result<(), ExecutionError> {
-        let Event::VariablesAssigned { scope, variables } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        let VariablesAssigned { scope, variables } = event;
         // Assign targets a *scope* — an Execution or a fan-out Thread. Dispatch on the reference's
         // structural kind so a branch's Assign lands on its Thread's variable snapshot instead of
         // being silently dropped (the former Execution-only path missed a Thread reference in the

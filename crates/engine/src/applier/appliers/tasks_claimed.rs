@@ -1,58 +1,24 @@
 //! `TasksClaimed` event projection: folds the `Event::TasksClaimed` batch into Storage, marking
 //! each task `Running` and recording its leasing worker and lease deadline.
 
-use async_trait::async_trait;
-
+use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
+use crate::types::event::TasksClaimed;
 
-use crate::{RetryState, Task, TaskStatus};
+use crate::TaskStatus;
 
 #[derive(Default)]
 pub(crate) struct TasksClaimedApplier;
-#[async_trait]
-impl EventApplier for TasksClaimedApplier {
-    fn event(&self) -> Event {
-        Event::TasksClaimed {
-            request_id: crate::types::id::RequestId::nil(),
-            tasks: vec![Task {
-                execution: crate::types::meta::ObjectReference::nil(),
-                resource: String::new(),
-                arguments: Default::default(),
-                status: TaskStatus::Running,
-                deadline: None,
-                worker_id: Some(String::new()),
-                lease_until: Some(crate::log::Timestamp::from_millis(0)),
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Task,
-                    ulid::Ulid::nil(),
-                )
-                .timestamps(
-                    crate::log::Timestamp::from_millis(0),
-                    crate::log::Timestamp::from_millis(0),
-                )
-                .build(),
-            }],
-        }
-    }
-
-    async fn apply(
+impl TasksClaimedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &TasksClaimed,
     ) -> Result<(), ExecutionError> {
-        let Event::TasksClaimed {
+        let TasksClaimed {
             request_id: _,
             tasks,
-        } = event
-        else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        } = event;
         // Fold each claim **only while the task is still available** (`Pending`) — the conditional
         // exactly-once stake. The batch was decided at discovery time (see `ClaimTasksHandler`), so a
         // racing pull can learn of a task it no longer legitimately owns, or a stale/replayed

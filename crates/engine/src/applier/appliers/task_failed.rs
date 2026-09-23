@@ -1,13 +1,11 @@
 //! `TaskFailed` event projection: folds the `Event::TaskFailed` into Storage.
 
-use async_trait::async_trait;
+use crate::ApplierContext;
+use crate::types::error::ExecutionError;
+use crate::types::event::TaskFailed;
 
-use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
-use crate::{ApplierContext, EventApplier};
-
+use crate::TaskStatus;
 use crate::types::meta::ObjectKind;
-use crate::{RetryState, Task, TaskStatus};
 
 /// Applies `TaskFailed`, whose **task entity's `status` is the outcome**:
 ///
@@ -23,44 +21,13 @@ use crate::{RetryState, Task, TaskStatus};
 ///   (it drives the state's `Catch`/`terminate` decision instead).
 #[derive(Default)]
 pub(crate) struct TaskFailedApplier;
-#[async_trait]
-impl EventApplier for TaskFailedApplier {
-    fn event(&self) -> Event {
-        Event::TaskFailed {
-            task: Task {
-                execution: crate::types::meta::ObjectReference::nil(),
-                resource: String::new(),
-                arguments: Default::default(),
-                status: TaskStatus::Failed,
-                deadline: None,
-                worker_id: None,
-                lease_until: None,
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Task,
-                    ulid::Ulid::nil(),
-                )
-                .timestamps(
-                    crate::log::Timestamp::from_millis(0),
-                    crate::log::Timestamp::from_millis(0),
-                )
-                .build(),
-            },
-            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(String::new())),
-        }
-    }
-
-    async fn apply(
+impl TaskFailedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        event: &TaskFailed,
     ) -> Result<(), ExecutionError> {
-        let Event::TaskFailed { task, .. } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
+        let TaskFailed { task, .. } = event;
         let retryable = task.status == TaskStatus::Pending;
         if let Some(mut t) = ctx.storage.get_task(&task.reference()).await? {
             let parent = t

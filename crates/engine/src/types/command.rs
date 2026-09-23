@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::id::{FlowName, RequestId};
 use crate::types::meta::{ObjectName, ObjectReference};
+use crate::types::state_path::StatePath;
 use crate::types::task::RetryPolicy;
 
 /// Why an entity (execution or activity) terminated without succeeding.
@@ -62,6 +63,163 @@ impl TerminationReason {
     }
 }
 
+/// The payload of [`Command::ActivateState`] — the values needed to enter a state. A dedicated type
+/// (rather than inline struct-variant fields) lets the lifecycle entry
+/// [`StateHandler::activate`](crate::handlers::StateHandler::activate) receive it by its own type,
+/// so dispatch narrowing is a compile-time guarantee instead of a runtime `else unreachable!`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivateState {
+    /// The top-level run this state lives in — carried verbatim through nesting.
+    pub execution: ObjectReference,
+    /// The immediate scope the new activity enters (an `Execution` or fan-out `Thread`).
+    pub owner: ObjectReference,
+    /// The exact JSON Pointer to the state being entered (self-locating definition lookup).
+    pub state_path: StatePath,
+    /// The state's raw input, projected from the transition (`StateTransitioned` output).
+    pub input: Value,
+}
+
+/// Payload of [`Command::CreateFlow`] — the sole definition transport (mirrors Zeebe's
+/// Deployment→Process record).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateFlow {
+    /// Correlation key for the awaiting caller (Zeebe's `requestId`): an opaque, never-reused
+    /// id minted by the authoring Engine operation, carried onto the `FlowCreated` event so the
+    /// acknowledgement is routed back to exactly this request — never keyed by the entity.
+    pub request_id: RequestId,
+    pub name: FlowName,
+    /// The state machine definition as its raw ASL (JSON) string.
+    pub definition: String,
+}
+
+/// Payload of [`Command::CreateExecution`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateExecution {
+    /// Correlation key for the awaiting caller (Zeebe's `requestId`). The acknowledgement for a
+    /// `CreateExecution` is the execution's birth `ExecutionCreated`, which echoes this id; the
+    /// `AckHook` observer wakes the caller with it once the event is applied (see the engine's
+    /// injected Hook consumer).
+    pub request_id: RequestId,
+    /// The execution's **user-supplied addressing name** (validated at the public boundary via
+    /// `ObjectName::plain`). The execution's durable `uid` is not carried here: the handler mints
+    /// it at dispatch, which stays replay-deterministic because `CreateExecution`'s produced
+    /// `ExecutionCreated` lands in the same atomic batch (a committed command has a causal event
+    /// and is never re-dispatched; an uncommitted one is re-dispatched fresh).
+    pub name: ObjectName,
+    pub flow_version: ObjectReference,
+    pub input: Value,
+}
+
+/// Payload of [`Command::SpawnThread`] — fan out a `Parallel` branch / `Map` item into a `Thread`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnThread {
+    /// The owning node — the `Parallel`/`Map` activity's reference (kind `Activity`) whose
+    /// `active_children` must drain before the container can finish.
+    pub owner: ObjectReference,
+    /// The reference of the top-level run this branch belongs to (the child inherits it as
+    /// its `execution` anchor, carried verbatim through every nesting level).
+    pub execution: ObjectReference,
+    /// Resolved JSON Pointer to this branch's `states` table within the shared machine.
+    pub state_path: Option<StatePath>,
+    /// This child's ordinal within its container's fan-out source — the `Branches` array index
+    /// for a `Parallel`, or the `Items` array index for a `Map`. Carried so the created child
+    /// (`Thread.index`) is recorded under this index for ordered output aggregation when the
+    /// container converges. `SpawnThread` is shared by both, hence the container-neutral name.
+    pub index: usize,
+    /// The **entry-point state name** the child enters first — the branch's `StartAt` for a
+    /// `Parallel`, the item-processor's `StartAt` for a `Map`. Distinct from `state_path` (which
+    /// names only the sub-machine's `states` table): it is the one carrier of *where within that
+    /// table* the child starts, needed to build the sibling `ActivateState`'s path and
+    /// unrecoverable from `state_path` alone without re-resolving the definition.
+    pub start_at: String,
+    /// The input the branch receives (the `Parallel` state's projected `Arguments`, or the
+    /// state's input by default).
+    pub input: Value,
+}
+
+/// Payload of [`Command::CompleteExecution`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteExecution {
+    pub execution: ObjectReference,
+    pub output: Value,
+}
+
+/// Payload of [`Command::CompleteThread`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteThread {
+    pub thread: ObjectReference,
+    pub output: Value,
+}
+
+/// Payload of [`Command::TerminateExecution`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminateExecution {
+    pub name: ObjectName,
+    pub uid: Option<ulid::Ulid>,
+    pub reason: TerminationReason,
+}
+
+/// Payload of [`Command::TerminateThread`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminateThread {
+    pub thread: ObjectReference,
+    pub reason: TerminationReason,
+}
+
+/// Payload of [`Command::CompleteState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteState {
+    pub activity: ObjectReference,
+    /// The state's raw result (see the variant's doc: carried makes the command
+    /// self-describing and the complete step record it without re-reading storage).
+    pub output: Value,
+}
+
+/// Payload of [`Command::TerminateState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminateState {
+    pub activity: ObjectReference,
+    pub reason: TerminationReason,
+}
+
+/// Payload of [`Command::ActivateTask`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivateTask {
+    pub execution: ObjectReference,
+    pub owner: ObjectReference,
+    pub task: ObjectReference,
+    pub resource: String,
+    pub arguments: Value,
+    pub retry_plan: Vec<RetryPolicy>,
+}
+
+/// Payload of [`Command::ClaimTasks`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimTasks {
+    pub request_id: RequestId,
+    pub worker_id: String,
+    pub resource: String,
+    pub max_tasks: usize,
+    pub lease_seconds: u64,
+}
+
+/// Payload of [`Command::CompleteTask`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompleteTask {
+    pub request_id: RequestId,
+    pub task: ObjectReference,
+    pub worker_id: String,
+    pub output: Value,
+}
+
+/// Payload of [`Command::FailTask`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailTask {
+    pub task: ObjectReference,
+    pub worker_id: String,
+    pub error: ExecutionError,
+}
+
 /// An operation to perform against an [`Execution`](crate::Execution), [`Activity`](crate::Activity),
 /// or [`Timer`](crate::Timer). Commands are appended to the [`LogStream`](crate::LogStream) and
 /// consumed by the [`StreamProcessor`](crate::StreamProcessor), which dispatches each to the matching handler.
@@ -92,15 +250,7 @@ pub enum Command {
     /// emits [`Event::FlowCreated`](crate::Event), which folds the definition into Storage. Every
     /// other command carries only ids — an execution references a version's `ObjectReference`, never the
     /// machine — keeping execution commands small and fully serializable.
-    CreateFlow {
-        /// Correlation key for the awaiting caller (Zeebe's `requestId`): an opaque, never-reused
-        /// id minted by the authoring Engine operation, carried onto the `FlowCreated` event so the
-        /// acknowledgement is routed back to exactly this request — never keyed by the entity.
-        request_id: RequestId,
-        name: FlowName,
-        /// The state machine definition as its raw ASL (JSON) string.
-        definition: String,
-    },
+    CreateFlow(CreateFlow),
 
     // ── Execution (lifecycle: spawn → complete → terminate) ─────────────────
     /// Begin executing a state machine. `flow_version` is the [`ObjectReference`] of the immutable
@@ -108,20 +258,7 @@ pub enum Command {
     /// dispatch time, never carried in the command. Produces `ExecutionCreated` +
     /// `ActivateState`(start state) + (if `TimeoutSeconds` is set) a `TimerActivated`
     /// (`ExecutionTimeout`, emitted inline).
-    CreateExecution {
-        /// Correlation key for the awaiting caller (Zeebe's `requestId`). The acknowledgement for a
-        /// `CreateExecution` is the execution's birth `ExecutionCreated`, which echoes this id; the
-        /// `AckHook` observer wakes the caller with it once the event is applied (see the engine's injected Hook consumer).
-        request_id: RequestId,
-        /// The execution's **user-supplied addressing name** (validated at the public boundary via
-        /// `ObjectName::plain`). The execution's durable `uid` is not carried here: the handler mints
-        /// it at dispatch, which stays replay-deterministic because `CreateExecution`'s produced
-        /// `ExecutionCreated` lands in the same atomic batch (a committed command has a causal event
-        /// and is never re-dispatched; an uncommitted one is re-dispatched fresh).
-        name: ObjectName,
-        flow_version: ObjectReference,
-        input: Value,
-    },
+    CreateExecution(CreateExecution),
 
     /// Fan out one branch of a `Parallel` state as a **child execution** (M3). Produces an
     /// `ExecutionCreated{parent, execution, state_path}` (rooting the child in the owning
@@ -142,39 +279,13 @@ pub enum Command {
     /// (container kind, whether the index is a branch or item index, and any future fan-out
     /// metadata). Redesign this command as a more general child-thread spawn command before adding
     /// richer container types.
-    SpawnThread {
-        /// The owning node — the `Parallel`/`Map` activity's reference (kind `Activity`) whose
-        /// `active_children` must drain before the container can finish.
-        owner: ObjectReference,
-        /// The reference of the top-level run this branch belongs to (the child inherits it as
-        /// its `execution` anchor, carried verbatim through every nesting level).
-        execution: ObjectReference,
-        /// Resolved JSON Pointer to this branch's `states` table within the shared machine.
-        state_path: Option<jsonptr::PointerBuf>,
-        /// This child's ordinal within its container's fan-out source — the `Branches` array index
-        /// for a `Parallel`, or the `Items` array index for a `Map`. Carried so the created child
-        /// (`Thread.index`) is recorded under this index for ordered output aggregation when the
-        /// container converges. `SpawnThread` is shared by both, hence the container-neutral name.
-        index: usize,
-        /// The **entry-point state name** the child enters first — the branch's `StartAt` for a
-        /// `Parallel`, the item-processor's `StartAt` for a `Map`. Distinct from `state_path` (which
-        /// names only the sub-machine's `states` table): it is the one carrier of *where within that
-        /// table* the child starts, needed to build the sibling `ActivateState`'s path and
-        /// unrecoverable from `state_path` alone without re-resolving the definition.
-        start_at: String,
-        /// The input the branch receives (the `Parallel` state's projected `Arguments`, or the
-        /// state's input by default).
-        input: Value,
-    },
+    SpawnThread(SpawnThread),
 
     /// Drive an execution to a successful finish (terminal `Succeed`/`End` reached). Carries the
     /// output (the terminal state's result). Produces `ExecutionCompleting`, cancels the sm-timer,
     /// and `ExecutionCompleted` once drained. The output itself is already fixed at
     /// `ExecutionCompleting` and is stored directly on the execution row.
-    CompleteExecution {
-        execution: ObjectReference,
-        output: Value,
-    },
+    CompleteExecution(CompleteExecution),
 
     /// Drive a fan-out [`Thread`](crate::Thread) to a successful finish (its sub-run's terminal
     /// `Succeed`/`End` reached). Distinct from [`CompleteExecution`](Command::CompleteExecution):
@@ -186,10 +297,7 @@ pub enum Command {
     /// Produces `ThreadCompleting`, cancels the branch's sm-timers, and `ThreadCompleted` once
     /// drained — mirroring `CompleteExecution`'s cascade but resolved against thread storage and
     /// running the inline child-settled reaction back to the owning container.
-    CompleteThread {
-        thread: ObjectReference,
-        output: Value,
-    },
+    CompleteThread(CompleteThread),
 
     /// Drive an execution to an abnormal finish with `reason`. Addressed by `name` (the execution's
     /// per-scope-unique primary key, matching `CreateExecution`); the optional `uid` is an
@@ -197,11 +305,7 @@ pub enum Command {
     /// terminated (a stale/wrong incarnation is refused with a `StateConflict` `Reject`), while
     /// `None` addresses by name alone. Produces `ExecutionTerminating`, terminates active children
     /// (states / timers), and `ExecutionTerminated{reason}` once drained.
-    TerminateExecution {
-        name: ObjectName,
-        uid: Option<ulid::Ulid>,
-        reason: TerminationReason,
-    },
+    TerminateExecution(TerminateExecution),
 
     /// Drive a fan-out [`Thread`](crate::Thread) to an abnormal finish with `reason`. Distinct from
     /// [`TerminateExecution`](Command::TerminateExecution): that verb is **name-addressed** (the
@@ -213,10 +317,7 @@ pub enum Command {
     /// Produces `ThreadTerminating`, sweeps owned children, and `ThreadTerminated{reason}` once
     /// drained — mirroring `TerminateExecution`'s cascade, but resolved against thread storage and
     /// running the inline child-settled reaction back to the owning container.
-    TerminateThread {
-        thread: ObjectReference,
-        reason: TerminationReason,
-    },
+    TerminateThread(TerminateThread),
 
     // ── Activity / State (single-state lifecycle) ────────────────────────────
     /// Enter a single state (create its `Activity`). Emits `StateActivating` and runs the state's
@@ -239,12 +340,11 @@ pub enum Command {
     /// longer infers the enclosing `states` table from the owning scope's stored `state_path` — and
     /// keeps the log self-describing for replay/audit. The state's leaf name is
     /// [`state_name_from_path`](crate::handlers::state_name_from_path).
-    ActivateState {
-        execution: ObjectReference,
-        owner: ObjectReference,
-        state_path: jsonptr::PointerBuf,
-        input: Value,
-    },
+    ///
+    /// The payload is a dedicated [`ActivateState`] value type, so the lifecycle entry
+    /// [`StateHandler::activate`](crate::handlers::StateHandler::activate) receives it by its own
+    /// type and the else-`unreachable!` narrowing moves to compile time.
+    ActivateState(ActivateState),
 
     /// Successfully finish the state bound to `activity` (the activity is `Running`). Runs the
     /// state's `complete` step: emits `StateCompleting`/`StateCompleted` (recording output via
@@ -256,18 +356,12 @@ pub enum Command {
     /// `CompleteTask` worker payload; for synchronous states and `Wait` it defaults to the
     /// processed input. Carrying it makes the command self-describing (the log alone says what the
     /// completing state produced) and lets the complete step record it without re-reading storage.
-    CompleteState {
-        activity: ObjectReference,
-        output: Value,
-    },
+    CompleteState(CompleteState),
 
     /// Abnormally finish the state bound to `activity` with `reason`. Emits `StateTerminating`,
     /// terminates active children, then `StateTerminated{reason}` (deferred/cascaded), which drains
     /// the parent execution.
-    TerminateState {
-        activity: ObjectReference,
-        reason: TerminationReason,
-    },
+    TerminateState(TerminateState),
 
     // ── Timer (fire → cancel) ────────────────────────────────────────────────
     /// Signal that an armed timer has fired (its deadline passed). Dispatched by a `WaitResume`
@@ -295,14 +389,7 @@ pub enum Command {
     ///
     /// `execution` is the owning top-level run (the flat anchor, carried through branches); it feeds
     /// `Task::execution` and the task's `{execution.name}-{suffix}` generated name (finding #13).
-    ActivateTask {
-        execution: ObjectReference,
-        owner: ObjectReference,
-        task: ObjectReference,
-        resource: String,
-        arguments: Value,
-        retry_plan: Vec<RetryPolicy>,
-    },
+    ActivateTask(ActivateTask),
 
     /// A worker's claim of up to `max_tasks` available (`Pending`) tasks of `resource` (Zeebe
     /// `ActivateJobs`). The engine's `poll_tasks` API writes this **only when a read-first gate found
@@ -313,13 +400,7 @@ pub enum Command {
     /// serialized, lock-holding dispatch, so the grant is decided where the projection is read.
     /// `request_id` correlates the caller's `poll_tasks` with the returned task list (the
     /// `TasksClaimed` event echoes it back).
-    ClaimTasks {
-        request_id: RequestId,
-        worker_id: String,
-        resource: String,
-        max_tasks: usize,
-        lease_seconds: u64,
-    },
+    ClaimTasks(ClaimTasks),
 
     /// A worker reported its claimed task completed successfully (Zeebe `CompleteJob`). Validated by
     /// the engine: the task must be `Running` (leased) to this `worker_id`. Drives the owning
@@ -331,21 +412,12 @@ pub enum Command {
     /// `TaskCompleted` on success, or a `Reject` if the settlement guard refuses — to that exact caller.
     /// Without it a `CompleteTask` would be fire-and-forget; with it, `TaskApi::complete` awaits the
     /// result and reports whether the settlement was accepted or rejected.
-    CompleteTask {
-        request_id: RequestId,
-        task: ObjectReference,
-        worker_id: String,
-        output: Value,
-    },
+    CompleteTask(CompleteTask),
 
     /// A worker reported its claimed task failed (Zeebe `FailJob`), or the engine's `TimeoutSeconds`
     /// backstop failed it (`worker_id` empty). Validated by the engine (leasing worker must match);
     /// drives the owning state's `Retry`/`Catch`/terminate policy.
-    FailTask {
-        task: ObjectReference,
-        worker_id: String,
-        error: ExecutionError,
-    },
+    FailTask(FailTask),
 
     /// A task's lease elapsed without a settle: return it to `Pending` (re-claimable by any worker).
     /// Produces `Event::TaskLeaseExpired`. Idempotent — a no-op if the task already settled.

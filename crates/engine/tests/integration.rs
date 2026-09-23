@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_client::worker::{TaskFailure, TaskService};
 use spica_engine::{
-    Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionError,
-    ExecutionStatus, FlowName, InMemoryLogStream, LogStream, ObjectName, RuntimeError, StreamId,
-    TaskApi,
+    ActivateState, Command, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionError, ExecutionStatus, FlowName, InMemoryLogStream, LogStream, ObjectName,
+    RuntimeError, StreamId, TaskApi,
 };
 use spica_logstream::LogError;
 use spica_storage::InMemoryStorage;
@@ -787,7 +787,7 @@ async fn activate_state_carries_self_locating_state_path() {
     let mut paths: Vec<String> = entries
         .iter()
         .filter_map(|e| match &e.payload {
-            EntryPayload::Command(Command::ActivateState { state_path, .. }) => {
+            EntryPayload::Command(Command::ActivateState(ActivateState { state_path, .. })) => {
                 Some(state_path.to_string())
             }
             _ => None,

@@ -1,8 +1,8 @@
-//! Event projection, as a per-variant applier table.
+//! Event projection, as a per-variant applier dispatch.
 //!
 //! Storage is a pure fold of the [`Event`] stream; the [`StreamProcessor`](crate::StreamProcessor) rebuilds the
-//! execution tree by applying each event. Mirroring the [`CommandHandler`](crate::CommandHandler)
-//! design, projection is split into per-`Event` applier implementations (each in
+//! execution tree by applying each event. Mirroring the [`Command`](crate::types::command::Command)
+//! dispatch, projection is split into per-`Event` applier implementations (each in
 //! [`appliers`]), keeping each event's fold rule local.
 //!
 //! An applier is a **pure function of the fold**: it mutates the store only. External side effects are
@@ -13,58 +13,65 @@
 //! transaction and post-commit recovery replay alike.
 //!
 //! A storage implementation needs only supply the read/mutate primitives ([`Storage`](crate::Storage));
-//! the applier table is shared and constructed once per StreamProcessor.
+//! the applier dispatch is a single exhaustive [`dispatch_event`] match.
 
 mod appliers;
 
-use std::collections::HashMap;
-use std::mem::discriminant;
-
 use crate::log::Timestamp;
+use crate::types::error::ExecutionError;
 use crate::types::event::Event;
 
 use appliers::*;
 
-/// Registers one or more [`EventApplier`]s into a `Discriminant<Event>` dispatch map.
-/// Each applier knows which [`Event`] variant it serves via [`EventApplier::event`], which returns
-/// that variant as a `Default` placeholder (used only to read its discriminant — real events are
-/// folded by the StreamProcessor). The applier type is therefore the single source of truth for its own
-/// key; there is no hand-written placeholder to keep in sync. `$applier` is captured as a `path` so
-/// it can serve both as a type (`<… as EventApplier>`) and as a `Default`-constructible value
-/// (`<$applier>::default()`).
-///
-/// Recursive: `event_applier_entry!` handles the first applier and recurses into the
-/// `event_applier_entry!`-rest form; the tail emits nothing.
-macro_rules! event_applier_entry {
-    ($map:expr, $applier:path $(, $rest:path)*) => {{
-        let sample = <$applier as EventApplier>::event(&<$applier>::default());
-        $map.insert(std::mem::discriminant(&sample), Box::new(<$applier>::default()));
-        event_applier_entry!($map $(, $rest)*);
-    }};
-    ($map:expr) => {};
+/// Route one `Event` to its applier's fold. Exhaustive: every variant maps to an inherent applier
+/// method (`XApplier::apply`), so adding an `Event` variant fails to compile until a match arm
+/// exists — the compile-time guarantee that previously came from a `Discriminant` table.
+pub async fn dispatch_event(
+    ctx: &mut ApplierContext<'_>,
+    event: &Event,
+) -> Result<(), ExecutionError> {
+    match event {
+        Event::ExecutionCreated(p) => ExecutionCreatedApplier.apply(ctx, p).await,
+        Event::ExecutionCompleting { execution } => {
+            ExecutionCompletingApplier.apply(ctx, execution).await
+        }
+        Event::ExecutionCompleted { execution } => {
+            ExecutionCompletedApplier.apply(ctx, execution).await
+        }
+        Event::ExecutionTerminating { execution } => {
+            ExecutionTerminatingApplier.apply(ctx, execution).await
+        }
+        Event::ExecutionTerminated { execution } => {
+            ExecutionTerminatedApplier.apply(ctx, execution).await
+        }
+        Event::FlowCreated(p) => FlowCreatedApplier.apply(ctx, p).await,
+        Event::FlowVersionCreated(p) => FlowVersionCreatedApplier.apply(ctx, p).await,
+        Event::StateActivating { activity } => StateActivatingApplier.apply(ctx, activity).await,
+        Event::StateActivated { activity } => StateActivatedApplier.apply(ctx, activity).await,
+        Event::StateCompleting { activity } => StateCompletingApplier.apply(ctx, activity).await,
+        Event::StateCompleted { activity } => StateCompletedApplier.apply(ctx, activity).await,
+        Event::StateTerminating { activity } => StateTerminatingApplier.apply(ctx, activity).await,
+        Event::StateTerminated { activity } => StateTerminatedApplier.apply(ctx, activity).await,
+        Event::TimerActivated { timer } => TimerActivatedApplier.apply(ctx, timer).await,
+        Event::TimerTriggered { timer } => TimerTriggeredApplier.apply(ctx, timer).await,
+        Event::TimerCancelled { timer } => TimerCancelledApplier.apply(ctx, timer).await,
+        Event::VariablesAssigned(p) => VariablesAssignedApplier.apply(ctx, p).await,
+        Event::StateTransitioned(p) => StateTransitionedApplier.apply(ctx, p).await,
+        Event::TaskActivated { task } => TaskActivatedApplier.apply(ctx, task).await,
+        Event::TasksClaimed(p) => TasksClaimedApplier.apply(ctx, p).await,
+        Event::TaskLeaseExpired { task } => TaskLeaseExpiredApplier.apply(ctx, task).await,
+        Event::TaskCompleted(p) => TaskCompletedApplier.apply(ctx, p).await,
+        Event::TaskFailed(p) => TaskFailedApplier.apply(ctx, p).await,
+        Event::TaskCancelled { task } => TaskCancelledApplier.apply(ctx, task).await,
+        Event::ThreadCreated { thread } => ThreadCreatedApplier.apply(ctx, thread).await,
+        Event::ThreadCompleting { thread } => ThreadCompletingApplier.apply(ctx, thread).await,
+        Event::ThreadCompleted { thread } => ThreadCompletedApplier.apply(ctx, thread).await,
+        Event::ThreadTerminating { thread } => ThreadTerminatingApplier.apply(ctx, thread).await,
+        Event::ThreadTerminated { thread } => ThreadTerminatedApplier.apply(ctx, thread).await,
+    }
 }
 
-/// An `EventApplier` receives one `Event` plus context, mutates Storage, and returns nothing — the
-/// projection is a pure fold (an applier never performs external side effects itself). Table-driven
-/// like [`CommandHandler`](crate::CommandHandler).
-#[async_trait::async_trait]
-pub trait EventApplier: Send + Sync {
-    /// The [`Event`] variant this applier folds, identified by a `Default` placeholder instance
-    /// standing in only to read its discriminant — the real event instances are applied by the
-    /// StreamProcessor. The [`EventDispatcher`]'s table reads this off the applier to derive its key, so
-    /// the applier is the single source of truth for which variant it handles. Takes `&self` (rather
-    /// than being a `Self: Sized` associated function) so the trait stays object-safe for the
-    /// `Box<dyn EventApplier>` dispatch table.
-    fn event(&self) -> Event;
-
-    async fn apply(
-        &self,
-        context: &mut ApplierContext<'_>,
-        event: &Event,
-    ) -> Result<(), crate::types::error::ExecutionError>;
-}
-
-/// Context handed to a single `EventApplier::apply` call: mutable access to the store, plus the
+/// Context handed to a single event applier `apply` call: mutable access to the store, plus the
 /// **`timestamp`** of the entry currently being applied — the single deterministic source for the
 /// projection's `created_at`/`updated_at` facts; it is the value frozen in the log record, so every
 /// replica replaying the same entries computes identical times (see `storage::*::created_at`).
@@ -81,66 +88,4 @@ pub struct ApplierContext<'a> {
     /// consumes the `Box`) nor move the resume watermark — atomicity is *type-enforced*.
     pub storage: &'a mut dyn crate::storage::StorageTxn,
     pub timestamp: Timestamp,
-}
-
-/// Consume the collector's accumulated entries and route them to the applier table.
-pub struct EventDispatcher {
-    handlers: HashMap<std::mem::Discriminant<Event>, Box<dyn EventApplier>>,
-}
-
-impl EventDispatcher {
-    pub fn new() -> Self {
-        let mut map: HashMap<std::mem::Discriminant<Event>, Box<dyn EventApplier>> = HashMap::new();
-        event_applier_entry!(
-            map,
-            ExecutionCreatedApplier,
-            ExecutionCompletingApplier,
-            ExecutionCompletedApplier,
-            ExecutionTerminatingApplier,
-            ExecutionTerminatedApplier,
-            FlowCreatedApplier,
-            FlowVersionCreatedApplier,
-            StateActivatingApplier,
-            StateActivatedApplier,
-            StateCompletingApplier,
-            StateCompletedApplier,
-            StateTerminatingApplier,
-            StateTerminatedApplier,
-            TimerActivatedApplier,
-            TimerTriggeredApplier,
-            TimerCancelledApplier,
-            VariablesAssignedApplier,
-            StateTransitionedApplier,
-            TaskActivatedApplier,
-            TasksClaimedApplier,
-            TaskLeaseExpiredApplier,
-            TaskCompletedApplier,
-            TaskFailedApplier,
-            TaskCancelledApplier,
-            ThreadCreatedApplier,
-            ThreadCompletingApplier,
-            ThreadCompletedApplier,
-            ThreadTerminatingApplier,
-            ThreadTerminatedApplier
-        );
-        Self { handlers: map }
-    }
-
-    pub async fn apply(
-        &self,
-        ctx: &mut ApplierContext<'_>,
-        event: &Event,
-    ) -> Result<(), crate::types::error::ExecutionError> {
-        let handler = self
-            .handlers
-            .get(&discriminant(event))
-            .expect("an applier is registered for every Event variant");
-        handler.apply(ctx, event).await
-    }
-}
-
-impl Default for EventDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
 }

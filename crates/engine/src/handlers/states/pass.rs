@@ -2,169 +2,211 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{PassState, State};
 
-use super::super::state_handler::StateHandler;
-use super::super::{emit_transition, state_activated_value, state_completed_value};
-use crate::eval_env::EvalEnv;
-use crate::handler::{ActivityCtx, Collector};
-use crate::types::context::build_states;
+use super::super::emit_transition;
+use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use crate::ActivityStatus;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
 use crate::types::meta::ObjectReference;
 
-pub struct PassStateHandler;
+pub struct PassStateHandlerFactory;
 
 #[async_trait]
-impl StateHandler for PassStateHandler {
+impl StateHandlerFactory for PassStateHandlerFactory {
     fn state(&self) -> State {
         State::Pass(PassState::default())
     }
 
-    async fn activate(
-        &self,
-        _env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        actx: &ActivityCtx,
-        _state: &State,
-    ) {
-        // Pass is fully synchronous: no side effect to arm, so its activate simply moves it on to
-        // the complete step in the very next Command. Emit the activation-complete ed first, then
-        // the transition command.
-        out.emit_event(crate::types::event::Event::StateActivated {
-            activity: state_activated_value(actx, actx.activity.raw_input.clone(), None),
-        })
-        .await;
-        out.emit_command(crate::types::command::Command::CompleteState {
-            activity,
-            // A Pass's raw result is its processed input (no distinct raw output); the complete step
-            // projects any `Output` template from it.
-            output: actx.activity.raw_input.clone(),
-        });
-    }
-
-    async fn complete(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        actx: &ActivityCtx,
-        state: &State,
-    ) {
-        // A Pass state is always completed via `CompleteState` with the `Pass` variant — the
-        // dispatch table matches this handler only to `State::Pass`, so any other variant is a
-        // programming error (a table/dispatch mismatch), not a runtime condition.
+    fn create<'a>(&self, state: &'a State) -> Box<dyn StateHandler + 'a> {
         let State::Pass(s) = state else {
             unreachable!(
-                "complete dispatch guarantees the state handler receives its own variant; got {state:?}"
+                "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        complete_pass(env, out, activity, actx, s).await;
+        Box::new(PassStateHandler { state: s })
     }
 }
 
-// A Pass self-implements its success finish (rather than reuse the shared `complete_activity`):
-// `StateCompleting` is emitted by the `CompleteStateHandler` framework, so this only has to project
-// the output, emit `StateCompleted`, and route. Pass's projection — `Assign` (a delta on the
-// execution scope, emitted as `VariablesAssigned`) then `Output` (defaults to the input) — is the
-// canonical ASL success projection, kept here as the reference implementation the other complete
-// paths mirror.
-async fn complete_pass(
-    env: &mut EvalEnv,
-    out: &mut Collector<'_>,
-    activity: ObjectReference,
-    actx: &ActivityCtx,
-    state: &PassState,
-) {
-    let states = build_states(
-        &actx.activity.raw_input,
-        Some(&actx.activity.raw_input),
-        &actx.state_name(),
-        &actx.exec_input,
-        Some(&actx.activity.raw_input),
-        actx.activity.retry_count(),
-        None, // no Catch `errorOutput` in the success path
-        None, // not a Map item — no `context.Map.Item` binding
-    );
-    let mut local_scope = actx.variables.clone();
+struct PassStateHandler<'a> {
+    state: &'a PassState,
+}
 
-    if let Some(assign_obj) = &state.assign {
-        let assign_value = Value::Object(assign_obj.0.clone());
-        let evaluated = fail_or!(
-            out,
-            Some(activity),
-            actx.activity
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-            env.eval_json(&assign_value, &states, &local_scope)
-        );
-        match evaluated {
-            Value::Object(map) => {
-                if !map.is_empty() {
-                    for (k, v) in map {
-                        local_scope.insert(k, v);
-                    }
-                    out.emit_event(Event::VariablesAssigned {
-                        scope: actx
-                            .activity
-                            .meta
-                            .owner
-                            .clone()
-                            .expect("an owned activity has an owner"),
-                        variables: local_scope.clone(),
-                    })
-                    .await;
-                }
-            }
-            _ => {
+#[async_trait]
+impl StateHandler for PassStateHandler<'_> {
+    // Pass's projection — `Assign` (a delta on the execution scope, emitted as `VariablesAssigned`)
+    // then `Output` (defaults to the input) — is the canonical ASL success projection, kept here as
+    // the reference the other complete paths mirror.
+    /// The `Command::CompleteState` finish — the shared orchestration (liveness/Terminating-race
+    /// guards, owning-scope resolution, activity and variables reconstruction) and this state's projection,
+    /// all inline.
+    async fn complete(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity: ObjectReference,
+        raw_result: Option<&Value>,
+    ) {
+        let act = match ctx.storage.get_activity(&activity).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
                 out.terminate(
-                    Some(activity),
-                    actx.activity
-                        .meta
-                        .owner
-                        .clone()
-                        .expect("an owned activity has an owner"),
-                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "Assign must evaluate to a JSON object".to_string(),
-                    )),
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "activity {activity}"
+                    ))),
                 );
                 return;
             }
-        }
-    }
+            Err(e) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    crate::types::meta::ObjectReference::nil(),
+                    e,
+                );
+                return;
+            }
+        };
 
-    let output_value = match &state.output {
-        Some(o) => fail_or!(
-            out,
-            Some(activity),
-            actx.activity
+        // Race fix: a cancel already won on this activity. The drain that would have been emitted by
+        // the cancel side may have been missed because the ordering interleaved (e.g. timer-fired +
+        // cancel together). Re-emit the deferred termination ed so the parent finishes, reusing the
+        // reason embedded in the terminating status itself.
+        if act.value.status != ActivityStatus::Running {
+            match act.value.status {
+                ActivityStatus::Terminating(ref reason) => {
+                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
+                    // preserving every previously-folded domain field while only flipping the status
+                    // from `Terminating(reason)` to `Terminated(reason)`.
+                    let mut activity_value = act.value();
+                    activity_value.status = ActivityStatus::Terminated(reason.clone());
+                    out.append_event(crate::types::event::Event::StateTerminated {
+                        activity: activity_value,
+                    })
+                    .await;
+                }
+                _ => return,
+            }
+            return;
+        }
+        // The activity's owner is its *scope* — resolved through the central Execution/Thread
+        // dispatch in storage, which silently ignores non-scope kinds.
+        let scope = match crate::storage::load_scope_ref(
+            ctx.storage,
+            &act.value
                 .meta
                 .owner
                 .clone()
                 .expect("an owned activity has an owner"),
-            env.eval_json(o, &states, &local_scope)
-        ),
-        None => actx.activity.raw_input.clone(),
-    };
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
+            Err(_) => return,
+        };
+        if !scope.is_running() {
+            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
+        }
 
-    out.emit_event(Event::StateCompleted {
-        activity: state_completed_value(actx, output_value.clone()),
-    })
-    .await;
-    emit_transition(
-        out,
-        actx.activity.execution.clone(),
-        actx.activity
+        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
+        // step observes the canonical domain payload rather than the projection-only row. The
+        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
+        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
+        // record the command-carried result.
+        let mut activity_value = act.value();
+        if let Some(result) = raw_result {
+            activity_value.raw_output = Some(result.clone());
+        }
+        let variables = scope.variables().clone();
+        let env = &mut *ctx.env;
+
+        // Advance the one activity value in place to the completing lifecycle moment — it stays the
+        // single source of truth for the rest of the complete step, so the completing status (and its
+        // re-stamped update time) carries forward instead of a stale copy held alongside.
+        activity_value
+            .meta
+            .with_update_at(crate::log::Timestamp::now());
+        activity_value.status = ActivityStatus::Completing;
+        if activity_value.raw_output.is_none() {
+            activity_value.raw_output = Some(activity_value.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleting {
+            activity: activity_value.clone(),
+        })
+        .await;
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&activity_value.raw_input))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+
+        let owner = activity_value
             .meta
             .owner
             .clone()
-            .expect("an owned activity has an owner"),
-        activity,
-        actx.state_path(),
-        &output_value,
-        state.next.as_deref(),
-        state.end,
-    )
-    .await;
+            .expect("an owned activity has an owner");
+        let assigned = self
+            .apply_assign(
+                out,
+                env,
+                &owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
+            .await;
+        fail_or!(out, Some(activity), owner.clone(), assigned);
+
+        let output_value = fail_or!(
+            out,
+            Some(activity),
+            owner.clone(),
+            self.project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                activity_value.raw_input.clone(),
+            )
+            .await
+        );
+
+        // Advance the same value in place to the completed lifecycle moment (mirroring the completing
+        // step above): it stays the single source of truth, so the completed status and projected
+        // output carry forward into the transition that follows.
+        activity_value
+            .meta
+            .with_update_at(crate::log::Timestamp::now());
+        activity_value.status = ActivityStatus::Completed;
+        activity_value.output = Some(output_value.clone());
+        if activity_value.raw_output.is_none() {
+            activity_value.raw_output = Some(activity_value.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleted {
+            activity: activity_value.clone(),
+        })
+        .await;
+        emit_transition(
+            out,
+            activity_value.execution.clone(),
+            activity_value
+                .meta
+                .owner
+                .clone()
+                .expect("an owned activity has an owner"),
+            activity,
+            &activity_value.state_path,
+            &output_value,
+            self.state.next.as_deref(),
+            self.state.end,
+        )
+        .await;
+    }
 }

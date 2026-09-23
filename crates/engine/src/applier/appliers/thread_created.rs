@@ -2,46 +2,18 @@
 
 use std::collections::HashSet;
 
-use async_trait::async_trait;
-
 use crate::types::error::ExecutionError;
-use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
-use crate::{ActivityState, ApplierContext, EventApplier, Thread, ThreadStatus};
+use crate::types::meta::ObjectKind;
+use crate::{ActivityState, ApplierContext, Thread};
 
 #[derive(Default)]
 pub(crate) struct ThreadCreatedApplier;
-#[async_trait]
-impl EventApplier for ThreadCreatedApplier {
-    fn event(&self) -> Event {
-        Event::ThreadCreated {
-            thread: Thread {
-                execution: ObjectReference::nil(),
-                state_path: jsonptr::PointerBuf::new(),
-                index: 0,
-                status: ThreadStatus::Running,
-                input: Default::default(),
-                output: None,
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Thread,
-                    ulid::Ulid::nil(),
-                )
-                .at(crate::log::Timestamp::from_millis(0))
-                .build(),
-            },
-        }
-    }
-
-    async fn apply(
+impl ThreadCreatedApplier {
+    pub(crate) async fn apply(
         &self,
         ctx: &mut ApplierContext<'_>,
-        event: &Event,
+        thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        let Event::ThreadCreated { thread, .. } = event else {
-            unreachable!(
-                "event dispatch guarantees the applier receives its own variant; got {event:?}"
-            );
-        };
         let mut row = crate::storage::ThreadRecord::from_value(thread.clone(), HashSet::new());
         // Birth: the row's `created_at`/`updated_at` are stamped with the `ThreadCreated` entry's
         // moment (deterministic across replicas — see `ApplierContext::timestamp`).

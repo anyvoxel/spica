@@ -1,41 +1,37 @@
-//! The **follower** role of [`ProcessingStateMachine`](crate::processing::ProcessingStateMachine): a
-//! read replica that replicates the log but never dispatches Commands. It folds the replicated
-//! Events into its **own** projection (so it can serve reads), folding each atomic batch into a
-//! **driver-held transaction** and committing it **as one all-or-nothing fold at the batch's
-//! terminating [`EntryPayload::Noop`](crate::log::EntryPayload::Noop)** — the exact sibling-loss
-//! hazard the Noop batch marker was built to close (§8 / §4.2 of
-//! `docs/durable-execution-recovery-design.md`).
+//! The **follower** role of the engine's [`StateMachine`](crate::processing::StateMachine): a read
+//! replica that replicates the log but never dispatches Commands. It folds the replicated Events into
+//! its **own** projection (so it can serve reads), folding each atomic batch into a **driver-held
+//! transaction** and committing it **as one all-or-nothing fold at the batch's terminating
+//! [`EntryPayload::Noop`](crate::log::EntryPayload::Noop)** — the exact sibling-loss hazard the Noop
+//! batch marker was built to close (§8 / §4.2 of `docs/durable-execution-recovery-design.md`).
 //!
 //! How it differs from the [`Leader`](crate::leader::Leader), which eagerly applies its own batches
 //! at production time:
 //!
-//! - `process_command` produces **nothing** — a follower neither dispatches nor appends, so the
-//!   driver's "empty batch" arm sends nothing to the log.
+//! - it never dispatches nor appends — every Command read back is the leader's decision to replay,
+//!   reflected only through the Events that follow in the same batch (which it folds);
 //! - `apply_event` folds each replicated Event into the **transaction the driver opened at this
 //!   batch's first Event and holds across the batch**, but returns `None` — it does **not** commit
 //!   per Event. A crash mid-batch therefore leaves the partial batch un-applied; on restart the
 //!   follower resumes from its watermark and re-folds the same entries into a fresh transaction, then
-//!   commits once at the Noop (idempotent).
+//!   commits once at the Noop (idempotent);
 //! - `commit_at_noop` **rounds off** the batch: the Events were already folded incrementally, so it
 //!   only advances the resume watermark to the Noop's position, letting the driver commit the whole
-//!   batch atomically — the same granularity as the leader's eager apply. Transactions are
-//!   **driver-owned**: the driver opens one held transaction per batch (now that `begin_txn` no longer
-//!   borrows the store), folds each Event in via `apply_event`, and commits the returned watermark.
-//! - `after_commit` is a no-op (a follower has no awaiting callers); `is_already_applied` is always
-//!   `false` (it folds every replicated Event).
+//!   batch atomically. Transactions are **driver-owned**: the driver opens one held transaction per
+//!   batch, folds each Event in via `apply_event`, and commits the returned watermark.
 //! - Rejections are audited by the driver's `log_reject` trace — a follower has no awaiting caller.
 //!
 //! This is a **single-node stub**: nothing installs a `Follower` yet, and the open multi-node design
 //! questions (how a follower learns which Commands are undecided, take-over, fencing) are unresolved.
-//! `stream_processor::run` reads the resume watermark from `Storage` and the driver is role-agnostic,
-//! so a `Follower` swapped in for the `Leader` would "just work" structurally — but that wiring is
-//! explicitly out of scope here. See [`ProcessingStateMachine`] and `TODO(multi-node)` markers.
-use async_trait::async_trait;
+//! `stream_processor::run` reads the resume watermark from `Storage` and selects the role at the
+//! [`StateMachine`](crate::processing::StateMachine) variant, so a `Follower` swapped in for the
+//! `Leader` would "just work" structurally — but that wiring is explicitly out of scope here. See
+//! `TODO(multi-node)` markers.
 use tracing::debug;
 
-use crate::applier::{ApplierContext, EventDispatcher};
+use crate::applier::{ApplierContext, dispatch_event};
 use crate::log::Timestamp;
-use crate::processing::{CommandProcessed, ProcessingHandles, ProcessingStateMachine, Role};
+use crate::processing::ProcessingHandles;
 use crate::storage::StorageTxn;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
@@ -53,11 +49,8 @@ use crate::types::id::EntryId;
 pub(crate) struct Follower {
     /// Resume watermark — the last Noop (batch boundary) whose whole batch is durably applied.
     /// Installed from [`Storage`] at boot (`set_resume_position`) and advanced at each
-    /// [`ProcessingStateMachine::commit_at_noop`] commit.
+    /// `commit_at_noop` commit.
     watermark: i64,
-    /// Table-driven event applier (fold an [`Event`] into [`Storage`]) — reused across the events of
-    /// one in-flight batch, all folded into the same driver-owned transaction.
-    dispatcher: EventDispatcher,
 }
 
 /// See the struct doc for the `#[allow(dead_code)]` rationale: this role has no caller yet.
@@ -66,10 +59,7 @@ impl Follower {
     /// Build an empty follower. The resume watermark is installed later, when the driver reads it
     /// from [`Storage`] at boot (`set_resume_position`).
     pub(crate) fn new() -> Self {
-        Self {
-            watermark: 0,
-            dispatcher: EventDispatcher::new(),
-        }
+        Self { watermark: 0 }
     }
 }
 
@@ -79,34 +69,15 @@ impl Default for Follower {
     }
 }
 
-#[async_trait]
-impl ProcessingStateMachine for Follower {
-    fn role(&self) -> Role {
-        Role::Follower
-    }
-
-    fn set_resume_position(&mut self, position: i64) {
+impl Follower {
+    /// Install the resume position read from [`Storage`] at boot — the last position whose effects
+    /// are durable, so the driver resumes the log tail from `position + 1`. The follower advances it
+    /// from each Noop's `commit_at_noop` (a leader advances it at fold time instead).
+    pub(crate) fn set_resume_position(&mut self, position: i64) {
         self.watermark = position;
     }
 
-    async fn process_command(
-        &mut self,
-        _entry_id: EntryId,
-        _command: &crate::types::command::Command,
-        _handles: &ProcessingHandles,
-    ) -> Result<CommandProcessed, ExecutionError> {
-        // A follower never dispatches and never produces entries: every Command read back (a
-        // client's root command or a leader's follow-up) is someone else's decision to replay, not
-        // ours to re-run. Returning an empty `CommandProcessed` makes the driver append nothing (no
-        // Noop either), so the follower stays write-silent on the log. Its decision is reflected
-        // only through the Events that follow in the same batch, which we buffer here.
-        Ok(CommandProcessed {
-            entries: Vec::new(),
-            work: crate::working::WorkingState::empty(),
-        })
-    }
-
-    async fn apply_event(
+    pub(crate) async fn apply_event(
         &mut self,
         txn: &mut dyn StorageTxn,
         entry_id: EntryId,
@@ -130,17 +101,11 @@ impl ProcessingStateMachine for Follower {
             storage: &mut *txn,
             timestamp,
         };
-        self.dispatcher.apply(&mut ctx, event).await?;
+        dispatch_event(&mut ctx, event).await?;
         Ok(None)
     }
 
-    fn is_already_applied(&self, _entry_id: EntryId) -> bool {
-        // A follower never skips a replicated Event — each one must be folded into its in-flight
-        // batch transaction. The driver therefore always applies Events for us.
-        false
-    }
-
-    async fn commit_at_noop(
+    pub(crate) async fn commit_at_noop(
         &mut self,
         _txn: &mut dyn StorageTxn,
         entry_id: EntryId,
@@ -155,11 +120,6 @@ impl ProcessingStateMachine for Follower {
         debug!(watermark = self.watermark, "follower applied batch at noop");
         Ok(Some(self.watermark))
     }
-
-    async fn after_commit(&mut self, _handles: &ProcessingHandles) {
-        // A follower has no awaiting callers and defers nothing, so there are no post-commit
-        // side effects to fire here.
-    }
 }
 
 #[cfg(test)]
@@ -167,6 +127,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex as StdMutex};
 
+    use async_trait::async_trait;
     use tokio::sync::Mutex;
 
     use crate::Storage;
@@ -174,6 +135,7 @@ mod tests {
     use crate::storage::{
         ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     };
+    use crate::types::event::FlowVersionCreated;
     use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
@@ -445,7 +407,7 @@ mod tests {
         (
             EntryId::new(2),
             Timestamp::now(),
-            Event::FlowVersionCreated {
+            Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
                     meta: crate::types::meta::ObjectMeta::builder(
@@ -468,7 +430,7 @@ mod tests {
                     definition: String::new(),
                     checksum: FlowVersion::definition_checksum(""),
                 },
-            },
+            }),
         )
     }
 

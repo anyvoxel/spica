@@ -1,12 +1,10 @@
-use async_trait::async_trait;
-
 use crate::RejectionType;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
+use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::command::Command;
+use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
 use crate::types::id::RequestId;
-use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectReference};
 
 /// Handles `TerminateExecution`: begins the abnormal finish of a running execution with `reason`.
 /// Emits `ExecutionTerminating`, sweeps owned children (`CancelTimer` for timers,
@@ -15,22 +13,14 @@ use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
 #[derive(Default)]
 pub struct TerminateExecutionHandler;
 
-#[async_trait]
-impl CommandHandler for TerminateExecutionHandler {
-    fn command(&self) -> Command {
-        Command::TerminateExecution {
-            name: ObjectName::plain("default").expect("static placeholder name is valid"),
-            uid: None,
-            reason: crate::types::command::TerminationReason::Cancelled,
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::TerminateExecution { name, uid, reason } = cmd else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+impl TerminateExecutionHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &TerminateExecution,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let TerminateExecution { name, uid, reason } = p;
         // Storage keys executions by name, so a name-only probe (the uid, when present, doubles as the
         // incarnation guard below) resolves the row regardless of incarnation.
         let probe =
@@ -90,7 +80,7 @@ impl CommandHandler for TerminateExecutionHandler {
         // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
         // carries forward.
         terminating_execution.meta.with_update_at(Timestamp::now());
-        out.emit_event(Event::ExecutionTerminating {
+        out.append_event(Event::ExecutionTerminating {
             execution: terminating_execution,
         })
         .await;
@@ -100,20 +90,31 @@ impl CommandHandler for TerminateExecutionHandler {
         for child in children {
             match child.kind {
                 ObjectKind::Timer => {
-                    out.emit_command(Command::CancelTimer { timer: child });
+                    out.append_command(Command::CancelTimer { timer: child });
                     pending += 1;
                 }
                 ObjectKind::Activity => {
-                    out.emit_command(Command::TerminateState {
+                    out.append_command(Command::TerminateState(TerminateState {
                         activity: child,
                         reason: reason.clone(),
-                    });
+                    }));
                     pending += 1;
                 }
-                // A Parallel-branch child *execution*, a fan-out `Thread`, and a `Task` are all owned
-                // by a container *Activity*, never directly by an Execution — so they are reached
-                // transitively through the `TerminateState` sweep above, and there is nothing to
-                // sweep at this level. (An Execution directly owns only its activities and timers.)
+                // The execution's single root Thread (the top-level owner) is swept here too:
+                // terminating the run must tear down the root thread's whole subtree, after which the
+                // thread relays its settle back (via `child_settled`) letting this execution drain and
+                // emit its own terminal.
+                ObjectKind::Thread => {
+                    out.append_command(Command::TerminateThread(TerminateThread {
+                        thread: child,
+                        reason: reason.clone(),
+                    }));
+                    pending += 1;
+                }
+                // A Parallel-branch child *execution* and a `Task` are owned by a container
+                // *Activity*, never directly by an Execution — so they are reached transitively
+                // through the sweeps above, and there is nothing to sweep at this level. (An Execution
+                // directly owns only its root thread, its activities, and its timers.)
                 _ => {}
             }
         }
@@ -128,7 +129,7 @@ impl CommandHandler for TerminateExecutionHandler {
             let terminated_event = Event::ExecutionTerminated {
                 execution: terminated_execution,
             };
-            out.emit_event(terminated_event).await;
+            out.append_event(terminated_event).await;
             // A terminating child execution (a Parallel branch that failed) runs the inline reaction
             // to its owning node — the `Parallel` activity — the same way a successful branch does
             // (see `CompleteExecutionHandler`). Without this the failed branch drains `P`'s

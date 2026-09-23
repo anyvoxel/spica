@@ -1,10 +1,9 @@
 //! Per-`Event` applier implementations, one unit-struct per file.
 //!
-//! Each applier knows its [`Event`](crate::types::event::Event) variant via [`EventApplier::event`] and
-//! folds it into Storage (and, for timers, the scheduler). Splitting them one-per-file mirrors how
-//! the command handlers live one-per-file under `handlers/`, keeping each fold rule local and
-//! greppable. The [`EventDispatcher`](crate::applier::EventDispatcher) registers all of them via the
-//! `event_applier_entry!` macro against the variants they self-describe.
+//! Each applier folds one [`Event`](crate::types::event::Event) variant into Storage (and, for
+//! timers, the scheduler). Splitting them one-per-file mirrors how the command handlers live
+//! one-per-file under `handlers/`, keeping each fold rule local and greppable. The exhaustive
+//! [`dispatch_event`](super::dispatch_event) routes every variant to its applier's inherent `apply`.
 
 mod execution_completed;
 mod execution_completing;

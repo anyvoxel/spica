@@ -3,7 +3,7 @@
 //!
 //! During one `process_command`, the leader opens a single [`StorageTxn`] over committed storage (the
 //! driver opens a fresh txn via `Storage::begin_txn`) and folds each emitted `Event` into it
-//! immediately, at `emit_event` time (via the collector's overlay). Handlers read through this type's
+//! immediately, at `append_event` time (via the collector's overlay). Handlers read through this type's
 //! [`ReadonlyStorageTxn`] face, which resolves overlay-then-committed — so an inline `child_settled`
 //! sees the just-emitted terminal's effect (its parent's `active_children` drained) and can converge
 //! the whole settled ancestor chain in the same batch.
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::applier::{ApplierContext, EventDispatcher};
+use crate::applier::{ApplierContext, dispatch_event};
 use crate::log::Timestamp;
 use crate::storage::{
     ActivityRecord, ExecutionRecord, ReadonlyStorageTxn, StorageTxn, TaskRecord, ThreadRecord,
@@ -65,7 +65,6 @@ impl WorkingState {
     /// Fold one emitted `Event` into the overlay. A no-op once the txn has been taken/committed.
     pub(crate) async fn apply_projection(
         &self,
-        dispatcher: &EventDispatcher,
         event: &Event,
         timestamp: Timestamp,
     ) -> Result<(), ExecutionError> {
@@ -77,7 +76,7 @@ impl WorkingState {
             storage: &mut **storage,
             timestamp,
         };
-        dispatcher.apply(&mut ctx, event).await
+        dispatch_event(&mut ctx, event).await
     }
 
     /// Take the txn out and commit it with `watermark` (the batch-end position). Consumes the overlay

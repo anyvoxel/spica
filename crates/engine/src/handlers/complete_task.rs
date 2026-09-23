@@ -1,11 +1,7 @@
-use async_trait::async_trait;
-use serde_json::Value;
-
 use crate::TaskStatus;
-use crate::handler::{Collector, CommandHandler, HandlerContext};
-use crate::types::command::Command;
-use crate::types::event::Event;
-use crate::types::id::RequestId;
+use crate::handler::{Collector, HandlerContext};
+use crate::types::command::{Command, CompleteState, CompleteTask};
+use crate::types::event::{Event, TaskCompleted};
 use crate::types::meta::ObjectKind;
 use crate::types::reject::RejectionType;
 
@@ -30,29 +26,19 @@ use crate::types::reject::RejectionType;
 #[derive(Default)]
 pub struct CompleteTaskHandler;
 
-#[async_trait]
-impl CommandHandler for CompleteTaskHandler {
-    fn command(&self) -> Command {
-        Command::CompleteTask {
-            request_id: RequestId::nil(),
-            task: crate::types::meta::ObjectReference::nil(),
-            worker_id: String::new(),
-            output: Value::Null,
-        }
-    }
-
-    async fn handle(&self, cmd: &Command, ctx: &mut HandlerContext<'_>, out: &mut Collector<'_>) {
-        let Command::CompleteTask {
+impl CompleteTaskHandler {
+    pub(crate) async fn handle(
+        &self,
+        p: &CompleteTask,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+    ) {
+        let CompleteTask {
             request_id,
             task,
             worker_id,
             output,
-        } = cmd
-        else {
-            unreachable!(
-                "command dispatch guarantees the handler receives its own variant; got {cmd:?}"
-            );
-        };
+        } = p;
 
         let act = match ctx.storage.get_task(task).await {
             Ok(Some(t)) => t,
@@ -126,26 +112,26 @@ impl CommandHandler for CompleteTaskHandler {
         task_value.lease_until = None;
         // Stamp the completion moment; `created_at` is already carried on `task_value`.
         task_value.meta.with_update_at(crate::log::Timestamp::now());
-        let completed = Event::TaskCompleted {
+        let completed = Event::TaskCompleted(TaskCompleted {
             request_id: *request_id,
             task: task_value,
             output: output.clone(),
-        };
+        });
         // The success settlement echoes the worker's own request id back on the event; the `AckHook`
         // observer wakes the awaiting `TaskApi::complete` with it (the request/response contract that
         // lets it report this settlement was applied).
-        out.emit_event(completed).await;
+        out.append_event(completed).await;
         // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
         // before `CompleteState`: the M1 activity-completion guard refuses to finish an activity that
         // still has live children, and a settled task must leave none behind. Fired-since timers are
         // no longer active children and are simply absent.
         super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
-        out.emit_command(Command::CompleteState {
+        out.append_command(Command::CompleteState(CompleteState {
             activity: activity_id,
             // The Task's raw result is the worker's payload (its `raw_output` / `$states.result`).
             // Carrying it on the command makes the complete step self-contained and the log
             // self-describing, independent of the `TaskCompleted` projection fold.
             output: output.clone(),
-        });
+        }));
     }
 }
