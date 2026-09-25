@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use spica_machinery::{Clock, IdGenerator, SystemClock, SystemIdGenerator};
 use tokio::sync::Mutex;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -10,7 +11,7 @@ use crate::TaskStatus;
 use crate::follower::Follower;
 use crate::hook::Hook;
 use crate::leader::Leader;
-use crate::log::{Entry, EntryPayload, LogStream, Timestamp};
+use crate::log::{Entry, EntryPayload, LogStream};
 use crate::processing::{ProcessingHandles, StateMachine};
 use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
@@ -49,10 +50,20 @@ pub struct StreamProcessor {
 impl StreamProcessor {
     /// Build a fresh StreamProcessor with an empty handler table, installed as a [`Leader`] — the
     /// single-node default role. Command dispatch is a single exhaustive match (see
-    /// [`dispatch_command`](crate::handlers::dispatch_command)); no table is built.
+    /// [`dispatch_command`](crate::handlers::dispatch_command)); no table is built. Stamps from the
+    /// wall clock and mints random ids; a caller that needs either to be an input (tests) uses
+    /// [`Self::with_seams`].
     pub fn new() -> Self {
+        Self::with_seams(Arc::new(SystemClock), Arc::new(SystemIdGenerator))
+    }
+
+    /// Build a StreamProcessor whose leader dispatches against the injected [`Clock`] and
+    /// [`IdGenerator`] — the seams every stamp, deadline and freshly minted `uid` in a dispatch reads
+    /// (see [`Clock`], [`IdGenerator`]). Both are handed down to each dispatch's collector and handler
+    /// context, so a run's timing *and* identity are inputs the caller controls.
+    pub fn with_seams(clock: Arc<dyn Clock>, ids: Arc<dyn IdGenerator>) -> Self {
         StreamProcessor {
-            state_machine: StateMachine::Leader(Leader::new()),
+            state_machine: StateMachine::Leader(Leader::new(clock, ids)),
         }
     }
 
@@ -294,7 +305,7 @@ impl StreamProcessor {
                             // harmless no-op.
                             if !produced.entries.is_empty() {
                                 let mut to_append: Vec<Entry> = produced.entries.clone();
-                                to_append.push(noop(StreamId::nil(), entry_id));
+                                to_append.push(noop(&*leader.clock(), StreamId::nil(), entry_id));
                                 // Append the batch atomically; on failure the `?` propagates and
                                 // `produced.work` is dropped, rolling the working txn back — nothing
                                 // durable was written, so there is no dirty data.
@@ -510,13 +521,14 @@ impl Default for StreamProcessor {
 
 /// Build a [`Noop`](EntryPayload::Noop) batch-commit marker. `cause_id` is the producing Command's
 /// position, giving the batch a stable identity (see [`EntryPayload::Noop`]). `stream_id`/`entry_id`
-/// are placeholders the log stamps on append, unless the caller materializes them first.
-fn noop(stream_id: StreamId, cause_id: EntryId) -> Entry {
+/// are placeholders the log stamps on append, unless the caller materializes them first. The stamp
+/// comes from the dispatching leader's clock, so a batch's marker shares its records' notion of time.
+fn noop(clock: &dyn Clock, stream_id: StreamId, cause_id: EntryId) -> Entry {
     Entry {
         stream_id,
         entry_id: EntryId::nil(),
         cause_id: Some(cause_id),
-        timestamp: Timestamp::now(),
+        timestamp: clock.now(),
         payload: EntryPayload::Noop,
     }
 }
@@ -686,12 +698,9 @@ pub(crate) fn log_event(event: &Event) {
             debug!(
                 count = tasks.len(),
                 worker = ?tasks.first().and_then(|t| t.worker_id.as_deref()),
-                lease_until = ?tasks.first().and_then(|t| t.lease_until),
+                lease_expires_at = ?tasks.first().and_then(|t| t.lease_expires_at),
                 "tasks claimed to worker"
             );
-        }
-        Event::TaskLeaseExpired { task } => {
-            debug!(task = %task.reference(), "task lease expired; re-queued");
         }
         Event::TaskCompleted(TaskCompleted {
             request_id: _,
@@ -738,7 +747,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::engine::NoopHook;
-    use crate::log::InMemoryLogStream;
+    use crate::log::{InMemoryLogStream, Timestamp};
     use crate::storage::{
         ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     };
@@ -839,6 +848,7 @@ mod tests {
         async fn activatable_tasks(
             &mut self,
             _r: &str,
+            _now: Timestamp,
             _l: usize,
         ) -> Result<Vec<TaskRecord>, ExecutionError> {
             unimplemented!("not exercised by the recovery test")
@@ -943,6 +953,7 @@ mod tests {
         async fn activatable_tasks(
             &self,
             _r: &str,
+            _now: Timestamp,
             _l: usize,
         ) -> Result<Vec<TaskRecord>, ExecutionError> {
             unimplemented!("not exercised by the recovery test")

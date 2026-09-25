@@ -1642,9 +1642,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "spica-engine",
+ "spica-machinery",
  "tokio",
- "tokio-stream",
- "tokio-util",
  "tracing",
  "ulid",
 ]

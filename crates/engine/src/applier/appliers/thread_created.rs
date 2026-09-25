@@ -66,6 +66,10 @@ impl ThreadCreatedApplier {
                     Some(ActivityState::Parallel(progress)) => {
                         progress.branches.insert(thread.index, thread.reference());
                     }
+                    // A `Wait` owns no fan-out — its only child is its resume timer — so no thread is
+                    // ever spawned under one and there is nothing to fold. Leaving the row untouched
+                    // keeps this projection free of a write for an owner it can never apply to.
+                    Some(ActivityState::Wait(_)) => return Ok(()),
                     None => {
                         let ActivityState::Parallel(progress) = act
                             .value

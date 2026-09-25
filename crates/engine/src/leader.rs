@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_asl::StateMachine;
+use spica_machinery::{Clock, IdGenerator};
 use tracing::debug;
 
 use crate::applier::{ApplierContext, dispatch_event};
@@ -54,20 +55,34 @@ pub(crate) struct Leader {
     /// and consumed by `after_commit` to report each as a `Hook` fact once it is durable (the Zeebe
     /// post-commit model).
     last_applied: Vec<Event>,
+    /// The engine's injected [`Clock`], handed to every dispatch it drives (both the collector's
+    /// envelope stamps and the handler context's decisions read it) — see [`Clock`].
+    clock: Arc<dyn Clock>,
+    /// The engine's injected [`IdGenerator`], handed to every dispatch alongside the clock: a
+    /// dispatch names the objects it creates through it, so identity is as controllable as time.
+    ids: Arc<dyn IdGenerator>,
 }
 
 impl Leader {
     /// Build the leader. The machinery cache, eval environment, and state-handler registry start
     /// empty/fresh; the resume watermark is installed later, when the driver reads it from [`Storage`]
     /// at boot (`set_resume_position`).
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(clock: Arc<dyn Clock>, ids: Arc<dyn IdGenerator>) -> Self {
         Self {
             definitions: HashMap::new(),
             env: Arc::new(tokio::sync::Mutex::new(EvalEnv::new())),
             state_handlers: build_state_handlers(),
             watermark: 0,
             last_applied: Vec::new(),
+            clock,
+            ids,
         }
+    }
+
+    /// The clock this role dispatches with — the driver's own stamping (the batch's `Noop` commit
+    /// marker) reads the same source as the handlers it drives, so one batch's records agree on time.
+    pub(crate) fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
     }
 
     /// Routes a [`Command`] to its handler, returning the [`Entry`]s it emitted (already enveloped with
@@ -89,11 +104,18 @@ impl Leader {
         // at command end. There is no durable fold on this path; `run` commits a real batch instead.
         let work = WorkingState::new(storage.begin_txn()?);
         let overlay = OverlaySink::new(&work);
-        let mut out = Collector::new(cause_id, Some(overlay));
+        let mut out = Collector::new(
+            cause_id,
+            Some(overlay),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.ids),
+        );
         let mut env_g = self.env.lock().await;
         let mut ctx = HandlerContext {
             env: &mut env_g,
             storage: &work,
+            clock: Arc::clone(&self.clock),
+            ids: Arc::clone(&self.ids),
             definitions: &mut self.definitions,
             state_handlers: &self.state_handlers,
         };
@@ -129,10 +151,17 @@ impl Leader {
             let mut env_g = self.env.lock().await;
             let work = WorkingState::new((**storage_guard).begin_txn()?);
             let overlay = OverlaySink::new(&work);
-            let mut out = Collector::new(entry_id, Some(overlay));
+            let mut out = Collector::new(
+                entry_id,
+                Some(overlay),
+                Arc::clone(&self.clock),
+                Arc::clone(&self.ids),
+            );
             let mut ctx = HandlerContext {
                 env: &mut env_g,
                 storage: &work,
+                clock: Arc::clone(&self.clock),
+                ids: Arc::clone(&self.ids),
                 definitions: &mut self.definitions,
                 state_handlers: &self.state_handlers,
             };

@@ -10,7 +10,8 @@
 //!
 //! # At-least-once
 //! A claim is leased for `LEASE_SECONDS`; if the handler outlives the lease (stall / crash) the task
-//! is re-queued and re-claimed, so the same handler may run more than once for one logical task.
+//! becomes claimable again and is re-claimed, so the same handler may run more than once for one
+//! logical task.
 //! Handlers must be idempotent (Zeebe's contract); the engine's settlement guard
 //! (`CompleteTask`/`FailTask` only honor the current lease holder) makes the *state* advance once.
 //!
@@ -30,7 +31,8 @@ use super::{ClaimedTask, TaskApi, TaskFailure, TaskHandler, TaskService};
 /// How many tasks a worker claims per `resource` per poll.
 pub(crate) const MAX_TASKS: usize = 10;
 /// Lease length (seconds) for each claimed task — the window in which the handler must settle before
-/// the engine re-queues it. ~60s matches Zeebe's default activation timeout.
+/// any worker (this one included) may claim it again. ~60s matches Zeebe's default activation
+/// timeout.
 pub(crate) const LEASE_SECONDS: u64 = 60;
 /// Idle poll interval when no work is available. Short enough for prompt pickup, long enough not to
 /// hammer the engine's discovery read.
@@ -351,8 +353,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn worker_reclaims_a_task_that_was_released() {
-        // A claim that returns the same task again (simulating a lease expiry re-queue) re-runs the
-        // handler, then completes — exercising the at-least-once retry of the worker loop.
+        // A claim that returns the same task again (simulating a lapsed lease re-claimed) re-runs
+        // the handler, then completes — exercising the at-least-once retry of the worker loop.
         let api = MockApi::default();
         let id = task_id();
         api.state

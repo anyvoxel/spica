@@ -29,7 +29,6 @@ mod create_execution;
 mod create_flow;
 mod dispatch;
 mod fail_task;
-mod release_task_lease;
 mod spawn_thread;
 pub(crate) mod state_handler;
 mod states;
@@ -51,7 +50,6 @@ pub use continue_::{ContinueCompleteHandler, ContinueTerminateHandler};
 pub use create_execution::CreateExecutionHandler;
 pub use create_flow::CreateFlowHandler;
 pub use fail_task::FailTaskHandler;
-pub use release_task_lease::ReleaseTaskLeaseHandler;
 pub use spawn_thread::SpawnThreadHandler;
 pub use terminate_execution::TerminateExecutionHandler;
 pub use terminate_state::TerminateStateHandler;
@@ -90,15 +88,17 @@ pub(super) fn resolve_state<'a>(
         .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string())))
 }
 
-/// Resolve a `states` table (a `HashMap<String, State>`) within the shared machine document by a
-/// JSON Pointer of the form
-/// `/states/<P>/branches/<i>/states/<P2>/branches/<j>/states…` for a `Parallel`, or
-/// `/states/<M>/item_processor/states/<P>/branches/<i>/…` for a `Map` — the exact pointers a child
-/// Parallel-branch / Map-item `Execution` carries. Each step names the container state and the
-/// child of it the run descends into (a `Parallel` branch index, or the `Map`'s single
-/// `item_processor`); the walk lands on that deepest child's `states` map in one pass (arbitrary
-/// nesting depth). Any mix of `Parallel` and `Map` steps composes naturally because every step
-/// yields a `states` table of the same type.
+/// Resolve a `States` table (a `HashMap<String, State>`) within the shared machine document by a
+/// JSON Pointer of the form `/States` (the machine's own top-level table), or
+/// `/States/<P>/Branches/<i>/States/<P2>/Branches/<j>/States…` for a `Parallel`, or
+/// `/States/<M>/ItemProcessor/States/<P>/Branches/<i>/…` for a `Map` — the exact pointers a thread
+/// carries. Each descent names the container state and the child of it the run descends into (a
+/// `Parallel` branch index, or the `Map`'s single `ItemProcessor`), then that child's `States`
+/// opener; the walk lands on the deepest table in one pass (arbitrary nesting depth). Any mix of
+/// `Parallel` and `Map` steps composes naturally because every step yields a `States` table of the
+/// same type. The tokens are the document's own keys (the constants on [`StatePath`]), compared
+/// case-sensitively: a path recorded against a differently-spelled key is malformed, not a
+/// silently different table.
 ///
 /// The machine document stays a **single shared instance** — this walk only *locates* a table inside
 /// it, never copies child state. That is what makes each child execution self-resolving: it carries
@@ -115,39 +115,46 @@ fn resolve_states_map<'a>(
     let mut states: &HashMap<String, S> = &sm.states;
     let mut i = 0usize;
     loop {
-        // If we've consumed the whole pointer, the current `states` map is the target (the pointer
-        // always ends *on* a child's states table).
+        // A pointer with nothing left names the table the walk currently stands on. Two shapes land
+        // here: the empty pointer of a thread recorded before this pointer spelled out its `States`
+        // opener (still read, so an old log replays), and the tail of every descent below — the
+        // opener is what a pointer ends *on*, so the table it names is simply where it stopped.
         if i >= tokens.len() {
             return Ok(states);
         }
-        // Each descent begins with the `states` opener naming a container state.
-        if tokens[i].decoded().as_ref() != "states" {
+        // Each descent begins with the `States` opener naming a container state.
+        if tokens[i].decoded().as_ref() != StatePath::STATES {
             return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                 format!(
-                    "state_path malformed: expected 'states', got '{}'",
+                    "state_path malformed: expected '{}', got '{}'",
+                    StatePath::STATES,
                     tokens[i].decoded()
                 ),
             )));
         }
-        let name = tokens.get(i + 1).ok_or_else(|| {
-            ExecutionError::Runtime(RuntimeError::StateNotFound(
-                "state_path truncated at state name".into(),
-            ))
-        })?;
-        let name = name.decoded();
+        i += 1; // consumed the "States" opener
+        // The opener with nothing behind it *is* the target: `/States` is the machine's top-level
+        // table, `/States/<P>/Branches/<i>/States` that branch's.
+        if i >= tokens.len() {
+            return Ok(states);
+        }
+        let name = tokens[i].decoded();
         let state = states.get(name.as_ref()).ok_or_else(|| {
             ExecutionError::Runtime(RuntimeError::StateNotFound(name.as_ref().to_string()))
         })?;
-        i += 2; // consumed "states" + <name>
+        i += 1; // consumed <name>
         match state {
-            // A `Parallel` descent names a branch: `branches/<idx>`, which yields that branch's
-            // `states` table. Consumes `branches` + <idx>.
+            // A `Parallel` descent names a branch: `Branches/<idx>`, whose `States` opener the next
+            // iteration consumes. Consumes `Branches` + <idx>.
             S::Parallel(p) => {
-                // `Cow<str> == &str` compares the decoded token against the literal without building
+                // `Cow<str> == &str` compares the decoded token against the constant without building
                 // a borrowed reference to a temporary.
-                if !tokens.get(i).is_some_and(|t| t.decoded() == "branches") {
+                if !tokens
+                    .get(i)
+                    .is_some_and(|t| t.decoded() == StatePath::BRANCHES)
+                {
                     return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "state_path malformed: expected 'branches'".into(),
+                        format!("state_path malformed: expected '{}'", StatePath::BRANCHES),
                     )));
                 }
                 let idx: usize = tokens
@@ -169,27 +176,30 @@ fn resolve_states_map<'a>(
                         "branch index {idx} of state {name}"
                     )))
                 })?;
-                i += 2; // consumed "branches" + <idx>
+                i += 2; // consumed "Branches" + <idx>
                 states = &branch.states;
             }
-            // A `Map` descent names its single `item_processor` (no index): every item runs the same
-            // processor, so the pointer names the `item_processor` token and lands directly on its
-            // `states` table. Consumes `item_processor` only.
+            // A `Map` descent names its single `ItemProcessor` (no index): every item runs the same
+            // processor, so the pointer names the `ItemProcessor` token and its `States` opener the
+            // next iteration consumes. Consumes `ItemProcessor` only.
             S::Map(m) => {
                 if !tokens
                     .get(i)
-                    .is_some_and(|t| t.decoded() == "item_processor")
+                    .is_some_and(|t| t.decoded() == StatePath::ITEM_PROCESSOR)
                 {
                     return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "state_path malformed: expected 'item_processor'".into(),
+                        format!(
+                            "state_path malformed: expected '{}'",
+                            StatePath::ITEM_PROCESSOR
+                        ),
                     )));
                 }
                 let processor = m.item_processor.as_ref().ok_or_else(|| {
                     ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
-                        "Map state '{name}' has no item_processor"
+                        "Map state '{name}' has no ItemProcessor"
                     )))
                 })?;
-                i += 1; // consumed "item_processor"
+                i += 1; // consumed "ItemProcessor"
                 states = &processor.states;
             }
             // Any other state type cannot be descended into — the pointer must always name a child
@@ -200,15 +210,15 @@ fn resolve_states_map<'a>(
                 )));
             }
         }
-        // Loop: the next token is either another "states" (a nested container) or the pointer ended —
-        // in which case the next iteration returns this child's states.
+        // Loop: the next token is either another `States` opener (a nested container) or the pointer
+        // ended — in which case the next iteration returns this child's states.
     }
 }
 
 /// Resolve a state definition for the scope owning the current activity, honoring a scope's
 /// `state_path`: a `Thread` (Parallel-branch / Map-item child) resolves its state within the shared
 /// machine at the pointer location (one flat lookup, no parent/root query); a top-level `Execution`
-/// falls back to the machine's top-level `states`. The `scope` is a loaded [`ScopeRecord`], so the
+/// falls back to the machine's top-level `States`. The `scope` is a loaded [`ScopeRecord`], so the
 /// caller (which already resolved the owning scope) passes it — no second storage read.
 pub(super) async fn resolve_state_for<'a>(
     sm: &'a StateMachine,
@@ -216,31 +226,31 @@ pub(super) async fn resolve_state_for<'a>(
     state_name: &str,
 ) -> Result<&'a spica_asl::State, ExecutionError> {
     match scope.state_path() {
-        // Thread: resolve within its branch/item_processor's `states` table.
+        // Thread: resolve within its branch/ItemProcessor's `States` table.
         Some(pointer) => {
             let states = resolve_states_map(sm, pointer.as_ptr())?;
             states.get(state_name).ok_or_else(|| {
                 ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string()))
             })
         }
-        // Top-level execution: the machine's top-level `states`.
+        // Top-level execution: the machine's top-level `States`.
         None => resolve_state(sm, state_name),
     }
 }
 
 /// Resolve a state definition by its full `state_path` (a JSON Pointer from the machine root to the
-/// state: `/states/<name>` for a top-level state, or `/states/.../branches/<idx>/<name>` for a branch /
-/// item). The carried path makes `Command::ActivateState` self-locating — the lookup no longer infers
-/// the enclosing `states` table from the owning scope's stored `state_path`. A top-level path is
-/// exactly `/states/<leaf>` (two tokens) and maps to the machine root; any deeper path's parent is a
-/// container's `states` table, resolved via `resolve_states_map`.
+/// state: `/States/<name>` for a top-level state, or `/States/.../Branches/<idx>/States/<name>` for
+/// a branch / item). The carried path makes `Command::ActivateState` self-locating — the lookup no
+/// longer infers the enclosing `States` table from the owning scope's stored `state_path`. A
+/// top-level path is exactly `/States/<leaf>` (two tokens) and maps to the machine root; any deeper
+/// path's parent is a container's `States` table, resolved via `resolve_states_map`.
 pub(crate) fn resolve_state_from_path<'a>(
     sm: &'a StateMachine,
     state_path: &StatePath,
 ) -> Result<&'a spica_asl::State, ExecutionError> {
     let leaf = state_path.state_name();
     if state_path.tokens().count() == 2 {
-        // `/states/<leaf>` — a top-level state, resolved against the machine's top-level `states`.
+        // `/States/<leaf>` — a top-level state, resolved against the machine's top-level `States`.
         return resolve_state(sm, &leaf);
     }
     let mut parent = state_path.as_ptr().to_owned();
@@ -293,19 +303,20 @@ pub(super) fn emit_scope_termination(
     }
 }
 
-/// Cancel every active timer child of `activity`. Used by the task **settlement** handlers
-/// (`CompleteTask`, `FailTask`) to sweep the task's parented timers — the `DeliveryLease` armed on
-/// assign, and the optional `TaskTimeout` — before the activity completes. Mirrors the M1 terminate
-/// sweep's timer arm, but for a *settling* (still `Running`) activity: leaving a live timer child
-/// would trip the activity-completion guard's "still has children" refusal, stalling the state.
-/// Idempotent: a timer already fired or cancelled is not an active child and is simply skipped.
+/// Cancel every active timer child of `activity`. A `Task` state's
+/// [`on_completing`](state_handler::StateHandler::on_completing) calls this for its own timers — a
+/// `TaskTimeout` only bounds the state, so it is swept as part of finishing rather
+/// than waited out. The task **failure** handlers call it directly too, for the paths that never reach
+/// `complete` (a retry re-queues the task, a terminal failure routes to `Catch`/terminate): a settled
+/// attempt must leave no live child behind. Idempotent: a timer already fired or cancelled is not an
+/// active child and is simply skipped.
 ///
-/// Emits the `TimerCancelled` **events** directly (rather than `CancelTimer` commands) so they land
-/// in the same batch **before** the caller's `CompleteState` — a `CancelTimer` command would only
-/// produce `TimerCancelled` as a *later* log entry, after which `CompleteState` had already read the
-/// activity with its child still attached. The applier deschedules the deadline and detaches the
-/// child, which is all the settle path needs (the activity itself is about to complete via
-/// `CompleteState`, so no parent drain reaction is needed here).
+/// Emits the `TimerCancelled` **events** directly (rather than `CancelTimer` commands) so they fold
+/// into the *current* batch, ahead of whatever the caller does next — a `CancelTimer` command would
+/// only produce `TimerCancelled` as a later log entry, after which the activity had already been read
+/// with the child still attached. The applier deschedules the deadline and detaches the child, which is
+/// all these callers need: a completing activity is already past the point of wanting a deadline, and a
+/// failing one is deciding its own next move — neither wants a parent drain reaction here.
 pub(super) async fn cancel_activity_timers(
     ctx: &HandlerContext<'_>,
     out: &mut Collector<'_>,
@@ -336,7 +347,7 @@ pub(super) async fn cancel_activity_timers(
                 // removal. Stamp the cancel moment as `updated_at`.
                 meta: {
                     let mut m = t.value.meta.clone();
-                    m.with_update_at(crate::log::Timestamp::now());
+                    m.with_update_at(ctx.now());
                     m
                 },
             },
@@ -388,7 +399,7 @@ pub(super) async fn emit_transition(
             output: output.clone(),
         }));
     } else if let Some(next) = next {
-        // The successor lives as a sibling of the completing state in the same enclosing `states`
+        // The successor lives as a sibling of the completing state in the same enclosing `States`
         // table — that table is the completing activity's `state_path` minus its own leaf.
         let next_path = activity_state_path.sibling(next);
         // The marker carries the resolved target *path* (self-locating), not a bare name that would
@@ -416,6 +427,25 @@ pub(super) async fn emit_transition(
     }
 }
 
+/// Advance a completing activity value to its completed lifecycle moment and emit `StateCompleted` —
+/// the terminator every success finish ends on (the base `StateHandler::finish`, and a container's own
+/// `finish_parallel`/`finish_map`), so the event's payload shape stays identical across states. The
+/// caller passes the value already advanced to `Completing`, so its `raw_output` is already settled.
+pub(super) async fn emit_state_completed(
+    out: &mut Collector<'_>,
+    activity_value: &Activity,
+    output_value: &Value,
+) {
+    let mut completed = activity_value.clone();
+    completed.meta.with_update_at(out.now());
+    completed.status = ActivityStatus::Completed;
+    completed.output = Some(output_value.clone());
+    out.append_event(Event::StateCompleted {
+        activity: completed,
+    })
+    .await;
+}
+
 /// Mint and arm a timer inline: allocate its uid (a raw `ulid::Ulid`) and derive a generated name
 /// (`{execution.name}-{8-char-suffix}`) from the owning execution, then emit `Event::TimerActivated`
 /// — the fact that both folds the timer row and arms the physical deadline (see
@@ -431,7 +461,7 @@ pub(super) async fn emit_timer(
     purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
-    let timer_uid: ulid::Ulid = ulid::Ulid::new();
+    let timer_uid: ulid::Ulid = out.mint();
     let timer_name = execution
         .name
         .base()
@@ -444,7 +474,7 @@ pub(super) async fn emit_timer(
             deadline,
             meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, timer_uid)
                 .name(timer_name)
-                .at(crate::log::Timestamp::now())
+                .at(out.now())
                 .build()
                 .with_owner(owner),
         },
@@ -561,7 +591,7 @@ pub(super) async fn complete_activity(
     // `complete_activity` only borrows `activity_value`, so the completed payload is a fresh copy
     // advanced in place — `state_completed_value` was removed.
     let mut completed = activity_value.clone();
-    completed.meta.with_update_at(crate::log::Timestamp::now());
+    completed.meta.with_update_at(out.now());
     completed.status = ActivityStatus::Completed;
     completed.output = Some(output_value.clone());
     if completed.raw_output.is_none() {

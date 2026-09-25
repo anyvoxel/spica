@@ -39,7 +39,7 @@ impl TriggerTimerHandler {
                 // `updated_at`.
                 meta: {
                     let mut m = act.value.meta.clone();
-                    m.with_update_at(crate::log::Timestamp::now());
+                    m.with_update_at(ctx.now());
                     m
                 },
             },
@@ -58,6 +58,12 @@ impl TriggerTimerHandler {
                 if activity_id.kind != ObjectKind::Activity {
                     return; // a Wait timer without an activity owner is an internal fault.
                 }
+                // Relay the settle now that the fired timer's edge is gone from the activity. A
+                // `Terminating` activity parked on this timer — a cancel raced the fire — drains only
+                // here: its own `CancelTimer` sweep no-ops on an already-fired timer, and the
+                // `CompleteState` below is refused by a non-Running activity.
+                super::child_completed::child_settled(ctx, out, activity_id.clone(), timer.clone())
+                    .await;
                 // A Wait's raw result is its processed input (no distinct raw output). Load it so the
                 // `CompleteState` command carries the raw result, keeping the command self-describing.
                 let raw_result = match ctx.storage.get_activity(&activity_id).await {
@@ -85,6 +91,11 @@ impl TriggerTimerHandler {
                 if activity_id.kind != ObjectKind::Activity {
                     return;
                 }
+                // Same settle relay as `WaitResume`: it must run even when no in-flight task is found,
+                // since that is exactly the case where a cancel already swept the task and only this
+                // fired timer is holding the activity open.
+                super::child_completed::child_settled(ctx, out, activity_id.clone(), timer.clone())
+                    .await;
                 let in_flight = ctx
                     .storage
                     .get_children(activity_id)
@@ -107,31 +118,6 @@ impl TriggerTimerHandler {
                         ),
                     }),
                 }));
-            }
-            TimerPurpose::DeliveryLease => {
-                // A claimed task's lease (Zeebe activation timeout) elapsed without a settle: re-queue
-                // it (`Pending`) so a stalled / crashed worker does not hold it forever. Parented on
-                // the owning activity like `TaskTimeout`; find the in-flight task child and release it
-                // (no-op if it already settled — `ReleaseTaskLeaseHandler` validates status).
-                let activity_id = act
-                    .value
-                    .meta
-                    .owner
-                    .clone()
-                    .expect("a live timer is always owned");
-                if activity_id.kind != ObjectKind::Activity {
-                    return;
-                }
-                let in_flight = ctx
-                    .storage
-                    .get_children(activity_id)
-                    .await
-                    .ok()
-                    .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
-                let Some(task) = in_flight else {
-                    return; // no in-flight task — the lease no longer applies.
-                };
-                out.append_command(Command::ReleaseTaskLease { task });
             }
             TimerPurpose::ExecutionTimeout => {
                 // The execution ran past its `TimeoutSeconds` deadline. Drive it to a `TimedOut`

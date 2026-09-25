@@ -233,6 +233,7 @@ mod tests {
         async fn activatable_tasks(
             &mut self,
             _r: &str,
+            _now: Timestamp,
             _l: usize,
         ) -> Result<Vec<TaskRecord>, ExecutionError> {
             unimplemented!("not exercised by the follower batch test")
@@ -337,6 +338,7 @@ mod tests {
         async fn activatable_tasks(
             &self,
             _r: &str,
+            _now: Timestamp,
             _l: usize,
         ) -> Result<Vec<TaskRecord>, ExecutionError> {
             unimplemented!("not exercised by the follower batch test")

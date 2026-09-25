@@ -354,13 +354,17 @@ impl Gateway {
     ) -> Result<Vec<ActivatedTask>, ExecutionError> {
         // Read-first gate (a busy-poller's idle polls must not bury the causal chain in no-op write
         // commands). Best-effort: it only decides whether to bother appending; the authoritative
-        // allotment still happens in the serialized dispatch.
+        // allotment still happens in the serialized dispatch. Claimability is a function of the
+        // task's own facts against a clock, so this asks the durable projection the same question the
+        // dispatch will, with its own reading of `now`.
         let claimable_now = {
             let now = Timestamp::now();
-            match self.engine.activatable_tasks(resource, max_tasks).await {
-                Ok(ts) => ts
-                    .into_iter()
-                    .any(|t| !t.retry_state.next_available_at.is_some_and(|at| now < at)),
+            match self
+                .engine
+                .activatable_tasks(resource, now, max_tasks)
+                .await
+            {
+                Ok(ts) => !ts.is_empty(),
                 Err(_) => false,
             }
         };

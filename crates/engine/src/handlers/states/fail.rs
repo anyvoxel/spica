@@ -8,7 +8,7 @@ use crate::Activity;
 use crate::ActivityStatus;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::Collector;
 use crate::types::command::TerminationReason;
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -39,113 +39,21 @@ struct FailStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for FailStateHandler<'_> {
-    // Fail's `complete` both terminates itself (emitting the activity's failure ed) and, being
-    // terminal, terminates the execution (throwing `TerminateExecution`). Both are issued from the
-    // same complete step so the state's terminal ed and the execution's terminating ed are produced
-    // in the same causal chain. This mirrors Pass: Pass emits `StateCompleted` and routes to
-    // `CompleteExecution` / the successor; Fail emits the failure ed and routes to
-    // `TerminateExecution` / the successor.
-    /// The `Command::CompleteState` finish — the shared orchestration (liveness/Terminating-race
-    /// guards, owning-scope resolution, activity and variables reconstruction) and this state's projection,
-    /// all inline.
-    async fn complete(
+    // Fail's finish both terminates itself (emitting the activity's failure ed) and, being terminal,
+    // terminates the owning scope. Both are issued from the same step so the state's terminal ed and the
+    // scope's terminating ed are produced in the same causal chain. This mirrors Pass: Pass emits
+    // `StateCompleted` and routes to the successor / a completed owner; Fail replaces that with the
+    // failure ed and the scope termination, so it overrides the base's success `finish` wholesale.
+    async fn finish(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
-        raw_result: Option<&Value>,
-    ) {
-        let act = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "activity {activity}"
-                    ))),
-                );
-                return;
-            }
-            Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    e,
-                );
-                return;
-            }
-        };
-
-        // Race fix: a cancel already won on this activity. The drain that would have been emitted by
-        // the cancel side may have been missed because the ordering interleaved (e.g. timer-fired +
-        // cancel together). Re-emit the deferred termination ed so the parent finishes, reusing the
-        // reason embedded in the terminating status itself.
-        if act.value.status != ActivityStatus::Running {
-            match act.value.status {
-                ActivityStatus::Terminating(ref reason) => {
-                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
-                    // preserving every previously-folded domain field while only flipping the status
-                    // from `Terminating(reason)` to `Terminated(reason)`.
-                    let mut activity_value = act.value();
-                    activity_value.status = ActivityStatus::Terminated(reason.clone());
-                    out.append_event(crate::types::event::Event::StateTerminated {
-                        activity: activity_value,
-                    })
-                    .await;
-                }
-                _ => return,
-            }
-            return;
-        }
-        // The activity's owner is its *scope* — resolved through the central Execution/Thread
-        // dispatch in storage, which silently ignores non-scope kinds.
-        let scope = match crate::storage::load_scope_ref(
-            ctx.storage,
-            &act.value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-        )
-        .await
-        {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
-            Err(_) => return,
-        };
-        if !scope.is_running() {
-            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
-        }
-
-        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
-        // step observes the canonical domain payload rather than the projection-only row. The
-        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
-        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
-        // record the command-carried result.
-        let mut activity_value = act.value();
-        if let Some(result) = raw_result {
-            activity_value.raw_output = Some(result.clone());
-        }
-        let variables = scope.variables().clone();
-        let env = &mut *ctx.env;
-
-        // Advance the one activity value in place to the completing lifecycle moment — it stays the
-        // single source of truth for the rest of the complete step, so the completing status (and its
-        // re-stamped update time) carries forward instead of a stale copy held alongside.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Completing;
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleting {
-            activity: activity_value.clone(),
-        })
-        .await;
-        // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed) — however late
-        // an `Assign` is applied, derived values read consistently with the scope already folded.
+        _activity: ObjectReference,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ExecutionError> {
+        // `$states` for the failure projection: `assign_ctx = Some` (matching Pass/Succeed) — however
+        // late an `Assign` is applied, derived values read consistently with the scope already folded.
         let states = States::new(
             &activity_value.raw_input,
             &activity_value.state_path.state_name(),
@@ -153,38 +61,24 @@ impl StateHandler for FailStateHandler<'_> {
         )
         .with_assign_ctx(Some(&activity_value.raw_input))
         .build();
-
-        let reason = fail_or!(
-            out,
-            Some(activity),
-            activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-            self.fail_reason(env, &activity_value, &states, &variables)
-                .await
-        );
+        let reason = self
+            .fail_reason(env, activity_value, &states, variables)
+            .await?;
 
         // Emit the activity's failure ed. `StateTerminating` + `StateTerminated` replace the
-        // `StateCompleted` a successful complete would emit; `TerminateExecution` then folds the
-        // execution's termination (`ExecutionTerminating` → `ExecutionTerminated`) rather than the
-        // `CompleteExecution` Pass would throw. Each status is advanced in place on the same value so
-        // the terminator carries forward the progressing state.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Terminating(reason.clone());
+        // `StateCompleted` a successful complete would emit. Each status is advanced in place on the
+        // same value so the terminator carries forward the progressing state.
+        let mut terminated = activity_value.clone();
+        terminated.meta.with_update_at(out.now());
+        terminated.status = ActivityStatus::Terminating(reason.clone());
         out.append_event(Event::StateTerminating {
-            activity: activity_value.clone(),
+            activity: terminated.clone(),
         })
         .await;
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Terminated(reason.clone());
+        terminated.meta.with_update_at(out.now());
+        terminated.status = ActivityStatus::Terminated(reason.clone());
         out.append_event(Event::StateTerminated {
-            activity: activity_value.clone(),
+            activity: terminated.clone(),
         })
         .await;
 
@@ -195,20 +89,21 @@ impl StateHandler for FailStateHandler<'_> {
         // silently miss it and leave the branch Running, wedging its container.
         super::super::emit_scope_termination(
             out,
-            activity_value
+            terminated
                 .meta
                 .owner
                 .as_ref()
                 .expect("an owned activity has an owner"),
             reason,
         );
+        Ok(())
     }
 }
 
 impl FailStateHandler<'_> {
     /// Evaluate `Error`/`Cause` (when present) and package them as the `Fail` complete step's
-    /// termination reason. An eval failure propagates as `Err`, which the caller's `fail_or!` turns
-    /// into the same terminate + return the inline block used to produce.
+    /// termination reason. An eval failure propagates as `Err`, which the base turns into the same
+    /// terminate + return the inline block used to produce.
     async fn fail_reason(
         &self,
         env: &mut EvalEnv,

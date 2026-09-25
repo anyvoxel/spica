@@ -35,33 +35,6 @@
 - 合并时须保留 recover 的「**有界**」性质(读到 durable tail 即停,不能 tail 等待),以及它**不触发 `after_commit`**/ack(恢复路径无在途 caller)。
 - 若把 follower 循环直接当作 recovery 的驱动,需把 Noop 水位推进参数化或统一到 `commit_at_noop`,改动面更大——明确后再评估。
 
-## ReleaseTaskLease 命令/处理器的臃肿:租约过期重回队走了一次多余的 Command 派发
-
-**状态:** 已识别,待评审后再动手(不要未经评审直接改)
-
-### 问题
-
-`Command::ReleaseTaskLease` + 专属 `ReleaseTaskLeaseHandler`(crates/engine/src/handlers/release_task_lease.rs)承载的逻辑偏重:它只是把「已领任务租约到期」重排回队列,却占了一个 Command 变体、一个 handler、以及 `stream_processor`/`mod.rs` 两处注册,为一个纯补偿动作引入了额外的命令转译层。
-
-关键链条:`AssignTask` 领取时设 `lease_until` 并布防 `TimerPurpose::DeliveryLease`;到期后 `TriggerTimer` 的 `DeliveryLease` 臂已经**解析出了在途 task**(crates/engine/src/handlers/trigger_timer.rs:121),却还要 `emit_command(Command::ReleaseTaskLease { task })`,再经一次全量派发把同一个 task 送回 `ReleaseTaskLeaseHandler` 重新 `get_task`、校验、构建事件。`TriggerTimer` 臂与 handler 之间的「找 task → 释放」是有机会合并的相邻逻辑,被一个多余命令切断。
-
-### 候选方案(已分析,评级:低风险、值得做)
-
-把 `ReleaseTaskLeaseHandler` 的逻辑**内联进 `TriggerTimer` 的 `DeliveryLease` 臂**,删掉中间命令:
-
-1. 在 `DeliveryLease` 臂内,解析出在途 task 后直接 `get_task`、做幂等校验、重置为 `Pending` 并 `emit_event(Event::TaskLeaseExpired)`——逻辑照搬 handler(参见下述「注意」)。
-2. 删除 `Command::ReleaseTaskLease` 变体(crates/engine/src/types/command.rs:352)。
-3. 删除 `ReleaseTaskLeaseHandler`(release_task_lease.rs)、`handlers/mod.rs:54` 的导出、`stream_processor.rs:103` 的注册。
-
-预期效果:每到期一次少一次额外命令派发与一次重复 `get_task`;Command 枚举/派发表少一个变体;补偿语义不变。
-
-### 注意(合并时须逐条保留,缺一即破坏 at-least-once)
-
-- **幂等校验不可丢**:释放前必须 `status.is_running()` 才重置。租约到期定时器与结算(settle)会竞态,先写者胜;已结算/已释放的任务必须 no-op——这是 at-least-once 契约安全的关键。
-- **字段重置语义照搬 handler**:清 `worker_id`、`lease_until`、`retry_state.next_available_at`;`next_available_at` 必须清(租约过期重回队是**新资格**,不能继承旧等待期,须立即可领)。
-- **`with_update_at` 时间戳** 与 `Event::TaskLeaseExpired` 的发射保持不变;(crates/engine/src/types/event.rs:208)与 `TaskLeaseExpiredApplier` 均不动。
-- 合并后 `TimerPurpose::DeliveryLease` 臂会同时做「读 task + 释放」,注意与现有 `TaskTimeout` 臂「读 task + 发 FailTask」并列,保持一致的代码形态。
-
 ## (参考)Zeebe 异步复制 + ahead-of-commit + committed-only 快照 —— multi-node 时的吞吐优化方案
 
 **状态:** 设计参考,已消化;**单节点不需要、也不应提前落地**。触发条件 = spica 跨入 multi-node(引入 quorum 复制)时再评估。
@@ -271,7 +244,7 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 ### 注意
 
 - 判定每处到底「重试 / 拦截 / panic / 终止」,**依据是 `Err` 携带的 `ExecutionError` 变体**,不是调用点位置;`evaluate`/`resolve_state_*` 只返回 `RuntimeError`(永久),只有包了存储读取的 `machine*`/`load_scope_ref*` 才会透出 `InfraError`(瞬时)——这一步是清单的关键判据。
-- 未评估 `terminate` 现是否会先被某处的 Catch 消费;若引入重试通道,须保证「重试」不破坏 at-least-once(重放条目须幂等,与 ReleaseTaskLease 的幂等契约同一原则)。
+- 未评估 `terminate` 现是否会先被某处的 Catch 消费;若引入重试通道,须保证「重试」不破坏 at-least-once(重放条目须幂等,与 `TasksClaimed` 的条件折叠同一原则)。
 - TODO 内联注释系统(crates/engine/src/handlers/activate_state.rs:38 的 Scope/reject/retry 批注)与本条目同源,落地时一并收敛。
 
 ## (设计参考)Reject / Incident / Resolve / SetVariables —— 引擎「不可遵循的命令」与「可恢复的暂停」如何分工、恢复
@@ -309,4 +282,4 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 - 分辨「reject vs incident」的判据是**已接受的执行 vs 尚未接受的命令**:`Reject` 拒绝的是"命令我不会执行";`Incident` 暂停的是"已执行的转换我卡住了"。二者分层不同,互不替代。
 - incident 必须持久(进 state),才能跨重启保留、才能让 `RESOLVE` 按元素状态重放;这与 spica 目前「Reject 不进 projection」是**有意为之**的差异。
 - 若引入运行期 `SetVariables`,需与定案期 `Assign` 明确作用域语义(SetVariables 用 `variableScopeKey` 定位,Assign 只写当前 activity 的 owner scope),避免两套写变量入口语义漂移。
-- `RESOLVE` 重放的是原命令,**必须幂等**(重放条目不得重复入账),与 `ReleaseTaskLease` 的幂等契约同一原则(at-least-once 安全)。
+- `RESOLVE` 重放的是原命令,**必须幂等**(重放条目不得重复入账),与 `TasksClaimed` 的条件折叠同一原则(at-least-once 安全)。

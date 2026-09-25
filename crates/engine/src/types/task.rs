@@ -95,8 +95,8 @@ pub struct RetryState {
 /// task is a leaf side-effect node: it never initiates its own completion — it is either claimed
 /// and settled by a worker, or cancelled. The two non-terminal states model the Zeebe job lifecycle:
 /// a task is created **pending** (`Pending`), a worker **claims** it (`Running`, leased to that
-/// worker until `lease_until`), and only the leasing worker's `CompleteTask`/`FailTask` settles it
-/// — otherwise it re-queues (`Pending`) when its lease expires. Splitting the worker out of the
+/// worker until `lease_expires_at`), and only the leasing worker's `CompleteTask`/`FailTask` settles
+/// it — otherwise it is claimable again once that instant passes. Splitting the worker out of the
 /// engine's process is what this lifecycle exists for: the engine stays the single writer that
 /// validates each transition, the worker is just a (possibly remote) claimant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +104,7 @@ pub enum TaskStatus {
     /// Created and waiting for a worker to claim it (Zeebe `ACTIVATABLE`/queued). An unclaimed task
     /// sits in this state indefinitely — the engine never predicts whether a worker will appear.
     Pending,
-    /// Leased to a worker for `Task::lease_until`; the worker is executing it (Zeebe
+    /// Leased to a worker until `Task::lease_expires_at`; the worker is executing it (Zeebe
     /// `ACTIVATED`).
     Running,
     Completed,
@@ -164,15 +164,19 @@ pub struct Task {
     pub deadline: Option<Timestamp>,
     /// The worker that currently leases this task, set when a worker claims it (`Running`). A
     /// `CompleteTask`/`FailTask` is accepted only from this worker (the Zeebe lease-ownership
-    /// invariant); cleared when the lease expires or the task settles.
+    /// invariant); cleared when the task settles or is re-claimed. It is deliberately *not* cleared
+    /// when the lease lapses: a stale lease leaves the task claimable (see
+    /// [`Task::is_claimable_at`]) but still leased, so the lapsed worker's late settle is accepted —
+    /// the work is already done, and re-queueing it would run it twice.
     #[serde(default)]
     pub worker_id: Option<String>,
-    /// Wall-clock lease expiry for the claiming worker; `Some` iff `status == Running`. When it
-    /// passes without a settle, the task returns to `Pending` (re-claimable). Distinct from
-    /// `deadline` (the ASL `TimeoutSeconds` terminal backstop): the lease re-queues on a crashed /
-    /// stalled worker, the deadline eventually fails the task.
+    /// Wall-clock lease expiry for the claiming worker; `Some` iff `status == Running`. Once it
+    /// passes without a settle the task is claimable again — by another worker (which takes it over)
+    /// or by the same one re-polling. Distinct from `deadline` (the ASL `TimeoutSeconds` terminal
+    /// backstop): the lease frees a crashed / stalled worker's task for re-claim, the deadline
+    /// eventually fails the task.
     #[serde(default)]
-    pub lease_until: Option<Timestamp>,
+    pub lease_expires_at: Option<Timestamp>,
     /// The frozen `Retry` policy resolved at the task's first activation (empty = no retry). The
     /// task decides retry from this alone, so it never revisits the owning state's definition.
     #[serde(default)]
@@ -190,5 +194,25 @@ impl Task {
     /// reference) is stable across retry attempts.
     pub fn reference(&self) -> ObjectReference {
         ObjectReference::new(ObjectKind::Task, self.meta.name.clone(), self.meta.uid)
+    }
+
+    /// Whether a worker may claim this task *at* `now`: a `Pending` task whose retry backoff gate has
+    /// lapsed, or a `Running` task whose delivery lease has expired.
+    ///
+    /// The lease half is the engine's **lazy re-claim**: no timer is armed per claim, so an
+    /// un-settled lease is reclaimed by whichever poll observes it expired rather than by a deadline
+    /// firing. Liveness therefore depends on a worker polling again — the price of not carrying a
+    /// durable timer per claim. Both the discovery scan (storage) and the claim's conditional fold
+    /// (the applier) decide through this one predicate, so what a poll grants is exactly what the fold
+    /// accepts.
+    pub fn is_claimable_at(&self, now: Timestamp) -> bool {
+        match self.status {
+            TaskStatus::Pending => !self
+                .retry_state
+                .next_available_at
+                .is_some_and(|at| now < at),
+            TaskStatus::Running => self.lease_expires_at.is_some_and(|at| at <= now),
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => false,
+        }
     }
 }

@@ -1,5 +1,4 @@
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::{ActivateState, Command, SpawnThread};
 use crate::types::event::Event;
 
@@ -84,7 +83,7 @@ impl SpawnThreadHandler {
         // Mint the child's uid and its stable ObjectReference up front: the child `Thread` row is
         // keyed by that reference, and the sibling `ActivateState` entry must name the same run
         // before the `ThreadCreated` applier builds the entity.
-        let uid: ulid::Ulid = ulid::Ulid::new();
+        let uid: ulid::Ulid = ctx.mint();
         // Name the thread as a child of its owning execution (the #3/#11/#13 convention, applied to
         // threads): the generated name's plain base is the owning execution's name, inherited
         // verbatim through every nesting level — so a branch thread still names its root run — and
@@ -107,17 +106,23 @@ impl SpawnThreadHandler {
         // `active_children` the applier populates, so the Parallel drains only once every branch
         // settles); `execution` inherits the top-level run's id verbatim (the flat query
         // anchor shared by the whole tree); `state_path` lets the child resolve its own branch
-        // states without querying its parent or the root — it already names the branch's `states`
+        // states without querying its parent or the root — it already names the branch's `States`
         // table within the single shared machine document.
+        //
+        // A thread's `state_path` is its defining property — it always descends into the shared
+        // machine — so the command must carry it. `SpawnThread` is only issued by the container
+        // states (Parallel/Map), which always compute the branch/item pointer.
+        let branch_states = state_path
+            .clone()
+            .expect("a spawned thread always receives its state_path from the container");
         out.append_event(Event::ThreadCreated {
             thread: crate::Thread {
                 execution: execution.clone(),
-                // A thread's `state_path` is its defining property — it always descends into the
-                // shared machine — so the command must carry it. `SpawnThread` is only issued by the
-                // container states (Parallel/Map), which always compute the branch/item pointer.
-                state_path: state_path
-                    .clone()
-                    .expect("a spawned thread always receives its state_path from the container"),
+                state_path: branch_states.clone(),
+                // The entry point inside that table travels with the thread too, so the entity names
+                // its whole sub-run (which table it runs, and where in it it starts) rather than
+                // leaving the entry recoverable only from the `ActivateState` emitted just below.
+                start_at: start_at.clone(),
                 // The thread records its own ordinal (branch/item index in declaration order); the
                 // container's ordered fan-out map is projected from this by the `ThreadCreated`
                 // applier, so the value lives here on the entity as its identity.
@@ -132,24 +137,20 @@ impl SpawnThreadHandler {
                     uid,
                 )
                 .name(thread_name)
-                .at(Timestamp::now())
+                .at(ctx.now())
                 .build()
                 .with_owner(owner.clone()),
             },
         })
         .await;
         // Enter the branch at its `StartAt` state. The child's path = the thread's branch/item
-        // `state_path` (its enclosing `states` table) extended by the start state's name, so the
+        // `state_path` (its enclosing `States` table) extended by the start state's name, so the
         // carried path locates the state self-containedly. `owner` is the new Thread (the branch's
         // immediate scope); `execution` is the inherited top-level anchor.
-        let mut enter_path = state_path
-            .clone()
-            .expect("a spawned thread always receives its state_path from the container");
-        enter_path.push_back(start_at.as_str());
         out.append_command(Command::ActivateState(ActivateState {
             execution: root_execution,
             owner: reference,
-            state_path: enter_path,
+            state_path: branch_states.state(start_at),
             input: input.clone(),
         }));
     }

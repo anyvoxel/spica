@@ -731,7 +731,7 @@ async fn handler_error_is_recorded_as_failure() {
 #[tokio::test]
 async fn activate_state_carries_self_locating_state_path() {
     // finding #2: `Command::ActivateState` must carry the state's full `state_path` (top-level
-    // `/states/<name>`, or `/states/.../branches/<idx>/<name>` inside a container), so the command is
+    // `/States/<name>`, or `/States/.../Branches/<idx>/<name>` inside a container), so the command is
     // self-locating rather than asking the handler to infer the enclosing `states` table from the
     // owning thread's stored path. Run a flow that hops through a top-level state, a Parallel whose
     // first branch itself transitions sequentially, and a second single-state branch, then assert
@@ -795,12 +795,12 @@ async fn activate_state_carries_self_locating_state_path() {
         .collect();
     paths.sort();
     let mut expected: Vec<String> = [
-        "/states/Start",
-        "/states/P",
-        "/states/P/branches/0/A0",
-        "/states/P/branches/0/A1",
-        "/states/P/branches/1/B0",
-        "/states/Done",
+        "/States/Start",
+        "/States/P",
+        "/States/P/Branches/0/States/A0",
+        "/States/P/Branches/0/States/A1",
+        "/States/P/Branches/1/States/B0",
+        "/States/Done",
     ]
     .iter()
     .map(|s| s.to_string())

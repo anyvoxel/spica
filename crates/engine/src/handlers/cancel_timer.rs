@@ -36,7 +36,7 @@ impl CancelTimerHandler {
                 // removal. Stamp the cancel moment as `updated_at`.
                 meta: {
                     let mut m = act.value.meta.clone();
-                    m.with_update_at(crate::log::Timestamp::now());
+                    m.with_update_at(ctx.now());
                     m
                 },
             },

@@ -1,6 +1,5 @@
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
 use crate::types::id::RequestId;
@@ -79,7 +78,7 @@ impl TerminateExecutionHandler {
         terminating_execution.status = crate::ExecutionStatus::Terminating(reason.clone());
         // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
         // carries forward.
-        terminating_execution.meta.with_update_at(Timestamp::now());
+        terminating_execution.meta.with_update_at(ctx.now());
         out.append_event(Event::ExecutionTerminating {
             execution: terminating_execution,
         })
@@ -121,7 +120,7 @@ impl TerminateExecutionHandler {
         if pending == 0 {
             let mut terminated_execution = exec.value();
             terminated_execution.status = crate::ExecutionStatus::Terminated(reason.clone());
-            terminated_execution.meta.with_update_at(Timestamp::now());
+            terminated_execution.meta.with_update_at(ctx.now());
             // Termination is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionTerminated` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an

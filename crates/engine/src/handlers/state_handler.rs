@@ -4,15 +4,16 @@ use spica_asl::{AssignObject, State};
 use std::collections::HashMap;
 use std::mem::Discriminant;
 
+use super::{emit_state_completed, emit_transition};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::{ActivateState, Command, CompleteState};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
+use crate::types::id::RequestId;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
-use crate::{Activity, ActivityStatus, Variables};
+use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
 /// (via [`Self::state`], the single source of truth for the dispatch-table key) and builds a
@@ -87,17 +88,34 @@ impl StateHandlerRegistry {
     }
 }
 
+/// The state's answer to "may the success finish run now?", returned by
+/// [`StateHandler::on_completing`] once it has dealt with its own unfinished children. A named value
+/// rather than a `bool` because `Waiting` also carries *how many* children are still live, which the
+/// base reports in its deferral log.
+pub enum FinishReadiness {
+    /// Proceed into the finish: no child of this state outlives the decision.
+    Ready,
+    /// Defer: `pending` children are still live. The activity is already `Completing`, so the last
+    /// one's settle drives the drain (see `crate::handlers::continue_`) — nothing re-drives `complete`.
+    Waiting { pending: usize },
+    /// The activity's row is gone or unreadable: there is no finish to run.
+    Gone,
+}
+
 /// A short-lived handler bound to one resolved [`State`] definition. Owned for a single lifecycle
 /// dispatch (activate / complete / child-settled) and dropped once it returns. A concrete adapter
 /// holds a typed definition reference (e.g. `&TaskState`), so the per-variant hooks read it directly
 /// instead of receiving `&State` and re-matching.
 ///
-/// The base [`activate`](Self::activate) orchestration (a Template Method) constructs the activity,
-/// runs the four activate hooks (`initialize` / `process_input` / `after_activated` /
-/// `complete_directly`) in a fixed order, and hands into `CompleteState`, so synchronous states
-/// (Pass/Succeed/Fail/Choice) share one code path instead of each re-emitting `StateActivated` +
-/// `CompleteState`. The activate causal chain is
-/// `StateActivating → StateActivated → (CompleteState | side effect)`.
+/// Both lifecycle operations are Template Methods owned by the base. [`activate`](Self::activate)
+/// constructs the activity, runs the four activate hooks (`initialize` / `process_input` /
+/// `after_activated` / `complete_directly`) in a fixed order, and hands into `CompleteState`, so
+/// synchronous states (Pass/Succeed/Fail/Choice) share one code path instead of each re-emitting
+/// `StateActivated` + `CompleteState`. [`complete`](Self::complete) runs the shared complete-step
+/// orchestration (load, guards, `StateCompleting`, the [`on_completing`](Self::on_completing) child
+/// gate, scope resolution) and then the single per-state [`finish`](Self::finish). The activate causal
+/// chain is `StateActivating → StateActivated → (CompleteState | side effect)`; the complete chain is
+/// `StateCompleting → (StateCompleted | failure ed) → transition`.
 #[async_trait]
 pub trait StateHandler: Send + Sync {
     // ── activate hooks — the only per-state variation ────────────────────────
@@ -108,18 +126,22 @@ pub trait StateHandler: Send + Sync {
     async fn initialize(&self, _activity: &mut Activity) {}
 
     /// (2.4) Turn the activity's `raw_input` into its processed input. Default: pass it through. A
-    /// `Task`/`Parallel` project `Arguments`; a `Map` harvests its item plan onto `activity_state`.
-    /// An error is returned for the base to terminate on. `activity` is the state being processed
-    /// (read `raw_input`, write `activity_state`); `variables` is its scope's bindings, which the
-    /// state-specific projections evaluate against — that reads live in the hook because the
-    /// activity does not carry scope state. `states` is the activate-step `$states`, built once in
-    /// the base (uniform across every state) and shared by all hooks.
+    /// `Task`/`Parallel` project `Arguments`; a `Map` harvests its item plan onto `activity_state`,
+    /// and a `Wait` its resume instant. An error is returned for the base to terminate on.
+    /// `activity` is the state being processed (read `raw_input`, write `activity_state`);
+    /// `variables` is its scope's bindings, which the state-specific projections evaluate against —
+    /// that reads live in the hook because the activity does not carry scope state. `states` is the
+    /// activate-step `$states`, built once in the base (uniform across every state) and shared by all
+    /// hooks. `now` is the entry instant, passed explicitly so a repository that records a *deadline*
+    /// (a `Wait`'s resume) resolves it against the same clock reading the base stamps the activity
+    /// with, rather than re-reading a clock the hook cannot see.
     async fn process_input(
         &self,
         _env: &mut EvalEnv,
         activity: &mut Activity,
         _variables: &Variables,
         _states: &Value,
+        _now: Timestamp,
     ) -> Result<Value, ExecutionError> {
         Ok(activity.raw_input.clone())
     }
@@ -158,6 +180,128 @@ pub trait StateHandler: Send + Sync {
         _variables: &Variables,
         _child: ObjectReference,
     ) {
+    }
+
+    // ── complete hooks — the only per-state variation of the complete step ──
+
+    /// (3.4) Deal with this state's unfinished children as the finish opens, reporting whether the
+    /// base may continue into [`finish`](Self::finish). The state is the only code that knows *what*
+    /// its children are, so the disposition belongs here: it cleans up whatever must not outlive its
+    /// own decision (a `Task` cancels the deadline/lease timers that merely bounded it), then reports a
+    /// wait for whatever is left. The default waits on the generic child set — a state owning no
+    /// children is trivially `Ready`, and a state whose child *is* its completion trigger (`Wait`'s
+    /// resume timer, a container's fan-out) needs no cleanup of its own.
+    async fn on_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        _out: &mut Collector<'_>,
+        activity: &ObjectReference,
+        _activity_value: &Activity,
+    ) -> FinishReadiness {
+        match self.live_children(ctx, activity).await {
+            Some(0) => FinishReadiness::Ready,
+            Some(pending) => FinishReadiness::Waiting { pending },
+            None => FinishReadiness::Gone,
+        }
+    }
+
+    /// How many children the activity still has, re-read from storage. Re-read rather than trusting
+    /// the complete step's opening snapshot: an [`on_completing`](Self::on_completing) override folds
+    /// child edges away (a cancelled timer) before asking, and those folds must be visible to the
+    /// count. `None` when the row is gone or unreadable.
+    async fn live_children(
+        &self,
+        ctx: &HandlerContext<'_>,
+        activity: &ObjectReference,
+    ) -> Option<usize> {
+        match ctx.storage.get_activity(activity).await {
+            Ok(Some(a)) => Some(a.active_children.len()),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// The state's `Assign` delta, applied to the completing scope by the default
+    /// [`finish`](Self::finish). These sources live on the typed definition, which a trait default
+    /// method cannot reach, so a state on the canonical success path (`Pass`/`Succeed`/`Wait`/`Task`)
+    /// exposes them here instead of re-implementing the finish. A state that overrides `finish`
+    /// (`Fail`, `Choice`, a container) projects its own sources inside that override.
+    fn assign(&self) -> Option<&AssignObject> {
+        None
+    }
+
+    /// The state's `Output` projection over its raw result; absent means the result passes through.
+    fn output(&self) -> Option<&Value> {
+        None
+    }
+
+    /// The successor this state routes to — a sibling hop in the same `States` table. `None` has no
+    /// successor, which [`end`](Self::end) turns into an owner-terminal completion.
+    fn next(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether this state is terminal (`End`), routing to its owner's completion instead of a sibling.
+    fn end(&self) -> Option<bool> {
+        None
+    }
+
+    /// (3.5) The per-state finish, run by the base [`complete`](Self::complete) once the activity has
+    /// been loaded, guarded, opened with `StateCompleting` and cleared for the finish by
+    /// [`on_completing`](Self::on_completing). The default is the canonical
+    /// ASL success projection — `Assign` (a delta on the scope, emitted as `VariablesAssigned`) then
+    /// `Output` (defaulting to the state's raw result) — followed by `StateCompleted` and the state's
+    /// transition, so every state on that path (`Pass`/`Succeed`/`Wait`/`Task`) shares one
+    /// implementation instead of four copies. `Fail` overrides it to terminate instead, `Choice` to
+    /// route by its resolved rule, and a container to its own defensive finish. An error is turned
+    /// into a terminate by the base.
+    async fn finish(
+        &self,
+        env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity: ObjectReference,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ExecutionError> {
+        // `$states.result` is the state's raw result — for a `Task` the worker payload, for
+        // synchronous states and `Wait` the processed input (see `CompleteState`'s docs). It is also
+        // the fallback the projection passes through when the state declares no `Output`.
+        let result = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| activity_value.raw_input.clone());
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+        let owner = activity_value
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner");
+        self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
+            .await?;
+        let output_value = self
+            .project_output(env, self.output(), &states, &local_scope, result)
+            .await?;
+
+        emit_state_completed(out, activity_value, &output_value).await;
+        emit_transition(
+            out,
+            activity_value.execution.clone(),
+            owner,
+            activity,
+            &activity_value.state_path,
+            &output_value,
+            self.next(),
+            self.end(),
+        )
+        .await;
+        Ok(())
     }
 
     /// Apply a state's `Assign` delta (when present) onto the scope variables in place, emitting
@@ -250,14 +394,14 @@ pub trait StateHandler: Send + Sync {
             activity_state: None,
             retry_state: None,
             output: None,
-            meta: ObjectMeta::builder(ObjectKind::Activity, ulid::Ulid::new())
+            meta: ObjectMeta::builder(ObjectKind::Activity, ctx.mint())
                 .name(
                     execution
                         .name
                         .base()
                         .generated_from_key(out.next_generated_seq().await),
                 )
-                .at(Timestamp::now())
+                .at(ctx.now())
                 .build()
                 .with_owner(owner.clone()),
         };
@@ -310,7 +454,7 @@ pub trait StateHandler: Send + Sync {
 
         // (2.4)
         let input = match self
-            .process_input(ctx.env, &mut activity_value, &variables, &states)
+            .process_input(ctx.env, &mut activity_value, &variables, &states, ctx.now())
             .await
         {
             Ok(input) => input,
@@ -324,7 +468,7 @@ pub trait StateHandler: Send + Sync {
         // (2.5) `activity_value` already carries the processed input (`input`, set above) and, for a
         // container state, its activation plan written by `process_input` — so `StateActivated`
         // reuses the in-place value with a fresh `updated_at` stamp.
-        activity_value.meta.with_update_at(Timestamp::now());
+        activity_value.meta.with_update_at(ctx.now());
         out.append_event(Event::StateActivated {
             activity: activity_value.clone(),
         })
@@ -348,18 +492,124 @@ pub trait StateHandler: Send + Sync {
         }
     }
 
-    /// The `Command::CompleteState` flow, implemented fully by each state: load the activity, drive
-    /// the liveness/Terminating-race guards, resolve the owning scope, reconstruct the activity and
-    /// variables, and run the state's own finish projection (`StateCompleting`/`StateCompleted`, or `Fail`'s
-    /// terminate) — all inline, so a single handler is self-contained. Receiving the activity by
-    /// reference (not `&Command`) keeps the dispatch a compile-time guarantee.
+    /// The `Command::CompleteState` flow, owned by the base — the mirror of [`Self::activate`]. The
+    /// only input is the typed [`CompleteState`] payload (receiving it by its own type rather than as
+    /// loose `activity`/`output` parameters makes the dispatch a compile-time guarantee), and every
+    /// step below is identical across states: load the activity, run the liveness / Terminating-race
+    /// guards, open the finish with `StateCompleting` (folding the command's raw result in), hand the
+    /// unfinished children to [`on_completing`](Self::on_completing) and defer if it says to wait,
+    /// resolve the owning scope and its variables, and hand into the per-state [`finish`](Self::finish).
     async fn complete(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
-        raw_result: Option<&Value>,
-    );
+        cmd: &CompleteState,
+    ) {
+        let CompleteState { activity, output } = cmd;
+
+        // (3.1) Load the activity the command names. A missing row means the activity is gone (or was
+        // never a state's) — fail the execution, with no activity to attach a state-level terminate to.
+        // TODO：拿到 activity 之后，如果遇到错误不应该是直接 terminate（有些临时性质的错误应该重试）。
+        let act = match ctx.storage.get_activity(activity).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                out.terminate(
+                    Some(activity.clone()),
+                    ObjectReference::nil(),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "activity {activity}"
+                    ))),
+                );
+                return;
+            }
+            Err(e) => {
+                out.terminate(Some(activity.clone()), ObjectReference::nil(), e);
+                return;
+            }
+        };
+
+        // (3.2) A cancel (or a competing terminator) already won on this activity: the command lost the
+        // race, so the success finish no longer applies. Refuse it durably with the nil id an internal
+        // command carries — a rejection still leaves a trace, unlike a silent no-op. Recovering the
+        // activity's *own* terminal is deliberately not this step's job: the child whose settle stranded
+        // it drives that drain (see [`crate::handlers::trigger_timer`]), so emitting `StateTerminated`
+        // from here would duplicate a terminal event the settle path already owns.
+        if act.value.status != ActivityStatus::Running {
+            out.reject(
+                RequestId::nil(),
+                RejectionType::InvalidState,
+                format!(
+                    "activity {activity} is {:?}, not Running; cannot complete",
+                    act.value.status
+                ),
+            );
+            return;
+        }
+
+        // (3.3) Open the finish now that this command has won the activity. Emitting here — before the
+        // children below are dealt with — is what makes the decision durable rather than provisional:
+        // a step that defers on a live child leaves the activity `Completing` (not `Running`), so the
+        // child's eventual settle drives the drain through the generic `Completing` path instead of
+        // depending on the state to re-issue a command. The command's raw result is folded in first
+        // (`CompleteState` always carries the state's raw result, so this overwrites rather than
+        // defaults) so a deferred drain can read it back off the row to project with.
+        let mut activity_value = act.value();
+        activity_value.raw_output = Some(output.clone());
+        activity_value.meta.with_update_at(ctx.now());
+        activity_value.status = ActivityStatus::Completing;
+        out.append_event(Event::StateCompleting {
+            activity: activity_value.clone(),
+        })
+        .await;
+
+        // (3.4) Hand the disposition of this state's unfinished children to the state itself (see
+        // `on_completing`): it cleans up whatever must not outlive its own decision, and reports
+        // whether the finish may run now. A wait leaves the activity `Completing`, so the last child's
+        // settle drives the drain (see `continue_`) and nothing re-drives `complete` — which is why the
+        // decision had to be durable before this point (3.3).
+        match self
+            .on_completing(ctx, out, activity, &activity_value)
+            .await
+        {
+            FinishReadiness::Ready => {}
+            FinishReadiness::Waiting { pending } => {
+                tracing::debug!(
+                    activity = %activity,
+                    children = pending,
+                    "state is Completing but its children have not all drained; finish deferred"
+                );
+                return;
+            }
+            FinishReadiness::Gone => return,
+        }
+
+        // The activity's owner is its *scope* — resolved through the central Execution/Thread dispatch
+        // in storage, which silently ignores non-scope kinds.
+        let owner = act
+            .value
+            .meta
+            .owner
+            .clone()
+            .expect("an owned activity has an owner");
+        let scope = match crate::storage::load_scope_ref(ctx.storage, &owner).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
+            Err(_) => return,
+        };
+        if !scope.is_running() {
+            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
+        }
+
+        // (3.5) The scope's variables as of the transition, and the per-state finish — the projection
+        // (`$states.result` / `Assign` / `Output`) plus the `Next`/`End` routing. `activity_value` is
+        // the value (3.3) already opened the finish with, so its `Completing` status and folded raw
+        // result carry forward into whichever lifecycle the finish emits.
+        let variables = scope.variables().clone();
+        let finished = self
+            .finish(ctx.env, out, activity.clone(), &activity_value, &variables)
+            .await;
+        fail_or!(out, Some(activity.clone()), owner, finished);
+    }
 }
 #[cfg(test)]
 mod tests {

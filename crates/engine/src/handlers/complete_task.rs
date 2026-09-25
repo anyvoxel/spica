@@ -109,9 +109,9 @@ impl CompleteTaskHandler {
         let mut task_value = act.value();
         task_value.status = TaskStatus::Completed;
         task_value.worker_id = None;
-        task_value.lease_until = None;
+        task_value.lease_expires_at = None;
         // Stamp the completion moment; `created_at` is already carried on `task_value`.
-        task_value.meta.with_update_at(crate::log::Timestamp::now());
+        task_value.meta.with_update_at(ctx.now());
         let completed = Event::TaskCompleted(TaskCompleted {
             request_id: *request_id,
             task: task_value,
@@ -121,11 +121,9 @@ impl CompleteTaskHandler {
         // observer wakes the awaiting `TaskApi::complete` with it (the request/response contract that
         // lets it report this settlement was applied).
         out.append_event(completed).await;
-        // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
-        // before `CompleteState`: the M1 activity-completion guard refuses to finish an activity that
-        // still has live children, and a settled task must leave none behind. Fired-since timers are
-        // no longer active children and are simply absent.
-        super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
+        // The activity's own `TaskTimeout` child needs no sweep here: the Task state declares it
+        // supervisory, so the base complete step cancels it before it finishes. (A claim leaves no
+        // child at all — the delivery lease is a field on the task, not a timer.)
         out.append_command(Command::CompleteState(CompleteState {
             activity: activity_id,
             // The Task's raw result is the worker's payload (its `raw_output` / `$states.result`).

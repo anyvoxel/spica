@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use spica_machinery::{Clock, IdGenerator, SystemClock, SystemIdGenerator};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -67,9 +68,10 @@ use crate::types::task::Task;
 /// without the mandatory `processor`; `start` is what closes that gap (and enforces the linear
 /// lifecycle described in the module docs).
 pub struct EngineBuilder {
-    /// See the running [`Engine::log`] — owned here until [`start`](Self::start) moves it into the
-    /// `Engine` it returns.
-    log: Arc<Box<dyn LogStream<EntryPayload>>>,
+    /// The caller's log, **unwrapped** until [`start`](Self::start): the Noop-terminating wrapper that
+    /// every running engine appends through needs the [`Clock`], and the clock is not known until
+    /// `start` (the builder may be reconfigured between `with_backends` and then).
+    log: Box<dyn LogStream<EntryPayload>>,
     /// See the running [`Engine::storage`] — owned here until [`start`](Self::start) moves it.
     storage: Arc<Mutex<Box<dyn Storage>>>,
     /// The injected [`Hook`] observer the StreamProcessor reports durable facts to. Defaults to a
@@ -77,6 +79,14 @@ pub struct EngineBuilder {
     /// inject one via [`with_hook`](Self::with_hook). The engine itself never fabricates a concrete
     /// observer — it only publishes observations.
     hook: Arc<dyn Hook>,
+    /// The engine's time source — see [`Clock`]. Defaults to the wall clock; a caller that needs time
+    /// to be an input (tests driving a `Wait`/timeout/lease boundary) injects one via
+    /// [`with_clock`](Self::with_clock), and every stamp and deadline in a dispatch reads it.
+    clock: Arc<dyn Clock>,
+    /// The engine's identity source — see [`IdGenerator`]. Defaults to fresh random ULIDs; a caller
+    /// that needs a run's identities to be predictable injects one via
+    /// [`with_id_generator`](Self::with_id_generator), and every `uid` a dispatch mints reads it.
+    ids: Arc<dyn IdGenerator>,
 }
 
 /// Executes ASL state machines via the CCES architecture (Causal Command Event Sourcing).
@@ -121,6 +131,9 @@ pub struct EngineInner {
     /// `resolve_version_id` resolving the latest revision) while the StreamProcessor runs. `Box<dyn …>`
     /// so `StreamProcessor::run` sees a Sized type.
     storage: Arc<Mutex<Box<dyn Storage>>>,
+    /// The engine's injected time source — the worker-initiated commands this engine appends itself
+    /// (`append_command`) stamp from it, and it is the same clock the StreamProcessor dispatches with.
+    clock: Arc<dyn Clock>,
     /// Handle to the engine's single long-lived StreamProcessor run loop, booted by
     /// [`EngineBuilder::start`] and shut down by [`Engine::stop`]. Present **unconditionally** — the
     /// type guarantees this engine is running (it is only produced by `EngineBuilder::start`, which
@@ -156,15 +169,40 @@ impl EngineBuilder {
     /// fabricates concrete backends itself, so it has no dependency on the implementation crates
     /// (keeping `storage → engine`, not the reverse, acyclic — see `crate::storage`).
     pub fn with_backends(log: Box<dyn LogStream<EntryPayload>>, storage: Box<dyn Storage>) -> Self {
-        // Wrap the caller's log so every atomic append is Noop-terminated (defensive; a bare Command
-        // gains an inert trailing Noop). See `NoopTerminatedLogStream`. The StreamProcessor's own
-        // causal-batch terminator is unaffected.
-        let log = Box::new(NoopTerminatedLogStream::new(log)) as Box<dyn LogStream<EntryPayload>>;
         Self {
-            log: Arc::new(log),
+            log,
             storage: Arc::new(Mutex::new(storage)),
             hook: Arc::new(NoopHook),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(SystemIdGenerator),
         }
+    }
+
+    /// Inject the [`Clock`] this engine reads "now" from. Every deadline a handler decides on
+    /// (`Wait`, `TimeoutSeconds`, a task lease, a retry backoff gate) and every stamp it writes is
+    /// derived from this source, so injecting a manual clock makes a run's *timing* as controllable
+    /// as its ids — a test advances the clock instead of waiting for it. Defaults to the wall clock.
+    ///
+    /// The consumer must inject the **same** clock into whatever drives the waits (the scheduler
+    /// armed from the `TimerActivated` facts), otherwise a timer's deadline is computed against one
+    /// clock and awaited against another.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Inject the [`IdGenerator`] this engine mints every new object's `uid` from. Identity, like
+    /// time, is otherwise a hidden input: two runs of one definition produce the same events but
+    /// never the same log, because each names its objects afresh. Injecting a generator that returns
+    /// predictable ids makes a run reproduce itself exactly — which is what lets a test pin a whole
+    /// entry chain literally instead of masking identities out of it. Defaults to fresh random ULIDs.
+    ///
+    /// A caller booting several engines over one store must give each a generator with a **disjoint
+    /// range** ([`CountingIdGenerator::starting_at`](spica_machinery::CountingIdGenerator::starting_at)),
+    /// otherwise the engines mint the same ids and their objects collide.
+    pub fn with_id_generator(mut self, ids: Arc<dyn IdGenerator>) -> Self {
+        self.ids = ids;
+        self
     }
 
     /// Inject the [`Hook`] observer the StreamProcessor reports durable facts to. Callers that want
@@ -196,8 +234,16 @@ impl EngineBuilder {
     /// type cannot express "stop then restart on the same Engine," which is the safe reading of the
     /// old convention (boot once, run many commands, stop once, drop).
     pub async fn start(self) -> Result<Engine, ExecutionError> {
-        let mut processor = StreamProcessor::new();
-        let log = Arc::clone(&self.log);
+        // Wrap the caller's log so every atomic append is Noop-terminated (defensive; a bare Command
+        // gains an inert trailing Noop). See `NoopTerminatedLogStream`. The StreamProcessor's own
+        // causal-batch terminator is unaffected. Done here (not in `with_backends`) because the
+        // wrapper stamps its terminator from the clock.
+        let log = Arc::new(Box::new(NoopTerminatedLogStream::new(
+            self.log,
+            Arc::clone(&self.clock),
+        )) as Box<dyn LogStream<EntryPayload>>);
+        let mut processor =
+            StreamProcessor::with_seams(Arc::clone(&self.clock), Arc::clone(&self.ids));
         let storage = Arc::clone(&self.storage);
         // Hand the StreamProcessor the injected observer as the `Hook` it reports facts to. The
         // engine never fabricates a concrete observer (default is the no-op); consumers that await
@@ -208,19 +254,23 @@ impl EngineBuilder {
         // `JoinHandle::abort`, which hard-kills the spawned future mid-iteration with no teardown.
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
+        // The run loop borrows the wrapped log for its whole life, so it holds its own handle: the
+        // engine keeps one for its appends (`EngineInner::append_command`) while the loop tails.
+        let run_log = Arc::clone(&log);
         let handle = tokio::spawn(async move {
-            // `&*log` is `&Box<dyn LogStream<EntryPayload>>` — a Sized implementor of `LogStream` via
-            // `#[auto_impl(Box)]`, which `StreamProcessor::run`'s `L: LogStream` accepts. The StreamProcessor is
-            // handed the storage `Arc` and acquires the `Mutex` per entry (releasing it between
-            // entries), so it never holds the lock for the whole run; it also owns the shared
-            // response registry (`ack`), completing each awaiter's channel when it applies the
-            // matching event.
-            processor.run(&*log, storage, hook, task_cancel).await
+            // `&*run_log` is `&Box<dyn LogStream<EntryPayload>>` — a Sized implementor of `LogStream`
+            // via `#[auto_impl(Box)]`, which `StreamProcessor::run`'s `L: LogStream` accepts. The
+            // StreamProcessor is handed the storage `Arc` and acquires the `Mutex` per entry
+            // (releasing it between entries), so it never holds the lock for the whole run; it also
+            // owns the shared response registry (`ack`), completing each awaiter's channel when it
+            // applies the matching event.
+            processor.run(&*run_log, storage, hook, task_cancel).await
         });
         // Assemble the engine's run state.
         let inner = Arc::new(EngineInner {
-            log: self.log,
+            log,
             storage: self.storage,
+            clock: self.clock,
             processor: StreamProcessorTask { cancel, handle },
         });
         let engine = Engine { inner };
@@ -448,18 +498,21 @@ impl EngineInner {
         crate::query::list_kind(&*storage, kind, limit, continue_token).await
     }
 
-    /// Pure read: scan up to `limit` `Pending` tasks of `resource` from the durable projection — the
-    /// discovery query behind a worker pull. The worker-facing consumer (spica-server) uses it as a
-    /// **read-first gate** before appending a `ClaimTasks`, so an idle poll (nothing claimable now)
-    /// stays a pure query and never writes to the log.
+    /// Pure read: scan up to `limit` tasks of `resource` that a worker may claim **at** `now`
+    /// ([`Task::is_claimable_at`]) from the durable projection — the discovery query behind a worker
+    /// pull. The worker-facing consumer (spica-server) uses it as a **read-first gate** before
+    /// appending a `ClaimTasks`, so an idle poll (nothing claimable now) stays a pure query and never
+    /// writes to the log. `now` is the caller's clock reading: the gate is best-effort, and the
+    /// authoritative eligibility is re-decided inside the serialized dispatch.
     pub async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<Task>, ExecutionError> {
         let storage = self.storage.lock().await;
         Ok(storage
-            .activatable_tasks(resource, limit)
+            .activatable_tasks(resource, now, limit)
             .await?
             .into_iter()
             .map(|r| r.value)
@@ -601,7 +654,7 @@ impl EngineInner {
                 stream_id: StreamId::nil(), // the log stamps its own id at append.
                 entry_id: EntryId::nil(),   // placeholder — the log assigns the real position.
                 cause_id: None,             // worker-initiated: no causal parent.
-                timestamp: Timestamp::now(),
+                timestamp: self.clock.now(),
                 payload: EntryPayload::Command(command),
             }])
             .await?;

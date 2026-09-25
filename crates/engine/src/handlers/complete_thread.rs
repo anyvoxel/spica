@@ -1,6 +1,5 @@
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::storage::ScopeRecord;
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
@@ -51,7 +50,7 @@ impl CompleteThreadHandler {
         completing_thread.output = Some(output.clone());
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
-        completing_thread.meta.with_update_at(Timestamp::now());
+        completing_thread.meta.with_update_at(ctx.now());
         out.append_event(Event::ThreadCompleting {
             thread: completing_thread,
         })
@@ -63,7 +62,7 @@ impl CompleteThreadHandler {
             let mut completed_thread = thread_row.value();
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
-            completed_thread.meta.with_update_at(Timestamp::now());
+            completed_thread.meta.with_update_at(ctx.now());
             out.append_event(Event::ThreadCompleted {
                 thread: completed_thread,
             })

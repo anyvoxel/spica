@@ -1,18 +1,15 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::{IntOrExpr, State, WaitState, WaitTimestamp};
+use spica_asl::{AssignObject, IntOrExpr, State, WaitState, WaitTimestamp};
 
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use super::super::{emit_timer, emit_transition, eval_string_or_expr};
+use super::super::{emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::Collector;
 use crate::log::Timestamp;
 use crate::types::command::TimerPurpose;
-use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
-use crate::{Activity, ActivityStatus, Variables};
+use crate::{Activity, ActivityState, Variables, WaitActivityState};
 
 /// The inclusive upper bound of a `Wait` `Seconds` value, per the ASL spec.
 const MAX_WAIT_SECONDS: i64 = 99_999_999;
@@ -41,16 +38,38 @@ struct WaitStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for WaitStateHandler<'_> {
-    // Wait's processed input is its raw input; the only activate work is arming the resume timer.
-    async fn after_activated(
+    // Wait's processed input is its raw input; the activate work is resolving the resume instant,
+    // which is the activity's activation product.
+    async fn process_input(
         &self,
         env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity_value: &Activity,
+        activity: &mut Activity,
         variables: &Variables,
         states: &Value,
+        now: Timestamp,
+    ) -> Result<Value, ExecutionError> {
+        // Resolve the deadline here rather than when the timer is armed, so the instant is a property
+        // of the entering activity (carried by `StateActivated` and every later event) and *one*
+        // computation feeds both carriers: this repository field and the `WaitResume` timer
+        // `after_activated` arms from it.
+        let resume_at = self.resolve_wait_deadline(env, variables, states, now)?;
+        activity.activity_state = Some(ActivityState::Wait(WaitActivityState { resume_at }));
+        Ok(activity.raw_input.clone())
+    }
+
+    // The only post-activation work is arming the resume timer, from the instant resolved above — the
+    // timer is what actually resumes the state; the field only records when that will be.
+    async fn after_activated(
+        &self,
+        _env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+        _states: &Value,
     ) -> Result<(), ExecutionError> {
-        let deadline = self.resolve_wait_deadline(env, variables, states)?;
+        let Some(ActivityState::Wait(wait)) = activity_value.activity_state.as_ref() else {
+            return Ok(()); // deadline not recorded — nothing to arm.
+        };
         emit_timer(
             out,
             // The timer's `execution` anchor is the flat top-level run (`activity.execution`), not
@@ -59,7 +78,7 @@ impl StateHandler for WaitStateHandler<'_> {
             activity_value.execution.clone(),
             activity_value.reference(),
             TimerPurpose::WaitResume,
-            deadline,
+            wait.resume_at,
         )
         .await;
         Ok(())
@@ -69,213 +88,40 @@ impl StateHandler for WaitStateHandler<'_> {
         false
     }
 
-    /// Resumed by `CompleteState` after the Wait's `WaitResume` timer fires.
-    /// The `Command::CompleteState` finish — the shared orchestration (liveness/Terminating-race
-    /// guards, owning-scope resolution, activity and variables reconstruction) and this state's projection,
-    /// all inline.
-    async fn complete(
-        &self,
-        ctx: &mut HandlerContext<'_>,
-        out: &mut Collector<'_>,
-        activity: ObjectReference,
-        raw_result: Option<&Value>,
-    ) {
-        let act = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "activity {activity}"
-                    ))),
-                );
-                return;
-            }
-            Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    e,
-                );
-                return;
-            }
-        };
+    // A `Wait` owns no result of its own: the timer that resumes it carries the raw result as the
+    // `CompleteState` output, so the base's default `finish` (raw result = `raw_output`, falling back
+    // to the processed input) is exactly this state's projection — only the routing is its own.
+    fn assign(&self) -> Option<&AssignObject> {
+        self.state.assign.as_ref()
+    }
 
-        // Race fix: a cancel already won on this activity. The drain that would have been emitted by
-        // the cancel side may have been missed because the ordering interleaved (e.g. timer-fired +
-        // cancel together). Re-emit the deferred termination ed so the parent finishes, reusing the
-        // reason embedded in the terminating status itself.
-        if act.value.status != ActivityStatus::Running {
-            match act.value.status {
-                ActivityStatus::Terminating(ref reason) => {
-                    // Re-emit the terminal lifecycle event using the canonical activity payload shape,
-                    // preserving every previously-folded domain field while only flipping the status
-                    // from `Terminating(reason)` to `Terminated(reason)`.
-                    let mut activity_value = act.value();
-                    activity_value.status = ActivityStatus::Terminated(reason.clone());
-                    out.append_event(crate::types::event::Event::StateTerminated {
-                        activity: activity_value,
-                    })
-                    .await;
-                }
-                _ => return,
-            }
-            // A synchronous state that owns no children drains its owner Execution as soon as its own
-            // terminal lands; run the inline reaction so the owner's own drain walks up.
-            let owner = act
-                .value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner");
-            if owner.kind == ObjectKind::Activity {
-                super::super::child_completed::child_settled(ctx, out, owner, activity.clone())
-                    .await;
-            }
-            return;
-        }
-        // Defensive: an activity with live children cannot enter success yet; its ed is deferred
-        // until drain.
-        if !act.active_children.is_empty() {
-            return;
-        }
+    fn output(&self) -> Option<&Value> {
+        self.state.output.as_ref()
+    }
 
-        // The activity's owner is its *scope* — resolved through the central Execution/Thread
-        // dispatch in storage, which silently ignores non-scope kinds.
-        let scope = match crate::storage::load_scope_ref(
-            ctx.storage,
-            &act.value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-        )
-        .await
-        {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
-            Err(_) => return,
-        };
-        if !scope.is_running() {
-            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
-        }
+    fn next(&self) -> Option<&str> {
+        self.state.next.as_deref()
+    }
 
-        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
-        // step observes the canonical domain payload rather than the projection-only row. The
-        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
-        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
-        // record the command-carried result.
-        let mut activity_value = act.value();
-        if let Some(result) = raw_result {
-            activity_value.raw_output = Some(result.clone());
-        }
-        let variables = scope.variables().clone();
-        let env = &mut *ctx.env;
-
-        // Advance the one activity value in place to the completing lifecycle moment — it stays the
-        // single source of truth for the rest of the complete step, so the completing status (and its
-        // re-stamped update time) carries forward instead of a stale copy held alongside.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Completing;
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleting {
-            activity: activity_value.clone(),
-        })
-        .await;
-        let raw_result = activity_value
-            .raw_output
-            .as_ref()
-            .unwrap_or(&activity_value.raw_input);
-        let states = States::new(
-            &activity_value.raw_input,
-            &activity_value.state_path.state_name(),
-            activity_value.retry_count(),
-        )
-        .with_result(Some(raw_result))
-        .with_assign_ctx(Some(&activity_value.raw_input))
-        .build();
-        let mut local_scope = variables.clone();
-
-        let owner = activity_value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
-        let assigned = self
-            .apply_assign(
-                out,
-                env,
-                &owner,
-                self.state.assign.as_ref(),
-                &states,
-                &mut local_scope,
-            )
-            .await;
-        fail_or!(out, Some(activity), owner.clone(), assigned);
-
-        let output_value = fail_or!(
-            out,
-            Some(activity),
-            owner.clone(),
-            self.project_output(
-                env,
-                self.state.output.as_ref(),
-                &states,
-                &local_scope,
-                raw_result.clone(),
-            )
-            .await
-        );
-
-        // Advance the same value in place to the completed lifecycle moment (mirroring the completing
-        // step above): it stays the single source of truth, so the completed status and projected
-        // output carry forward into the transition that follows.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Completed;
-        activity_value.output = Some(output_value.clone());
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleted {
-            activity: activity_value.clone(),
-        })
-        .await;
-        emit_transition(
-            out,
-            activity_value.execution.clone(),
-            activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-            activity,
-            &activity_value.state_path,
-            &output_value,
-            self.state.next.as_deref(),
-            self.state.end,
-        )
-        .await;
+    fn end(&self) -> Option<bool> {
+        self.state.end
     }
 }
 
 impl WaitStateHandler<'_> {
     /// Compute the absolute deadline the Wait holds until. `Seconds` is relative — normalized to an
-    /// absolute moment at activation; `Timestamp` is already absolute (parsed from RFC3339). Exactly
-    /// one of the two is present by the well-formedness assumption (validated on submission); both may
-    /// be a JSONata expression (evaluated against the activate-step `$states`). Any invalid/out-of-range
-    /// value is a definition error that terminates the activity via the base hook.
+    /// absolute moment at activation **against the caller's `now`** (the injected clock's reading, so
+    /// the expiry is as controllable as the definition); `Timestamp` is already absolute (parsed from
+    /// RFC3339). Exactly one of the two is present by the well-formedness assumption (validated on
+    /// submission); both may be a JSONata expression (evaluated against the activate-step
+    /// `$states`). Any invalid/out-of-range value is a definition error that terminates the activity
+    /// via the base hook.
     fn resolve_wait_deadline(
         &self,
         env: &mut EvalEnv,
         variables: &Variables,
         states: &Value,
+        now: Timestamp,
     ) -> Result<Timestamp, ExecutionError> {
         match (&self.state.seconds, &self.state.timestamp) {
             // Literal `Seconds`: a non-negative integer, normalized to an absolute deadline.
@@ -285,8 +131,7 @@ impl WaitStateHandler<'_> {
                         "Wait Seconds must be an integer in the range 0..99999999".into(),
                     )));
                 }
-                Timestamp::now()
-                    .checked_add(std::time::Duration::from_secs(*n as u64))
+                now.checked_add(std::time::Duration::from_secs(*n as u64))
                     .ok_or_else(|| {
                         ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "Wait Seconds overflows the absolute deadline".into(),
@@ -319,8 +164,7 @@ impl WaitStateHandler<'_> {
                             .into(),
                     )));
                 }
-                Timestamp::now()
-                    .checked_add(std::time::Duration::from_secs(n as u64))
+                now.checked_add(std::time::Duration::from_secs(n as u64))
                     .ok_or_else(|| {
                         ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "Wait Seconds overflows the absolute deadline".into(),

@@ -1,6 +1,5 @@
 use crate::ExecutionStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::storage::ScopeRecord;
 use crate::types::command::{Command, CompleteExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -62,7 +61,7 @@ impl CompleteExecutionHandler {
         completing_execution.output = Some(output.clone());
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
         // construction, not from Entry metadata); `created_at` is carried forward unchanged.
-        completing_execution.meta.with_update_at(Timestamp::now());
+        completing_execution.meta.with_update_at(ctx.now());
         out.append_event(Event::ExecutionCompleting {
             execution: completing_execution,
         })
@@ -74,7 +73,7 @@ impl CompleteExecutionHandler {
             let mut completed_execution = exec.value();
             completed_execution.status = ExecutionStatus::Completed;
             completed_execution.output = Some(output.clone());
-            completed_execution.meta.with_update_at(Timestamp::now());
+            completed_execution.meta.with_update_at(ctx.now());
             // Completion is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionCompleted` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an
