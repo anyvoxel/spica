@@ -12,9 +12,9 @@ use spica_engine::{
     ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus, FlowVersion,
     FlowVersionCreated, InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId,
     RetryPolicy, RetryState, RuntimeError, StateTransitioned, Storage, StreamProcessor, Task,
-    TaskCompleted, TaskFailed, TaskStatus, TasksClaimed, TerminateExecution, TerminationReason,
-    Thread, ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables,
-    VariablesAssigned,
+    TaskCompleted, TaskFailed, TaskStatus, TasksClaimed, TerminateExecution, TerminateState,
+    TerminationReason, Thread, ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp,
+    Variables, VariablesAssigned,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -330,7 +330,6 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::TimerCancelled { .. } => "TimerCancelled",
         Event::TaskActivated { .. } => "TaskActivated",
         Event::TasksClaimed(TasksClaimed { .. }) => "TasksClaimed",
-        Event::TaskLeaseExpired { .. } => "TaskLeaseExpired",
         Event::TaskCompleted(TaskCompleted { .. }) => "TaskCompleted",
         Event::TaskFailed(TaskFailed { .. }) => "TaskFailed",
         Event::TaskCancelled { .. } => "TaskCancelled",
@@ -366,6 +365,7 @@ async fn storage_projects_execution_and_activity_state() {
             &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({ "x": 1 }),
@@ -389,7 +389,7 @@ async fn storage_projects_execution_and_activity_state() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
+                    state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({ "x": 1 }),
                     input: Some(json!({ "x": 1 })),
@@ -425,6 +425,7 @@ async fn storage_projects_execution_and_activity_state() {
             &mut storage,
             &Event::ExecutionCompleted {
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Completed,
                     input: json!({ "x": 1 }),
@@ -466,6 +467,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
             &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
@@ -502,6 +504,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
             &mut storage,
             &Event::ExecutionCompleted {
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Completed,
                     input: json!({}),
@@ -549,7 +552,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
 
     let act_birth = |at: u64| Activity {
         execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
+        state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
         status: ActivityStatus::Running,
         raw_input: json!({}),
         input: Some(json!({})),
@@ -652,7 +655,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         status: TaskStatus::Pending,
         deadline: None,
         worker_id: None,
-        lease_until: None,
+        lease_expires_at: None,
         retry_plan: vec![],
         retry_state: RetryState::default(),
         meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
@@ -676,7 +679,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                 task: Task {
                     status: TaskStatus::Completed,
                     worker_id: None,
-                    lease_until: None,
+                    lease_expires_at: None,
                     meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
                         .timestamps(ts(100), ts(180))
                         .build(),
@@ -719,6 +722,7 @@ async fn projection_records_create_and_update_timestamps() {
             &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
@@ -764,7 +768,7 @@ async fn projection_records_create_and_update_timestamps() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
+                    state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -790,7 +794,7 @@ async fn projection_records_create_and_update_timestamps() {
             &Event::StateCompleted {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/S").unwrap().into(),
+                    state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
                     status: ActivityStatus::Completed,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -869,7 +873,7 @@ async fn projection_records_create_and_update_timestamps() {
                     status: TaskStatus::Pending,
                     deadline: None,
                     worker_id: None,
-                    lease_until: None,
+                    lease_expires_at: None,
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
@@ -892,7 +896,7 @@ async fn projection_records_create_and_update_timestamps() {
                     status: TaskStatus::Failed,
                     deadline: None,
                     worker_id: None,
-                    lease_until: None,
+                    lease_expires_at: None,
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task)
@@ -1042,9 +1046,10 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     let activity = act_ref();
     let thread = Thread {
         execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/states/P/branches/0/states")
+        state_path: jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
             .unwrap()
             .into(),
+        start_at: "A".to_string(),
         index: 0,
         status: ThreadStatus::Running,
         input: json!({}),
@@ -1068,6 +1073,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             &Event::ExecutionCreated(ExecutionCreated {
                 request_id: RequestId::nil(),
                 execution: Execution {
+                    deadline: None,
                     flow_version: ObjectReference::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
@@ -1101,7 +1107,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             &Event::StateActivating {
                 activity: Activity {
                     execution: exec.clone(),
-                    state_path: jsonptr::PointerBuf::parse("/states/P").unwrap().into(),
+                    state_path: jsonptr::PointerBuf::parse("/States/P").unwrap().into(),
                     status: ActivityStatus::Running,
                     raw_input: json!({}),
                     input: Some(json!({})),
@@ -1193,6 +1199,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
         Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
             execution: Execution {
+                deadline: None,
                 flow_version: ObjectReference::nil(),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
@@ -1211,7 +1218,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
         Event::StateActivating {
             activity: Activity {
                 execution: exec.clone(),
-                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap().into(),
+                state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
                 input: Some(Value::Null),
@@ -1234,7 +1241,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
         Event::StateActivated {
             activity: Activity {
                 execution: exec.clone(),
-                state_path: jsonptr::PointerBuf::parse("/states/W").unwrap().into(),
+                state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
                 status: ActivityStatus::Running,
                 raw_input: Value::Null,
                 input: Some(Value::Null),
@@ -1415,6 +1422,610 @@ async fn late_trigger_timer_after_cancel_is_noop() {
     drop(logstream);
 }
 
+// ── Race guard: a cancel racing a Wait's timer fire must still drain ─────────
+
+#[tokio::test]
+async fn terminating_wait_drains_when_its_timer_fires_first() {
+    // A cancel parks the Wait activity in `Terminating` while its still-Active resume timer keeps the
+    // sweep deferred. The timer then fires *before* `CancelTimer` is dispatched, so the fired timer's
+    // child edge is gone and `CancelTimer` would no-op on it: the fired timer's own settle relay is
+    // the only thing left that can drain the stranded activity. The late `CompleteState` the fire also
+    // issues is refused rather than acted on — safe only because that relay exists.
+    let exec = exec_ref();
+    let activity = act_ref();
+    let timer = ulid::Ulid::new();
+
+    // The refused `CompleteState` still resolves the owning scope's machine before it can reject, so
+    // the definition the activity's `state_path` points into must be resolvable from storage.
+    let mut storage = InMemoryStorage::new();
+    let revision = seed_revision(
+        &mut storage,
+        parse_sm(
+            r#"{ "StartAt": "W", "States": { "W": { "Type": "Wait", "Seconds": 1, "End": true } } }"#,
+        ),
+    )
+    .await;
+
+    let wait_activity = || Activity {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
+        status: ActivityStatus::Running,
+        raw_input: Value::Null,
+        input: Some(Value::Null),
+        raw_output: None,
+        activity_state: None,
+        retry_state: None,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Activity, activity.uid)
+            .timestamps(
+                spica_engine::Timestamp::from_millis(0),
+                spica_engine::Timestamp::from_millis(0),
+            )
+            .build()
+            .with_owner(exec.clone()),
+    };
+
+    let projector = Projector::new();
+    for ev in &[
+        Event::ExecutionCreated(ExecutionCreated {
+            request_id: RequestId::nil(),
+            execution: Execution {
+                deadline: None,
+                flow_version: revision.clone(),
+                status: ExecutionStatus::Running,
+                input: Value::Null,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Execution,
+                    exec.uid,
+                )
+                .timestamps(
+                    spica_engine::Timestamp::from_millis(0),
+                    spica_engine::Timestamp::from_millis(0),
+                )
+                .build(),
+            },
+        }),
+        Event::StateActivating {
+            activity: wait_activity(),
+        },
+        Event::StateActivated {
+            activity: wait_activity(),
+        },
+        Event::TimerActivated {
+            timer: Timer {
+                execution: exec.clone(),
+                purpose: TimerPurpose::WaitResume,
+                status: TimerStatus::Active,
+                deadline: Timestamp::from_millis(1_000_000_000_000),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                    .timestamps(
+                        spica_engine::Timestamp::from_millis(0),
+                        spica_engine::Timestamp::from_millis(0),
+                    )
+                    .build()
+                    .with_owner(activity.clone()),
+            },
+        },
+    ] {
+        projector.apply(&mut storage, ev).await;
+    }
+
+    // The cancel arrives first, while the timer is still live: the sweep defers on that child.
+    let entries = dispatch_command(
+        &storage,
+        Command::TerminateState(TerminateState {
+            activity: activity.clone(),
+            reason: TerminationReason::Cancelled,
+        }),
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTerminating { .. })
+        )),
+        "the cancel opens with StateTerminating: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTerminated { .. })
+        )),
+        "the terminal ed must be deferred on the live timer child: {entries:?}"
+    );
+    for e in &entries {
+        if let EntryPayload::Event(ev) = &e.payload {
+            projector.apply(&mut storage, ev).await;
+        }
+    }
+
+    // The timer fires before the sweep reaches it: its edge is removed, and the fired timer must relay
+    // its own settle so the stranded `Terminating` activity drains.
+    let entries = dispatch_command(
+        &storage,
+        Command::TriggerTimer {
+            timer: timer_ref(timer),
+        },
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TimerTriggered { .. })
+        )),
+        "a live timer fires: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity
+        )),
+        "the fired timer must relay its settle so the stranded activity drains: {entries:?}"
+    );
+    for e in &entries {
+        if let EntryPayload::Event(ev) = &e.payload {
+            projector.apply(&mut storage, ev).await;
+        }
+    }
+
+    // The `CompleteState` the fire issued arrives at a non-Running activity: refused durably, never a
+    // silent no-op.
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity: activity.clone(),
+            output: Value::Null,
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a late CompleteState must produce exactly one Reject: {entries:?}"
+    );
+    assert_eq!(rejects[0].rejection_type, RejectionType::InvalidState);
+
+    // The relay's Continue drives the drain that the refused command no longer performs.
+    let entries = dispatch_command(
+        &storage,
+        Command::ContinueTerminate {
+            owner: activity.clone(),
+        },
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTerminated { .. })
+        )),
+        "the relayed drain must terminate the stranded activity: {entries:?}"
+    );
+}
+
+// ── Race guard: a Task's timeout timer must relay its settle too ────────────
+
+#[tokio::test]
+async fn terminating_task_drains_when_its_deadline_timer_fires() {
+    // A `TaskTimeout` hangs off the Task activity, so a cancel that races it strands the activity
+    // exactly like the Wait case. The relay must run *before* the in-flight task lookup: "no in-flight
+    // task" is precisely the state a cancel leaves behind (it swept the task already), and returning
+    // early there would leave the activity parked in `Terminating` forever.
+    let exec = exec_ref();
+    let activity = act_ref();
+    let timer = ulid::Ulid::new();
+    let purpose = TimerPurpose::TaskTimeout;
+
+    let mut storage = InMemoryStorage::new();
+    let projector = Projector::new();
+    for ev in &[
+        Event::ExecutionCreated(ExecutionCreated {
+            request_id: RequestId::nil(),
+            execution: Execution {
+                deadline: None,
+                flow_version: ObjectReference::nil(),
+                status: ExecutionStatus::Running,
+                input: Value::Null,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Execution,
+                    exec.uid,
+                )
+                .timestamps(
+                    spica_engine::Timestamp::from_millis(0),
+                    spica_engine::Timestamp::from_millis(0),
+                )
+                .build(),
+            },
+        }),
+        Event::StateActivating {
+            activity: Activity {
+                execution: exec.clone(),
+                state_path: jsonptr::PointerBuf::parse("/States/T").unwrap().into(),
+                status: ActivityStatus::Running,
+                raw_input: Value::Null,
+                input: Some(Value::Null),
+                raw_output: None,
+                activity_state: None,
+                retry_state: None,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Activity,
+                    activity.uid,
+                )
+                .timestamps(
+                    spica_engine::Timestamp::from_millis(0),
+                    spica_engine::Timestamp::from_millis(0),
+                )
+                .build()
+                .with_owner(exec.clone()),
+            },
+        },
+        Event::TimerActivated {
+            timer: Timer {
+                execution: exec.clone(),
+                purpose,
+                status: TimerStatus::Active,
+                deadline: Timestamp::from_millis(1_000_000_000_000),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                    .timestamps(
+                        spica_engine::Timestamp::from_millis(0),
+                        spica_engine::Timestamp::from_millis(0),
+                    )
+                    .build()
+                    .with_owner(activity.clone()),
+            },
+        },
+    ] {
+        projector.apply(&mut storage, ev).await;
+    }
+
+    // The cancel parks the activity in `Terminating`, deferring on the live timer.
+    let entries = dispatch_command(
+        &storage,
+        Command::TerminateState(TerminateState {
+            activity: activity.clone(),
+            reason: TerminationReason::Cancelled,
+        }),
+    )
+    .await;
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTerminated { .. })
+        )),
+        "the terminal ed must be deferred on the live timer child: {entries:?}"
+    );
+    for e in &entries {
+        if let EntryPayload::Event(ev) = &e.payload {
+            projector.apply(&mut storage, ev).await;
+        }
+    }
+
+    // The deadline elapses: with no in-flight task left, only the relay can drain the activity.
+    let entries = dispatch_command(
+        &storage,
+        Command::TriggerTimer {
+            timer: timer_ref(timer),
+        },
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity
+        )),
+        "a fired {purpose:?} timer must relay its settle even with no in-flight task: {entries:?}"
+    );
+}
+
+// ── A supervisory timer must not block the success finish ────────────────────
+
+#[tokio::test]
+async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
+    // A `Task`'s `TaskTimeout` child only *bounds* the state; once the task settles it is moot, so the
+    // base complete step sweeps it rather than waiting on it (the deadline may be minutes out). Pinned
+    // here: a `CompleteState` arriving with one still attached must still finish — if the sweep ever
+    // moves out of the base, this step silently defers on that child forever, since a `Running`
+    // activity has no child-settle path back into `complete`.
+    let exec = exec_ref();
+    let activity = act_ref();
+    let timer = ulid::Ulid::new();
+
+    let mut storage = InMemoryStorage::new();
+    let revision = seed_revision(
+        &mut storage,
+        parse_sm(
+            r#"{ "StartAt": "T", "States": { "T": { "Type": "Task", "Resource": "arn:aws:lambda:::f", "End": true } } }"#,
+        ),
+    )
+    .await;
+
+    let task_activity = || Activity {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States/T").unwrap().into(),
+        status: ActivityStatus::Running,
+        raw_input: Value::Null,
+        input: Some(Value::Null),
+        raw_output: None,
+        activity_state: None,
+        retry_state: None,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Activity, activity.uid)
+            .timestamps(
+                spica_engine::Timestamp::from_millis(0),
+                spica_engine::Timestamp::from_millis(0),
+            )
+            .build()
+            .with_owner(exec.clone()),
+    };
+
+    let projector = Projector::new();
+    for ev in &[
+        Event::ExecutionCreated(ExecutionCreated {
+            request_id: RequestId::nil(),
+            execution: Execution {
+                deadline: None,
+                flow_version: revision.clone(),
+                status: ExecutionStatus::Running,
+                input: Value::Null,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Execution,
+                    exec.uid,
+                )
+                .timestamps(
+                    spica_engine::Timestamp::from_millis(0),
+                    spica_engine::Timestamp::from_millis(0),
+                )
+                .build(),
+            },
+        }),
+        Event::StateActivating {
+            activity: task_activity(),
+        },
+        Event::StateActivated {
+            activity: task_activity(),
+        },
+        Event::TimerActivated {
+            timer: Timer {
+                execution: exec.clone(),
+                purpose: TimerPurpose::TaskTimeout,
+                status: TimerStatus::Active,
+                deadline: Timestamp::from_millis(1_000_000_000_000),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                    .timestamps(
+                        spica_engine::Timestamp::from_millis(0),
+                        spica_engine::Timestamp::from_millis(0),
+                    )
+                    .build()
+                    .with_owner(activity.clone()),
+            },
+        },
+    ] {
+        projector.apply(&mut storage, ev).await;
+    }
+
+    // The settled task resumes the state while the timeout timer is still live.
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity: activity.clone(),
+            output: Value::Null,
+        }),
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TimerCancelled { timer: t }) if t.meta.uid == timer
+        )),
+        "the base complete step must sweep the live supervisory timer: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateCompleted { .. })
+        )),
+        "the swept activity must reach its success finish: {entries:?}"
+    );
+
+    // The finishing decision is durable from the moment the command is accepted, so `StateCompleting`
+    // precedes everything the step does afterwards — including the supervisory sweep it opens with.
+    let events: Vec<Event> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Event(ev) => Some(ev.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(pos(&events, "StateCompleting") < pos(&events, "TimerCancelled"));
+    assert!(pos(&events, "TimerCancelled") < pos(&events, "StateCompleted"));
+}
+
+// ── A deferred CompleteState must drain through the state's own finish ───────
+
+#[tokio::test]
+async fn deferred_complete_drains_through_the_states_own_finish() {
+    // A `CompleteState` that arrives while a blocking child is still live cannot finish now: the base
+    // opens the finish (`StateCompleting`) and defers, so the activity is durably "decided, waiting"
+    // rather than silently unchanged. The last child's settle then reaches it through the generic
+    // `Completing` drain arm — which must run the *state's* finish, not a kind-local close, or the
+    // projection and the `Next` routing are lost and the execution parks on a completed state.
+    // A Wait whose resume timer has not fired is exactly that shape (the timer is its completion
+    // trigger, not a supervisory arm, so nothing sweeps it out from under the deferral).
+    let exec = exec_ref();
+    let activity = act_ref();
+    let timer = ulid::Ulid::new();
+
+    let mut storage = InMemoryStorage::new();
+    let revision = seed_revision(
+        &mut storage,
+        parse_sm(
+            r#"{
+              "StartAt": "W",
+              "States": {
+                "W": { "Type": "Wait", "Seconds": 1, "Next": "P" },
+                "P": { "Type": "Pass", "End": true }
+              }
+            }"#,
+        ),
+    )
+    .await;
+
+    let wait_activity = || Activity {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
+        status: ActivityStatus::Running,
+        raw_input: Value::Null,
+        input: Some(Value::Null),
+        raw_output: None,
+        activity_state: None,
+        retry_state: None,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Activity, activity.uid)
+            .timestamps(
+                spica_engine::Timestamp::from_millis(0),
+                spica_engine::Timestamp::from_millis(0),
+            )
+            .build()
+            .with_owner(exec.clone()),
+    };
+
+    let projector = Projector::new();
+    for ev in &[
+        Event::ExecutionCreated(ExecutionCreated {
+            request_id: RequestId::nil(),
+            execution: Execution {
+                deadline: None,
+                flow_version: revision.clone(),
+                status: ExecutionStatus::Running,
+                input: Value::Null,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Execution,
+                    exec.uid,
+                )
+                .timestamps(
+                    spica_engine::Timestamp::from_millis(0),
+                    spica_engine::Timestamp::from_millis(0),
+                )
+                .build(),
+            },
+        }),
+        Event::StateActivating {
+            activity: wait_activity(),
+        },
+        Event::StateActivated {
+            activity: wait_activity(),
+        },
+        Event::TimerActivated {
+            timer: Timer {
+                execution: exec.clone(),
+                purpose: TimerPurpose::WaitResume,
+                status: TimerStatus::Active,
+                deadline: Timestamp::from_millis(1_000_000_000_000),
+                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, timer)
+                    .timestamps(
+                        spica_engine::Timestamp::from_millis(0),
+                        spica_engine::Timestamp::from_millis(0),
+                    )
+                    .build()
+                    .with_owner(activity.clone()),
+            },
+        },
+    ] {
+        projector.apply(&mut storage, ev).await;
+    }
+
+    // (1) The premature complete: accepted (the activity is running), opened, then deferred on the
+    // live timer child — so no terminal lands yet, only the durable intent.
+    let raw_result = json!({ "n": 7 });
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity: activity.clone(),
+            output: raw_result.clone(),
+        }),
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateCompleting { .. })
+        )),
+        "the accepted complete opens the finish: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateCompleted { .. })
+        )),
+        "the terminal must be deferred on the live timer child: {entries:?}"
+    );
+    for e in &entries {
+        if let EntryPayload::Event(ev) = &e.payload {
+            projector.apply(&mut storage, ev).await;
+        }
+    }
+
+    // (2) The timer fires: its own settle relay carries the drained activity to the drain hop.
+    let entries = dispatch_command(
+        &storage,
+        Command::TriggerTimer {
+            timer: timer_ref(timer),
+        },
+    )
+    .await;
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::ContinueComplete { owner }) if *owner == activity
+        )),
+        "the drain of the completing activity must be issued: {entries:?}"
+    );
+    for e in &entries {
+        if let EntryPayload::Event(ev) = &e.payload {
+            projector.apply(&mut storage, ev).await;
+        }
+    }
+
+    // (3) The drain hop: the state's own finish projects the raw result captured earlier and routes.
+    let entries = dispatch_command(
+        &storage,
+        Command::ContinueComplete {
+            owner: activity.clone(),
+        },
+    )
+    .await;
+    let completed = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::StateCompleted { activity }) => Some(activity),
+            _ => None,
+        })
+        .expect("the drained activity must reach its terminal");
+    assert_eq!(
+        completed.output.as_ref(),
+        Some(&raw_result),
+        "the raw result folded in before the deferral must still be the projection's result"
+    );
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTransitioned(t)) if t.next.as_str() == "/States/P"
+        )),
+        "the drain must route through the state's finish, not close the activity locally: {entries:?}"
+    );
+}
+
 // ── Timeout cascade: TimeoutSeconds fires past a blocking Wait ───────────────
 
 #[tokio::test]
@@ -1584,6 +2195,7 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
     storage
         .put_execution(spica_engine::ExecutionRecord {
             value: Execution {
+                deadline: None,
                 flow_version: ObjectReference::nil(),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
@@ -1657,6 +2269,7 @@ async fn seed_named_execution(
     storage
         .put_execution(spica_engine::ExecutionRecord {
             value: Execution {
+                deadline: None,
                 flow_version: ObjectReference::nil(),
                 status,
                 input: Value::Null,
@@ -2084,7 +2697,7 @@ async fn seed_task(
     task_id: ulid::Ulid,
     status: TaskStatus,
     worker_id: Option<String>,
-    lease_until: Option<Timestamp>,
+    lease_expires_at: Option<Timestamp>,
 ) {
     storage
         .put_task(spica_engine::TaskRecord {
@@ -2095,7 +2708,7 @@ async fn seed_task(
                 status,
                 deadline: None,
                 worker_id,
-                lease_until,
+                lease_expires_at,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task_id)
@@ -2110,6 +2723,14 @@ async fn seed_task(
         .unwrap();
 }
 
+/// A lease that has not lapsed yet, for the cases about a task a worker *holds* (as opposed to one
+/// whose lease ran out and is therefore up for grabs again).
+fn live_lease() -> Timestamp {
+    Timestamp::now()
+        .checked_add(std::time::Duration::from_secs(3_600))
+        .expect("an hour from now fits in a timestamp")
+}
+
 /// Dispatch `command` through a fresh [`StreamProcessor`] (which resolves any needed definition from
 /// `storage`) and return the emitted [`Entry`]s.
 async fn dispatch_command(storage: &InMemoryStorage, command: Command) -> Vec<Entry> {
@@ -2122,8 +2743,9 @@ async fn dispatch_command(storage: &InMemoryStorage, command: Command) -> Vec<En
 
 #[tokio::test]
 async fn poll_tasks_leases_only_available_tasks_of_resource() {
-    // A bulk pull (the command behind `TaskApi::poll_tasks`) must lease exactly the `Pending` tasks of
-    // its `resource` — never ones already leased/settled/cancelled, and never another resource's.
+    // A bulk pull (the command behind `TaskApi::poll_tasks`) must lease exactly the claimable tasks of
+    // its `resource` — the `Pending` ones — and never one a worker still holds under a live lease, nor
+    // a settled/cancelled/foreign-resource one.
     let mut storage = InMemoryStorage::new();
     let pending1 = ulid::Ulid::new();
     let pending2 = ulid::Ulid::new();
@@ -2139,7 +2761,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
         running,
         TaskStatus::Running,
         Some("w1".into()),
-        Some(Timestamp::from_millis(1000)),
+        Some(live_lease()),
     )
     .await;
     seed_task(&mut storage, done, TaskStatus::Completed, None, None).await;
@@ -2154,7 +2776,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
                 status: TaskStatus::Pending,
                 deadline: None,
                 worker_id: None,
-                lease_until: None,
+                lease_expires_at: None,
                 retry_plan: vec![],
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(
@@ -2193,32 +2815,29 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
         .flatten()
         .map(|t| (t.reference().uid, &t.status, &t.worker_id))
         .collect();
-    // Exactly the two `Pending` tasks of `resource "r"` are leased to w2; the running / settled /
-    // cancelled / foreign-resource tasks are untouched.
+    // Exactly the two `Pending` tasks of `resource "r"` are leased to w2; the live lease, the settled,
+    // the cancelled and the foreign-resource tasks are untouched.
     let mut ids: Vec<_> = leased.iter().map(|(id, _, _)| *id).collect();
     ids.sort();
     let mut expect: Vec<ulid::Ulid> = vec![pending1, pending2];
     expect.sort();
     assert_eq!(
         ids, expect,
-        "pull must grant only the resource's Pending tasks"
+        "pull must grant only the resource's claimable tasks"
     );
     for (_, status, worker) in leased {
         assert_eq!(*status, TaskStatus::Running);
         assert_eq!(worker.as_deref(), Some("w2"));
     }
-    // Each grant arms its DeliveryLease expiry timer (emitted inline with the lease).
-    let timers = entries
-        .iter()
-        .filter(|e| {
-            matches!(
-                &e.payload,
-                EntryPayload::Event(Event::TimerActivated { timer })
-                    if timer.purpose == TimerPurpose::DeliveryLease
-            )
-        })
-        .count();
-    assert_eq!(timers, 2, "each granted task arms a DeliveryLease timer");
+    // A grant writes no side-effect child at all: the lease window lives only as `lease_expires_at` on the
+    // leased task itself, so a poll can never be gated behind a timer's lifecycle.
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TimerActivated { .. })
+        )),
+        "a claim arms no timer: {entries:?}"
+    );
 }
 
 #[tokio::test]
@@ -2260,12 +2879,15 @@ async fn poll_tasks_respects_max_tasks() {
 
 #[tokio::test]
 async fn stale_task_leased_does_not_override_owner_or_settlement() {
-    // The conditional `TasksClaimed` applier folds each lease only while the task is still `Pending`; a
-    // stale/racing lease (already leased to someone else, or already settled/cancelled) is a no-op, so
-    // the *state* advances exactly-once even though a racing pull may hand the *work* to two workers.
+    // The conditional `TasksClaimed` applier folds each lease only while the task is still *claimable
+    // at the entry's own timestamp*; a stale/racing lease (one a live lease still covers, or one
+    // already settled/cancelled) is a no-op, so the *state* advances exactly-once even though a racing
+    // pull may hand the *work* to two workers.
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
-    // Stale lease against an already-leased (Running) task: must not change who owns it.
+    // Stale lease against an already-leased (Running) task: must not change who owns it. `Projector`
+    // folds at its fixed 1 ms entry stamp, so this task's 1000 ms lease is live *at that instant* —
+    // which is exactly the condition the fold re-decides (a lapsed lease would be a steal instead).
     let running = ulid::Ulid::new();
     seed_task(
         &mut storage,
@@ -2287,7 +2909,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                     status: TaskStatus::Running,
                     deadline: None,
                     worker_id: Some("w2".into()),
-                    lease_until: Some(Timestamp::from_millis(2000)),
+                    lease_expires_at: Some(Timestamp::from_millis(2000)),
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(
@@ -2331,7 +2953,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                     status: TaskStatus::Running,
                     deadline: None,
                     worker_id: Some("w3".into()),
-                    lease_until: Some(Timestamp::from_millis(2000)),
+                    lease_expires_at: Some(Timestamp::from_millis(2000)),
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, done)
@@ -2437,7 +3059,7 @@ async fn leasing_worker_complete_settles_task() {
         .expect("the leasing worker's complete should emit TaskCompleted");
     assert_eq!(completed.status, TaskStatus::Completed);
     assert_eq!(completed.worker_id, None); // lease cleared
-    assert_eq!(completed.lease_until, None);
+    assert_eq!(completed.lease_expires_at, None);
     // The owning Task state resumes via CompleteState.
     assert!(
         entries.iter().any(|e| matches!(
@@ -2449,11 +3071,16 @@ async fn leasing_worker_complete_settles_task() {
 }
 
 #[tokio::test]
-async fn late_complete_after_release_or_cancel_is_refused() {
+async fn late_complete_after_steal_or_cancel_is_refused() {
     let mut storage = InMemoryStorage::new();
-    // A helper asserting that a settle on a task not currently Running to the reporting worker is
-    // refused with a single `InvalidState` `Reject` (the request/response dlivery), never a silent no-op.
-    async fn assert_refused(storage: &InMemoryStorage, task: ulid::Ulid) {
+    // A helper asserting that a settle on a task not currently Running *for* the reporting worker is
+    // refused with a single `Reject` of the expected kind (the request/response delivery), never a
+    // silent no-op — the reporting worker is told why.
+    async fn assert_refused(
+        storage: &InMemoryStorage,
+        task: ulid::Ulid,
+        expected: spica_engine::RejectionType,
+    ) {
         let entries = dispatch_command(
             storage,
             Command::CompleteTask(CompleteTask {
@@ -2474,27 +3101,40 @@ async fn late_complete_after_release_or_cancel_is_refused() {
         assert_eq!(
             rejects.len(),
             1,
-            "a settle on a non-Running task must produce exactly one Reject: {entries:?}"
+            "a settle on a task this worker does not hold must produce exactly one Reject: {entries:?}"
         );
-        assert_eq!(
-            rejects[0].rejection_type,
-            spica_engine::RejectionType::InvalidState
-        );
+        assert_eq!(rejects[0].rejection_type, expected);
     }
 
-    // Re-queued (released → Pending) after the lease lapsed: the stale worker's late settle is refused.
-    let requeued = ulid::Ulid::new();
-    seed_task(&mut storage, requeued, TaskStatus::Pending, None, None).await;
-    assert_refused(&storage, requeued).await;
+    // Stolen by a second worker once the first one's lease lapsed: the task runs for `w2` now, so the
+    // stale `w1`'s late settle is refused on ownership — the state advances once for whoever holds it.
+    let stolen = ulid::Ulid::new();
+    seed_task(
+        &mut storage,
+        stolen,
+        TaskStatus::Running,
+        Some("w2".into()),
+        Some(live_lease()),
+    )
+    .await;
+    assert_refused(&storage, stolen, RejectionType::StateConflict).await;
+
+    // A task no worker ever leased has no leaseholder to accept a settle from.
+    let unclaimed = ulid::Ulid::new();
+    seed_task(&mut storage, unclaimed, TaskStatus::Pending, None, None).await;
+    assert_refused(&storage, unclaimed, RejectionType::InvalidState).await;
 
     // Same for a cancelled task.
     let cancelled = ulid::Ulid::new();
     seed_task(&mut storage, cancelled, TaskStatus::Cancelled, None, None).await;
-    assert_refused(&storage, cancelled).await;
+    assert_refused(&storage, cancelled, RejectionType::InvalidState).await;
 }
 
 #[tokio::test]
-async fn release_requeues_task_for_a_fresh_claim() {
+async fn late_complete_after_a_lapsed_lease_is_accepted() {
+    // The deliberate other half of a steal: a lease that lapsed with nobody re-claiming it leaves the
+    // task `Running` for `w1`, so `w1`'s late settle is accepted — the work is done, and re-queueing it
+    // for a second worker would run it twice. Only a task *taken over* refuses the old worker.
     let mut storage = InMemoryStorage::new();
     let task = ulid::Ulid::new();
     seed_task(
@@ -2507,26 +3147,40 @@ async fn release_requeues_task_for_a_fresh_claim() {
     .await;
     let entries = dispatch_command(
         &storage,
-        Command::ReleaseTaskLease {
+        Command::CompleteTask(CompleteTask {
             task: task_ref(task),
-        },
+            worker_id: "w1".into(),
+            output: json!({ "ok": true }),
+            request_id: RequestId::new(),
+        }),
     )
     .await;
-    let expired = entries
+    let completed = entries
         .iter()
         .find_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TaskLeaseExpired { task }) => Some(task.clone()),
+            EntryPayload::Event(Event::TaskCompleted(TaskCompleted { task, .. })) => Some(task),
             _ => None,
         })
-        .expect("release should emit TaskLeaseExpired");
-    assert_eq!(expired.status, TaskStatus::Pending);
-    assert_eq!(expired.worker_id, None);
+        .expect("the lapsed-but-unstolen worker's settle is accepted");
+    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(completed.worker_id, None);
+}
 
-    // Re-queue makes the task claimable again: apply the expiry (fold it to storage), then a fresh
-    // poll by another worker succeeds.
-    let proj = Projector::new();
-    proj.apply(&mut storage, &Event::TaskLeaseExpired { task: expired })
-        .await;
+#[tokio::test]
+async fn lapsed_lease_is_reclaimed_by_a_fresh_poll() {
+    // A lease that lapsed with nobody watching is handed back *lazily*: the task is left `Running`
+    // where it stands (still naming `w1`), and the next poll's discovery grants the same entity to
+    // `w2`. No expiry event, no requeue step, and no timer is involved anywhere in the transition.
+    let mut storage = InMemoryStorage::new();
+    let task = ulid::Ulid::new();
+    seed_task(
+        &mut storage,
+        task,
+        TaskStatus::Running,
+        Some("w1".into()),
+        Some(Timestamp::from_millis(1000)),
+    )
+    .await;
     let entries = dispatch_command(
         &storage,
         Command::ClaimTasks(ClaimTasks {
@@ -2538,11 +3192,20 @@ async fn release_requeues_task_for_a_fresh_claim() {
         }),
     )
     .await;
+    let granted = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) => {
+                tasks.first().cloned()
+            }
+            _ => None,
+        })
+        .expect("a task whose lease lapsed must be grantable again");
+    assert_eq!(granted.reference().uid, task);
+    assert_eq!(granted.worker_id.as_deref(), Some("w2"));
     assert!(
-        entries
-            .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TasksClaimed(TasksClaimed { tasks, .. })) if !tasks.is_empty())),
-        "a re-queued task can be claimed by a fresh worker: {entries:?}"
+        granted.lease_expires_at > Some(Timestamp::from_millis(1000)),
+        "the second lease must be a fresh window, not the lapsed one"
     );
 }
 
@@ -2623,7 +3286,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
                 status: TaskStatus::Running,
                 deadline: None,
                 worker_id: Some("w1".into()),
-                lease_until: Some(Timestamp::from_millis(1000)),
+                lease_expires_at: Some(Timestamp::from_millis(1000)),
                 retry_plan: vec![RetryPolicy {
                     error_equals: vec!["States.ALL".into()],
                     interval_seconds: 1,
@@ -2671,7 +3334,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
         "retry re-queues to Pending"
     );
     assert_eq!(failed.worker_id, None, "lease cleared on re-queue");
-    assert_eq!(failed.lease_until, None);
+    assert_eq!(failed.lease_expires_at, None);
     assert_eq!(failed.retry_state.attempts, 1);
     assert!(
         failed.retry_state.next_available_at.is_some(),
@@ -2705,7 +3368,7 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
                 status: TaskStatus::Pending,
                 deadline: None,
                 worker_id: None,
-                lease_until: None,
+                lease_expires_at: None,
                 retry_plan: vec![],
                 retry_state: RetryState {
                     attempts: 1,

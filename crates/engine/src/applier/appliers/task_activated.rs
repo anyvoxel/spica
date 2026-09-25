@@ -14,9 +14,9 @@ impl TaskActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         task: &Task,
     ) -> Result<(), ExecutionError> {
-        // Fold the invocation as a durable fact: an `Pending` (available) task row owned by the
-        // invoking activity. `deadline` is `None` in M1 (no `TimeoutSeconds` support yet), and
-        // `worker_id`/`lease_until` are `None` until a worker claims it.
+        // Fold the invocation as a durable fact: a `Pending` (available) task row owned by the
+        // invoking activity. `deadline` is the state's `TimeoutSeconds` instant (carried on the
+        // command), and `worker_id`/`lease_expires_at` are `None` until a worker claims it.
         let mut row = crate::storage::TaskRecord::from_value(task.clone());
         // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
         row.born(ctx.timestamp);

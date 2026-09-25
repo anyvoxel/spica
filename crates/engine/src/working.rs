@@ -160,11 +160,12 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
-        storage.activatable_tasks(resource, limit).await
+        storage.activatable_tasks(resource, now, limit).await
     }
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
         let mut txn = self.txn.lock().await;

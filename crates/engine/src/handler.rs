@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_asl::StateMachine;
+use spica_machinery::{Clock, IdGenerator};
 
 use crate::eval_env::EvalEnv;
 use crate::handlers::state_handler::StateHandlerRegistry;
@@ -40,6 +41,12 @@ pub struct Collector<'a> {
     /// the working txn immediately (not deferred to a later flush). `None` for a collector with no
     /// working overlay (a pure non-overlay dispatch).
     overlay: Option<OverlaySink<'a>>,
+    /// The clock this batch's envelope stamps are read from — see [`Self::now`].
+    clock: Arc<dyn Clock>,
+    /// The engine's injected [`IdGenerator`] — the one legitimate source of a fresh `uid`. Every
+    /// object a dispatch names mints here, so a test can substitute predictable ids and pin the
+    /// chain it expects (see [`Self::mint`]).
+    ids: Arc<dyn IdGenerator>,
 }
 
 /// The eager-apply channel from the [`Collector`] into the leader's working overlay: on each
@@ -61,12 +68,33 @@ impl<'a> OverlaySink<'a> {
 }
 
 impl<'a> Collector<'a> {
-    pub(crate) fn new(cause_id: EntryId, overlay: Option<OverlaySink<'a>>) -> Self {
+    pub(crate) fn new(
+        cause_id: EntryId,
+        overlay: Option<OverlaySink<'a>>,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> Self {
         Self {
             cause_id,
             entries: Vec::new(),
             overlay,
+            clock,
+            ids,
         }
+    }
+
+    /// A fresh `uid` for an object this batch creates, read from the injected [`IdGenerator`] — see
+    /// [`Self::now`] for why the emit helpers that carry only the collector need their own accessor.
+    pub(crate) fn mint(&self) -> ulid::Ulid {
+        self.ids.next_ulid()
+    }
+
+    /// The current time **inside this dispatch** — one reading, from the same injected clock a
+    /// [`HandlerContext`] reads, so a record's meta time, the envelope it travels in, and the deadline
+    /// decided alongside it cannot disagree (and a test's clock controls all three at once). Handlers
+    /// that hold a context read it there; the emit helpers that carry only the collector read it here.
+    pub(crate) fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     /// Emit an [`Event`], enveloped into an [`Entry`] with this call's `cause_id`, a fresh
@@ -112,8 +140,9 @@ impl<'a> Collector<'a> {
             cause_id: Some(self.cause_id),
             // Stamped per-entry rather than reusing a fixed value: `Timestamp` is audit metadata
             // used for neither ordering nor decisions (ordering is by `entry_id`), so each push can
-            // cheaply record its own write moment.
-            timestamp: Timestamp::now(),
+            // cheaply record its own write moment. Read from the injected clock, not the wall clock,
+            // so a replay-equivalent run reproduces the same stamps.
+            timestamp: self.clock.now(),
             payload,
         }
     }
@@ -230,6 +259,17 @@ pub struct HandlerContext<'a> {
     /// The leader's working-overlay [`Storage`] read face — how the handler reads state. Never a
     /// write path: mutations flow through emitted events, applied by the applier.
     pub storage: &'a dyn ReadonlyStorageTxn,
+    /// The engine's injected [`Clock`] — the one legitimate source of "now" for a handler. Both the
+    /// stamps a handler writes and the deadlines it decides on (a `Wait`'s expiry, a task's
+    /// `TimeoutSeconds`, a lease's lapse, a retry backoff gate) must read it, so time enters the
+    /// engine as an input the caller controls rather than an ambient wall-clock read.
+    pub clock: Arc<dyn Clock>,
+    /// The engine's injected [`IdGenerator`] — the one legitimate source of a fresh `uid` for a
+    /// handler. Handlers are the sole identity-assigners (the name addresses, the uid identifies the
+    /// incarnation), so every object they create mints through this rather than calling `Ulid::new()`
+    /// directly: identity then enters the engine as an input the caller controls, exactly as time
+    /// does through [`Self::clock`].
+    pub ids: Arc<dyn IdGenerator>,
 
     // TODO：这个应该进行修改，按照一个通用的 Cache 结构调整，而不是直接暴露 map
     /// The StreamProcessor's per-version machine cache. Handlers resolve the machine an execution is
@@ -244,6 +284,20 @@ pub struct HandlerContext<'a> {
 }
 
 impl HandlerContext<'_> {
+    /// The current time, read from the injected [`Clock`] — see [`Self::clock`]. Kept as a method so
+    /// a handler never has to remember which of the two (this or the [`Collector`]) to read from.
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+
+    /// A fresh `uid` for an object this dispatch creates, read from the injected [`IdGenerator`] —
+    /// see [`Self::clock`] for why ids, like time, are an input rather than an ambient read. Kept as
+    /// a method so a handler never has to remember which of the two (this or the [`Collector`]) to
+    /// mint from, and so the two agree on the generator they read.
+    pub fn mint(&self) -> ulid::Ulid {
+        self.ids.next_ulid()
+    }
+
     /// Resolve — and cache — the state machine version `flow_version` references, loading it lazily
     /// from `Storage` on first use. Executions bind only to a (never-reused) version reference;
     /// the machine content is fetched here and cached per reference in the StreamProcessor, so the same definition

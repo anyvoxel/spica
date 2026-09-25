@@ -1,6 +1,5 @@
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::storage::ScopeRecord;
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
@@ -48,7 +47,7 @@ impl TerminateThreadHandler {
         terminating_thread.status = ThreadStatus::Terminating(reason.clone());
         // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
         // carries forward.
-        terminating_thread.meta.with_update_at(Timestamp::now());
+        terminating_thread.meta.with_update_at(ctx.now());
         out.append_event(Event::ThreadTerminating {
             thread: terminating_thread,
         })
@@ -107,7 +106,7 @@ impl TerminateThreadHandler {
         if pending == 0 {
             let mut terminated_thread = thread_row.value();
             terminated_thread.status = ThreadStatus::Terminated(reason.clone());
-            terminated_thread.meta.with_update_at(Timestamp::now());
+            terminated_thread.meta.with_update_at(ctx.now());
             out.append_event(Event::ThreadTerminated {
                 thread: terminated_thread,
             })

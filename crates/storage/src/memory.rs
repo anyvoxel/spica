@@ -8,8 +8,8 @@ use async_trait::async_trait;
 
 use spica_engine::{
     ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind,
-    ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, TaskStatus, ThreadRecord,
-    TimerRecord,
+    ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
+    Timestamp,
 };
 
 /// The in-memory projection state, kept behind a shared interior (see [`InMemoryStorage`]). The
@@ -184,6 +184,7 @@ impl Storage for InMemoryStorage {
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
         // A linear scan of the task map — no per-resource queue index in M1 (see the trait doc).
@@ -191,7 +192,7 @@ impl Storage for InMemoryStorage {
         Ok(db
             .tasks
             .values()
-            .filter(|t| t.value.resource == resource && t.value.status == TaskStatus::Pending)
+            .filter(|t| t.value.resource == resource && t.value.is_claimable_at(now))
             .take(limit)
             .cloned()
             .collect())
@@ -475,6 +476,7 @@ impl StorageTxn for InMemoryTxn {
     async fn activatable_tasks(
         &mut self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
         // read-your-writes: the committed rows, with the pending batch winning by name — so a task
@@ -490,7 +492,7 @@ impl StorageTxn for InMemoryTxn {
         }
         Ok(tasks
             .values()
-            .filter(|t| t.value.resource == resource && t.value.status == TaskStatus::Pending)
+            .filter(|t| t.value.resource == resource && t.value.is_claimable_at(now))
             .take(limit)
             .cloned()
             .collect())
@@ -779,7 +781,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, RetryState, Task,
+        TaskStatus, Timestamp, Variables,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
@@ -798,6 +801,7 @@ mod tests {
     fn sample_execution(id: ObjectReference) -> ExecutionRecord {
         ExecutionRecord {
             value: Execution {
+                deadline: None,
                 flow_version: ObjectReference::new(
                     ObjectKind::FlowVersion,
                     PlainName::new("flow").unwrap().generated_from_key(1),
@@ -831,6 +835,132 @@ mod tests {
         // Advancing past an existing watermark overwrites it (the StreamProcessor applies `max`).
         store.put_last_processed_position(12).await.unwrap();
         assert_eq!(store.last_processed_position().await.unwrap(), 12);
+    }
+
+    /// A task row of `resource`, for exercising the claimable-at-`now` discovery: the caller sets
+    /// exactly the facts the predicate reads (status, lease expiry, retry gate).
+    fn sample_task(
+        id: ulid::Ulid,
+        resource: &str,
+        status: TaskStatus,
+        worker_id: Option<&str>,
+        lease_expires_at: Option<Timestamp>,
+        next_available_at: Option<Timestamp>,
+    ) -> TaskRecord {
+        TaskRecord {
+            value: Task {
+                execution: ObjectReference::nil(),
+                resource: resource.to_string(),
+                arguments: Value::Null,
+                status,
+                deadline: None,
+                worker_id: worker_id.map(str::to_string),
+                lease_expires_at,
+                retry_plan: vec![],
+                retry_state: RetryState {
+                    attempts: 0,
+                    retrier_attempts: vec![],
+                    next_available_at,
+                },
+                meta: spica_engine::ObjectMeta::builder(ObjectKind::Task, id)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build(),
+            },
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn activatable_tasks_is_exactly_the_claimable_set_of_the_resource() {
+        // The discovery half of a poll: only rows of `resource` that `now` makes claimable come back —
+        // a lapsed lease does, a live one does not — and `limit` counts *eligible* rows, so a
+        // non-claimable row can never occupy a slot the poll could have filled.
+        let mut store = InMemoryStorage::new();
+        let now = Timestamp::from_millis(1_000_000);
+        let expired = ulid::Ulid::new();
+        let live = ulid::Ulid::new();
+        let gated = ulid::Ulid::new();
+        let foreign = ulid::Ulid::new();
+        store
+            .put_task(sample_task(
+                expired,
+                "r",
+                TaskStatus::Running,
+                Some("w1"),
+                Some(Timestamp::from_millis(999_999)),
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .put_task(sample_task(
+                live,
+                "r",
+                TaskStatus::Running,
+                Some("w1"),
+                Some(Timestamp::from_millis(1_000_001)),
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .put_task(sample_task(
+                gated,
+                "r",
+                TaskStatus::Pending,
+                None,
+                None,
+                Some(Timestamp::from_millis(1_000_001)),
+            ))
+            .await
+            .unwrap();
+        store
+            .put_task(sample_task(
+                foreign,
+                "other",
+                TaskStatus::Pending,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let found = store.activatable_tasks("r", now, 10).await.unwrap();
+        assert_eq!(
+            found.iter().map(|t| t.value.meta.uid).collect::<Vec<_>>(),
+            vec![expired],
+            "only the lapsed lease is claimable at `now`"
+        );
+        // `limit` is applied to the eligible set, not the scanned set: the non-claimable rows ahead of
+        // it in the scan may not consume the one slot a poll asked for.
+        let one = store
+            .activatable_tasks("r", Timestamp::from_millis(1_000_001), 1)
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        // A zero cap is an empty page, not an unbounded scan: every backend reads `limit` the same
+        // way, so a poll asking for nothing gets nothing.
+        assert_eq!(
+            store
+                .activatable_tasks("r", Timestamp::from_millis(1_000_001), 0)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // One second later the live lease has lapsed and the gated retry has come due.
+        let later = store
+            .activatable_tasks("r", Timestamp::from_millis(1_000_001), 10)
+            .await
+            .unwrap();
+        let mut uids: Vec<_> = later.iter().map(|t| t.value.meta.uid).collect();
+        uids.sort();
+        let mut expected = vec![expired, live, gated];
+        expected.sort();
+        assert_eq!(uids, expected);
     }
 
     #[tokio::test]

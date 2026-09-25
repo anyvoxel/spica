@@ -192,6 +192,9 @@ message Execution {
   bytes output = 6;
   // The execution's current variable scope — `Variables` returned alongside the entity.
   map<string, bytes> variables = 7;
+  // The definition's `TimeoutSeconds` deadline (millis since epoch); empty when none. The run is
+  // terminated by the `ExecutionTimeout` timer, which carries this same instant.
+  int64 deadline_millis = 8;
 }
 enum ExecutionStatus {
   EXECUTION_STATUS_UNSPECIFIED = 0;
@@ -281,8 +284,7 @@ enum TimerPurpose {
   TIMER_PURPOSE_WAIT_RESUME = 2;
   // A Task state's `TimeoutSeconds` deadline; firing fails the in-flight task `States.Timeout`.
   TIMER_PURPOSE_TASK_TIMEOUT = 3;
-  // The delivery lease on a claimed Task; firing re-queues a stalled worker's task.
-  TIMER_PURPOSE_DELIVERY_LEASE = 4;
+  reserved 4; // was TIMER_PURPOSE_DELIVERY_LEASE (a per-claim lease timer)
 }
 enum TimerStatus {
   TIMER_STATUS_UNSPECIFIED = 0;
@@ -306,7 +308,7 @@ message Task {
   // The worker currently leasing this task; empty when unclaimed.
   string worker_id = 7;
   // The claiming worker's lease expiry (millis since epoch); empty unless RUNNING.
-  int64 lease_until_millis = 8;
+  int64 lease_expires_at_millis = 8;
   // The frozen Retry plan (serde JSON), empty when no retry.
   bytes retry_plan = 9;
   // The retry run-state (`RetryState`, serde JSON).

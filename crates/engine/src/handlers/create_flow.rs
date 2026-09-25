@@ -2,7 +2,6 @@
 
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::CreateFlow;
 use crate::types::event::{Event, FlowCreated, FlowVersionCreated};
 use crate::types::flow::Flow;
@@ -89,10 +88,10 @@ impl CreateFlowHandler {
         // flow's first version is always ordinal 1 (its object name `{flow_name}-1`); the flow's
         // `meta.uid` is a distinct fresh ulid from the version's. `created_at` is stamped now and
         // carried on both rows.
-        let flow_uid = ulid::Ulid::new();
+        let flow_uid = ctx.mint();
         let flow_version = FlowVersion::version_name(name, 1);
-        let flow_version_uid = ulid::Ulid::new();
-        let created_at = Timestamp::now();
+        let flow_version_uid = ctx.mint();
+        let created_at = ctx.now();
         tracing::info!(name = %name, uid = %flow_uid, version = %flow_version, "flow with first version created");
 
         // Emit the flow's birth and its first version in one atomic batch (same cause/stream). The

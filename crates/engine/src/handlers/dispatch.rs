@@ -8,9 +8,8 @@ use super::{
     ActivateStateHandler, ActivateTaskHandler, CancelTaskHandler, CancelTimerHandler,
     ClaimTasksHandler, CompleteExecutionHandler, CompleteStateHandler, CompleteTaskHandler,
     CompleteThreadHandler, ContinueCompleteHandler, ContinueTerminateHandler,
-    CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, ReleaseTaskLeaseHandler,
-    SpawnThreadHandler, TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler,
-    TriggerTimerHandler,
+    CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, SpawnThreadHandler,
+    TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler, TriggerTimerHandler,
 };
 use crate::handler::{Collector, HandlerContext};
 use crate::types::command::Command;
@@ -79,7 +78,6 @@ pub(crate) async fn dispatch_command(
         Command::FailTask(p) => FailTaskHandler.handle(p, ctx, out).await,
         Command::TriggerTimer { timer } => TriggerTimerHandler.handle(timer, ctx, out).await,
         Command::CancelTimer { timer } => CancelTimerHandler.handle(timer, ctx, out).await,
-        Command::ReleaseTaskLease { task } => ReleaseTaskLeaseHandler.handle(task, ctx, out).await,
         Command::CancelTask { task } => CancelTaskHandler.handle(task, ctx, out).await,
         Command::ContinueComplete { owner } => {
             ContinueCompleteHandler.handle(owner, ctx, out).await

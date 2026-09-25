@@ -9,13 +9,15 @@
 //! pending — the earlier deadlock where an inline `sleep` blocked the whole stream can't recur.
 //!
 //! This crate depends on `spica-engine` for the value types the contract carries
-//! ([`ObjectReference`](spica_engine::ObjectReference), [`Timestamp`](spica_engine::Timestamp)); the
-//! graph stays acyclic (`scheduler → engine`, never the reverse), and the assembly binary
+//! ([`ObjectReference`](spica_engine::ObjectReference), [`Timestamp`](spica_engine::Timestamp)) and
+//! on `spica-machinery` for the [`Clock`](spica_machinery::Clock) its expiry decisions read; the
+//! graph stays acyclic (`scheduler → engine`/`machinery`, never the reverse), and the assembly binary
 //! (`spica-server`) selects a concrete implementation and injects it as `Arc<dyn Scheduler>`.
 //!
-//! The one implementation today is [`InMemoryScheduler`], an in-process `DelayQueue` loop. It is the
-//! scheduler's analogue of `InMemoryStorage`: sufficient for single-node operation and tests, and a
-//! drop-in shape a distributed / remote timer implementation can later match behind the same traits.
+//! The one implementation today is [`InMemoryScheduler`], an in-process loop that fires each timer
+//! once its injected clock reaches the timer's deadline. It is the scheduler's analogue of
+//! `InMemoryStorage`: sufficient for single-node operation and tests, and a drop-in shape a
+//! distributed / remote timer implementation can later match behind the same traits.
 
 mod contract;
 mod in_memory;

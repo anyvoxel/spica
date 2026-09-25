@@ -6,6 +6,7 @@
 //! generic lives in the separate `spica-logstream` crate.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use tokio_stream::Stream;
 
@@ -13,6 +14,7 @@ pub use crate::types::entry::{Entry, EntryPayload};
 use crate::types::id::{EntryId, StreamId};
 
 pub use spica_logstream::{InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
+use spica_machinery::Clock;
 
 /// A [`LogStream`] adapter that closes every atomic append with a [`Noop`](EntryPayload::Noop)
 /// unless it is already Noop-terminated.
@@ -30,6 +32,9 @@ pub use spica_logstream::{InMemoryLogStream, LogStream, RocksLogStream, Timestam
 // keeps it printable for `debug!` traces.
 pub struct NoopTerminatedLogStream {
     inner: Box<dyn LogStream<EntryPayload>>,
+    /// The clock the added terminator stamps from — the engine's injected one, so even this
+    /// engine-minted entry carries a time the caller controls rather than an ambient wall-clock read.
+    clock: Arc<dyn Clock>,
 }
 impl std::fmt::Debug for NoopTerminatedLogStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,8 +43,8 @@ impl std::fmt::Debug for NoopTerminatedLogStream {
 }
 
 impl NoopTerminatedLogStream {
-    pub fn new(inner: Box<dyn LogStream<EntryPayload>>) -> Self {
-        Self { inner }
+    pub fn new(inner: Box<dyn LogStream<EntryPayload>>, clock: Arc<dyn Clock>) -> Self {
+        Self { inner, clock }
     }
 }
 
@@ -61,7 +66,7 @@ impl LogStream<EntryPayload> for NoopTerminatedLogStream {
                 stream_id: StreamId::nil(),
                 entry_id: EntryId::nil(),
                 cause_id: None,
-                timestamp: Timestamp::now(),
+                timestamp: self.clock.now(),
                 payload: EntryPayload::Noop,
             });
             entries

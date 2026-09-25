@@ -62,4 +62,16 @@ pub trait Scheduler: Send + Sync {
 
     /// Cancel a previously-armed `timer` (a `TimerCancelled` event was applied).
     fn cancel(&self, timer: &ObjectReference);
+
+    /// Re-evaluate the armed timers against the clock's current reading — "time has moved, look
+    /// again". Required **only** of a caller that moves the clock itself (a manual clock substituted
+    /// for the wall clock, e.g. in a test): nothing inside the scheduler can observe such an advance,
+    /// so without this call a timer whose deadline has passed would stay armed until some other
+    /// event woke the loop. With the wall clock the loop's own wait already covers every advance and
+    /// this is never needed, which is why the default is a no-op.
+    ///
+    /// A caller must inject the *same* [`Clock`](spica_machinery::Clock) it advances here and into
+    /// the engine (see `EngineBuilder::with_clock`): deadlines are computed against one clock and
+    /// awaited against another otherwise.
+    fn tick(&self) {}
 }

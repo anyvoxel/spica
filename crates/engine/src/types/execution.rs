@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
+use crate::Timestamp;
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
 
@@ -59,7 +60,7 @@ impl ExecutionStatus {
 /// `Execution` is the entity of a **top-level run only** — the run a client started. A `Parallel`
 /// branch or `Map` item is a different, dedicated entity type ([`Thread`](crate::Thread)) with its
 /// own `state_path`/owner; it is **never** an `Execution`. Consequently an `Execution` needs neither a
-/// `state_path` (it always resolves against the machine's top-level `states`) nor a
+/// `state_path` (it always resolves against the machine's top-level `States`) nor a
 /// `root_execution` (it is its own root — its `reference()` IS the flat query anchor). Removing those
 /// two fields is exactly what makes the type self-describing: no consumer must inspect fields to
 /// decide whether an `Execution` is a root or a branch, because it is always a root.
@@ -82,6 +83,13 @@ pub struct Execution {
     /// shares the same version.
     pub flow_version: ObjectReference,
     pub status: ExecutionStatus,
+    /// The absolute moment the state machine's `TimeoutSeconds` expires, `Some` iff the definition
+    /// sets one. Nothing decides from it — the run is terminated by the `ExecutionTimeout` timer whose
+    /// `deadline` is the *same* instant (both written from one computation at creation) — so this is
+    /// the run's own answer to "when is it due", where a client would otherwise have to find and filter
+    /// the timer child. It is the run-level counterpart of a state's [`Task::deadline`](crate::Task).
+    #[serde(default)]
+    pub deadline: Option<Timestamp>,
     /// The original execution input.
     pub input: Value,
     /// The execution's decided success output. It is written when `ExecutionCompleting` lands and is

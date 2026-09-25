@@ -25,15 +25,13 @@ impl CompleteStateHandler {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) {
-        let CompleteState {
-            activity,
-            output: raw_result,
-        } = p;
+        let CompleteState { activity, .. } = p;
         // Resolve the owning scope + its machine/state definition just far enough to pick the right
         // handler — the base `StateHandler::complete` owns the whole orchestration (re-loading the
-        // activity, running the status/children/scope guards, reconstructing the activity and variables, and
-        // delegating to the per-state projection). Mirror the `ActivateStateHandler` dispatch: this
-        // dispatcher never builds the context itself.
+        // activity, folding the command's raw result, running the status/children/scope guards,
+        // reconstructing the activity and variables, and delegating to the per-state finish). Mirror
+        // the `ActivateStateHandler` dispatch: this dispatcher builds no context itself and forwards
+        // the payload verbatim.
         let act = match ctx.storage.get_activity(activity).await {
             Ok(Some(a)) => a,
             Ok(None) => {
@@ -85,8 +83,6 @@ impl CompleteStateHandler {
             .state_handlers
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
-        handler
-            .complete(ctx, out, activity.clone(), Some(raw_result))
-            .await;
+        handler.complete(ctx, out, p).await;
     }
 }

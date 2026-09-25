@@ -120,7 +120,7 @@ pub enum Event {
     /// Result of `Command::CreateExecution` — a **top-level run**'s single creation record. A
     /// top-level `Execution` is its own flat query anchor: it has no `parent`, no `root_execution`
     /// (it IS the root) and no branch `state_path` (its states resolve against the machine's
-    /// top-level `states`). Fan-out children (`Parallel` branches / `Map` items) are **not**
+    /// top-level `States`). Fan-out children (`Parallel` branches / `Map` items) are **not**
     /// executions — they are [`Thread`]s, created via [`ThreadCreated`](Event::ThreadCreated).
     ///
     /// `request_id` is the echoing correlate for the `CreateExecution` command: it carries the
@@ -236,7 +236,7 @@ pub enum Event {
     /// worker, never the engine.
     TaskActivated { task: Task },
     /// A worker's `ClaimTasks` claimed one batch of tasks: each is `Running` with `worker_id` /
-    /// `lease_until` recorded. From here only the leasing worker's `CompleteTask`/`FailTask` may
+    /// `lease_expires_at` recorded. From here only the leasing worker's `CompleteTask`/`FailTask` may
     /// settle them; the worker/lease fields are the durable record a restarted engine needs to keep
     /// honoring the claim. Batched (one event per poll, not per task) because all claims share one
     /// causal `ClaimTasks` batch — the applier folds each entry against its own `Pending` stake.
@@ -244,10 +244,6 @@ pub enum Event {
     /// durable record. Emitted even for an empty claim (a poll that crossed the read-first gate but
     /// raced to nothing) so every appended `ClaimTasks` has a response entry.
     TasksClaimed(TasksClaimed),
-    /// The claimed task's lease elapsed before a settle (`ReleaseTaskLease`): `status` returns to
-    /// `Pending` and `worker_id`/`lease_until` are cleared, so the task is re-claimable by any worker
-    /// (or the same one, if it stalled then recovered — Zeebe's activation-timeout re-queue).
-    TaskLeaseExpired { task: Task },
     /// The task settled successfully. Carries the same task entity with `status = Completed`; the
     /// concrete returned payload is kept separately as `output` because it feeds the owning activity's
     /// `raw_output` rather than becoming part of the task entity itself.

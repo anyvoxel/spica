@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
+use crate::log::Timestamp;
 use crate::types::error::ExecutionError;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
@@ -73,15 +74,23 @@ pub trait Storage: Send + Sync {
         id: ObjectReference,
     ) -> Result<HashSet<ObjectReference>, ExecutionError>;
 
-    /// Scan up to `limit` available (`TaskStatus::Pending`) tasks of `resource` — the discovery
+    /// Scan up to `limit` tasks of `resource` that a worker may claim **at** `now` — the discovery
     /// query behind a worker pull ([`TaskApi::poll_tasks`](crate::task_api::TaskApi::poll_tasks)). A
     /// straight scan over the task rows (there is no per-resource ready-queue index in M1); a
     /// production store would maintain a ready-queue per job-type to serve this in O(queued) instead
     /// of O(tasks). Restart-safe for the same reason every read is: it observes the durable
-    /// projection, so a task created before a restart and still `Pending` is found and claimed.
+    /// projection, so a task created before a restart and still claimable is found and claimed.
+    ///
+    /// Eligibility is [`Task::is_claimable_at`](crate::Task::is_claimable_at) — claimability is a
+    /// function of the task's own persisted facts (status, retry backoff, lease deadline) and the
+    /// caller's clock, so `now` is a parameter rather than a storage concern: the handler passes
+    /// `ctx.now()`, and `limit` counts *eligible* rows so in-flight tasks of other workers cannot
+    /// crowd out the ones a poll can actually grant. `limit == 0` is a valid request with an empty
+    /// answer, not an unbounded scan.
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError>;
 
@@ -241,13 +250,14 @@ pub trait StorageTxn: Send {
         id: ObjectReference,
     ) -> Result<HashSet<ObjectReference>, ExecutionError>;
 
-    /// Scan up to `limit` available (`TaskStatus::Pending`) tasks of `resource`, read-your-writes:
-    /// the pending batch is consulted first, then committed rows — the overlay equivalent of
+    /// Scan up to `limit` claimable-at-`now` tasks of `resource`, read-your-writes: the pending
+    /// batch is consulted first, then committed rows — the overlay equivalent of
     /// [`Storage::activatable_tasks`], letting a handler pulling work see its own just-emitted
     /// task rows (the no-op scheduler's overlay never arms physical side effects).
     async fn activatable_tasks(
         &mut self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError>;
 
@@ -344,6 +354,7 @@ pub trait ReadonlyStorageTxn: Send + Sync {
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError>;
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError>;
@@ -403,9 +414,10 @@ impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
-        <T as Storage>::activatable_tasks(self, resource, limit).await
+        <T as Storage>::activatable_tasks(self, resource, now, limit).await
     }
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
         <T as Storage>::get_flow_by_name(self, name).await

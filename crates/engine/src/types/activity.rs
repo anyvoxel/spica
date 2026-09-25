@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
+use crate::Timestamp;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
@@ -54,10 +55,9 @@ impl ActivityStatus {
 ///
 /// The shared lifecycle skeleton (`id`/`parent`/`state`/`status`/`raw_input`/`input`/`retry_state`/
 /// `raw_output`/`output`/...) lives on `Activity` directly because every state needs it; this
-/// enum holds only what *some* states need. A new container state (or a Map gaining
-/// `ItemSelector`/`ToleratedFailure*`) adds a variant rather than widening the shared struct.
-/// `Activity.activity_state` is `None` while no state-specific data exists (Pass/Wait/Task/Choice/
-/// Succeed/Fail), and `Some` once a container's repository materializes.
+/// enum holds only what *some* states need. A state gaining a runtime repository adds a variant
+/// rather than widening the shared struct. `Activity.activity_state` is `None` while the state
+/// holds no state-specific data (Pass/Task/Choice/Succeed/Fail), and `Some` once one materializes.
 ///
 /// - `Parallel(ParallelActivityState)` — the branch index → child execution fan-out map, so
 ///   convergence aggregates branch outputs in declaration order.
@@ -65,10 +65,15 @@ impl ActivityStatus {
 ///   activation product on `Event::StateActivated`. The running completed/failed tallies are **not**
 ///   stored here: they are derived live from the terminal status of the parallel child executions, so
 ///   a follower rebuilds them from each child's own terminal event without extra projections.
+/// - `Wait(WaitActivityState)` — the absolute moment the `Wait` resumes, harvested the same way. A
+///   `Wait` holds no other runtime data; the instant rides `StateActivated` so every later event of
+///   the activity carries it, which is what a client asks when it wants "when does this state
+///   resume" without having to find and filter the activity's `WaitResume` timer child.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ActivityState {
     Parallel(ParallelActivityState),
     Map(MapActivityState),
+    Wait(WaitActivityState),
 }
 
 /// A `Parallel` state's activity-level runtime repository — the ordered fan-out mapping. The
@@ -79,6 +84,21 @@ pub struct ParallelActivityState {
     /// Branch index → child execution, populated by `Event::ThreadCreated` (from each thread's own
     /// `index`) as branches fan out, so convergence can aggregate outputs in declaration order.
     pub branches: HashMap<usize, ObjectReference>,
+}
+
+/// A `Wait` state's activity-level runtime repository — the absolute instant the wait resumes.
+///
+/// Nothing decides from it: the `WaitResume` timer, armed from this same value at activation, is
+/// what actually resumes the state (matching [`Execution::deadline`](crate::Execution) and
+/// [`Task::deadline`](crate::Task), where the enforcing timer likewise stays the actor). Resolving
+/// it in the activation step rather than when the timer is armed makes the instant a property of
+/// the entering activity, so a client can read "when will this state resume" off the activity alone
+/// instead of searching its children for the timer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaitActivityState {
+    /// The absolute moment the state's `Seconds`/`Timestamp` resolves to, measured from the
+    /// activity's entry instant.
+    pub resume_at: Timestamp,
 }
 
 /// The `Map` state's activity-level runtime repository — the **static activation plan** projected
@@ -127,9 +147,9 @@ pub struct Activity {
     /// which the field's name lied about.)
     pub execution: ObjectReference,
     /// The complete JSON Pointer (RFC 6901) to this state's definition within the shared machine
-    /// document, e.g. `/states/P2` (top-level) or `/states/P1/branches/0/states/P2` (inside a
+    /// document, e.g. `/States/P2` (top-level) or `/States/P1/Branches/0/States/P2` (inside a
     /// Parallel branch). The leaf state name (the activity's identity — the state's key in the
-    /// enclosing `states` table) is **derived** as the pointer's last token, so it is not duplicated
+    /// enclosing `States` table) is **derived** as the pointer's last token, so it is not duplicated
     /// here. Carried on `Event::StateActivating` so a follower / recovered leader records exactly
     /// where the activity lives without re-deriving it from the machine + parent chain.
     pub state_path: StatePath,
@@ -158,12 +178,12 @@ pub struct Activity {
     /// `null`. Kept distinct from `output` so the engine preserves both the pre-projection and the
     /// final projected view of the state's result.
     pub raw_output: Option<Value>,
-    /// The **state-specific runtime repository** — data only a container state's activity carries.
-    /// `None` for every non-container state (Pass/Wait/Task/Choice/...), which hold no state-specific
-    /// runtime data. A `Parallel` holds its branch index → child execution fan-out map; a `Map` holds
-    /// its iteration plan harvested from the activation product. Kept as an enum so state-specific
-    /// data is *typed* (not a bunch of `Option`s/empty collections polluting the shared skeleton) and
-    /// grows by adding a variant for a new container state.
+    /// The **state-specific runtime repository** — data only some states' activities carry.
+    /// `None` while the state holds no state-specific runtime data (Pass/Task/Choice/Succeed/Fail),
+    /// `Some` once one materializes. A `Parallel` holds its branch index → child execution fan-out
+    /// map, a `Map` its iteration plan harvested from the activation product, and a `Wait` the
+    /// absolute instant it resumes. Kept as an enum so state-specific data is *typed* (not a bunch of
+    /// `Option`s/empty collections polluting the shared skeleton) and grows by adding a variant.
     pub activity_state: Option<ActivityState>,
     /// Retry-specific runtime state: total retry count exposed to `$states.context.State.RetryCount`
     /// plus per-retrier attempt metadata (`attempt_count` and `last_retry_at`). `None` until a retry

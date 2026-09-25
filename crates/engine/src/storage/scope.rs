@@ -39,9 +39,9 @@ impl ScopeRecord {
         }
     }
 
-    /// The JSON Pointer to this scope's sub-`states` table: `Some` for a `Thread` (its defining
+    /// The JSON Pointer to this scope's sub-`States` table: `Some` for a `Thread` (its defining
     /// property — it always descends into the shared machine), `None` for a top-level `Execution`
-    /// (it resolves against the machine's top-level `states`).
+    /// (it resolves against the machine's top-level `States`).
     pub fn state_path(&self) -> Option<&StatePath> {
         match self {
             ScopeRecord::Execution(_) => None,

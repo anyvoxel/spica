@@ -45,6 +45,7 @@ impl TerminateStateHandler {
                 // duplicate; the owned parent then reacts via the inline child-settled cascade
                 // (activity already drained from its snapshot) and advances the parent's finish.
                 let mut activity_value = act.value();
+                activity_value.meta.updated_at = ctx.now();
                 activity_value.status = S::Terminated(reason.clone());
                 out.append_event(crate::types::event::Event::StateTerminated {
                     activity: activity_value,
@@ -73,7 +74,13 @@ impl TerminateStateHandler {
         }
         let _ = TerminationReason::Cancelled; // referenced above
 
+        // Every record emitted below is this row *after* its own write, so each carries the moment of
+        // that write rather than the stored stamp: re-reading the activity would date a termination
+        // that happened after a deadline (a `Wait` cancelled a minute into its resume) at the
+        // activation it was read from.
+        let now = ctx.now();
         let mut terminating_activity = act.value();
+        terminating_activity.meta.updated_at = now;
         terminating_activity.status = S::Terminating(reason.clone());
         out.append_event(Event::StateTerminating {
             activity: terminating_activity,
@@ -138,6 +145,7 @@ impl TerminateStateHandler {
         }
         if pending == 0 {
             let mut terminated_activity = act.value();
+            terminated_activity.meta.updated_at = now;
             terminated_activity.status = S::Terminated(reason.clone());
             out.append_event(Event::StateTerminated {
                 activity: terminated_activity,

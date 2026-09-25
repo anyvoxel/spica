@@ -86,15 +86,21 @@ pub struct Thread {
     /// [`crate::storage::resolve_scope_flow_version`] from `execution`, never stored twice.
     pub execution: ObjectReference,
     /// A JSON Pointer (RFC 6901) into the single shared `StateMachine` document locating this
-    /// thread's sub-`states` table, e.g. `/states/P1/branches/0/states/P2/item_processor/states`.
+    /// thread's sub-`States` table, e.g. `/States/P1/Branches/0/States/P2/ItemProcessor/States`.
     /// **Always present** — a thread's defining property is that it runs a portion of the shared
     /// machine, and `resolve_states_map` walks this pointer to resolve its states without copying
     /// any definition. (This is the field that used to be `Option` on `Execution`; for a `Thread`
     /// it is unconditional.) A **root** thread — the one an `Execution` derives to run its top-level
-    /// states — carries the empty pointer `/`, which `resolve_states_map` resolves back to the
-    /// machine's top-level `states`, so a root thread and a fan-out thread share one resolution path
-    /// rather than Execution's former `None` (top-level) special case.
+    /// states — names the machine's own top-level table (`/States`), so a root thread and a fan-out
+    /// thread carry the *same shape* of pointer: each names the `States` table it runs, and every
+    /// thread resolves through that one path rather than Execution's former `None` special case.
     pub state_path: StatePath,
+    /// The state this thread's sub-run enters first: the `StartAt` of the branch / `ItemProcessor`
+    /// whose `States` table [`state_path`](Self::state_path) names, or the machine's own top-level
+    /// `StartAt` for a root thread. Recorded on the entity so a thread describes its whole sub-run —
+    /// *which* table it runs and *where in it* it begins — instead of the entry point being
+    /// recoverable only from the `ActivateState` the container happened to emit beside it.
+    pub start_at: String,
     /// This thread's **ordinal** within its container Activity — the `Parallel` branch index or the
     /// `Map` item index (0-based, in declaration order). Part of the thread's own identity: a thread
     /// *is* "the i-th branch/item of its container", so the index lives here on the entity, and the

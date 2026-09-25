@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::Timestamp;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::id::{FlowName, RequestId};
 use crate::types::meta::{ObjectName, ObjectReference};
@@ -119,7 +120,7 @@ pub struct SpawnThread {
     /// The reference of the top-level run this branch belongs to (the child inherits it as
     /// its `execution` anchor, carried verbatim through every nesting level).
     pub execution: ObjectReference,
-    /// Resolved JSON Pointer to this branch's `states` table within the shared machine.
+    /// Resolved JSON Pointer to this branch's `States` table within the shared machine.
     pub state_path: Option<StatePath>,
     /// This child's ordinal within its container's fan-out source — the `Branches` array index
     /// for a `Parallel`, or the `Items` array index for a `Map`. Carried so the created child
@@ -128,7 +129,7 @@ pub struct SpawnThread {
     pub index: usize,
     /// The **entry-point state name** the child enters first — the branch's `StartAt` for a
     /// `Parallel`, the item-processor's `StartAt` for a `Map`. Distinct from `state_path` (which
-    /// names only the sub-machine's `states` table): it is the one carrier of *where within that
+    /// names only the sub-machine's `States` table): it is the one carrier of *where within that
     /// table* the child starts, needed to build the sibling `ActivateState`'s path and
     /// unrecoverable from `state_path` alone without re-resolving the definition.
     pub start_at: String,
@@ -191,6 +192,11 @@ pub struct ActivateTask {
     pub resource: String,
     pub arguments: Value,
     pub retry_plan: Vec<RetryPolicy>,
+    /// The state's resolved `TimeoutSeconds` instant, if it sets one — carried on the command so the
+    /// born task records it (`Task::deadline`). The `TaskTimeout` timer that enforces it is armed from
+    /// the same computation, so the field and the timer can never name different moments.
+    #[serde(default)]
+    pub deadline: Option<Timestamp>,
 }
 
 /// Payload of [`Command::ClaimTasks`].
@@ -263,13 +269,13 @@ pub enum Command {
     /// Fan out one branch of a `Parallel` state as a **child execution** (M3). Produces an
     /// `ExecutionCreated{parent, execution, state_path}` (rooting the child in the owning
     /// tree, inheriting the top-level run's id as its flat query anchor, and pointing its
-    /// `state_path` at the branch's `states` table within the shared machine) followed by an
+    /// `state_path` at the branch's `States` table within the shared machine) followed by an
     /// `ActivateState` entering the branch's `StartAt` state. The child runs as a self-contained
     /// sub-state-machine; its terminal hop runs the inline child-settled reaction back to `owner`.
     ///
     /// `owner` is the `Parallel` activity that owns the branch, `execution` the top-level run
     /// (carried verbatim through every nesting level), `state_path` the resolved JSON Pointer to
-    /// this branch's `states` table (computed by the fan-out from the owning execution's pointer +
+    /// this branch's `States` table (computed by the fan-out from the owning execution's pointer +
     /// the `Parallel` state name + branch index), and `state` the branch's `StartAt` to enter first.
     ///
     /// TODO(command-design): `SpawnThread` is reused by both `Parallel` branches and `Map` items
@@ -335,9 +341,9 @@ pub enum Command {
     /// `Activity::execution`.
     ///
     /// `state_path` is the exact JSON Pointer to the state being entered (from the machine root:
-    /// `/states/<name>` for a top-level state, `/states/.../branches/<idx>/<name>` for a branch /
-    /// item). Carrying the full path makes `ActivateState` self-locating — the definition lookup no
-    /// longer infers the enclosing `states` table from the owning scope's stored `state_path` — and
+    /// `/States/<name>` for a top-level state, `/States/.../Branches/<idx>/States/<name>` for a
+    /// branch / item). Carrying the full path makes `ActivateState` self-locating — the definition lookup no
+    /// longer infers the enclosing `States` table from the owning scope's stored `state_path` — and
     /// keeps the log self-describing for replay/audit. The state's leaf name is
     /// [`state_name_from_path`](crate::handlers::state_name_from_path).
     ///
@@ -394,8 +400,8 @@ pub enum Command {
     /// A worker's claim of up to `max_tasks` available (`Pending`) tasks of `resource` (Zeebe
     /// `ActivateJobs`). The engine's `poll_tasks` API writes this **only when a read-first gate found
     /// claimable work** — an idle poll is a pure query and never reaches the log. Dispatch leases each
-    /// discovered task to `worker_id` for `lease_seconds`, emitting one batched `TasksClaimed` (+ a
-    /// per-task `DeliveryLease` timer), and returns the granted set to the awaiting caller via the
+    /// discovered task to `worker_id` for `lease_seconds`, emitting one batched `TasksClaimed`, and
+    /// returns the granted set to the awaiting caller via the
     /// acknowledgment channel (`AckOutcome::Granted`). Allocation stays in the StreamProcessor's
     /// serialized, lock-holding dispatch, so the grant is decided where the projection is read.
     /// `request_id` correlates the caller's `poll_tasks` with the returned task list (the
@@ -419,10 +425,6 @@ pub enum Command {
     /// drives the owning state's `Retry`/`Catch`/terminate policy.
     FailTask(FailTask),
 
-    /// A task's lease elapsed without a settle: return it to `Pending` (re-claimable by any worker).
-    /// Produces `Event::TaskLeaseExpired`. Idempotent — a no-op if the task already settled.
-    ReleaseTaskLease { task: ObjectReference },
-
     /// Cancel a pending `Task` (e.g. the owning activity/execution is terminated while the call is
     /// in flight). Idempotent — a no-op if the task already settled.
     CancelTask { task: ObjectReference },
@@ -445,11 +447,8 @@ pub enum Command {
 /// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s dispatch and is a
 /// placeholder for later per-state `TimeoutSeconds` (M2).
 ///
-/// The first three variants are **state-machine semantic** timers: they arise from the ASL
-/// definition (`Seconds`/`TimeoutSeconds`) and drive a state transition when they fire. The last
-/// (`DeliveryLease`) is an **infra/delivery** guard, not workflow-defined — it shares the durable
-/// timer path only because a claimed-but-unsettled task must be re-queued after a restart, and its
-/// firing is engine-internal coordination rather than a state-machine behavior.
+/// Every variant is a **state-machine semantic** timer: it arises from the ASL definition
+/// (`Seconds`/`TimeoutSeconds`) and drives a state transition when it fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimerPurpose {
     /// The state-machine `TimeoutSeconds` deadline; its firing terminates the execution `TimedOut`.
@@ -459,9 +458,5 @@ pub enum TimerPurpose {
     /// A Task state's `TimeoutSeconds` deadline; its firing fails the in-flight task with
     /// `States.Timeout` (routed back into the owning state's `Retry`/`Catch` policy).
     TaskTimeout,
-    /// The engine's **delivery lease** on a claimed Task (Zeebe activation timeout); its firing
-    /// re-queues the task (`Pending`) so a stalled / crashed worker does not hold it forever. An
-    /// infra/delivery timer, unlike the state-machine semantic timers above.
-    DeliveryLease,
     // M2: StateTimeout
 }

@@ -44,8 +44,8 @@ use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
 use spica_engine::{
     ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, InfraError,
-    ObjectKind, ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, TaskStatus,
-    ThreadRecord, TimerRecord,
+    ObjectKind, ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord,
+    TimerRecord, Timestamp,
 };
 
 use crate::{KeyBuilder, Kind, Scope};
@@ -202,6 +202,7 @@ impl Storage for RocksStorage {
     async fn activatable_tasks(
         &self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
         // A forward prefix scan over the `task` kind (no per-resource queue index in M1 — see the
@@ -215,11 +216,13 @@ impl Storage for RocksStorage {
             let task: TaskRecord = serde_json::from_slice(&value).map_err(|e| {
                 ExecutionError::Infra(InfraError::Log(format!("rocksdb task decode: {e}")))
             })?;
-            if task.value.resource == resource && task.value.status == TaskStatus::Pending {
-                out.push(task);
+            if task.value.resource == resource && task.value.is_claimable_at(now) {
+                // The cap counts rows already collected, so it is tested *before* the row joins
+                // them: `limit == 0` yields an empty page on every backend.
                 if out.len() >= limit {
                     break;
                 }
+                out.push(task);
             }
         }
         Ok(out)
@@ -513,6 +516,7 @@ impl StorageTxn for RocksTxn {
     async fn activatable_tasks(
         &mut self,
         resource: &str,
+        now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, ExecutionError> {
         // A forward prefix scan through the transaction iterator, which applies the pending
@@ -533,11 +537,12 @@ impl StorageTxn for RocksTxn {
             let task: TaskRecord = serde_json::from_slice(&value).map_err(|e| {
                 ExecutionError::Infra(InfraError::Log(format!("rocksdb txn task decode: {e}")))
             })?;
-            if task.value.resource == resource && task.value.status == TaskStatus::Pending {
-                out.push(task);
+            if task.value.resource == resource && task.value.is_claimable_at(now) {
+                // Same cap-before-collect ordering as the committed-store scan above.
                 if out.len() >= limit {
                     break;
                 }
+                out.push(task);
             }
         }
         Ok(out)
@@ -736,8 +741,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, Timer, TimerPurpose,
-        TimerStatus, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, RetryState, Task,
+        TaskStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
@@ -773,6 +778,7 @@ mod tests {
     fn sample_execution(id: ObjectReference) -> ExecutionRecord {
         ExecutionRecord {
             value: Execution {
+                deadline: None,
                 flow_version: ObjectReference::new(
                     ObjectKind::FlowVersion,
                     PlainName::new("flow").unwrap().generated_from_key(1),
@@ -901,6 +907,134 @@ mod tests {
                 store.get_execution(&id).await.unwrap().unwrap().reference(),
                 id
             );
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A task row of `resource`, for exercising the claimable-at-`now` discovery: the caller sets
+    /// exactly the facts the predicate reads (status, lease expiry, retry gate).
+    fn sample_task(
+        id: ulid::Ulid,
+        resource: &str,
+        status: TaskStatus,
+        worker_id: Option<&str>,
+        lease_expires_at: Option<Timestamp>,
+        next_available_at: Option<Timestamp>,
+    ) -> TaskRecord {
+        TaskRecord {
+            value: Task {
+                execution: ObjectReference::nil(),
+                resource: resource.to_string(),
+                arguments: Value::Null,
+                status,
+                deadline: None,
+                worker_id: worker_id.map(str::to_string),
+                lease_expires_at,
+                retry_plan: vec![],
+                retry_state: RetryState {
+                    attempts: 0,
+                    retrier_attempts: vec![],
+                    next_available_at,
+                },
+                meta: spica_engine::ObjectMeta::builder(ObjectKind::Task, id)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build(),
+            },
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn activatable_tasks_is_exactly_the_claimable_set_of_the_resource() {
+        // The discovery half of a poll, over a real prefix scan: only rows of `resource` that `now`
+        // makes claimable come back — a lapsed lease does, a live one does not — and `limit` counts
+        // *eligible* rows, so a non-claimable row can never occupy a slot the poll could have filled.
+        let path = temp_path("activatable");
+        let now = Timestamp::from_millis(1_000_000);
+        let expired = ulid::Ulid::new();
+        let live = ulid::Ulid::new();
+        let gated = ulid::Ulid::new();
+        let foreign = ulid::Ulid::new();
+        {
+            let mut store = RocksStorage::open(&path).unwrap();
+            store
+                .put_task(sample_task(
+                    expired,
+                    "r",
+                    TaskStatus::Running,
+                    Some("w1"),
+                    Some(Timestamp::from_millis(999_999)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            store
+                .put_task(sample_task(
+                    live,
+                    "r",
+                    TaskStatus::Running,
+                    Some("w1"),
+                    Some(Timestamp::from_millis(1_000_001)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            store
+                .put_task(sample_task(
+                    gated,
+                    "r",
+                    TaskStatus::Pending,
+                    None,
+                    None,
+                    Some(Timestamp::from_millis(1_000_001)),
+                ))
+                .await
+                .unwrap();
+            store
+                .put_task(sample_task(
+                    foreign,
+                    "other",
+                    TaskStatus::Pending,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+
+            let found = store.activatable_tasks("r", now, 10).await.unwrap();
+            assert_eq!(
+                found.iter().map(|t| t.value.meta.uid).collect::<Vec<_>>(),
+                vec![expired],
+                "only the lapsed lease is claimable at `now`"
+            );
+            // `limit` is applied to the eligible set, not the scanned set.
+            let one = store
+                .activatable_tasks("r", Timestamp::from_millis(1_000_001), 1)
+                .await
+                .unwrap();
+            assert_eq!(one.len(), 1);
+            // A zero cap is an empty page, not an unbounded scan: every backend reads `limit` the same
+            // way, so a poll asking for nothing gets nothing.
+            assert_eq!(
+                store
+                    .activatable_tasks("r", Timestamp::from_millis(1_000_001), 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                0
+            );
+            // One second later the live lease has lapsed and the gated retry has come due.
+            let later = store
+                .activatable_tasks("r", Timestamp::from_millis(1_000_001), 10)
+                .await
+                .unwrap();
+            let mut uids: Vec<_> = later.iter().map(|t| t.value.meta.uid).collect();
+            uids.sort();
+            let mut expected = vec![expired, live, gated];
+            expected.sort();
+            assert_eq!(uids, expected);
         }
         let _ = std::fs::remove_dir_all(&path);
     }

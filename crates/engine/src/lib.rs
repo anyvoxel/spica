@@ -80,6 +80,7 @@ pub use stream_processor::StreamProcessor;
 pub use task_api::{ActivatedTask, TaskApi};
 pub use types::activity::{
     Activity, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
+    WaitActivityState,
 };
 pub use types::command::{
     ActivateState, ActivateTask, ClaimTasks, Command, CompleteExecution, CompleteState,
@@ -99,6 +100,7 @@ pub use types::meta::{
     ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName, ScopeName,
 };
 pub use types::reject::{Reject, RejectionType};
+pub use types::state_path::StatePath;
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
 pub use types::thread::{Thread, ThreadStatus};
 pub use types::timer::{Timer, TimerStatus};

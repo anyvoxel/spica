@@ -1,7 +1,6 @@
 use spica_asl::State;
 
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::{FailTask, TerminationReason};
 use crate::types::error::ExecutionError;
 use crate::types::event::{Event, TaskFailed};
@@ -74,10 +73,10 @@ impl FailTaskHandler {
         // Build the failing task entity with the lease cleared; the retry decision below mutates it.
         let mut task_value = act.value();
         task_value.worker_id = None;
-        task_value.lease_until = None;
+        task_value.lease_expires_at = None;
         // Stamp the (re-queue / fail) decision moment; `created_at` is already carried on
         // `task_value`. Both the retry and the terminal paths emit below from this same value.
-        task_value.meta.with_update_at(Timestamp::now());
+        task_value.meta.with_update_at(ctx.now());
 
         // ── Retry self-decision (on the task, from its frozen `retry_plan`) ─────────────────────
         // Scan the frozen plan for the first entry matching the error name. Each retrier's attempt
@@ -103,7 +102,7 @@ impl FailTaskHandler {
                 // other's ladders.
                 let next_attempt = retrier_attempts + 1;
                 let delay = policy.backoff_for_attempt(retrier_attempts);
-                let now = Timestamp::now();
+                let now = ctx.now();
                 let next_available_at = now
                     .checked_add(std::time::Duration::from_secs(delay))
                     .unwrap_or(now);
@@ -126,9 +125,9 @@ impl FailTaskHandler {
                     error: error.clone(),
                 }))
                 .await;
-                // Sweep the failed attempt's `DeliveryLease`/`TaskTimeout` children (a settled task
-                // leaves no live child behind). No retry timer is armed — `next_available_at` is the
-                // gate, and the re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
+                // Sweep the failed attempt's `TaskTimeout` child (a settled task leaves no live child
+                // behind). No retry timer is armed — `next_available_at` is the gate, and the
+                // re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
                 super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
                 return;
             }
@@ -144,8 +143,8 @@ impl FailTaskHandler {
             error: error.clone(),
         }))
         .await;
-        // Sweep the activity's task timers (the `DeliveryLease` armed on assign, and any `TaskTimeout`)
-        // so a settled task leaves no live child behind; a terminal fail is then free to
+        // Sweep the activity's task timers (any `TaskTimeout`) so a settled task leaves no live child
+        // behind; a terminal fail is then free to
         // terminate/drain the activity (which would sweep them anyway — this just makes the settle
         // self-contained and avoids a stale child blocking a later complete).
         super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
@@ -288,13 +287,20 @@ impl FailTaskHandler {
             Ok(Some(a)) => a,
             Ok(None) | Err(_) => return,
         };
+        // Both records are this row *after* their write, so they carry the moment of the write rather
+        // than the stored stamp: a task that times out a minute into its deadline terminated *now*,
+        // and re-reading the activity would date its termination at its activation (its `updated_at`
+        // would then stand still across the whole timeout it just spent).
+        let now = ctx.now();
         let mut terminating_activity = activity.value();
+        terminating_activity.meta.updated_at = now;
         terminating_activity.status = ActivityStatus::Terminating(reason.clone());
         out.append_event(Event::StateTerminating {
             activity: terminating_activity,
         })
         .await;
         let mut terminated_activity = activity.value();
+        terminated_activity.meta.updated_at = now;
         terminated_activity.status = ActivityStatus::Terminated(reason.clone());
         out.append_event(Event::StateTerminated {
             activity: terminated_activity,

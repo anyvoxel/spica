@@ -59,7 +59,6 @@ pub async fn dispatch_event(
         Event::StateTransitioned(p) => StateTransitionedApplier.apply(ctx, p).await,
         Event::TaskActivated { task } => TaskActivatedApplier.apply(ctx, task).await,
         Event::TasksClaimed(p) => TasksClaimedApplier.apply(ctx, p).await,
-        Event::TaskLeaseExpired { task } => TaskLeaseExpiredApplier.apply(ctx, task).await,
         Event::TaskCompleted(p) => TaskCompletedApplier.apply(ctx, p).await,
         Event::TaskFailed(p) => TaskFailedApplier.apply(ctx, p).await,
         Event::TaskCancelled { task } => TaskCancelledApplier.apply(ctx, task).await,

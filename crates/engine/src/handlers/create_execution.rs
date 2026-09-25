@@ -1,6 +1,5 @@
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
@@ -57,13 +56,23 @@ impl CreateExecutionHandler {
         // The uid is NOT carried in the command — replay stays deterministic because the produced
         // `ExecutionCreated` lands in the same atomic batch as this command (committed ⇒ conclusive,
         // never re-dispatched), so a re-dispatch mints a fresh consistent uid.
-        let uid: ulid::Ulid = ulid::Ulid::new();
+        let uid: ulid::Ulid = ctx.mint();
         let id = ObjectReference::new(ObjectKind::Execution, name.clone(), uid);
         // Resolve the machine this execution binds to. This is the first use of the version in a
         // fresh StreamProcessor — it loads the definition (keyed by the version's object reference)
         // from Storage into the cache. If the version is missing (definition GC'd), the execution
         // cannot run and fails before any state is entered.
         let sm = fail_or!(out, None, id.clone(), ctx.machine(flow_version).await);
+        // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
+        // birth event, so the run's own `deadline` and the `ExecutionTimeout` timer that enforces it are
+        // written from one computation and cannot disagree. An overflow is a definition error with no
+        // instant to record: the run is still born (with `deadline: None`) and fails right below.
+        let timeout = sm.timeout_seconds.filter(|secs| *secs > 0);
+        let deadline = timeout.and_then(|secs| {
+            ctx.now()
+                .checked_add(std::time::Duration::from_secs(secs as u64))
+        });
+        let overflowed = timeout.is_some() && deadline.is_none();
         // Build the birth event once and emit it; an injected `Hook` observer wakes the awaiting `start`
         // caller from this same event (the `request_id` it echoes), so no separate ack echo is needed.
         let created_event = Event::ExecutionCreated(ExecutionCreated {
@@ -72,14 +81,15 @@ impl CreateExecutionHandler {
                 // The version this run executes against — every nested Thread inherits it.
                 flow_version: flow_version.clone(),
                 // A top-level run is its own root: it carries no `root_execution` and no branch
-                // `state_path` (it resolves states against the machine's top-level `states`). Fan-out
+                // `state_path` (it resolves states against the machine's top-level `States`). Fan-out
                 // children are `Thread`s instead, created via `SpawnThread`.
                 status: crate::ExecutionStatus::Running,
+                deadline,
                 input: input.clone(),
                 output: None,
                 meta: ObjectMeta::builder(ObjectKind::Execution, uid)
                     .name(name.clone())
-                    .at(Timestamp::now())
+                    .at(ctx.now())
                     .build(),
             },
         });
@@ -89,22 +99,16 @@ impl CreateExecutionHandler {
         // `wait_for_execution`).
         out.append_event(created_event).await;
 
-        if let Some(secs) = sm.timeout_seconds
-            && secs > 0
-        {
-            // Normalize the relative TimeoutSeconds into an absolute deadline at activation, so the
-            // persisted TimerActivated fact carries the wall-clock moment the execution must finish by.
-            let deadline =
-                Timestamp::now().checked_add(std::time::Duration::from_secs(secs as u64));
-            let Some(deadline) = deadline else {
-                out.fail_execution(
-                    id.clone(),
-                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "TimeoutSeconds overflows the absolute deadline".into(),
-                    )),
-                );
-                return;
-            };
+        if overflowed {
+            out.fail_execution(
+                id.clone(),
+                ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                    "TimeoutSeconds overflows the absolute deadline".into(),
+                )),
+            );
+            return;
+        }
+        if let Some(deadline) = deadline {
             // The ExecutionTimeout timer is generated **here** (inline): mint the
             // timer's durable uid, and derive the timer's name as `{execution.name}-{8-char-suffix}`
             // (k8s generateName style `PlainName::to_generated`, which mints its own suffix uid
@@ -113,7 +117,7 @@ impl CreateExecutionHandler {
             // `uid`, and must be carried forward by later timer events, so TimerActivated children
             // stay resolvable (see `TimerTriggered`/`TimerCancelled`, which preserve the row's meta
             // rather than re-deriving the name).
-            let uid: ulid::Ulid = ulid::Ulid::new();
+            let uid: ulid::Ulid = ctx.mint();
             // A generated child's base is the execution's own name, which is user-supplied (`Plain`)
             // by construction; unwrap it to derive the timer's `{name}-{8-char}` handle. The
             // `Generated` arm is unreachable for a CreateExecution name but kept explicit so a future
@@ -138,7 +142,7 @@ impl CreateExecutionHandler {
             let timer = crate::Timer {
                 meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, uid)
                     .name(name)
-                    .at(Timestamp::now())
+                    .at(ctx.now())
                     .build()
                     .with_owner(id.clone()),
                 execution: id.clone(),
@@ -152,25 +156,30 @@ impl CreateExecutionHandler {
         // Derive the execution's single root Thread — the top-level owner of every state, standing in
         // for a whole top-level run the way a Process has one main Thread. It is owned by the
         // Execution (so the `ThreadCreated` applier never aggregates its placeholder index 0 into a
-        // container fan-out map) and carries the empty pointer `/`, which `resolve_states_map`
-        // resolves back to the machine's top-level `states`. Its completion/termination bridges back
-        // to the Execution (see `complete_thread`/`terminate_thread`), so the externally-addressed
-        // root still settles through `wait_for_execution`.
-        let root_uid: ulid::Ulid = ulid::Ulid::new();
+        // container fan-out map) and names the machine's own top-level `States` table, so it resolves
+        // through the same walk a fan-out thread does. Its completion/termination bridges back to
+        // the Execution (see `complete_thread`/`terminate_thread`), so the externally-addressed root
+        // still settles through `wait_for_execution`.
+        let root_uid: ulid::Ulid = ctx.mint();
         let root_name = id
             .name
             .base()
             .generated_from_key(out.next_generated_seq().await);
         let root_thread = ObjectReference::new(ObjectKind::Thread, root_name.clone(), root_uid);
+        // The root thread runs the machine's top-level `States` table and enters the machine's own
+        // `StartAt` — the pointer and the entry point are the same pair every fan-out thread carries.
+        let root_states = StatePath::root();
+        let start_at = sm.start_at.clone();
         out.append_event(Event::ThreadCreated {
             thread: crate::Thread {
                 meta: ObjectMeta::builder(ObjectKind::Thread, root_uid)
                     .name(root_name)
-                    .at(Timestamp::now())
+                    .at(ctx.now())
                     .build()
                     .with_owner(id.clone()),
                 execution: id.clone(),
-                state_path: StatePath::from(jsonptr::PointerBuf::new()),
+                state_path: root_states.clone(),
+                start_at: start_at.clone(),
                 index: 0,
                 status: crate::ThreadStatus::Running,
                 input: input.clone(),
@@ -179,16 +188,13 @@ impl CreateExecutionHandler {
         })
         .await;
 
-        let start = sm.start_at.clone();
-        // The start state's path under the machine's top-level `states` table.
-        let mut start_path = jsonptr::PointerBuf::new();
-        start_path.push_back("states");
-        start_path.push_back(start.as_str());
+        // Enter the start state: the root thread's `state_path` (the top-level `States` table)
+        // extended by its own `start_at`, exactly how `SpawnThread` derives a branch's entry path.
         out.append_command(Command::ActivateState(ActivateState {
             // The top-level state is owned by the derived root Thread, not the Execution.
             execution: id.clone(),
             owner: root_thread,
-            state_path: StatePath::from(start_path),
+            state_path: root_states.state(&start_at),
             input: input.clone(),
         }));
     }

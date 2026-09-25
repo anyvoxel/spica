@@ -191,6 +191,11 @@ fn to_proto_execution(e: &spica_engine::ExecutionRecord) -> spica_proto::v1::Exe
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::to_vec(v).unwrap_or_default()))
             .collect(),
+        deadline_millis: e
+            .value
+            .deadline
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default(),
     }
 }
 
@@ -268,7 +273,6 @@ fn to_proto_timer(t: &spica_engine::TimerRecord) -> spica_proto::v1::Timer {
             spica_engine::TimerPurpose::ExecutionTimeout => P::ExecutionTimeout as i32,
             spica_engine::TimerPurpose::WaitResume => P::WaitResume as i32,
             spica_engine::TimerPurpose::TaskTimeout => P::TaskTimeout as i32,
-            spica_engine::TimerPurpose::DeliveryLease => P::DeliveryLease as i32,
         },
         status: match t.value.status {
             spica_engine::TimerStatus::Active => S::Active as i32,
@@ -299,9 +303,9 @@ fn to_proto_task(t: &spica_engine::TaskRecord) -> spica_proto::v1::Task {
             .map(|d| d.as_millis() as i64)
             .unwrap_or_default(),
         worker_id: t.value.worker_id.clone().unwrap_or_default(),
-        lease_until_millis: t
+        lease_expires_at_millis: t
             .value
-            .lease_until
+            .lease_expires_at
             .map(|d| d.as_millis() as i64)
             .unwrap_or_default(),
         retry_plan: serde_json::to_vec(&t.value.retry_plan).unwrap_or_default(),

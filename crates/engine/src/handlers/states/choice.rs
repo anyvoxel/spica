@@ -2,16 +2,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State};
 
+use super::super::emit_state_completed;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use crate::ActivityStatus;
-use crate::RejectionType;
+use crate::Activity;
 use crate::eval_env::{EvalEnv, extract_jsonata};
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::Collector;
 use crate::types::command::{ActivateState, Command};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::id::RequestId;
 use crate::types::meta::ObjectReference;
 use crate::types::variables::Variables;
 
@@ -92,182 +91,57 @@ impl ChoiceStateHandler<'_> {
 
 #[async_trait]
 impl StateHandler for ChoiceStateHandler<'_> {
-    /// Routes the Choice: scan rules in the complete step, evaluate the matching condition, project
-    /// the `Assign`/`Output` of the chosen rule (overriding the state level), and emit the
-    /// transition. `Assign`/`Output` from the chosen rule override the state level, and the
-    /// rule-provided `next` (or `Default`) drives the transition. No `next` and no `Default` is a
-    /// `NoChoiceMatched` failure.
-    async fn complete(
+    /// Routes the Choice: resolve the matching rule in the finish step, project the `Assign`/`Output`
+    /// of the chosen rule (overriding the state level), and emit the transition. `$states` carries no
+    /// `.result` — a Choice produces no raw result of its own. No match and no `Default` is a
+    /// `NoChoiceMatched` failure, propagated for the base's terminate.
+    async fn finish(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        env: &mut EvalEnv,
         out: &mut Collector<'_>,
         activity: ObjectReference,
-        raw_result: Option<&Value>,
-    ) {
-        // TODO：拿到 activity 之后，如果遇到错误不应该是直接 terminate（例如有些是临时性质的错误，应该重试）
-        let act = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "activity {activity}"
-                    ))),
-                );
-                return;
-            }
-            Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
-                    e,
-                );
-                return;
-            }
-        };
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ExecutionError> {
+        let state_name = activity_value.state_path.state_name();
 
-        // A late `CompleteState` on an activity that is no longer Running cannot apply — reject it
-        // (durably, with the nil id an internal command carries) rather than returning a silent
-        // no-op, so every command still yields a followup entry. The old re-emit of `StateTerminated`
-        // here was wrong: the cancel side always emits that event itself, and re-emitting it from the
-        // complete path would duplicate a terminal event.
-        if act.value.status != ActivityStatus::Running {
-            out.reject(
-                RequestId::nil(),
-                RejectionType::InvalidState,
-                format!(
-                    "activity {activity} is {:?}, not Running; cannot complete",
-                    act.value.status
-                ),
-            );
-            return;
-        }
-
-        // The activity's owner is its *scope* — resolved through the central Execution/Thread
-        // dispatch in storage, which silently ignores non-scope kinds.
-        let scope = match crate::storage::load_scope_ref(
-            ctx.storage,
-            &act.value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
-        )
-        .await
-        {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
-            Err(_) => return,
-        };
-        if !scope.is_running() {
-            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
-        }
-
-        // Rehydrate the same entity-shaped activity value lifecycle events carry, so the complete
-        // step observes the canonical domain payload rather than the projection-only row. The
-        // command's `output` is the state's raw result; fold it onto the rehydrated activity as
-        // `raw_output` so the complete-step events and `complete_activity`'s `$states.result` all
-        // record the command-carried result.
-        let mut activity_value = act.value();
-        if let Some(result) = raw_result {
-            activity_value.raw_output = Some(result.clone());
-        }
-        // Advance the one activity value in place to the completing lifecycle moment — it stays the
-        // single source of truth for the rest of the complete step, so the completing status (and its
-        // re-stamped update time) carries forward instead of a stale copy being held alongside.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Completing;
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleting {
-            activity: activity_value.clone(),
-        })
-        .await;
-        let variables = scope.variables().clone();
-        let env = &mut *ctx.env;
-
-        // `$states` for the complete step: `assign_ctx = Some` (matching Pass/Succeed/Fail) —
-        // however late an `Assign` is applied, derived values read consistently with the variables
-        // already folded.
+        // `$states` for the rule scan: `assign_ctx = Some` (matching Pass/Succeed/Fail) — however late
+        // an `Assign` is applied, derived values read consistently with the variables already folded.
         let states = States::new(
             &activity_value.raw_input,
-            &activity_value.state_path.state_name(),
+            &state_name,
             activity_value.retry_count(),
         )
         .with_assign_ctx(Some(&activity_value.raw_input))
         .build();
 
-        // The chosen rule's `next` (or the state `Default`) drives the transition; no match and no
-        // `Default` is a definitive `NoChoiceMatched` failure.
-        let (rule_assign, rule_output, rule_next) = match self.resolve_choice(
-            env,
-            &states,
-            &variables,
-            &activity_value.state_path.state_name(),
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    activity_value
-                        .meta
-                        .owner
-                        .clone()
-                        .expect("an owned activity has an owner"),
-                    e,
-                );
-                return;
-            }
-        };
-
+        // The chosen rule's `next` (or the state `Default`) drives the transition, and its
+        // `Assign`/`Output` override the state level's.
+        let (rule_assign, rule_output, rule_next) =
+            self.resolve_choice(env, &states, variables, &state_name)?;
         let assign = rule_assign.as_ref().or(self.state.assign.as_ref());
         let output_src = rule_output.as_ref().or(self.state.output.as_ref());
 
-        // Projection uses the complete-step `$states` plus any `Assign` effect folded in.
-        let mut local_variables = variables.clone();
+        // Projection reuses the scan's `$states` — a Choice produces no raw result of its own, so the
+        // pass-through fallback is the processed input.
+        let mut local_scope = variables.clone();
         let owner = activity_value
             .meta
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        let assigned = self
-            .apply_assign(out, env, &owner, assign, &states, &mut local_variables)
-            .await;
-        fail_or!(out, Some(activity), owner.clone(), assigned);
-
-        let output_value = fail_or!(
-            out,
-            Some(activity),
-            owner.clone(),
-            self.project_output(
+        self.apply_assign(out, env, &owner, assign, &states, &mut local_scope)
+            .await?;
+        let output_value = self
+            .project_output(
                 env,
                 output_src,
                 &states,
-                &local_variables,
+                &local_scope,
                 activity_value.raw_input.clone(),
             )
-            .await
-        );
-
-        // Advance the same value in place to the completed lifecycle moment (mirroring the completing
-        // step above): it stays the single source of truth, so the completed status and projected
-        // output carry forward into the transition that follows.
-        activity_value
-            .meta
-            .with_update_at(crate::log::Timestamp::now());
-        activity_value.status = ActivityStatus::Completed;
-        activity_value.output = Some(output_value.clone());
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleted {
-            activity: activity_value.clone(),
-        })
-        .await;
+            .await?;
+        emit_state_completed(out, activity_value, &output_value).await;
 
         // Choice's `next` is mandatory, so the transition is always a sibling hop — the general
         // `emit_transition` (which also handles the `end`/`NoTerminal` cases) is bypassed.
@@ -285,7 +159,8 @@ impl StateHandler for ChoiceStateHandler<'_> {
                 .clone()
                 .expect("an owned activity has an owner"),
             state_path: next_path,
-            input: output_value.clone(),
+            input: output_value,
         }));
+        Ok(())
     }
 }

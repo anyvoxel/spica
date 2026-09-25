@@ -34,6 +34,7 @@ impl ActivateTaskHandler {
             resource,
             arguments,
             retry_plan,
+            deadline,
         } = p;
         out.append_event(Event::TaskActivated {
             task: Task {
@@ -43,9 +44,11 @@ impl ActivateTaskHandler {
                 resource: resource.clone(),
                 arguments: arguments.clone(),
                 status: TaskStatus::Pending,
-                deadline: None,
+                // The state's `TimeoutSeconds` instant, decided once by the state handler; the
+                // `TaskTimeout` timer armed from the same value is what enforces it.
+                deadline: *deadline,
                 worker_id: None,
-                lease_until: None,
+                lease_expires_at: None,
                 retry_plan: retry_plan.clone(),
                 retry_state: RetryState::default(),
                 // Birth: `created_at == updated_at == now` (invocation moment). The `meta.name` is
@@ -57,7 +60,7 @@ impl ActivateTaskHandler {
                     task.uid,
                 )
                 .name(task.name.clone())
-                .at(crate::log::Timestamp::now())
+                .at(out.now())
                 .build()
                 .with_owner(owner.clone()),
             },
