@@ -53,27 +53,28 @@ impl CompleteStateHandler {
                 return;
             }
         };
+        // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read
+        // directly.
         let scope_ref = act
             .value
             .meta
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        let scope = match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
-            Ok(Some(s)) => s,
-            _ => return, // owning scope gone — nothing to complete into.
+        let Some(thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
+            return; // owning scope gone — nothing to complete into.
         };
         let sm = fail_or!(
             out,
             Some(activity.clone()),
             scope_ref.clone(),
-            ctx.machine_for_scope(&scope).await
+            ctx.machine_for_thread(&thread).await
         );
         let state_def = fail_or!(
             out,
             Some(activity.clone()),
             scope_ref.clone(),
-            resolve_state_for(&sm, &scope, &act.value.state_path.state_name()).await
+            resolve_state_for(&sm, &thread, &act.value.state_path.state_name()).await
         );
 
         // Every `State` variant has a registered factory (see `build_state_handlers` + the

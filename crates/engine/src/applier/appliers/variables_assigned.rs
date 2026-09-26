@@ -14,13 +14,12 @@ impl VariablesAssignedApplier {
         event: &VariablesAssigned,
     ) -> Result<(), ExecutionError> {
         let VariablesAssigned { scope, variables } = event;
-        // Assign targets a *scope* — an Execution or a fan-out Thread. Dispatch on the reference's
-        // structural kind so a branch's Assign lands on its Thread's variable snapshot instead of
-        // being silently dropped (the former Execution-only path missed a Thread reference in the
-        // execution table). The kind is the authoritative disambiguator here, exactly as `load_scope`
-        // centralizes it for the handler path. Variable assignment is a projection concern in the
-        // C-lite model: lifecycle events stay focused on identity/status, while the scope's mutable
-        // variables are folded here as a full snapshot for later JSONata evaluation and replay.
+        // Assign targets a *scope* — an Execution or a fan-out Thread — named by a bare reference, so
+        // this applier is where the kind must be branched on: a branch's Assign then lands on its
+        // Thread's variable snapshot instead of being dropped. Variable assignment is a projection
+        // concern in the C-lite model: lifecycle events stay focused on identity/status, while the
+        // scope's mutable variables are folded here as a full snapshot for later JSONata evaluation
+        // and replay.
         match scope.kind {
             ObjectKind::Execution => {
                 if let Some(mut exec) = ctx.storage.get_execution(scope).await? {

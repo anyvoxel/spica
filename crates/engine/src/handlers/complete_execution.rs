@@ -24,8 +24,8 @@ impl CompleteExecutionHandler {
         out: &mut Collector<'_>,
     ) {
         let CompleteExecution { execution, output } = p;
-        // Addressed by kind, so read the execution directly rather than through the generic scope
-        // reader: `CompleteExecution` is only ever dispatched for a top-level `Execution`.
+        // Addressed by kind: `CompleteExecution` is only ever dispatched for a top-level `Execution`,
+        // so the row is read directly.
         let exec = match ctx.storage.get_execution(execution).await {
             Ok(Some(e)) => e,
             Ok(None) => {

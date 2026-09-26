@@ -153,8 +153,8 @@ mod tests {
 
         let reason = TerminationReason::Failed {
             error: ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                "execution {}",
-                execution_ref()
+                "thread {}",
+                thread_ref()
             ))),
         };
         assert_eq!(

@@ -63,21 +63,22 @@ async fn finish_activity_via_state(
         .owner
         .clone()
         .expect("an owned activity has an owner");
-    let Ok(Some(scope)) = crate::storage::load_scope_ref(ctx.storage, &owner).await else {
+    // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
+    let Ok(Some(thread)) = ctx.storage.get_thread(&owner).await else {
         return DeferredFinish::Unresolvable;
     };
-    let Ok(sm) = ctx.machine_for_scope(&scope).await else {
+    let Ok(sm) = ctx.machine_for_thread(&thread).await else {
         return DeferredFinish::Unresolvable;
     };
     let Ok(state_def) =
-        super::resolve_state_for(&sm, &scope, &activity_value.state_path.state_name()).await
+        super::resolve_state_for(&sm, &thread, &activity_value.state_path.state_name()).await
     else {
         return DeferredFinish::Unresolvable;
     };
     let Some(handler) = ctx.state_handlers.create(state_def) else {
         return DeferredFinish::Unresolvable; // no registered handler — engine regression.
     };
-    let variables = scope.variables().clone();
+    let variables = thread.variables.clone();
     if let Err(e) = handler
         .finish(ctx.env, out, node.clone(), &activity_value, &variables)
         .await

@@ -173,24 +173,21 @@ impl FailTaskHandler {
             _ => return,
         };
         // An activity's owner is always a `Thread` — the derived root Thread for a top-level run, or a
-        // fan-out branch — so read it directly rather than through the kind-dispatching scope reader.
-        // Resolving it is what lets the state definition be consulted against the right `state_path`:
-        // for a branch, retry/catch then see the per-branch definition at the pointer location.
+        // fan-out branch. Resolving it is what lets the state definition be consulted against the
+        // right `state_path`: for a branch, retry/catch then see the per-branch definition at the
+        // pointer location.
         let owner = activity
             .value
             .meta
             .owner
             .clone()
-            .expect("a completing activity is owned by a scope");
+            .expect("a completing activity is owned by a thread");
         let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
-            return; // owning scope gone — nothing to consult.
+            return; // owning thread gone — nothing to consult.
         };
-        // TODO(step 2): drop this adapter — and the `ScopeRecord` wrapper it needs — once
-        // `machine_for_scope` / `resolve_state_for` take a `Thread` instead of a scope.
-        let scope = crate::storage::ScopeRecord::Thread(thread);
-        // The owning scope binds to a machine revision; resolve it (cached by the Processor)
+        // The owning thread binds to a machine revision; resolve it (cached by the Processor)
         // before consulting the state definition.
-        let sm = match ctx.machine_for_scope(&scope).await {
+        let sm = match ctx.machine_for_thread(&thread).await {
             Ok(s) => s,
             Err(_) => {
                 // Definition no longer resolvable — nothing left to consult; terminate.
@@ -199,7 +196,7 @@ impl FailTaskHandler {
             }
         };
         let state_def =
-            match super::resolve_state_for(&sm, &scope, &activity.value.state_path.state_name())
+            match super::resolve_state_for(&sm, &thread, &activity.value.state_path.state_name())
                 .await
             {
                 Ok(s) => s,
@@ -223,9 +220,9 @@ impl FailTaskHandler {
             // Catch handling reuses the same entity-shaped activity value lifecycle events carry,
             // so the success-style completion path sees the canonical domain payload.
             let activity_value = activity.value();
-            // The owning scope is the catch context. Its record was resolved above and nothing has
+            // The owning thread is the catch context. Its record was resolved above and nothing has
             // written to it since — the only intervening steps are definition reads.
-            let variables = scope.variables().clone();
+            let variables = thread.variables.clone();
             // Bind `$states.errorOutput` (the error-output object) for the catcher's `Assign`/
             // `Output`, then complete the activity as a successful finish routed to the catcher's
             // `Next` — the catcher's `Assign`/`Output` project against the error output.

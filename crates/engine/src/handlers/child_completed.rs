@@ -132,27 +132,27 @@ async fn dispatch_child_completed(
     act: &crate::storage::ActivityRecord,
     child: ObjectReference,
 ) {
+    // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
     let scope_ref = act
         .value
         .meta
         .owner
         .clone()
         .expect("an owned activity has an owner");
-    let scope = match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
-        Ok(Some(s)) => s,
-        _ => return, // owning scope gone — nothing to replenish into.
+    let Some(thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
+        return; // owning scope gone — nothing to replenish into.
     };
-    let sm = match ctx.machine_for_scope(&scope).await {
+    let sm = match ctx.machine_for_thread(&thread).await {
         Ok(s) => s,
         Err(_) => return, // definition gone — nothing to decide.
     };
     let state_def =
-        match super::resolve_state_for(&sm, &scope, &act.value.state_path.state_name()).await {
+        match super::resolve_state_for(&sm, &thread, &act.value.state_path.state_name()).await {
             Ok(s) => s,
             Err(_) => return, // definition gone — nothing to decide.
         };
     let activity_value = act.value();
-    let variables = scope.variables().clone();
+    let variables = thread.variables.clone();
     // Every `State` variant has a registered factory (see `build_state_handlers` + the
     // `registry.len() == 8` coverage test), so a miss here is an engine regression — fail loud
     // rather than leave the container stuck Running without its logic.

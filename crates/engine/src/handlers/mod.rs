@@ -215,27 +215,21 @@ fn resolve_states_map<'a>(
     }
 }
 
-/// Resolve a state definition for the scope owning the current activity, honoring a scope's
-/// `state_path`: a `Thread` (Parallel-branch / Map-item child) resolves its state within the shared
-/// machine at the pointer location (one flat lookup, no parent/root query); a top-level `Execution`
-/// falls back to the machine's top-level `States`. The `scope` is a loaded [`ScopeRecord`], so the
-/// caller (which already resolved the owning scope) passes it — no second storage read.
+/// Resolve a state definition for the thread owning the current activity, honoring that thread's
+/// `state_path`: a `Parallel`-branch / `Map`-item child resolves its state within the shared machine
+/// at the pointer location (one flat lookup, no parent/root query), and a top-level run's root thread
+/// names the machine's own top-level `States` (`/States`), so it lands on the same table through the
+/// same walk. The caller passes the [`ThreadRecord`](crate::storage::ThreadRecord) it already read —
+/// no second storage read.
 pub(super) async fn resolve_state_for<'a>(
     sm: &'a StateMachine,
-    scope: &crate::storage::ScopeRecord,
+    thread: &crate::storage::ThreadRecord,
     state_name: &str,
 ) -> Result<&'a spica_asl::State, ExecutionError> {
-    match scope.state_path() {
-        // Thread: resolve within its branch/ItemProcessor's `States` table.
-        Some(pointer) => {
-            let states = resolve_states_map(sm, pointer.as_ptr())?;
-            states.get(state_name).ok_or_else(|| {
-                ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string()))
-            })
-        }
-        // Top-level execution: the machine's top-level `States`.
-        None => resolve_state(sm, state_name),
-    }
+    let states = resolve_states_map(sm, thread.value.state_path.as_ptr())?;
+    states
+        .get(state_name)
+        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string())))
 }
 
 /// Resolve a state definition by its full `state_path` (a JSON Pointer from the machine root to the
