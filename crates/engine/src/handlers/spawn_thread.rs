@@ -67,18 +67,14 @@ impl SpawnThreadHandler {
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        // Resolve the owning scope to inherit the tree's top-level anchor (`execution`): the child
+        // Resolve the owning thread to inherit the tree's top-level anchor (`execution`): the child
         // Thread shares the owner's tree, so the anchor is taken verbatim while the Thread itself is
-        // the child's `owner`.
-        let root_execution = match scope_ref.kind {
-            crate::types::meta::ObjectKind::Execution | crate::types::meta::ObjectKind::Thread => {
-                match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
-                    Ok(Some(scope)) => scope.root_execution(),
-                    _ => return, // owning scope gone — nothing to bind the child to.
-                }
-            }
-            _ => return, // internal fault: a branch owner's parent must be a scope.
+        // the child's `owner`. An activity's owner is always a `Thread` (see `emit_transition`), so
+        // the row is read directly.
+        let Some(owner_thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
+            return; // owning thread gone — nothing to bind the child to.
         };
+        let root_execution = owner_thread.value.execution.clone();
 
         // Mint the child's uid and its stable ObjectReference up front: the child `Thread` row is
         // keyed by that reference, and the sibling `ActivateState` entry must name the same run

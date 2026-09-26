@@ -36,19 +36,18 @@ impl ActivateStateHandler {
         } = payload;
 
         // TODO：这个名称叫做 Scope 肯定是不合适的，需要修改一下；而且如果 Scope 是不存在的话，是不是不应该是 terminate，而应该是 reject？对 Err 的处理也不对，应该是一个其他的处理方式（因为有些临时的错误应该是可以重试的，而不是直接 terminate 掉）
-        // Resolve the owning scope + its machine/state definition just far enough to pick the right
+        // Resolve the owning thread + its machine/state definition just far enough to pick the right
         // handler. No activity is minted here — the base `StateHandler::activate` constructs it (and
-        // re-checks the scope's liveness), so a resolution failure (scope/definition gone) fails the
-        // execution directly: nothing has been persisted to attach a state-level terminate to.
-        let scope = match crate::storage::load_scope_ref(ctx.storage, owner).await {
-            Ok(Some(s)) => s,
+        // re-checks the scope's liveness), so a resolution failure (thread/definition gone) fails the
+        // execution directly: nothing has been persisted to attach a state-level terminate to. An
+        // activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
+        let thread = match ctx.storage.get_thread(owner).await {
+            Ok(Some(t)) => t,
             Ok(None) => {
                 out.terminate(
                     None,
                     execution.clone(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "execution {execution}"
-                    ))),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!("thread {owner}"))),
                 );
                 return;
             }
@@ -61,7 +60,7 @@ impl ActivateStateHandler {
             out,
             None,
             execution.clone(),
-            ctx.machine_for_scope(&scope).await
+            ctx.machine_for_thread(&thread).await
         );
         let state_def = fail_or!(
             out,

@@ -1434,6 +1434,28 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
     let exec = exec_ref();
     let activity = act_ref();
     let timer = ulid::Ulid::new();
+    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
+    // activity below is owned by one, matching the shape `CreateExecution` emits.
+    let thread = Thread {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+        start_at: "W".to_string(),
+        index: 0,
+        status: ThreadStatus::Running,
+        input: Value::Null,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(
+            spica_engine::ObjectKind::Thread,
+            ulid::Ulid::new(),
+        )
+        .timestamps(
+            spica_engine::Timestamp::from_millis(0),
+            spica_engine::Timestamp::from_millis(0),
+        )
+        .build()
+        .with_owner(exec.clone()),
+    };
+    let thread_ref = thread.reference();
 
     // The refused `CompleteState` still resolves the owning scope's machine before it can reject, so
     // the definition the activity's `state_path` points into must be resolvable from storage.
@@ -1462,11 +1484,14 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                 spica_engine::Timestamp::from_millis(0),
             )
             .build()
-            .with_owner(exec.clone()),
+            .with_owner(thread_ref.clone()),
     };
 
     let projector = Projector::new();
     for ev in &[
+        Event::ThreadCreated {
+            thread: thread.clone(),
+        },
         Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
             execution: Execution {
@@ -1738,6 +1763,28 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
     let exec = exec_ref();
     let activity = act_ref();
     let timer = ulid::Ulid::new();
+    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
+    // activity below is owned by one, matching the shape `CreateExecution` emits.
+    let thread = Thread {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+        start_at: "T".to_string(),
+        index: 0,
+        status: ThreadStatus::Running,
+        input: Value::Null,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(
+            spica_engine::ObjectKind::Thread,
+            ulid::Ulid::new(),
+        )
+        .timestamps(
+            spica_engine::Timestamp::from_millis(0),
+            spica_engine::Timestamp::from_millis(0),
+        )
+        .build()
+        .with_owner(exec.clone()),
+    };
+    let thread_ref = thread.reference();
 
     let mut storage = InMemoryStorage::new();
     let revision = seed_revision(
@@ -1764,11 +1811,14 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                 spica_engine::Timestamp::from_millis(0),
             )
             .build()
-            .with_owner(exec.clone()),
+            .with_owner(thread_ref.clone()),
     };
 
     let projector = Projector::new();
     for ev in &[
+        Event::ThreadCreated {
+            thread: thread.clone(),
+        },
         Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
             execution: Execution {
@@ -1864,6 +1914,28 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
     let exec = exec_ref();
     let activity = act_ref();
     let timer = ulid::Ulid::new();
+    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
+    // activity below is owned by one, matching the shape `CreateExecution` emits.
+    let thread = Thread {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+        start_at: "W".to_string(),
+        index: 0,
+        status: ThreadStatus::Running,
+        input: Value::Null,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(
+            spica_engine::ObjectKind::Thread,
+            ulid::Ulid::new(),
+        )
+        .timestamps(
+            spica_engine::Timestamp::from_millis(0),
+            spica_engine::Timestamp::from_millis(0),
+        )
+        .build()
+        .with_owner(exec.clone()),
+    };
+    let thread_ref = thread.reference();
 
     let mut storage = InMemoryStorage::new();
     let revision = seed_revision(
@@ -1896,11 +1968,14 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                 spica_engine::Timestamp::from_millis(0),
             )
             .build()
-            .with_owner(exec.clone()),
+            .with_owner(thread_ref.clone()),
     };
 
     let projector = Projector::new();
     for ev in &[
+        Event::ThreadCreated {
+            thread: thread.clone(),
+        },
         Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
             execution: Execution {

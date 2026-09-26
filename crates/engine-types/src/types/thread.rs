@@ -83,7 +83,7 @@ pub struct Thread {
     ///
     /// The thread's machine version is **not** duplicated here: every thread shares the owning tree's
     /// top-level run, so its `flow_version` is always that execution's — resolved via
-    /// [`crate::storage::resolve_scope_flow_version`] from `execution`, never stored twice.
+    /// [`crate::storage::resolve_thread_flow_version`] from `execution`, never stored twice.
     pub execution: ObjectReference,
     /// A JSON Pointer (RFC 6901) into the single shared `StateMachine` document locating this
     /// thread's sub-`States` table, e.g. `/States/P1/Branches/0/States/P2/ItemProcessor/States`.

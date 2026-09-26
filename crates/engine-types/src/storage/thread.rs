@@ -3,6 +3,8 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::ReadonlyStorageTxn;
+use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::meta::ObjectReference;
 use crate::types::thread::Thread;
 use crate::types::variables::Variables;
@@ -75,4 +77,25 @@ impl DerefMut for ThreadRecord {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
+}
+
+/// Resolve the **immutable flow version** a thread's states bind to (its machine definition), derived
+/// from the thread's root `execution`: the whole tree shares one definition, so a thread never stores
+/// its own copy (see [`Thread`]). Returns an `InvalidDefinition` error if the owning execution is
+/// gone, which can only mean the tree is being torn down.
+pub async fn resolve_thread_flow_version<S: ReadonlyStorageTxn + ?Sized>(
+    storage: &S,
+    thread: &ThreadRecord,
+) -> Result<ObjectReference, ExecutionError> {
+    let exec = storage
+        .get_execution(&thread.value.execution)
+        .await?
+        .ok_or_else(|| {
+            ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
+                "thread {} lost its owning execution {}",
+                thread.value.reference(),
+                thread.value.execution
+            )))
+        })?;
+    Ok(exec.value.flow_version.clone())
 }

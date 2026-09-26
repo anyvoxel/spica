@@ -338,18 +338,18 @@ impl HandlerContext<'_> {
         Ok(machine)
     }
 
-    /// Resolve — and cache — the state machine a [`ScopeRecord`] binds to, then return it. For a
-    /// top-level `Execution` the version is carried on the scope; for a fan-out `Thread` it is
-    /// derived from the thread's root `execution` (the whole tree shares one definition — see
-    /// [`crate::storage::resolve_scope_flow_version`]). Kept on the context so the resolve
-    /// (which may read `Storage` for the thread case) stays one call at every machine-using site.
-    pub async fn machine_for_scope(
+    /// Resolve — and cache — the state machine a [`crate::storage::ThreadRecord`] binds to, then
+    /// return it. The version is derived from the thread's root `execution` (the whole tree shares one
+    /// definition — see [`crate::storage::resolve_thread_flow_version`]). Kept on the context so the
+    /// resolve (which reads `Storage`) stays one call at every machine-using site.
+    pub async fn machine_for_thread(
         &mut self,
-        scope: &crate::storage::ScopeRecord,
+        thread: &crate::storage::ThreadRecord,
     ) -> Result<Arc<StateMachine>, ExecutionError> {
         // The immutable borrow of `storage` for resolving the version ends before the mutable
         // `machine` call below, so there is no aliasing of `self`.
-        let flow_version = crate::storage::resolve_scope_flow_version(self.storage, scope).await?;
+        let flow_version =
+            crate::storage::resolve_thread_flow_version(self.storage, thread).await?;
         self.machine(&flow_version).await
     }
 }

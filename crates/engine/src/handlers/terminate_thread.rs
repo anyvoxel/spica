@@ -23,8 +23,8 @@ impl TerminateThreadHandler {
         out: &mut Collector<'_>,
     ) {
         let TerminateThread { thread, reason } = p;
-        // Addressed by kind, so read the thread directly rather than through the generic scope reader:
-        // `TerminateThread` is only ever dispatched for a `Thread`.
+        // Addressed by kind: `TerminateThread` is only ever dispatched for a `Thread`, so the row is
+        // read directly.
         let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
             return; // gone, or unreadable (the fold errors out) — nothing to terminate.
         };

@@ -25,7 +25,7 @@ use spica_storage::InMemoryStorage;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink};
 use crate::handlers::dispatch::build_state_handlers;
-use crate::storage::{ActivityRecord, Storage, ThreadRecord, load_scope_ref};
+use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::id::EntryId;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
@@ -406,7 +406,7 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
 /// The activity value and the scope variables are read back out of `store` exactly as
 /// `dispatch_child_completed` reads them, so a test seeds the world (see [`seed_container`]) and this
 /// driver only supplies the state definition the production path resolves from the machine document.
-/// That definition lookup (`machine_for_scope` → `resolve_state_for`) is the one seam not exercised
+/// That definition lookup (`machine_for_thread` → `resolve_state_for`) is the one seam not exercised
 /// here: it maps a `state_path` into a machine, not into a state's decision.
 pub async fn child_completed(
     state: &State,
@@ -446,11 +446,15 @@ pub async fn child_completed(
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        let scope = load_scope_ref(ctx.storage, &scope_ref)
+        // The owner is always a `Thread` — read it directly, as `dispatch_child_completed` does; the
+        // driver needs only the scope variables it evaluates against.
+        let thread = ctx
+            .storage
+            .get_thread(&scope_ref)
             .await
             .expect("the in-memory store reads")
-            .expect("the owning scope is seeded");
-        let variables = scope.variables().clone();
+            .expect("the owning thread is seeded");
+        let variables = thread.variables.clone();
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")

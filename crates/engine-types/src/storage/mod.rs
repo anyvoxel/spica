@@ -9,7 +9,6 @@
 
 mod activity;
 mod execution;
-mod scope;
 mod task;
 mod thread;
 mod timer;
@@ -27,12 +26,10 @@ use spica_machinery::Timestamp;
 
 pub use activity::ActivityRecord;
 pub use execution::ExecutionRecord;
-// Re-export the two scope-resolution entry points consumers use. `load_scope` itself (reference-based)
-// stays module-private — `load_scope_ref` routes every reference through it — until a caller needs
-// to resolve a scope by a bare reference.
-pub use scope::{ScopeRecord, load_scope_ref, resolve_scope_flow_version};
 pub use task::TaskRecord;
-pub use thread::ThreadRecord;
+// Every state's owner is a `Thread`, so resolving the machine a state binds to is a read off that
+// thread's tree — its version derived from the thread's root `execution`.
+pub use thread::{ThreadRecord, resolve_thread_flow_version};
 pub use timer::TimerRecord;
 
 /// Persistent projection of the execution tree, rebuilt by applying the

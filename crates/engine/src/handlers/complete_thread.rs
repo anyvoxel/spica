@@ -25,8 +25,8 @@ impl CompleteThreadHandler {
         out: &mut Collector<'_>,
     ) {
         let CompleteThread { thread, output } = p;
-        // Addressed by kind, so read the thread directly rather than through the generic scope reader:
-        // `CompleteThread` is only ever dispatched for a `Thread`.
+        // Addressed by kind: `CompleteThread` is only ever dispatched for a `Thread`, so the row is
+        // read directly.
         let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
             return; // gone, or unreadable (the fold errors out) — nothing to complete.
         };

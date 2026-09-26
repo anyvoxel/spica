@@ -407,18 +407,17 @@ pub trait StateHandler: Send + Sync {
         };
         let activity = activity_value.reference();
 
-        // The activity lives in a scope (`Execution` or a fan-out `Thread`) addressed by the
-        // command's `owner`; load it to derive the scope variables the hooks evaluate against and
-        // confirm the scope still accepts transitions.
-        let scope = match crate::storage::load_scope_ref(ctx.storage, owner).await {
-            Ok(Some(s)) => s,
+        // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
+        // fan-out thread for a branch/item (see `emit_transition`, which only ever names a `Thread`).
+        // Reading the concrete row is exactly what yields the variables the hooks evaluate against and
+        // confirms the thread still accepts transitions.
+        let scope = match ctx.storage.get_thread(owner).await {
+            Ok(Some(t)) => t,
             Ok(None) => {
                 out.terminate(
                     Some(activity.clone()),
                     execution.clone(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "execution {execution}"
-                    ))),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!("thread {owner}"))),
                 );
                 return;
             }
@@ -427,11 +426,11 @@ pub trait StateHandler: Send + Sync {
                 return;
             }
         };
-        if !scope.is_running() {
+        if !scope.value.status.is_running() {
             return; // scope not running — a rescheduled activate is a no-op.
         }
 
-        let variables = scope.variables().clone();
+        let variables = scope.variables.clone();
         let state_name = activity_value.state_path.state_name();
 
         self.initialize(&mut activity_value).await;
@@ -583,20 +582,21 @@ pub trait StateHandler: Send + Sync {
             FinishReadiness::Gone => return,
         }
 
-        // The activity's owner is its *scope* — resolved through the central Execution/Thread dispatch
-        // in storage, which silently ignores non-scope kinds.
+        // The activity's owner is always a `Thread` (see `activate`), so — as there — the concrete row
+        // is read directly. The owner is taken from the *persisted row* rather than from the command,
+        // so this read is also what supplies the variables `finish` evaluates against.
         let owner = act
             .value
             .meta
             .owner
             .clone()
             .expect("an owned activity has an owner");
-        let scope = match crate::storage::load_scope_ref(ctx.storage, &owner).await {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // owning scope already gone (or not a scope) — nothing to complete into.
+        let scope = match ctx.storage.get_thread(&owner).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return, // owning thread already gone — nothing to complete into.
             Err(_) => return,
         };
-        if !scope.is_running() {
+        if !scope.value.status.is_running() {
             return; // owner is past accepting a new transition; a late CompleteState is a no-op.
         }
 
@@ -604,7 +604,7 @@ pub trait StateHandler: Send + Sync {
         // (`$states.result` / `Assign` / `Output`) plus the `Next`/`End` routing. `activity_value` is
         // the value (3.3) already opened the finish with, so its `Completing` status and folded raw
         // result carry forward into whichever lifecycle the finish emits.
-        let variables = scope.variables().clone();
+        let variables = scope.variables.clone();
         let finished = self
             .finish(ctx.env, out, activity.clone(), &activity_value, &variables)
             .await;
