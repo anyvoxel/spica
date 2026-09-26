@@ -2,26 +2,27 @@
 //! top-level [`Execution`] or a fan-out [`Thread`].
 //!
 //! An `Activity` is owned by a succession of states-one-at-a-time, and those states live "inside"
-//! exactly one scope: the top-level run (an `Execution`) or a scoped sub-run (a `Thread`). Every
-//! state-lifecycle address previously read "the owning execution"; now that address can be either
-//! kind, so the [`ScopeRecord`] enum + [`load_scope`] centralize that one branch. Consumers resolve
-//! a bare [`ObjectReference`] through `load_scope` (dispatching on its [`ObjectKind`]) and read the
-//! uniform accessors below — they never match on kind themselves, which is what keeps
-//! role-classification out of the domain path.
-
-use std::collections::HashSet;
-
-use serde_json::Value;
+//! exactly one scope: the top-level run (an `Execution`) or a scoped sub-run (a `Thread`). Exactly
+//! two consumers cannot know which without reading — resolving an activity's `meta.owner` to find
+//! its machine and state definition, and reacting to a settling child of a parent taken from
+//! `meta.owner` — and [`ScopeRecord`] + [`load_scope`] exist to serve them.
+//!
+//! A caller that *does* already know the kind it addressed reads the concrete record instead: a
+//! kind-typed command handler (`CompleteThread`), and a container reading its own fan-out children
+//! (always `Thread`s, folded from `ThreadCreated`). Routing those through here would let a
+//! behavioural dependency on the other kind's shape creep in unnoticed.
 
 use crate::storage::ReadonlyStorageTxn;
+use crate::storage::{ExecutionRecord, ThreadRecord};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::meta::{ObjectKind, ObjectReference};
 use crate::types::state_path::StatePath;
 use crate::types::variables::Variables;
-use crate::{ExecutionRecord, ThreadRecord};
 
 /// A state-owning node of the execution tree, resolved from an [`ObjectReference`]: either the
-/// top-level [`Execution`] or a scoped [`Thread`] (a `Parallel` branch / `Map` item).
+/// top-level [`Execution`](crate::types::execution::Execution) or a scoped
+/// [`Thread`](crate::types::thread::Thread) (a `Parallel` branch / `Map` item). Exposes only what the
+/// kind-agnostic consumers need (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScopeRecord {
     Execution(ExecutionRecord),
@@ -57,69 +58,10 @@ impl ScopeRecord {
         }
     }
 
-    /// Owned nodes still in flight — drains before this scope's terminal `ed`.
-    /// `#[allow(dead_code)]`: a uniform accessor kept on the scope surface; current consumers read
-    /// the concrete record's `active_children` directly (e.g. `process_child_completed.rs`), so it is
-    /// exercised only once a consumer unifies the Execution/Thread drain arms onto [`ScopeRecord`].
-    #[allow(dead_code)]
-    pub fn active_children(&self) -> &HashSet<ObjectReference> {
-        match self {
-            ScopeRecord::Execution(e) => &e.active_children,
-            ScopeRecord::Thread(t) => &t.active_children,
-        }
-    }
-
-    /// The single in-flight state cursor (projection-only).
-    pub fn current_activity(&self) -> &Option<ObjectReference> {
-        match self {
-            ScopeRecord::Execution(e) => &e.current_activity,
-            ScopeRecord::Thread(t) => &t.current_activity,
-        }
-    }
-
     pub fn is_running(&self) -> bool {
         match self {
             ScopeRecord::Execution(e) => e.value.status.is_running(),
             ScopeRecord::Thread(t) => t.value.status.is_running(),
-        }
-    }
-
-    /// See the note on [`ScopeRecord::active_children`] for why this uniform accessor is
-    /// `#[allow(dead_code)]`: it is exercised once a drain consumer unifies onto [`ScopeRecord`].
-    #[allow(dead_code)]
-    pub fn is_terminal(&self) -> bool {
-        match self {
-            ScopeRecord::Execution(e) => e.value.is_terminal(),
-            ScopeRecord::Thread(t) => t.value.is_terminal(),
-        }
-    }
-
-    /// The scope's input (the raw input its first state entered with).
-    pub fn input(&self) -> &Value {
-        match self {
-            ScopeRecord::Execution(e) => &e.value.input,
-            ScopeRecord::Thread(t) => &t.value.input,
-        }
-    }
-
-    /// The scope's settled output — `Some` once it reached a terminal state. A top-level `Execution`
-    /// and a fan-out `Thread` both carry an `output: Option<Value>`, so the aggregator (a `Parallel`
-    /// collecting branch results) reads it through one uniform accessor rather than matching kind.
-    pub fn output(&self) -> Option<&Value> {
-        match self {
-            ScopeRecord::Execution(e) => e.value.output.as_ref(),
-            ScopeRecord::Thread(t) => t.value.output.as_ref(),
-        }
-    }
-
-    /// The scope's terminal termination reason, if it settled by `Terminating`/`Terminated` with one.
-    /// Uniform over both kinds: a `Parallel` that scans its branches for failure reads the recorded
-    /// `TerminationReason` through this instead of matching the two distinct status enums. Returns
-    /// `None` for a `Completed` scope or one still running.
-    pub fn termination_reason(&self) -> Option<&crate::types::command::TerminationReason> {
-        match self {
-            ScopeRecord::Execution(e) => e.value.status.termination_reason(),
-            ScopeRecord::Thread(t) => t.value.status.termination_reason(),
         }
     }
 }
@@ -149,7 +91,8 @@ pub async fn load_scope<S: ReadonlyStorageTxn + ?Sized>(
 }
 
 /// Resolve a scope from a bare [`ObjectReference`] (the owner-style form used on
-/// [`ObjectMeta::owner`] / Activity's `execution`), dispatching on its structural kind.
+/// [`ObjectMeta::owner`](crate::types::meta::ObjectMeta::owner) / Activity's `execution`), dispatching
+/// on its structural kind.
 pub async fn load_scope_ref<S: ReadonlyStorageTxn + ?Sized>(
     storage: &S,
     reference: &ObjectReference,

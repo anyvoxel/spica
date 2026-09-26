@@ -1,14 +1,14 @@
-//! A persistent [`Storage`](spica_engine::Storage) projection backed by [RocksDB].
+//! A persistent [`Storage`](spica_engine_types::Storage) projection backed by [RocksDB].
 //!
 //! This is the durable sibling of the in-memory [`InMemoryStorage`](crate::InMemoryStorage), sharing
-//! the same [`Storage`](spica_engine::Storage) contract so the `StreamProcessor` can read/mutate either
+//! the same [`Storage`](spica_engine_types::Storage) contract so the `StreamProcessor` can read/mutate either
 //! interchangeably. Rows are keyed by entity type + id and stored as their JSON encoding (every row
 //! type already derives [`serde::Serialize`]).
 //!
 //! # Durability model
 //!
 //! Writes go through RocksDB's **default WAL** but are **not fsync'd per call**. That is deliberate:
-//! [`Storage`](spica_engine::Storage) is a *rebuildable projection* — the single source of truth is
+//! [`Storage`](spica_engine_types::Storage) is a *rebuildable projection* — the single source of truth is
 //! the (fsync-on-append) log, `LogStream` — so a torn storage row is never fatal. Recovery re-derives
 //! the store by replaying events against it (the CCES invariant: `Storage` = `fold(events)`). Forcing
 //! a synchronous write here would just harden a derivative cache at the cost of every event apply.
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
-use spica_engine::{
+use spica_engine_types::{
     ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, InfraError,
     ObjectKind, ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord,
     TimerRecord, Timestamp,
@@ -123,7 +123,7 @@ fn put_row<T: serde::Serialize>(
     Ok(())
 }
 
-/// A [`Storage`](spica_engine::Storage) whose rows are durably stored in RocksDB. Holds no internal
+/// A [`Storage`](spica_engine_types::Storage) whose rows are durably stored in RocksDB. Holds no internal
 /// lock: the `Storage` trait already grants the sole writer exclusive `&mut self` (the `StreamProcessor`'s
 /// run loop), so the `&self` RocksDB handle is never contended by two mutators of this store.
 pub struct RocksStorage {
@@ -740,7 +740,7 @@ impl StorageTxn for RocksTxn {
 mod tests {
     use super::*;
     use serde_json::Value;
-    use spica_engine::{
+    use spica_engine_types::{
         Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, RetryState, Task,
         TaskStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables,
     };
@@ -787,15 +787,14 @@ mod tests {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(
-                    spica_engine::ObjectKind::Execution,
+                meta: spica_engine_types::ObjectMeta::builder(
+                    spica_engine_types::ObjectKind::Execution,
                     id.uid,
                 )
                 .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                 .build(),
             },
             variables: Variables::new(),
-            current_activity: None,
             active_children: HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -887,10 +886,13 @@ mod tests {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
-                meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Timer, uid)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(id.clone()),
+                meta: spica_engine_types::ObjectMeta::builder(
+                    spica_engine_types::ObjectKind::Timer,
+                    uid,
+                )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build()
+                .with_owner(id.clone()),
             });
             store.put_timer(t.clone()).await.unwrap();
             assert_eq!(
@@ -936,7 +938,7 @@ mod tests {
                     retrier_attempts: vec![],
                     next_available_at,
                 },
-                meta: spica_engine::ObjectMeta::builder(ObjectKind::Task, id)
+                meta: spica_engine_types::ObjectMeta::builder(ObjectKind::Task, id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .build(),
             },

@@ -3,8 +3,6 @@
 use crate::types::error::ExecutionError;
 use crate::{Activity, ApplierContext};
 
-use crate::types::meta::ObjectKind;
-
 #[derive(Default)]
 pub(crate) struct StateCompletedApplier;
 impl StateCompletedApplier {
@@ -29,16 +27,6 @@ impl StateCompletedApplier {
             ctx.storage
                 .remove_child(parent.clone(), activity.reference())
                 .await?;
-            if parent.kind == ObjectKind::Execution
-                && let Some(mut exec) = ctx.storage.get_execution(&parent).await?
-            {
-                // Clear the projection-only active cursor as soon as the owned activity reaches its
-                // terminal `ed`, so later activation/termination logic never treats a finished state
-                // as still in flight.
-                exec.current_activity = None;
-                exec.with_update_at(ctx.timestamp);
-                ctx.storage.put_execution(exec).await?;
-            }
         }
         Ok(())
     }

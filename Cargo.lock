@@ -1585,6 +1585,7 @@ dependencies = [
  "serde_with",
  "spica-asl",
  "spica-client",
+ "spica-engine-types",
  "spica-logstream",
  "spica-machinery",
  "spica-scheduler",
@@ -1595,6 +1596,25 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "spica-engine-types"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "auto_impl",
+ "crc",
+ "derive_more",
+ "jsonptr",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "spica-asl",
+ "spica-logstream",
+ "spica-machinery",
+ "thiserror",
  "ulid",
 ]
 
@@ -1679,7 +1699,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
- "spica-engine",
+ "spica-engine-types",
  "tokio",
  "ulid",
 ]

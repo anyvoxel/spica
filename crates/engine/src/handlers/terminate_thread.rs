@@ -1,6 +1,5 @@
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::storage::ScopeRecord;
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
 use crate::types::meta::ObjectKind;
@@ -24,19 +23,10 @@ impl TerminateThreadHandler {
         out: &mut Collector<'_>,
     ) {
         let TerminateThread { thread, reason } = p;
-        // The addressed run is a fan-out `Thread`; resolve it from thread storage. Any other kind is
-        // an internal fault and the termination is dropped (nothing to tear down).
-        let scope = match crate::storage::load_scope_ref(ctx.storage, thread).await {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // thread already gone — nothing to terminate.
-            Err(_) => return,   // storage fault — the fold errors out; no fabricated Reject.
-        };
-        let ScopeRecord::Thread(thread_row) = scope else {
-            tracing::debug!(
-                target = %thread,
-                "terminate_thread: addressed node is not a thread; ignition ignored"
-            );
-            return;
+        // Addressed by kind, so read the thread directly rather than through the generic scope reader:
+        // `TerminateThread` is only ever dispatched for a `Thread`.
+        let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
+            return; // gone, or unreadable (the fold errors out) — nothing to terminate.
         };
         let thread_ref = thread_row.reference();
         if !thread_row.value.status.is_running() {

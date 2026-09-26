@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::log::Timestamp;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use spica_machinery::Timestamp;
 
 /// Per-retrier retry bookkeeping for a single `Retry` entry, carried **on the task** (Zeebe-style
 /// entity reuse) so a task decides its own retries without revisiting the owning activity.

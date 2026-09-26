@@ -2,8 +2,8 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::log::Timestamp;
 use crate::types::task::Task;
+use spica_machinery::Timestamp;
 
 /// The storage projection row of a TaskRecord.
 ///

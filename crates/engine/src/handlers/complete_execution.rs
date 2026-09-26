@@ -1,6 +1,5 @@
 use crate::ExecutionStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::storage::ScopeRecord;
 use crate::types::command::{Command, CompleteExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
@@ -25,12 +24,10 @@ impl CompleteExecutionHandler {
         out: &mut Collector<'_>,
     ) {
         let CompleteExecution { execution, output } = p;
-        // The addressed run is a **top-level** `Execution`. Resolve its scope and classify it: the
-        // scope wrapper is the uniform record for both kinds, but only `Execution` belongs here — a
-        // `Thread` addressed to this handler is an internal fault (dispatch routes those to
-        // `CompleteThread`), so it is refused rather than mis-completed.
-        let scope = match crate::storage::load_scope_ref(ctx.storage, execution).await {
-            Ok(Some(s)) => s,
+        // Addressed by kind, so read the execution directly rather than through the generic scope
+        // reader: `CompleteExecution` is only ever dispatched for a top-level `Execution`.
+        let exec = match ctx.storage.get_execution(execution).await {
+            Ok(Some(e)) => e,
             Ok(None) => {
                 out.fail_execution(
                     execution.clone(),
@@ -44,13 +41,6 @@ impl CompleteExecutionHandler {
                 out.fail_execution(execution.clone(), e);
                 return;
             }
-        };
-        let ScopeRecord::Execution(exec) = scope else {
-            tracing::debug!(
-                target = %execution,
-                "complete_execution: addressed node is not a top-level execution; ignition ignored"
-            );
-            return;
         };
         if !exec.value.status.is_running() {
             return; // idempotency: already finishing or terminal.

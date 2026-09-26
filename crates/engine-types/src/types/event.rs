@@ -71,7 +71,7 @@ pub struct TaskFailed {
 }
 
 /// The result of executing a [`Command`](crate::Command). Events are appended to the
-/// [`LogStream`](crate::LogStream) alongside Commands; the [`StreamProcessor`](crate::StreamProcessor) applies
+/// `LogStream` alongside Commands; the `StreamProcessor` applies
 /// each to [`Storage`](crate::Storage) to materialize the execution tree.
 ///
 /// Lifecycle verbs split into **before/after (`ing`/`ed`)** pairs so each phase records both what it
@@ -87,7 +87,7 @@ pub struct TaskFailed {
 pub enum Event {
     /// `FlowCreated` — a **brand-new flow** (a `name` appearing for the first time) was created.
     /// This is the durable record of a flow aggregate's birth, carrying the authoritative
-    /// [`Flow`](crate::Flow) value (its user-supplied `name` — the flow's sole identity, creation
+    /// [`Flow`] value (its user-supplied `name` — the flow's sole identity, creation
     /// stamp, `Active` status, and — since a flow is born with its first version — the initial
     /// `latest_version` counter). It fires **only** on a new name: creating a *new version* of an
     /// existing flow is a distinct operation that emits [`FlowVersionCreated`](Event::FlowVersionCreated)
@@ -102,7 +102,7 @@ pub enum Event {
     FlowCreated(FlowCreated),
 
     /// `FlowVersionCreated` — a new immutable version of a flow was created, carrying the full
-    /// [`FlowVersion`](crate::FlowVersion) value. This is the **durable definition record**: it is
+    /// [`FlowVersion`] value. This is the **durable definition record**: it is
     /// where a definition enters the stream (the projection keeps it in Storage keyed by
     /// its `{flow_name}-{version}` name), and it is exactly what lets a recovered Engine re-resolve a
     /// definition by reference without the caller re-supplying the machine.
@@ -166,7 +166,7 @@ pub enum Event {
     ThreadTerminated { thread: Thread },
 
     /// Result of `Command::ActivateState` — the state was entered and the lifecycle stream records
-    /// the full event-carried [`Activity`](crate::Activity) for that moment.
+    /// the full event-carried [`Activity`] for that moment.
     ///
     /// The value is the Activity's domain entity shape, intentionally excluding projection-only
     /// bookkeeping such as `active_children`. A follower / recovered leader can therefore rebuild the
@@ -178,7 +178,7 @@ pub enum Event {
     /// follow-up: a `CompleteState`/`TerminateState` sequence or an armed side-effect (e.g. a Wait
     /// resume timer). Full per-entry chain: `StateActivating → StateActivated → …`.
     ///
-    /// Carries the same entity-shaped [`Activity`](crate::Activity), now updated to
+    /// Carries the same entity-shaped [`Activity`], now updated to
     /// reflect the activation result (for example, a Task/Parallel processed input or a Map activity
     /// whose `activity_state` now contains its iteration plan).
     StateActivated { activity: Activity },
@@ -198,7 +198,7 @@ pub enum Event {
     StateTerminated { activity: Activity },
 
     /// A timer was armed and the lifecycle stream records the full event-carried
-    /// [`Timer`](crate::Timer) for that moment.
+    /// [`Timer`] for that moment.
     TimerActivated { timer: Timer },
     /// A timer's deadline passed. Carries the same timer entity with `status = Completed`.
     TimerTriggered { timer: Timer },
@@ -227,12 +227,12 @@ pub enum Event {
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────
     /// A `Task` state invoked its `Resource` and the lifecycle stream records the full event-carried
-    /// [`Task`](crate::Task) for that moment, with `status = Active` (available for a
+    /// [`Task`] for that moment, with `status = Active` (available for a
     /// worker to claim).
     ///
     /// Like `TimerActivated`, this is the durable single creation record for a leaf side effect: the
     /// task owns no children. Applying it makes the task **claimable** (a worker pulls it via
-    /// [`TaskApi::poll_tasks`](crate::TaskApi::poll_tasks)); the physical call is performed by the
+    /// `TaskApi::poll_tasks`); the physical call is performed by the
     /// worker, never the engine.
     TaskActivated { task: Task },
     /// A worker's `ClaimTasks` claimed one batch of tasks: each is `Running` with `worker_id` /

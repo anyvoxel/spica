@@ -18,8 +18,6 @@ impl ExecutionCompletedApplier {
             exec.output = execution.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
             exec.value.meta.updated_at = execution.meta.updated_at;
-            // A terminal execution cannot still own an in-flight state activation cursor.
-            exec.current_activity = None;
             let parent = exec.value.meta.owner.clone();
             exec.with_update_at(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// `/States/P1/Branches/0/States/P2/ItemProcessor/States` for a nested Parallel-branch / Map-item
 /// descent. Distinct from an arbitrary JSON Pointer: its tokens form a well-formed walk over the
 /// machine's `States` / `Branches` / `ItemProcessor` hierarchy (see
-/// [`resolve_states_map`](crate::handlers::resolve_states_map)), so wrap the pointer and host the
+/// `resolve_states_map`), so wrap the pointer and host the
 /// derivations the container handlers otherwise repeat inline.
 ///
 /// The ownership model kicked this off the plain [`jsonptr::PointerBuf`]: a `Parallel`/`Map`

@@ -3,8 +3,6 @@
 use crate::types::error::ExecutionError;
 use crate::{Activity, ApplierContext};
 
-use crate::types::meta::ObjectKind;
-
 #[derive(Default)]
 pub(crate) struct StateTerminatedApplier;
 impl StateTerminatedApplier {
@@ -29,15 +27,6 @@ impl StateTerminatedApplier {
             ctx.storage
                 .remove_child(parent.clone(), activity.reference())
                 .await?;
-            if parent.kind == ObjectKind::Execution
-                && let Some(mut exec) = ctx.storage.get_execution(&parent).await?
-            {
-                // Mirror `StateCompleted`: once the owned activity terminates, the execution-level
-                // projection cursor must be cleared so the unwind sees no stale "current" state.
-                exec.current_activity = None;
-                exec.with_update_at(ctx.timestamp);
-                ctx.storage.put_execution(exec).await?;
-            }
         }
         Ok(())
     }

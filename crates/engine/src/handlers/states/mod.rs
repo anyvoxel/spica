@@ -1,5 +1,7 @@
 mod choice;
 mod fail;
+#[cfg(test)]
+mod harness;
 mod map;
 mod parallel;
 mod pass;

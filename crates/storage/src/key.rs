@@ -1,4 +1,4 @@
-//! Canonical key encoding for the [`Storage`](spica_engine::Storage) projections.
+//! Canonical key encoding for the [`Storage`](spica_engine_types::Storage) projections.
 //!
 //! Every persisted row lives at a **single**, human-debuggable text key of the form
 //!
@@ -46,7 +46,7 @@
 //! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
 //! by the `version` field, never by key order.
 
-use spica_engine::{
+use spica_engine_types::{
     ExecutionError, FlowName, ObjectKind, ObjectName, ObjectReference, RuntimeError,
 };
 
@@ -225,7 +225,7 @@ impl KeyBuilder {
     }
 
     /// The task-row keys prefix `/<t>/<ns>/task/` — the range start for a forward scan over **all**
-    /// task rows (e.g. [`Storage::activatable_tasks`](spica_engine::Storage::activatable_tasks),
+    /// task rows (e.g. [`Storage::activatable_tasks`](spica_engine_types::Storage::activatable_tasks),
     /// which has no id to point-read and must enumerate). The trailing `/` binds the scan to exactly
     /// the `task` kind even though its id segment is appended verbatim.
     pub fn task_prefix(&self) -> Vec<u8> {
@@ -259,7 +259,7 @@ impl KeyBuilder {
 
     /// FlowVersion row: `/<t>/<ns>/flowversion/<flow_name>-<ver>`. The identifier segment is
     /// the version's own `ObjectName` (`{flow_name}-{version}`, see
-    /// [`FlowVersion::version_name`](spica_engine::FlowVersion::version_name)) — a generated name
+    /// [`FlowVersion::version_name`](spica_engine_types::FlowVersion::version_name)) — a generated name
     /// whose only `/`-forbidden char would be `/` (banned), so it is a safe single segment.
     pub fn flow_version(&self, name: &ObjectName) -> Vec<u8> {
         self.row(Kind::FlowVersion, &name.as_str())
@@ -318,7 +318,7 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine::{ObjectKind, PlainName};
+    use spica_engine_types::{ObjectKind, PlainName};
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn version_name_is_decimal_and_prefix_bound() {
-        use spica_engine::FlowVersion;
+        use spica_engine_types::FlowVersion;
         let kb = KeyBuilder::new(scope("acme", "prod"));
         let flow = FlowName::new("order").unwrap();
         // Names follow `{flow}-{decimal}`, human-readable rather than a hex/zero-padded code.

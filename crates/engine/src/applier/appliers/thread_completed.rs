@@ -16,8 +16,6 @@ impl ThreadCompletedApplier {
             row.output = thread.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
             row.value.meta.updated_at = thread.meta.updated_at;
-            // A terminal thread cannot still hold an in-flight state activation cursor.
-            row.current_activity = None;
             let parent = row.value.meta.owner.clone();
             row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;

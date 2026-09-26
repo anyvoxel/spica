@@ -172,25 +172,22 @@ impl FailTaskHandler {
             Ok(Some(a)) => a,
             _ => return,
         };
-        // Determine the owning scope (a top-level `Execution` or a fan-out `Thread`). Resolve it so
-        // the state definition is consulted against the right `state_path` — for a branch thread,
-        // retry/catch then see the per-branch definition at the pointer location.
-        let scope_ref = activity
+        // An activity's owner is always a `Thread` — the derived root Thread for a top-level run, or a
+        // fan-out branch — so read it directly rather than through the kind-dispatching scope reader.
+        // Resolving it is what lets the state definition be consulted against the right `state_path`:
+        // for a branch, retry/catch then see the per-branch definition at the pointer location.
+        let owner = activity
             .value
             .meta
             .owner
             .clone()
             .expect("a completing activity is owned by a scope");
-        let scope = match scope_ref.kind {
-            ObjectKind::Execution | ObjectKind::Thread => {
-                // The activity's owner reference is the scope; load its uniform record once.
-                match crate::storage::load_scope_ref(ctx.storage, &scope_ref).await {
-                    Ok(Some(s)) => s,
-                    _ => return, // owning scope gone — nothing to consult.
-                }
-            }
-            _ => return, // internal fault: a completing activity must be owned by a scope.
+        let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
+            return; // owning scope gone — nothing to consult.
         };
+        // TODO(step 2): drop this adapter — and the `ScopeRecord` wrapper it needs — once
+        // `machine_for_scope` / `resolve_state_for` take a `Thread` instead of a scope.
+        let scope = crate::storage::ScopeRecord::Thread(thread);
         // The owning scope binds to a machine revision; resolve it (cached by the Processor)
         // before consulting the state definition.
         let sm = match ctx.machine_for_scope(&scope).await {
@@ -223,27 +220,12 @@ impl FailTaskHandler {
             cs.iter()
                 .find(|c| error_matches(c.error_equals.as_slice(), error))
         }) {
-            // Resolve the owning scope again for the catch context — the branch thread's
-            // `state_path`/`input`/`variables` come from the scope (Execution or Thread).
-            let catch_scope_ref = activity
-                .value
-                .meta
-                .owner
-                .clone()
-                .expect("a completing activity is owned by a scope");
-            let catch_scope = match catch_scope_ref.kind {
-                ObjectKind::Execution | ObjectKind::Thread => {
-                    match crate::storage::load_scope_ref(ctx.storage, &catch_scope_ref).await {
-                        Ok(Some(s)) => s,
-                        _ => return, // owning scope gone — nothing to catch into.
-                    }
-                }
-                _ => return,
-            };
             // Catch handling reuses the same entity-shaped activity value lifecycle events carry,
             // so the success-style completion path sees the canonical domain payload.
             let activity_value = activity.value();
-            let variables = catch_scope.variables().clone();
+            // The owning scope is the catch context. Its record was resolved above and nothing has
+            // written to it since — the only intervening steps are definition reads.
+            let variables = scope.variables().clone();
             // Bind `$states.errorOutput` (the error-output object) for the catcher's `Assign`/
             // `Output`, then complete the activity as a successful finish routed to the catcher's
             // `Next` — the catcher's `Assign`/`Output` project against the error output.
@@ -306,15 +288,15 @@ impl FailTaskHandler {
             activity: terminated_activity,
         })
         .await;
-        // Route the terminal failure at the owning scope. A task may sit inside a top-level run
-        // (an `Execution`, via reference-addressed `TerminateExecution`) or inside a `Parallel`
-        // branch / `Map` item (a `Thread` — only reachable via `TerminateThread`); dispatch on kind.
+        // Route the terminal failure at the owning scope: an activity's owner is always a `Thread`, the
+        // root Thread for a top-level run (which relays onward to `TerminateExecution`) or a fan-out
+        // branch (reachable only via `TerminateThread`).
         let owner = activity
             .value
             .meta
             .owner
             .clone()
-            .expect("a completing activity is owned by an execution");
+            .expect("a completing activity is owned by a scope");
         super::emit_scope_termination(out, &owner, reason);
     }
 }

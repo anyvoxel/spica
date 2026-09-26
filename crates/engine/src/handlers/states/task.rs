@@ -229,3 +229,245 @@ impl TaskStateHandler<'_> {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use spica_asl::{IntOrExpr, TaskState};
+
+    use super::super::harness::*;
+    use super::*;
+    use crate::types::command::{
+        ActivateState, TerminateState, TerminateThread, TerminationReason,
+    };
+    use crate::types::event::{Event, StateTransitioned};
+    use crate::types::meta::ObjectMeta;
+    use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
+
+    // A `Task` is the engine's external-call edge: the invocation is thrown in `after_activated` (not
+    // from `process_input`), so the state's activation product is a pair of side effects — the
+    // `ActivateTask` command naming the invoked entity, and the optional `TaskTimeout` timer bounding
+    // it — with no inline `CompleteState`: only the task's own settle resumes the state. The tests
+    // cover the two side effects, their invalidation, and the sweep the complete step performs before
+    // it may finish.
+
+    const RESOURCE: &str = "arn:aws:states:::lambda:invoke";
+
+    /// The invoked entity's reference: named from the execution's plain base (the same convention the
+    /// activity and timer names follow) off the partition counter's second free suffix, and minted
+    /// from the injected generator's second id.
+    fn invoked_task_ref() -> ObjectReference {
+        ObjectReference::new(ObjectKind::Task, obj_name("execution-1"), uid(2))
+    }
+
+    /// The `TaskTimeout` timer `after_activated` arms: parented on the invoking activity — which is
+    /// what makes it that activity's child, and so what the complete step sweeps.
+    fn timeout_timer(deadline: Timestamp) -> Timer {
+        Timer {
+            execution: execution_ref(),
+            purpose: TimerPurpose::TaskTimeout,
+            status: TimerStatus::Active,
+            deadline,
+            meta: ObjectMeta::builder(ObjectKind::Timer, uid(3))
+                .name(obj_name("execution-2"))
+                .at(at())
+                .build()
+                .with_owner(minted_activity_ref()),
+        }
+    }
+
+    fn task_state(
+        arguments: Option<Value>,
+        timeout_seconds: Option<i64>,
+        next: Option<&str>,
+    ) -> State {
+        State::Task(TaskState {
+            next: next.map(str::to_string),
+            arguments,
+            resource: RESOURCE.to_string(),
+            timeout_seconds: timeout_seconds.map(IntOrExpr::Int),
+            ..Default::default()
+        })
+    }
+
+    /// `activate` projects `Arguments` as the task's input, throws the invocation, and arms the
+    /// `TimeoutSeconds` deadline — three side effects on one activation. The task and its timer are
+    /// both named off the execution's base, so a branch task still names its root run.
+    #[tokio::test]
+    async fn activate_invokes_the_resource_and_arms_the_timeout() {
+        let deadline = at()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("the fixture deadline is representable");
+        let activated = activate(
+            &task_state(
+                Some(json!({ "x": "{% $states.input.n %}" })),
+                Some(60),
+                Some("P2"),
+            ),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        let birth = minted_activity(path("/States/P"), seeded_input());
+        let mut processed = birth.clone();
+        // The projected `Arguments` — not the raw input — is what the external call receives, and it
+        // is what the activity carries forward as its input.
+        processed.input = Some(json!({ "x": 1.0 }));
+
+        assert_eq!(
+            activated.chain(),
+            vec![
+                EntryPayload::Event(Event::StateActivating { activity: birth }),
+                EntryPayload::Event(Event::StateActivated {
+                    activity: processed
+                }),
+                EntryPayload::Command(Command::ActivateTask(ActivateTask {
+                    execution: execution_ref(),
+                    owner: minted_activity_ref(),
+                    task: invoked_task_ref(),
+                    resource: RESOURCE.to_string(),
+                    arguments: json!({ "x": 1.0 }),
+                    retry_plan: vec![],
+                    deadline: Some(deadline),
+                })),
+                EntryPayload::Event(Event::TimerActivated {
+                    timer: timeout_timer(deadline),
+                }),
+            ]
+        );
+    }
+
+    /// Without `Arguments` the raw input is what the call receives — the projection has nothing to
+    /// reshape, so the task is invoked with exactly the input the state entered with.
+    #[tokio::test]
+    async fn activate_without_arguments_invokes_with_the_raw_input() {
+        let activated = activate(
+            &task_state(None, None, Some("P2")),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                activated.chain().last(),
+                Some(EntryPayload::Command(Command::ActivateTask(ActivateTask {
+                    arguments,
+                    deadline: None,
+                    ..
+                }))) if *arguments == seeded_input()
+            ),
+            "the raw input reaches the resource: {:?}",
+            activated.chain().last()
+        );
+        assert!(
+            !activated
+                .chain()
+                .iter()
+                .any(|p| matches!(p, EntryPayload::Event(Event::TimerActivated { .. }))),
+            "a task with no TimeoutSeconds arms no bound: {:?}",
+            activated.chain()
+        );
+    }
+
+    /// A non-positive `TimeoutSeconds` is a definition error, and it is raised *after* the invocation
+    /// was thrown: the chain still names the task the state would have invoked (carrying no deadline),
+    /// and the activity then fails. Dropping the command would leave an external call unaccounted for.
+    #[tokio::test]
+    async fn activate_fails_the_state_on_an_invalid_timeout() {
+        let activated = activate(
+            &task_state(None, Some(0), Some("P2")),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        let reason = TerminationReason::Failed {
+            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                "Task TimeoutSeconds must be a positive integer".to_string(),
+            )),
+        };
+        let chain = activated.chain();
+        assert!(
+            matches!(&chain[2], EntryPayload::Command(Command::ActivateTask(t))
+                if t.deadline.is_none()),
+            "the invocation is still thrown, unbounded: {:?}",
+            chain[2]
+        );
+        assert_eq!(
+            &chain[3..],
+            vec![
+                EntryPayload::Command(Command::TerminateState(TerminateState {
+                    activity: minted_activity_ref(),
+                    reason: reason.clone(),
+                })),
+                EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                    thread: thread_ref(),
+                    reason,
+                })),
+            ]
+        );
+    }
+
+    /// The complete step disposes of the deadline before it finishes: the `TaskTimeout` timer only
+    /// *bounds* the state, so waiting it out would be wrong — it is swept, and the sweep detaches the
+    /// child so the state is free to finish in the same step.
+    #[tokio::test]
+    async fn complete_sweeps_the_deadline_timer_then_finishes() {
+        let deadline = at()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("the fixture deadline is representable");
+        let state = task_state(None, Some(60), Some("P2"));
+        let activated = activate(
+            &state,
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+        let Dispatch { store, .. } = activated;
+
+        let completed = complete(&state, store, &complete_cmd(seeded_input())).await;
+
+        let mut completing = minted_activity(path("/States/P"), seeded_input());
+        completing.input = Some(seeded_input());
+        completing.raw_output = Some(seeded_input());
+        completing.status = ActivityStatus::Completing;
+        let mut done = completing.clone();
+        done.status = ActivityStatus::Completed;
+        done.output = Some(seeded_input());
+        let mut cancelled = timeout_timer(deadline);
+        cancelled.status = TimerStatus::Cancelled;
+
+        assert_eq!(
+            completed.chain(),
+            vec![
+                EntryPayload::Event(Event::StateCompleting {
+                    activity: completing
+                }),
+                EntryPayload::Event(Event::TimerCancelled { timer: cancelled }),
+                EntryPayload::Event(Event::StateCompleted { activity: done }),
+                EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
+                    activity: minted_activity_ref(),
+                    next: path("/States/P2").as_ptr().to_owned(),
+                })),
+                EntryPayload::Command(Command::ActivateState(ActivateState {
+                    execution: execution_ref(),
+                    owner: thread_ref(),
+                    state_path: path("/States/P2"),
+                    input: seeded_input(),
+                })),
+            ]
+        );
+        let row = completed
+            .activity(&minted_activity_ref())
+            .await
+            .expect("the finish folds the completed row");
+        assert_eq!(row.value.status, ActivityStatus::Completed);
+        assert!(
+            row.active_children.is_empty(),
+            "the swept timer is no longer a child: {:?}",
+            row.active_children
+        );
+    }
+}

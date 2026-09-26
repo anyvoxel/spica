@@ -1,6 +1,5 @@
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::storage::ScopeRecord;
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
 use crate::types::meta::ObjectKind;
@@ -26,19 +25,10 @@ impl CompleteThreadHandler {
         out: &mut Collector<'_>,
     ) {
         let CompleteThread { thread, output } = p;
-        // The addressed run is a fan-out `Thread`; any other kind is an internal fault (dispatch
-        // routes top-level runs to `CompleteExecution`), so it is ignored rather than mis-completed.
-        let scope = match crate::storage::load_scope_ref(ctx.storage, thread).await {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // thread already gone — nothing to complete.
-            Err(_) => return,   // storage fault — the fold errors out; no fabricated Reject.
-        };
-        let ScopeRecord::Thread(thread_row) = scope else {
-            tracing::debug!(
-                target = %thread,
-                "complete_thread: addressed node is not a thread; ignition ignored"
-            );
-            return;
+        // Addressed by kind, so read the thread directly rather than through the generic scope reader:
+        // `CompleteThread` is only ever dispatched for a `Thread`.
+        let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
+            return; // gone, or unreadable (the fold errors out) — nothing to complete.
         };
         let thread_ref = thread_row.reference();
         if !thread_row.value.status.is_running() {

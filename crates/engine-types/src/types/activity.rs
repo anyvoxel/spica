@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::Timestamp;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use spica_machinery::Timestamp;
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
 use crate::types::command::TerminationReason;
@@ -137,7 +137,7 @@ pub struct Activity {
     /// the domain `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside
     /// `meta`. Use [`Activity::reference`] to obtain the canonical [`ObjectReference`].
     pub meta: ObjectMeta,
-    /// The execution this activity belongs to — **always** the top-level [`Execution`]'s reference
+    /// The execution this activity belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s reference
     /// (the flat query anchor shared by the whole tree), regardless of how deep the activity sits in
     /// a `Parallel` branch / `Map` item. The activity's *immediate* container — the scope it lives
     /// inside (`Execution` or `Thread`) — is **not** stored here; it is `meta.owner`. So `execution`

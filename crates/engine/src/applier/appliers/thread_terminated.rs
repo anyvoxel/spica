@@ -14,9 +14,6 @@ impl ThreadTerminatedApplier {
         if let Some(mut row) = ctx.storage.get_thread(&thread.reference()).await? {
             row.status = thread.status.clone();
             row.value.meta.updated_at = thread.meta.updated_at;
-            // Termination also clears the projection-only active cursor; no state remains current
-            // once the thread itself has reached a terminal abnormal finish.
-            row.current_activity = None;
             let parent = row.value.meta.owner.clone();
             row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;

@@ -207,3 +207,231 @@ impl WaitStateHandler<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use spica_asl::WaitState;
+
+    use super::super::harness::*;
+    use super::*;
+    use crate::types::command::{
+        ActivateState, Command, TerminateState, TerminateThread, TerminationReason,
+    };
+    use crate::types::event::{Event, StateTransitioned};
+    use crate::types::meta::{ObjectKind, ObjectMeta};
+    use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
+
+    // A `Wait`'s activation product: the deadline is resolved in `process_input` (so it is a property
+    // of the entering activity) and the resume timer is armed from that same instant in
+    // `after_activated`. Its `complete_directly() == false` is what makes the timer — not an inline
+    // `CompleteState` — the thing that resumes the state.
+
+    /// The absolute instant `seconds` after [`at`].
+    fn deadline(seconds: i64) -> Timestamp {
+        at().checked_add(std::time::Duration::from_secs(seconds as u64))
+            .expect("the fixture deadline is representable")
+    }
+
+    fn wait_state(seconds: Option<i64>, next: Option<&str>) -> State {
+        State::Wait(WaitState {
+            seconds: seconds.map(spica_asl::IntOrExpr::Int),
+            next: next.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    /// The activity value a `Wait` carries once activated: `Wait` seeds no `activity_state` at birth
+    /// (it overrides no `initialize`), so the resume instant lands only when `process_input` resolves
+    /// it — carried by `StateActivated` and every later event.
+    fn activated_activity(resume_at: Timestamp) -> Activity {
+        let mut activated = minted_activity(path("/States/P"), seeded_input());
+        activated.input = Some(seeded_input());
+        activated.activity_state = Some(ActivityState::Wait(WaitActivityState { resume_at }));
+        activated
+    }
+
+    /// The resume timer `after_activated` arms: its own minted uid/name, anchored on the *root run*
+    /// rather than the immediate owner — so a `Wait` inside a branch still names the execution it
+    /// belongs to — and owned by the waiting activity, which is what makes it that activity's child.
+    fn resume_timer(resume_at: Timestamp) -> Timer {
+        Timer {
+            execution: execution_ref(),
+            purpose: TimerPurpose::WaitResume,
+            status: TimerStatus::Active,
+            deadline: resume_at,
+            meta: ObjectMeta::builder(ObjectKind::Timer, uid(2))
+                .name(obj_name("execution-1"))
+                .at(at())
+                .build()
+                .with_owner(minted_activity_ref()),
+        }
+    }
+
+    /// `activate` resolves the resume instant onto the activity, then arms the timer for that same
+    /// instant and stops: a `Wait` completes when the timer fires, so there is no inline
+    /// `CompleteState` — the state's whole activation is the pair (recorded deadline, armed timer).
+    #[tokio::test]
+    async fn activate_records_the_resume_instant_and_arms_the_resume_timer() {
+        let resume_at = deadline(30);
+        let activated = activate(
+            &wait_state(Some(30), Some("P2")),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        assert_eq!(
+            activated.chain(),
+            vec![
+                EntryPayload::Event(Event::StateActivating {
+                    activity: minted_activity(path("/States/P"), seeded_input()),
+                }),
+                EntryPayload::Event(Event::StateActivated {
+                    activity: activated_activity(resume_at),
+                }),
+                EntryPayload::Event(Event::TimerActivated {
+                    timer: resume_timer(resume_at),
+                }),
+            ]
+        );
+
+        // The timer is folded as the waiting activity's child — the edge the complete step reads to
+        // decide whether the state may finish yet.
+        let timer = resume_timer(resume_at).reference();
+        assert!(
+            activated
+                .children(&minted_activity_ref())
+                .await
+                .contains(&timer),
+            "TimerActivated folds the owner's child edge"
+        );
+    }
+
+    /// A `Wait` whose timer is still live must not finish: the complete step opens the finish —
+    /// `StateCompleting` is emitted, so the decision is durable — and then defers, leaving the
+    /// activity `Completing` for the timer's settle to drain.
+    #[tokio::test]
+    async fn complete_defers_the_finish_while_the_resume_timer_lives() {
+        let resume_at = deadline(30);
+        let state = wait_state(Some(30), Some("P2"));
+        let activated = activate(
+            &state,
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+        let Dispatch { store, .. } = activated;
+
+        let completed = complete(&state, store, &complete_cmd(seeded_input())).await;
+
+        let mut completing = activated_activity(resume_at);
+        completing.raw_output = Some(seeded_input());
+        completing.status = ActivityStatus::Completing;
+        assert_eq!(
+            completed.chain(),
+            vec![EntryPayload::Event(Event::StateCompleting {
+                activity: completing
+            })],
+            "only the durable `ing` lands while the resume timer lives"
+        );
+        assert_eq!(
+            completed
+                .activity(&minted_activity_ref())
+                .await
+                .expect("the row is still there")
+                .value
+                .status,
+            ActivityStatus::Completing,
+            "a deferred finish leaves the activity Completing, not Running"
+        );
+    }
+
+    /// Once the resume timer has drained (its settle detached it), the same complete step finishes:
+    /// the projection runs and the state routes to its successor. The timer's own settle drives that
+    /// drain, so nothing here re-arms or re-issues anything.
+    #[tokio::test]
+    async fn complete_finishes_once_the_resume_timer_has_drained() {
+        let state = wait_state(Some(30), Some("P2"));
+        let completed = complete(
+            &state,
+            complete_store(seeded_input(), []).await,
+            &complete_cmd(seeded_input()),
+        )
+        .await;
+
+        let mut completing = minted_activity(path("/States/P"), seeded_input());
+        completing.input = Some(seeded_input());
+        completing.raw_output = Some(seeded_input());
+        completing.status = ActivityStatus::Completing;
+        let mut done = completing.clone();
+        done.status = ActivityStatus::Completed;
+        done.output = Some(seeded_input());
+
+        assert_eq!(
+            completed.chain(),
+            vec![
+                EntryPayload::Event(Event::StateCompleting {
+                    activity: completing
+                }),
+                EntryPayload::Event(Event::StateCompleted { activity: done }),
+                EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
+                    activity: minted_activity_ref(),
+                    next: path("/States/P2").as_ptr().to_owned(),
+                })),
+                EntryPayload::Command(Command::ActivateState(ActivateState {
+                    execution: execution_ref(),
+                    owner: thread_ref(),
+                    state_path: path("/States/P2"),
+                    input: seeded_input(),
+                })),
+            ]
+        );
+    }
+
+    /// A `Seconds` outside the spec's inclusive range is a definition error, not a clamp: the failure
+    /// is routed at the owning scope so the run ends instead of wedging on a deadline that was never
+    /// armed.
+    #[tokio::test]
+    async fn activate_fails_the_state_on_an_out_of_range_seconds() {
+        let activated = activate(
+            &wait_state(Some(MAX_WAIT_SECONDS + 1), Some("P2")),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        let reason = TerminationReason::Failed {
+            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                "Wait Seconds must be an integer in the range 0..99999999".into(),
+            )),
+        };
+        assert_eq!(
+            activated.chain(),
+            vec![
+                // The birth was already recorded before the input was processed, so the failure
+                // unwinds a state that momentarily existed.
+                EntryPayload::Event(Event::StateActivating {
+                    activity: minted_activity(path("/States/P"), seeded_input()),
+                }),
+                EntryPayload::Command(Command::TerminateState(TerminateState {
+                    activity: minted_activity_ref(),
+                    reason: reason.clone(),
+                })),
+                EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                    thread: thread_ref(),
+                    reason,
+                })),
+            ]
+        );
+        assert_eq!(
+            activated
+                .activity(&minted_activity_ref())
+                .await
+                .expect("the birth event folded a row")
+                .value
+                .status,
+            ActivityStatus::Running,
+            "the unwinding terminate is a command, not a fold: the row stays as the birth left it"
+        );
+    }
+}
