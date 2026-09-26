@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
-use spica_engine::{
+use spica_engine_types::{
     ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind,
     ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     Timestamp,
@@ -780,7 +780,7 @@ where
 mod tests {
     use super::*;
     use serde_json::Value;
-    use spica_engine::{
+    use spica_engine_types::{
         Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, RetryState, Task,
         TaskStatus, Timestamp, Variables,
     };
@@ -810,15 +810,14 @@ mod tests {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(
-                    spica_engine::ObjectKind::Execution,
+                meta: spica_engine_types::ObjectMeta::builder(
+                    spica_engine_types::ObjectKind::Execution,
                     id.uid,
                 )
                 .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                 .build(),
             },
             variables: Variables::new(),
-            current_activity: None,
             active_children: HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -862,7 +861,7 @@ mod tests {
                     retrier_attempts: vec![],
                     next_available_at,
                 },
-                meta: spica_engine::ObjectMeta::builder(ObjectKind::Task, id)
+                meta: spica_engine_types::ObjectMeta::builder(ObjectKind::Task, id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .build(),
             },

@@ -114,7 +114,7 @@ impl RuntimeError {
 #[derive(Debug, Clone, PartialEq, Error, Serialize, Deserialize)]
 pub enum InfraError {
     /// A log/stream protocol violation or backend fault — e.g. an out-of-order, non-contiguous,
-    /// or duplicate `entry_id` passed to [`LogStream::append`](crate::LogStream::append), or a
+    /// or duplicate `entry_id` passed to `LogStream::append`, or a
     /// durable read/write failure.
     #[error("log/storage error: {0}")]
     Log(String),

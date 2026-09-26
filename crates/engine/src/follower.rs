@@ -124,277 +124,19 @@ impl Follower {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
-    use async_trait::async_trait;
+    use spica_storage::InMemoryStorage;
     use tokio::sync::Mutex;
 
     use crate::Storage;
     use crate::engine::NoopHook;
-    use crate::storage::{
-        ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-    };
     use crate::types::event::FlowVersionCreated;
-    use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
-    use crate::types::meta::ObjectReference;
+    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference};
 
     use super::*;
-
-    /// The durable state a [`FakeStore`] commit materializes: the resume watermark plus a count of
-    /// projection writes folded into the batch. A write only lands when its transaction **commits**,
-    /// so this is the observability point for "buffered until the Noop".
-    #[derive(Default)]
-    struct FakeState {
-        committed_watermark: Option<i64>,
-        committed_writes: usize,
-    }
-
-    /// A transaction-shaped write buffer whose writes are invisible until `commit` folds them into
-    /// [`FakeState`] all together.
-    struct FakeTxn {
-        state: Arc<StdMutex<FakeState>>,
-        pending_writes: usize,
-    }
-
-    #[async_trait]
-    impl StorageTxn for FakeTxn {
-        // The follower's fold touches only the flow rows the test event's applier needs; everything
-        // else is unused by this test, so it panics rather than silently passing with wrong behavior.
-        async fn get_flow_by_name(&mut self, _n: FlowName) -> Result<Option<Flow>, ExecutionError> {
-            Ok(None)
-        }
-        async fn put_flow(&mut self, _f: Flow) -> Result<(), ExecutionError> {
-            self.pending_writes += 1;
-            Ok(())
-        }
-        async fn put_flow_version(&mut self, _v: FlowVersion) -> Result<(), ExecutionError> {
-            self.pending_writes += 1;
-            Ok(())
-        }
-        fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
-            let mut s = self.state.lock().unwrap();
-            s.committed_watermark = watermark;
-            s.committed_writes += self.pending_writes;
-            Ok(())
-        }
-
-        async fn get_execution(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_thread(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_activity(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_timer(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_task(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_children(
-            &mut self,
-            _id: ObjectReference,
-        ) -> Result<HashSet<ObjectReference>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_flow_version(
-            &mut self,
-            _id: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn flow_version_of(
-            &mut self,
-            _name: FlowName,
-            _v: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn activatable_tasks(
-            &mut self,
-            _r: &str,
-            _now: Timestamp,
-            _l: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_thread(&mut self, _t: ThreadRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_activity(&mut self, _a: ActivityRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_timer(&mut self, _t: TimerRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_task(&mut self, _t: TaskRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn remove_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn add_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_next_generated_seq(&mut self, _seq: i64) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-    }
-
-    /// A minimal in-crate [`Storage`] whose fold commits are observable. A real store can't be used
-    /// here: `spica-storage` implements the *external* `spica_engine::Storage`, a distinct copy of
-    /// this crate's trait, so the trait bounds wouldn't line up in an in-crate unit test.
-    struct FakeStore(Arc<StdMutex<FakeState>>);
-
-    #[async_trait]
-    impl Storage for FakeStore {
-        fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
-            Ok(Box::new(FakeTxn {
-                state: self.0.clone(),
-                pending_writes: 0,
-            }))
-        }
-        async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
-            Ok(self.0.lock().unwrap().committed_watermark.unwrap_or(0))
-        }
-        async fn put_last_processed_position(&mut self, p: i64) -> Result<(), ExecutionError> {
-            self.0.lock().unwrap().committed_watermark = Some(p);
-            Ok(())
-        }
-        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-
-        async fn get_execution(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_thread(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_activity(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_timer(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_task(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_children(
-            &self,
-            _id: ObjectReference,
-        ) -> Result<HashSet<ObjectReference>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn activatable_tasks(
-            &self,
-            _r: &str,
-            _now: Timestamp,
-            _l: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_thread(&mut self, _t: ThreadRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_activity(&mut self, _a: ActivityRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_timer(&mut self, _t: TimerRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_task(&mut self, _t: TaskRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn remove_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn add_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_flow_by_name(&self, _n: FlowName) -> Result<Option<Flow>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_flow(&mut self, _f: Flow) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn get_flow_version(
-            &self,
-            _id: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn put_flow_version(&mut self, _v: FlowVersion) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-        async fn flow_version_of(
-            &self,
-            _name: FlowName,
-            _v: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the follower batch test")
-        }
-    }
 
     fn handles(storage: Arc<Mutex<Box<dyn Storage>>>) -> ProcessingHandles {
         ProcessingHandles {
@@ -403,37 +145,66 @@ mod tests {
         }
     }
 
-    /// A `FlowVersionCreated` event that folds cleanly into the fake store (its applier touches only
-    /// `get_flow_by_name` / `put_flow_version` / `put_flow`), used as a batch's sibling.
-    fn flow_version_event() -> (EntryId, Timestamp, Event) {
+    /// A `FlowVersionCreated` event that folds cleanly into the in-memory store (its applier touches
+    /// only `get_flow_by_name` / `put_flow_version` / `put_flow`), used as a batch's sibling. Each
+    /// sibling carries a **distinct** version, so the two land on two distinct rows and the commit's
+    /// scope can be read back row by row.
+    fn flow_version_event(version: u32) -> (EntryId, Timestamp, Event) {
         (
             EntryId::new(2),
             Timestamp::now(),
             Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: crate::types::meta::ObjectMeta::builder(
-                        crate::types::meta::ObjectKind::FlowVersion,
-                        ulid::Ulid::new(),
-                    )
-                    .name(FlowVersion::version_name(
-                        &FlowName::new("flow").expect("literal name is valid"),
-                        1,
-                    ))
-                    .at(Timestamp::now())
-                    .build()
-                    .with_owner(crate::types::meta::OwnerReference::new(
-                        crate::types::meta::ObjectKind::Flow,
-                        crate::types::meta::ObjectName::plain("flow")
-                            .expect("literal name is valid"),
-                        ulid::Ulid::nil(),
-                    )),
-                    version: 1,
+                    meta: ObjectMeta::builder(ObjectKind::FlowVersion, ulid::Ulid::new())
+                        .name(FlowVersion::version_name(
+                            &FlowName::new("flow").expect("literal name is valid"),
+                            version,
+                        ))
+                        .at(Timestamp::now())
+                        .build()
+                        .with_owner(OwnerReference::new(
+                            ObjectKind::Flow,
+                            ObjectName::plain("flow").expect("literal name is valid"),
+                            ulid::Ulid::nil(),
+                        )),
+                    version,
                     definition: String::new(),
                     checksum: FlowVersion::definition_checksum(""),
                 },
             }),
         )
+    }
+
+    /// The reference the event's applier files its row under — the key a read addresses.
+    fn version_ref(event: &Event) -> ObjectReference {
+        let Event::FlowVersionCreated(created) = event else {
+            panic!("the fixture emits a flow-version create; got {event:?}");
+        };
+        created.flow_version.reference()
+    }
+
+    /// Read a row through the store's **committed** face — the only face the Noop commit writes, so a
+    /// `None` here is what "this entry has not been folded yet" means to a reader.
+    async fn committed_version(
+        storage: &Mutex<Box<dyn Storage>>,
+        reference: &ObjectReference,
+    ) -> Option<FlowVersion> {
+        storage
+            .lock()
+            .await
+            .get_flow_version(reference)
+            .await
+            .expect("the in-memory store reads")
+    }
+
+    async fn resume_position(storage: &Mutex<Box<dyn Storage>>) -> i64 {
+        storage
+            .lock()
+            .await
+            .last_processed_position()
+            .await
+            .expect("the in-memory store reads")
     }
 
     /// Two sibling Events of one batch followed by their Noop. The test drives a `Follower` the way
@@ -443,14 +214,14 @@ mod tests {
     /// advanced to the Noop's position.
     #[tokio::test]
     async fn follower_applies_batch_atomically_at_noop() {
-        let state = Arc::new(StdMutex::new(FakeState::default()));
         let storage: Arc<Mutex<Box<dyn Storage>>> =
-            Arc::new(Mutex::new(Box::new(FakeStore(state.clone()))));
+            Arc::new(Mutex::new(Box::new(InMemoryStorage::new())));
         let h = handles(storage.clone());
         let mut follower = Follower::new();
 
-        let (id1, ts1, ev1) = flow_version_event();
-        let (id2, ts2, ev2) = flow_version_event();
+        let (id1, ts1, ev1) = flow_version_event(1);
+        let (id2, ts2, ev2) = flow_version_event(2);
+        let (v1, v2) = (version_ref(&ev1), version_ref(&ev2));
 
         // As the driver would, open **one** owned transaction at the batch's first Event and hold it
         // across the batch. The guard is dropped at the end of this statement — `begin_txn` no longer
@@ -468,19 +239,21 @@ mod tests {
             .unwrap();
         assert_eq!(w2, None, "follower never commits mid-batch");
 
-        // Before the Noop nothing is committed: the projection is untouched and W is unchanged.
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(s.committed_watermark, None, "no watermark before the Noop");
-            assert_eq!(s.committed_writes, 0, "no fold before the Noop");
-        }
-        let probe = storage
-            .lock()
-            .await
-            .last_processed_position()
-            .await
-            .unwrap();
-        assert_eq!(probe, 0, "resume position unchanged before the Noop");
+        // Before the Noop nothing is committed: neither sibling's row is readable through the store's
+        // committed face, and W is unchanged.
+        assert!(
+            committed_version(&storage, &v1).await.is_none(),
+            "no fold before the Noop"
+        );
+        assert!(
+            committed_version(&storage, &v2).await.is_none(),
+            "no fold before the Noop"
+        );
+        assert_eq!(
+            resume_position(&storage).await,
+            0,
+            "resume position unchanged before the Noop"
+        );
 
         // The Noop closes the batch: `commit_at_noop` rounds it off (returns the watermark to commit),
         // and the driver commits the still-open, now-whole transaction atomically.
@@ -495,19 +268,20 @@ mod tests {
             "commit_at_noop returns the Noop position to commit"
         );
         assert_eq!(follower.watermark, 3, "W advanced to the Noop position");
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(
-                s.committed_watermark,
-                Some(3),
-                "W persisted to the Noop position"
-            );
-            // Each sibling's applier writes both a flow-version and a flow row, so at least the two
-            // siblings' rows landed in the single commit — nothing was written before the Noop.
-            assert!(
-                s.committed_writes >= 2,
-                "both siblings folded in the single commit"
-            );
-        }
+        // The single commit landed the whole batch: both siblings' rows became readable together,
+        // and nothing was written before the Noop (asserted above).
+        assert!(
+            committed_version(&storage, &v1).await.is_some(),
+            "the first sibling folded in the single commit"
+        );
+        assert!(
+            committed_version(&storage, &v2).await.is_some(),
+            "the second sibling folded in the single commit"
+        );
+        assert_eq!(
+            resume_position(&storage).await,
+            3,
+            "W persisted to the Noop position"
+        );
     }
 }

@@ -740,276 +740,22 @@ pub(crate) fn log_event(event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use async_trait::async_trait;
+    use spica_storage::InMemoryStorage;
     use tokio::sync::Mutex;
 
     use crate::engine::NoopHook;
     use crate::log::{InMemoryLogStream, Timestamp};
-    use crate::storage::{
-        ActivityRecord, ExecutionRecord, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-    };
     use crate::types::command::CreateFlow;
-    use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
-    use crate::types::meta::ObjectReference;
+    use crate::types::meta::{
+        ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName,
+    };
 
     use super::*;
-
-    /// The durable state a [`FakeStore`] commit materializes: the resume watermark plus a count of
-    /// projection writes folded into the batch. A write only lands when its transaction **commits**,
-    /// so this is the observability point for "recovery folds a residue exactly once, at its Noop".
-    #[derive(Default)]
-    struct FakeState {
-        committed_watermark: Option<i64>,
-        committed_writes: usize,
-    }
-
-    /// A transaction-shaped write buffer whose writes are invisible until `commit` folds them into
-    /// [`FakeState`] all together.
-    struct FakeTxn {
-        state: Arc<StdMutex<FakeState>>,
-        pending_writes: usize,
-    }
-
-    #[async_trait]
-    impl StorageTxn for FakeTxn {
-        // The fold touches only the flow rows the test Event's applier needs; the rest is unused.
-        async fn get_flow_by_name(&mut self, _n: FlowName) -> Result<Option<Flow>, ExecutionError> {
-            Ok(None)
-        }
-        async fn put_flow(&mut self, _f: Flow) -> Result<(), ExecutionError> {
-            self.pending_writes += 1;
-            Ok(())
-        }
-        async fn put_flow_version(&mut self, _v: FlowVersion) -> Result<(), ExecutionError> {
-            self.pending_writes += 1;
-            Ok(())
-        }
-        fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
-            let mut s = self.state.lock().unwrap();
-            s.committed_watermark = watermark;
-            s.committed_writes += self.pending_writes;
-            Ok(())
-        }
-
-        async fn get_execution(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_thread(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_activity(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_timer(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_task(
-            &mut self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_children(
-            &mut self,
-            _id: ObjectReference,
-        ) -> Result<HashSet<ObjectReference>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_flow_version(
-            &mut self,
-            _id: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn flow_version_of(
-            &mut self,
-            _name: FlowName,
-            _v: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn activatable_tasks(
-            &mut self,
-            _r: &str,
-            _now: Timestamp,
-            _l: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_thread(&mut self, _t: ThreadRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_activity(&mut self, _a: ActivityRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_timer(&mut self, _t: TimerRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_task(&mut self, _t: TaskRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn remove_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn add_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_next_generated_seq(&mut self, _seq: i64) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-    }
-
-    /// A minimal in-crate [`Storage`] whose fold commits are observable, matching the follower tests'
-    /// fake (`spica-storage` implements a distinct copy of this crate's trait, so a real store can't
-    /// satisfy the trait bound in an in-crate unit test).
-    struct FakeStore(Arc<StdMutex<FakeState>>);
-
-    #[async_trait]
-    impl Storage for FakeStore {
-        fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
-            Ok(Box::new(FakeTxn {
-                state: self.0.clone(),
-                pending_writes: 0,
-            }))
-        }
-        async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
-            Ok(self.0.lock().unwrap().committed_watermark.unwrap_or(0))
-        }
-        async fn put_last_processed_position(&mut self, p: i64) -> Result<(), ExecutionError> {
-            self.0.lock().unwrap().committed_watermark = Some(p);
-            Ok(())
-        }
-        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-
-        async fn get_execution(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_thread(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_activity(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_timer(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_task(
-            &self,
-            _reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_children(
-            &self,
-            _id: ObjectReference,
-        ) -> Result<HashSet<ObjectReference>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn activatable_tasks(
-            &self,
-            _r: &str,
-            _now: Timestamp,
-            _l: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_execution(&mut self, _e: ExecutionRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_thread(&mut self, _t: ThreadRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_activity(&mut self, _a: ActivityRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_timer(&mut self, _t: TimerRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_task(&mut self, _t: TaskRecord) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn remove_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn add_child(
-            &mut self,
-            _p: ObjectReference,
-            _c: ObjectReference,
-        ) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_flow_by_name(&self, _n: FlowName) -> Result<Option<Flow>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_flow(&mut self, _f: Flow) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn get_flow_version(
-            &self,
-            _id: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn put_flow_version(&mut self, _v: FlowVersion) -> Result<(), ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-        async fn flow_version_of(
-            &self,
-            _name: FlowName,
-            _v: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
-            unimplemented!("not exercised by the recovery test")
-        }
-    }
 
     fn handles(storage: Arc<Mutex<Box<dyn Storage>>>) -> ProcessingHandles {
         ProcessingHandles {
@@ -1036,9 +782,8 @@ mod tests {
     #[tokio::test]
     async fn leader_reports_applied_events_to_the_hook() {
         let mut sp = StreamProcessor::new();
-        let state = Arc::new(StdMutex::new(FakeState::default()));
         let storage: Arc<Mutex<Box<dyn Storage>>> =
-            Arc::new(Mutex::new(Box::new(FakeStore(state.clone()))));
+            Arc::new(Mutex::new(Box::new(InMemoryStorage::new())));
         let hook = Arc::new(RecordingHook::default());
         let handles = ProcessingHandles {
             storage,
@@ -1078,36 +823,76 @@ mod tests {
         );
     }
 
-    /// A `FlowVersionCreated` event that folds cleanly into the fake store (its applier touches only
-    /// `get_flow_by_name` / `put_flow_version` / `put_flow`), used as the crash-residue Event.
+    /// A `FlowVersionCreated` event that folds cleanly into the in-memory store (its applier touches
+    /// only `get_flow_by_name` / `put_flow_version` / `put_flow`), used as the crash-residue Event.
     fn flow_version_event() -> (Timestamp, Event) {
         (
             Timestamp::now(),
             Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: crate::types::meta::ObjectMeta::builder(
-                        crate::types::meta::ObjectKind::FlowVersion,
-                        ulid::Ulid::new(),
-                    )
-                    .name(FlowVersion::version_name(
-                        &FlowName::new("flow").expect("literal name is valid"),
-                        1,
-                    ))
-                    .at(Timestamp::now())
-                    .build()
-                    .with_owner(crate::types::meta::OwnerReference::new(
-                        crate::types::meta::ObjectKind::Flow,
-                        crate::types::meta::ObjectName::plain("flow")
-                            .expect("literal name is valid"),
-                        ulid::Ulid::nil(),
-                    )),
+                    meta: ObjectMeta::builder(ObjectKind::FlowVersion, ulid::Ulid::new())
+                        .name(FlowVersion::version_name(
+                            &FlowName::new("flow").expect("literal name is valid"),
+                            1,
+                        ))
+                        .at(Timestamp::now())
+                        .build()
+                        .with_owner(OwnerReference::new(
+                            ObjectKind::Flow,
+                            ObjectName::plain("flow").expect("literal name is valid"),
+                            ulid::Ulid::nil(),
+                        )),
                     version: 1,
                     definition: String::new(),
                     checksum: FlowVersion::definition_checksum(""),
                 },
             }),
         )
+    }
+
+    /// The reference the event's applier files its row under — the key a read addresses.
+    fn version_ref(event: &Event) -> ObjectReference {
+        let Event::FlowVersionCreated(created) = event else {
+            panic!("the fixture emits a flow-version create; got {event:?}");
+        };
+        created.flow_version.reference()
+    }
+
+    /// Read a row through the store's **committed** face — a `None` here is what "this entry has not
+    /// been folded yet" means to a reader.
+    async fn committed_version(
+        storage: &Mutex<Box<dyn Storage>>,
+        reference: &ObjectReference,
+    ) -> Option<FlowVersion> {
+        storage
+            .lock()
+            .await
+            .get_flow_version(reference)
+            .await
+            .expect("the in-memory store reads")
+    }
+
+    /// Overwrite the persisted row with `definition = marker`, so a later pass that wrongly re-folded
+    /// the residue would overwrite the mark back — the observable form of "folded exactly once".
+    async fn mark_committed(
+        storage: &Mutex<Box<dyn Storage>>,
+        reference: &ObjectReference,
+        marker: &str,
+    ) {
+        let mut row = committed_version(storage, reference)
+            .await
+            .expect("recovery folded the residue's row");
+        row.definition = marker.to_string();
+        let mut txn = storage
+            .lock()
+            .await
+            .begin_txn()
+            .expect("the in-memory store begins a txn");
+        txn.put_flow_version(row)
+            .await
+            .expect("the in-memory txn buffers the row");
+        txn.commit(None).expect("the in-memory txn commits");
     }
 
     /// Recovery folds a durably-appended but never-applied batch (the crash residue) into the
@@ -1119,10 +904,11 @@ mod tests {
         // whose eager-apply never committed before the crash — the O the storage still says 0.
         let log = InMemoryLogStream::<EntryPayload>::default();
         let (ts, ev) = flow_version_event();
+        let residue_ref = version_ref(&ev);
         let residual_uid: ulid::Ulid = ulid::Ulid::new();
-        let residual_timer = crate::types::meta::ObjectReference::new(
-            crate::types::meta::ObjectKind::Timer,
-            crate::types::meta::PlainName::new("child")
+        let residual_timer = ObjectReference::new(
+            ObjectKind::Timer,
+            PlainName::new("child")
                 .expect("static literal is a valid segment")
                 .generated_from_key(residual_uid.0 as u64),
             residual_uid,
@@ -1162,10 +948,9 @@ mod tests {
             "residue batch lands at positions 1..=3"
         );
 
-        let state = Arc::new(StdMutex::new(FakeState::default()));
         let storage: Arc<Mutex<Box<dyn Storage>>> =
-            Arc::new(Mutex::new(Box::new(FakeStore(state.clone()))));
-        let h = handles(storage);
+            Arc::new(Mutex::new(Box::new(InMemoryStorage::new())));
+        let h = handles(storage.clone());
 
         let mut sp = StreamProcessor::new();
         let StateMachine::Leader(leader) = &mut sp.state_machine else {
@@ -1176,16 +961,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Folded exactly once (one projection write committed), watermark on the batch's Noop.
+        // The residue reached the projection in the one commit at its Noop, and recovery resumes from
+        // that Noop. The `CancelTimer` the batch led with was skipped, not re-dispatched.
         assert_eq!(w, 3, "recovery resumes from the last durable Noop");
-        {
-            // Scoped so the std guard drops before the next await (`recover_leader` idempotence below).
-            let st = state.lock().unwrap();
-            assert_eq!(st.committed_watermark, Some(3));
-            // The one residue Event folds its two rows (`put_flow` index + `put_flow_version`), all in
-            // the single commit at the Noop — proof the whole batch landed atomically, exactly once.
-            assert_eq!(st.committed_writes, 2, "residue Event folded exactly once");
-        }
+        assert!(
+            committed_version(&storage, &residue_ref).await.is_some(),
+            "the residue Event folded into the projection"
+        );
+        assert_eq!(
+            storage
+                .lock()
+                .await
+                .last_processed_position()
+                .await
+                .unwrap(),
+            3,
+            "W persisted to the Noop position"
+        );
         // The log's length must be unchanged: recovery folds residues in place, never re-appends.
         assert_eq!(
             log.entries().len(),
@@ -1193,12 +985,21 @@ mod tests {
             "no duplicate append during recovery"
         );
 
-        // The residue is now at/below the watermark, so a subsequent `recover_leader` with the
-        // advanced watermark sees nothing above it to fold — a second pass is idempotent.
+        // Mark the folded row, then re-run recovery from the advanced watermark: the residue is now
+        // at/below it, so the second pass sees nothing above it to fold. A pass that re-folded would
+        // rewrite the row from the Event and erase the mark.
+        mark_committed(&storage, &residue_ref, "the residue folded once").await;
         let w2 = StreamProcessor::recover_leader(leader, &log, &h, w)
             .await
             .unwrap();
         assert_eq!(w2, 3, "idempotent across restarts");
-        assert_eq!(state.lock().unwrap().committed_writes, 2, "no double fold");
+        assert_eq!(
+            committed_version(&storage, &residue_ref)
+                .await
+                .expect("the row survives the second pass")
+                .definition,
+            "the residue folded once",
+            "no double fold"
+        );
     }
 }

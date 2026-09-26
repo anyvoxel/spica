@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Timestamp;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::id::{FlowName, RequestId};
 use crate::types::meta::{ObjectName, ObjectReference};
 use crate::types::state_path::StatePath;
 use crate::types::task::RetryPolicy;
+use spica_machinery::Timestamp;
 
 /// Why an entity (execution or activity) terminated without succeeding.
 ///
@@ -66,7 +66,7 @@ impl TerminationReason {
 
 /// The payload of [`Command::ActivateState`] — the values needed to enter a state. A dedicated type
 /// (rather than inline struct-variant fields) lets the lifecycle entry
-/// [`StateHandler::activate`](crate::handlers::StateHandler::activate) receive it by its own type,
+/// `StateHandler::activate` receive it by its own type,
 /// so dispatch narrowing is a compile-time guarantee instead of a runtime `else unreachable!`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivateState {
@@ -227,8 +227,8 @@ pub struct FailTask {
 }
 
 /// An operation to perform against an [`Execution`](crate::Execution), [`Activity`](crate::Activity),
-/// or [`Timer`](crate::Timer). Commands are appended to the [`LogStream`](crate::LogStream) and
-/// consumed by the [`StreamProcessor`](crate::StreamProcessor), which dispatches each to the matching handler.
+/// or [`Timer`](crate::Timer). Commands are appended to the `LogStream` and
+/// consumed by the `StreamProcessor`, which dispatches each to the matching handler.
 ///
 /// The model is **Command-driven lifecycle** per entity — three verbs: `Activate` (enter),
 /// `Complete` (finish successfully), `Terminate` (finish abnormally with a
@@ -345,10 +345,10 @@ pub enum Command {
     /// branch / item). Carrying the full path makes `ActivateState` self-locating — the definition lookup no
     /// longer infers the enclosing `States` table from the owning scope's stored `state_path` — and
     /// keeps the log self-describing for replay/audit. The state's leaf name is
-    /// [`state_name_from_path`](crate::handlers::state_name_from_path).
+    /// `state_name_from_path`.
     ///
     /// The payload is a dedicated [`ActivateState`] value type, so the lifecycle entry
-    /// [`StateHandler::activate`](crate::handlers::StateHandler::activate) receives it by its own
+    /// `StateHandler::activate` receives it by its own
     /// type and the else-`unreachable!` narrowing moves to compile time.
     ActivateState(ActivateState),
 
@@ -431,7 +431,7 @@ pub enum Command {
 
     /// Continue a drained-and-finishing `owner`'s **success** drain on a later round. Issued by the
     /// one-hop child-settled reactor (see `handlers::child_completed`) the moment it observes the
-    /// `owner` is `Completing` with no remaining children; the [`ContinueCompleteHandler`] emits the
+    /// `owner` is `Completing` with no remaining children; the `ContinueCompleteHandler` emits the
     /// owner's terminal next round and issues a follow-up Continue for *its* owner. Replaces the old
     /// inline recursive cascade with one hop per round (Zeebe's `COMPLETE_ELEMENT` decoupling), so
     /// convergence no longer recurses up the owner chain on the call stack.

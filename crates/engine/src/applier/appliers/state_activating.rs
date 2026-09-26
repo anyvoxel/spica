@@ -32,34 +32,6 @@ impl StateActivatingApplier {
                 activity.reference(),
             )
             .await?;
-        // Advance the owning scope's projection-only `current_activity` cursor. The scope that owns
-        // this activity is `activity.meta.owner` (an `Execution` for a top-level activity, a `Thread`
-        // for one inside a `Parallel` branch / `Map` item) — *not* `activity.execution`, which is only
-        // the shared top-level anchor and would wrongly move a deeply-nested activity's cursor onto
-        // the root. Matching on the owner's kind updates whichever record actually holds the cursor.
-        let ownership = activity
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
-        let reference = activity.reference();
-        match ownership.kind {
-            crate::types::meta::ObjectKind::Execution => {
-                if let Some(mut exec) = ctx.storage.get_execution(&ownership).await? {
-                    exec.current_activity = Some(reference.clone());
-                    exec.with_update_at(ctx.timestamp);
-                    ctx.storage.put_execution(exec).await?;
-                }
-            }
-            crate::types::meta::ObjectKind::Thread => {
-                if let Some(mut thread) = ctx.storage.get_thread(&ownership).await? {
-                    thread.current_activity = Some(reference.clone());
-                    thread.with_update_at(ctx.timestamp);
-                    ctx.storage.put_thread(thread).await?;
-                }
-            }
-            _ => {} // a non-scope owner resolves to nothing (silent) — no cursor to move.
-        }
         Ok(())
     }
 }

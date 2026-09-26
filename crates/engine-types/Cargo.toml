@@ -1,0 +1,20 @@
+[package]
+name = "spica-engine-types"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+auto_impl.workspace = true
+crc.workspace = true
+derive_more.workspace = true
+jsonptr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+spica-asl.workspace = true
+spica-logstream.workspace = true
+spica-machinery.workspace = true
+thiserror.workspace = true
+ulid.workspace = true

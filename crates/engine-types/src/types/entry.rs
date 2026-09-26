@@ -25,12 +25,12 @@ use crate::types::reject::Reject;
 pub enum EntryPayload {
     Command(Command),
     Event(Event),
-    /// A command that was refrained from applying — a parallel record to [`Event`](crate::Event),
+    /// A command that was refrained from applying — a parallel record to [`Event`],
     /// carrying its own `request_id` so the StreamProcessor can awake the awaiting caller directly (see
     /// [`Reject`]). A rejection is the engine's `COMMAND_REJECTION` analogue, not an event subtype.
     Reject(Reject),
     /// The terminator of one **atomic append batch** (see `docs/durable-execution-recovery-design.md`).
-    /// The [`StreamProcessor`](crate::StreamProcessor) appends a `Noop` as the **last** entry of
+    /// The `StreamProcessor` appends a `Noop` as the **last** entry of
     /// every non-empty batch it writes for a dispatched Command, so a reader can tell — from the log
     /// alone, without peeking ahead — that a causal batch is complete and safe to fold/commit. Its
     /// `cause_id` (on the envelope) is the producing Command's position, giving the batch a stable,

@@ -40,7 +40,7 @@ pub struct FlowVersion {
     pub version: u32,
     /// The ASL state machine definition this version publishes, as its raw JSON string form.
     /// Stored as a string so the durable record is the exact definition the user submitted; it is
-    /// parsed into a `StateMachine` where an execution needs it ([`HandlerContext::machine`]).
+    /// parsed into a `StateMachine` where an execution needs it (`HandlerContext::machine`).
     pub definition: String,
     /// CRC-64/ECMA checksum of `definition`'s bytes — a cheap way to detect whether two versions
     /// hold byte-identical content without comparing the (possibly large) raw strings. See
@@ -91,8 +91,8 @@ impl FlowVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::Timestamp;
     use crate::types::meta::OwnerReference;
+    use spica_machinery::Timestamp;
 
     #[test]
     fn version_name_encodes_flow_and_decimal_ordinal() {

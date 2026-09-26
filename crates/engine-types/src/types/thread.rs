@@ -72,7 +72,7 @@ pub struct Thread {
     /// `Parallel`/`Map` activity that fanned this thread out — the drain cascade and the container's
     /// `active_children` rely on that owning edge.
     pub meta: ObjectMeta,
-    /// The execution this thread belongs to — **always** the top-level [`Execution`]'s
+    /// The execution this thread belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s
     /// `ObjectReference`, regardless of nesting depth (a tree holds exactly one `Execution`, and it
     /// is always the root). This is the flat grouping key for "all events of one top-level run" (the
     /// CCES analogue of Zeebe's `processInstanceKey`), so a query can filter the whole tree by

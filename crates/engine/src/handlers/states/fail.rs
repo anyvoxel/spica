@@ -132,3 +132,174 @@ impl FailStateHandler<'_> {
         Ok(TerminationReason::Failed { error })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use spica_asl::FailState;
+
+    use super::super::harness::*;
+    use super::*;
+    use crate::ActivityState;
+    use crate::types::command::{Command, CompleteState, TerminateThread};
+    use crate::types::event::Event;
+    use crate::{ActivityStatus, EntryPayload, ThreadStatus};
+
+    // A `Fail` inherits the base's `activate` untouched and overrides only `finish`: the activation
+    // chain is therefore the shared synchronous one, while `complete` replaces the success projection
+    // with the activity's failure ed followed by the owning scope's termination — the pair that turns
+    // "this state failed" into "the run this state belongs to failed".
+
+    fn fail_state(error: Option<&str>, cause: Option<&str>) -> State {
+        State::Fail(FailState {
+            comment: None,
+            cause: cause.map(str::to_string),
+            error: error.map(str::to_string),
+        })
+    }
+
+    /// `activate` runs the shared chain — `Fail` has nothing to scaffold, arm or fan out, and its
+    /// terminal routing is decided in the finish.
+    #[tokio::test]
+    async fn activate_emits_the_synchronous_success_chain() {
+        let activated = activate(
+            &fail_state(Some("ErrorA"), None),
+            &activate_cmd(path("/States/P"), seeded_input()),
+            Some(seeded_scope(ThreadStatus::Running)),
+        )
+        .await;
+
+        let birth = minted_activity(path("/States/P"), seeded_input());
+        let mut processed = birth.clone();
+        processed.input = Some(seeded_input());
+
+        assert_eq!(
+            activated.chain(),
+            vec![
+                EntryPayload::Event(Event::StateActivating { activity: birth }),
+                EntryPayload::Event(Event::StateActivated {
+                    activity: processed
+                }),
+                EntryPayload::Command(Command::CompleteState(CompleteState {
+                    activity: minted_activity_ref(),
+                    output: seeded_input(),
+                })),
+            ]
+        );
+        // No side effect, so nothing beyond the activity row itself was folded as its child.
+        assert!(
+            activated
+                .children(&thread_ref())
+                .await
+                .contains(&minted_activity_ref()),
+            "the failure is still a normal activation until the finish runs"
+        );
+    }
+
+    /// The finish terminates the activity **and** its owning scope from one step: the activity's
+    /// failure ed (`StateTerminating` → `StateTerminated`, replacing the `StateCompleted` a success
+    /// would emit), then the scope's termination — here a `TerminateThread`, because the activity's
+    /// owner is a thread. A `Fail` with no `Error` names itself with the spec's default.
+    #[tokio::test]
+    async fn complete_terminates_the_activity_and_its_owner_scope() {
+        let completed = complete(
+            &fail_state(None, None),
+            complete_store(seeded_input(), []).await,
+            &complete_cmd(seeded_input()),
+        )
+        .await;
+
+        let reason = TerminationReason::Failed {
+            error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                state: "P".to_string(),
+                error: "States.Fail".to_string(),
+                output: Box::new(json!({})),
+            }),
+        };
+        let mut completing = minted_activity(path("/States/P"), seeded_input());
+        completing.input = Some(seeded_input());
+        completing.raw_output = Some(seeded_input());
+        completing.status = ActivityStatus::Completing;
+        let mut terminating = completing.clone();
+        terminating.status = ActivityStatus::Terminating(reason.clone());
+        let mut terminated = terminating.clone();
+        terminated.status = ActivityStatus::Terminated(reason.clone());
+
+        assert_eq!(
+            completed.chain(),
+            vec![
+                EntryPayload::Event(Event::StateCompleting {
+                    activity: completing
+                }),
+                EntryPayload::Event(Event::StateTerminating {
+                    activity: terminating
+                }),
+                EntryPayload::Event(Event::StateTerminated {
+                    activity: terminated
+                }),
+                EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                    thread: thread_ref(),
+                    reason,
+                })),
+            ]
+        );
+        let row = completed
+            .activity(&minted_activity_ref())
+            .await
+            .expect("the failure ed folds the activity row");
+        assert!(
+            row.value.status.is_terminal(),
+            "the activity is left terminal, not Running: {:?}",
+            row.value.status
+        );
+    }
+
+    /// `Error` and `Cause` are projections of the state's input: the evaluated `Error` becomes the
+    /// failure's error name (which `Retry`/`Catch` would match on) and both are carried together in
+    /// the termination reason's context object.
+    #[tokio::test]
+    async fn complete_projects_error_and_cause_into_the_failure() {
+        let state = fail_state(
+            Some("{% $states.input.code %}"),
+            Some("{% $states.input.msg %}"),
+        );
+        let input = json!({ "code": "E-42", "msg": "boom" });
+        let completed = complete(
+            &state,
+            complete_store(input.clone(), []).await,
+            &complete_cmd(input.clone()),
+        )
+        .await;
+
+        let reason = TerminationReason::Failed {
+            error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                state: "P".to_string(),
+                error: "E-42".to_string(),
+                output: Box::new(json!({ "Error": "E-42", "Cause": "boom" })),
+            }),
+        };
+        assert!(
+            matches!(
+                completed.chain().last(),
+                Some(EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                    reason: actual,
+                    ..
+                }))) if *actual == reason
+            ),
+            "the evaluated Error/Cause reach the scope termination: {:?}",
+            completed.chain().last()
+        );
+
+        // The activity carries no `activity_state` of its own: a leaf `Fail` seeds none, so the
+        // failure's context travels entirely on the termination reason.
+        assert_eq!(
+            completed
+                .activity(&minted_activity_ref())
+                .await
+                .expect("the failure ed folds the activity row")
+                .value
+                .activity_state,
+            None::<ActivityState>
+        );
+    }
+}

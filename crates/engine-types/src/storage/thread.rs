@@ -3,18 +3,18 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Thread;
-use crate::log::Timestamp;
 use crate::types::meta::ObjectReference;
+use crate::types::thread::Thread;
 use crate::types::variables::Variables;
+use spica_machinery::Timestamp;
 
 /// The storage projection row of a [`Thread`] — one scoped sub-run (`Parallel` branch / `Map` item).
 ///
 /// Mirrors [`ExecutionRecord`](crate::storage::ExecutionRecord) exactly: the canonical `Thread`
 /// domain entity reconstructed from the stream, wrapped so projection-only bookkeeping
-/// (`variables`, `active_children`, `current_activity`, timing facts) stays off the event-carried
-/// entity value. A thread is a self-contained sub-run, so it owns its own variable scope and
-/// in-flight children, exactly like a top-level execution.
+/// (`variables`, `active_children`, timing facts) stays off the event-carried entity value. A thread
+/// is a self-contained sub-run, so it owns its own variable scope and in-flight children, exactly
+/// like a top-level execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadRecord {
     /// The canonical thread domain value reconstructed from the event stream. Not `#[serde(flatten)]`
@@ -23,9 +23,6 @@ pub struct ThreadRecord {
     pub value: Thread,
     /// The thread's current variable scope (see `ExecutionRecord::variables`).
     pub variables: Variables,
-    /// The activity currently in flight for this thread (projection convenience; single-active-state
-    /// cursor, derivable from activity rows).
-    pub current_activity: Option<ObjectReference>,
     /// Owned nodes still in flight (active activities / timers / child threads). A completing or
     /// terminating thread waits for this projection-only set to drain before its terminal `ed`.
     pub active_children: HashSet<ObjectReference>,
@@ -44,7 +41,6 @@ impl ThreadRecord {
         Self {
             value,
             variables: Variables::new(),
-            current_activity: None,
             active_children,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),

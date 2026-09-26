@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::Timestamp;
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use spica_machinery::Timestamp;
 
-/// Lifecycle status of an [`Execution`](crate::Execution).
+/// Lifecycle status of an [`Execution`].
 ///
 /// The state machine is: `Running` -> `Completing` -> `Completed` (success) and
 /// `Running` -> `Terminating` -> `Terminated` (abnormal). `Completing`/`Terminating` are real,

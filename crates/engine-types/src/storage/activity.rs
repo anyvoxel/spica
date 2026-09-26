@@ -3,9 +3,9 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::log::Timestamp;
 use crate::types::activity::Activity;
 use crate::types::meta::ObjectReference;
+use spica_machinery::Timestamp;
 
 /// The storage projection row of an ActivityRecord.
 ///
@@ -22,10 +22,9 @@ pub struct ActivityRecord {
     /// Owned nodes still in flight (e.g. this Wait's resume timer). Terminating waits on them.
     pub active_children: HashSet<ObjectReference>,
     /// When this row's birth event (`StateActivating`) landed in the log. Projection-derived from the
-    /// applied entry's [`timestamp`](crate::ApplierContext) — never a local `Timestamp::now()` — so
-    /// every replica replaying the same entries computes the identical value. A reconstruction
-    /// applier carries it over from the loaded row rather than re-stamping it (this is an update, not
-    /// a birth).
+    /// applied entry's `timestamp` — never a local `Timestamp::now()` — so every replica replaying the
+    /// same entries computes the identical value. A reconstruction applier carries it over from the
+    /// loaded row rather than re-stamping it (this is an update, not a birth).
     pub created_at: Timestamp,
     /// The latest applied entry's timestamp that touched this row; each mutating applier bumps it on
     /// write. Same determinism note as `created_at`.

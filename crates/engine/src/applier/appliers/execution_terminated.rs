@@ -16,9 +16,6 @@ impl ExecutionTerminatedApplier {
         if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
             exec.status = execution.status.clone();
             exec.value.meta.updated_at = execution.meta.updated_at;
-            // Termination also clears the projection-only active cursor; no state remains current
-            // once the execution itself has reached a terminal abnormal finish.
-            exec.current_activity = None;
             let parent = exec.value.meta.owner.clone();
             exec.with_update_at(ctx.timestamp);
             ctx.storage.put_execution(exec).await?;

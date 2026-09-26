@@ -3,17 +3,17 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Execution;
-use crate::log::Timestamp;
+use crate::types::execution::Execution;
 use crate::types::meta::ObjectReference;
 use crate::types::variables::Variables;
+use spica_machinery::Timestamp;
 
 /// The storage projection row of an execution.
 ///
 /// `Execution` is the canonical execution domain entity reconstructed from the stream. Storage
-/// wraps it so projection-only bookkeeping — currently `variables`, `active_children`,
-/// `current_activity`, and the `created_at`/`updated_at` timing facts — stays separated from the
-/// entity value that lifecycle events carry.
+/// wraps it so projection-only bookkeeping — currently `variables`, `active_children`, and the
+/// `created_at`/`updated_at` timing facts — stays separated from the entity value that lifecycle
+/// events carry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionRecord {
     /// The canonical execution domain value reconstructed from the event stream.
@@ -29,17 +29,13 @@ pub struct ExecutionRecord {
     /// `VariablesAssigned`; it stays off the event-carried `Execution` so execution lifecycle
     /// events do not repeatedly serialize a mutable scope snapshot.
     pub variables: Variables,
-    /// The activity currently in flight for this execution. This is a projection convenience used
-    /// by handlers for single-active-state invariants; it is derivable from activity rows and does
-    /// not belong in the event-carried execution entity.
-    pub current_activity: Option<ObjectReference>,
     /// Owned nodes still in flight (active activities / timers / child executions). Completing or
     /// terminating waits for this projection-only set to drain before the terminal `ed` is emitted.
     pub active_children: HashSet<ObjectReference>,
     /// When this row's birth event (the `ExecutionCreated`) landed in the log. Projection-derived
-    /// from the applied entry's [`timestamp`](crate::ApplierContext) — never a local
-    /// `Timestamp::now()` at apply time — so every replica replaying the same entries computes the
-    /// identical value (the timestamp is a deterministic fold of the frozen log record).
+    /// from the applied entry's `timestamp` — never a local `Timestamp::now()` at apply time — so
+    /// every replica replaying the same entries computes the identical value (the timestamp is a
+    /// deterministic fold of the frozen log record).
     pub created_at: Timestamp,
     /// The latest applied entry's timestamp that touched this row; each mutating applier bumps it on
     /// write. Same determinism note as `created_at`.
@@ -55,7 +51,6 @@ impl ExecutionRecord {
         Self {
             value,
             variables: Variables::new(),
-            current_activity: None,
             active_children,
             // Zero-stamped here; a creation applier stamps the real entry timestamp (see
             // `ApplierContext::timestamp`).

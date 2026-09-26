@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use crate::log::Timestamp;
 use crate::types::command::TimerPurpose;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use spica_machinery::Timestamp;
 
 /// Lifecycle status of a Timer. Kept separate from `ExecutionStatus` / `ActivityStatus` because a
 /// timer has a strictly simpler shape — it never initiates its own completion; it is armed by a

@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 spica-asl.workspace = true
+spica-engine-types.workspace = true
 spica-logstream = { workspace = true }
 spica-machinery.workspace = true
 thiserror.workspace = true

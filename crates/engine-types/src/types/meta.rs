@@ -2,7 +2,7 @@
 //!
 //! The object identity model is `(tenant, namespace, kind, name)` plus a `uid` for sameness:
 //!
-//! - The **name layer** ([`ObjectName`], [`PlainName`], [`ScopeName`], [`GeneratedName`]) lives in
+//! - The **name layer** ([`ObjectName`], [`PlainName`], [`ScopeName`], `GeneratedName`) lives in
 //!   the leaf kernel [`spica_machinery::name`] — naming is a pure, engine-agnostic rule (a
 //!   user-supplied segment bans `-`, which is reserved for the system's `generateName` suffix), so
 //!   it belongs in the bottom crate shared by every layer. It is re-exported here so engine users
@@ -15,8 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::log::Timestamp;
 use crate::types::error::{ExecutionError, RuntimeError};
+use spica_machinery::Timestamp;
 
 pub use spica_machinery::name::{ObjectName, PlainName, ScopeName};
 
@@ -88,7 +88,7 @@ impl std::fmt::Display for ObjectKind {
 /// by its execution; a child execution by the container that spawned it). `owner` is the **single
 /// parent edge** for every entity — the former ad-hoc `Execution.parent`/`Activity.parent`/
 /// `Task.parent`/`Timer.parent` handle fields have migrated into it, and the parent is read back
-/// from the reference's [`ObjectKind`](ObjectKind). `root_execution` is a
+/// from the reference's [`ObjectKind`]. `root_execution` is a
 /// separate flat top-of-tree query anchor, **not** the owner (the owner is the direct parent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectMeta {
@@ -102,7 +102,7 @@ pub struct ObjectMeta {
     pub name: ObjectName,
     /// Opaque, system-minted, never-reused incarnation id (k8s `uid`).
     pub uid: ulid::Ulid,
-    /// When the object was born (its creation event landed); see [`Self::born`].
+    /// When the object was born (its creation event landed); see `ObjectMeta::born`.
     pub created_at: Timestamp,
     /// When the object was last updated; see [`Self::with_update_at`].
     pub updated_at: Timestamp,
