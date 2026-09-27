@@ -2759,19 +2759,23 @@ async fn engine_runs_many_create_flow_concurrently() {
 //
 // These exercise the Zeebe-style job contract at the command/handler seam with full control over
 // `worker_id` (the integration harness's in-memory worker hides it). Each test seeds a lone task row
-// and dispatches a single command through the real handler. Only the task row is needed: every
-// settlement guard (`is_activated` + `worker_id` match) returns *before* touching the owning
-// activity, and the beyond-guard emissions (`CompleteState`, the timer sweep) are graceful no-ops on
-// a storage with no activity — so a single row exercises the full guard.
+// and dispatches a single command through the real handler. Only the task row is needed for the
+// guards: every settlement guard (`is_activated` + `worker_id` match) returns *before* touching the
+// owning activity. A test that asserts the *beyond-guard* emission must also seed that activity (see
+// [`seed_owning_activity`]), since the task's settle is handed to the owning activity's container,
+// which reads the activity to decide what the settle means.
 
-/// Seed a `task` row with the given domain state, owning it under a throwaway activity.
+/// Seed a `task` row with the given domain state, owning it under a throwaway activity, and return
+/// that owning activity's reference — the row [`seed_owning_activity`] can seed when a test needs the
+/// settle to reach past the guards.
 async fn seed_task(
     storage: &mut InMemoryStorage,
     task_id: ulid::Ulid,
     status: TaskStatus,
     worker_id: Option<String>,
     lease_expires_at: Option<Timestamp>,
-) {
+) -> spica_engine::ObjectReference {
+    let owner = act_ref();
     storage
         .put_task(spica_engine::TaskRecord {
             value: Task {
@@ -2787,8 +2791,52 @@ async fn seed_task(
                 meta: spica_engine::ObjectMeta::builder(spica_engine::ObjectKind::Task, task_id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .build()
-                    .with_owner(act_ref()),
+                    .with_owner(owner.clone()),
             },
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        })
+        .await
+        .unwrap();
+    owner
+}
+
+/// Seed the `Running` activity row that owns a [`seed_task`] task — the row the owning activity's
+/// container reads to decide a settle. Its own owner is a throwaway thread: nothing on this path reads
+/// the scope above it.
+async fn seed_owning_activity(
+    storage: &mut InMemoryStorage,
+    activity: spica_engine::ObjectReference,
+) {
+    let uid: ulid::Ulid = ulid::Ulid::new();
+    let owner = ObjectReference::new(
+        spica_engine::ObjectKind::Thread,
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(uid.0 as u64),
+        uid,
+    );
+    storage
+        .put_activity(spica_engine::ActivityRecord {
+            value: Activity {
+                execution: spica_engine::ObjectReference::nil(),
+                state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
+                status: ActivityStatus::Running,
+                raw_input: json!({ "x": 1 }),
+                input: Some(json!({ "x": 1 })),
+                raw_output: None,
+                activity_state: None,
+                retry_state: None,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(
+                    spica_engine::ObjectKind::Activity,
+                    activity.uid,
+                )
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .build()
+                .with_owner(owner),
+            },
+            active_children: std::collections::HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
         })
@@ -3095,7 +3143,7 @@ async fn complete_by_foreign_worker_is_rejected() {
 async fn leasing_worker_complete_settles_task() {
     let mut storage = InMemoryStorage::new();
     let task = ulid::Ulid::new();
-    seed_task(
+    let owner = seed_task(
         &mut storage,
         task,
         TaskStatus::Running,
@@ -3103,6 +3151,9 @@ async fn leasing_worker_complete_settles_task() {
         Some(Timestamp::from_millis(1000)),
     )
     .await;
+    // The beyond-guard path runs: the settle reaches the owning activity's container, which needs that
+    // activity row (a `Running` one) to decide the settle means "resume my state".
+    seed_owning_activity(&mut storage, owner).await;
     let request_id = spica_engine::RequestId::new();
     let entries = dispatch_command(
         &storage,
@@ -3140,6 +3191,62 @@ async fn leasing_worker_complete_settles_task() {
             EntryPayload::Command(Command::CompleteState(CompleteState { .. }))
         )),
         "a settled task should resume its state"
+    );
+}
+
+#[tokio::test]
+async fn complete_without_a_live_owning_activity_is_refused() {
+    let mut storage = InMemoryStorage::new();
+    let task = ulid::Ulid::new();
+    // The task is seeded owned by an activity that was never written — the owning row is gone. The
+    // settle has no container to hand itself to, so the handler must answer that *before* it logs a
+    // `TaskCompleted` nothing could resume.
+    seed_task(
+        &mut storage,
+        task,
+        TaskStatus::Running,
+        Some("w1".into()),
+        Some(Timestamp::from_millis(1000)),
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteTask(CompleteTask {
+            task: task_ref(task),
+            worker_id: "w1".into(),
+            output: json!({ "ok": true }),
+            request_id: spica_engine::RequestId::nil(),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "an ownerless settle must produce exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::ProcessingError,
+        "an ownerless settle is an internal fault, not a wrong-state refusal"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskCompleted(_)))),
+        "the terminal event must not be written when nothing can resume it: {entries:?}"
+    );
+    let t = storage.get_task(&task_ref(task)).await.unwrap().unwrap();
+    assert_eq!(
+        t.status,
+        TaskStatus::Running,
+        "a refused settle must leave the task leased for its worker"
     );
 }
 
@@ -3210,7 +3317,7 @@ async fn late_complete_after_a_lapsed_lease_is_accepted() {
     // for a second worker would run it twice. Only a task *taken over* refuses the old worker.
     let mut storage = InMemoryStorage::new();
     let task = ulid::Ulid::new();
-    seed_task(
+    let owner = seed_task(
         &mut storage,
         task,
         TaskStatus::Running,
@@ -3218,6 +3325,9 @@ async fn late_complete_after_a_lapsed_lease_is_accepted() {
         Some(Timestamp::from_millis(1000)),
     )
     .await;
+    // The settle is handed to the owning activity's container, so that row has to exist for the
+    // settle to be accepted at all — this test is about the lease, not about a missing owner.
+    seed_owning_activity(&mut storage, owner).await;
     let entries = dispatch_command(
         &storage,
         Command::CompleteTask(CompleteTask {

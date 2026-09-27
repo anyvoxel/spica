@@ -283,3 +283,45 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 - incident 必须持久(进 state),才能跨重启保留、才能让 `RESOLVE` 按元素状态重放;这与 spica 目前「Reject 不进 projection」是**有意为之**的差异。
 - 若引入运行期 `SetVariables`,需与定案期 `Assign` 明确作用域语义(SetVariables 用 `variableScopeKey` 定位,Assign 只写当前 activity 的 owner scope),避免两套写变量入口语义漂移。
 - `RESOLVE` 重放的是原命令,**必须幂等**(重放条目不得重复入账),与 `TasksClaimed` 的条件折叠同一原则(at-least-once 安全)。
+
+## `TaskTimeout` Timer 的归属:`Activity -> Timer` 还是 `Task -> Timer`
+
+**状态:** 已识别,待评审后再动手(不要未经评审直接改)。倾向**维持现状**(Timer 挂 Activity),另有更小的替代方案;触发条件 = 重试(`TaskTimeout` 按 attempt 重新 arm)真正落地时再评估。
+
+### 问题
+
+一个 `Task` state 今天产出两个子节点,都挂在**同一个 activity** 下:`Activity -> Task`、`Activity -> Timer`(`TimerPurpose::TaskTimeout`,由 `states/task.rs::after_activated` 经 `emit_timer` arm)。因此 timer 不知道自己约束哪一次 task attempt:它 fire 时必须**反过来向 activity 要** in-flight task(`trigger_timer.rs` 的 `TaskTimeout` 臂:`get_children(activity).find(kind == Task)`,找不到就 return)。把 timer 改挂到 Task 下,这两个动作(搜索 + `no in-flight task` 分支)都会消失。问题是代价。
+
+### 现状为什么能工作:归属同时承担了「终结扫荡」职责
+
+- **子边只存在于三种容器行**:`ExecutionRecord` / `ThreadRecord` / `ActivityRecord` 有 `active_children`(`put_child` / `remove_child` 维护),`TaskRecord` **没有** children 集合 —— Task 在模型里是叶子。
+- **三条级联扫荡全靠这条子边**:`terminate_execution.rs`、`terminate_thread.rs`、`terminate_state.rs` 都是「遍历 scope 的 `active_children`,遇 `ObjectKind::Timer` 就 `CancelTimer`」。Timer 挂 Activity ⇒ 任何 scope 终结路径都自动兜住它,不依赖 Task 那条路径做任何事。
+- **命名与 owner 无关**:timer 名来自 `execution.name.base().generated_from_key(seq)`(`handlers/mod.rs::emit_timer`),`Timer::execution` 也是顶层 flat run。所以改挂不影响子边按名匹配,这一点是中立的。
+
+### 改挂 Task 的收益(确实存在)
+
+1. `TaskTimeout` fire 变成直接定位:owner 就是 task,`FailTask` 直出。
+2. **重试更干净**:`states/task.rs` 的 `TODO(M2): re-arm TaskTimeout` 一旦落实,attempt ↔ timer 对应天然唯一。今天同一 activity 下可并存多个 attempt 的 timer,靠的是更宽的规则「task 一 settle 就扫掉 activity 的**所有** timer」。
+
+### 改挂 Task 的代价(四条实打实)
+
+1. **要给 Task 行加 children 集合**:`TaskRecord`、相关 applier、所有写 task 的地方全动,Task 从叶子变容器。
+2. **级联扫荡不再覆盖它**(最关键)。今天「`CancelTask` / `TaskCompleted` / 租约过期 / `terminate_state`」任一路径都由 activity 级一次扫荡兜底;改挂后必须成立新不变式:**每条让 task 终结的路径都扫它自己的 timer**。漏一条就会留下活着的 timer,scheduler 到点触发 `TriggerTimer` 去打一个已不存在的 task(即那堆 late-fire 防御分支要处理的情形)。
+3. **Activity 的 drain 信号变了**。`trigger_timer` 现在特意在「没找到 in-flight task」时仍跑 `child_settled`,注释明写:那正是 cancel 已扫掉 task、只剩已 fire 的 timer 撑住 activity 的场景。改挂后这个 relay 的收敛对象换成 task 的容器,而此刻 task 自身已 terminal/drained,收敛推理要重做。
+4. **容器分发扩容**:Timer 的 owner kind 从 {Execution, Thread, Activity} 变成再加 Task,`cancel_timer` / `trigger_timer` 里的 `if owner.kind != ObjectKind::Activity { return }` 需变成按 kind 分发(`TaskContainer`)。与现有 `Container` 抽象方向一致,但是**新增工作量**,不是改挂的自动结果;且与 `8e0f90f`(把每个 state 的 owner 统一到 Thread)方向相反 —— 那是在收敛「谁拥有子节点」。
+
+### 候选方案:Task 持有自己的 timeout timer 引用(倾向这条)
+
+保留 Timer 挂 Activity,让 **Task 记住自己的 timer**(`Task.timeout_timer: Option<ObjectReference>`,随 `ActivateTask` 一起带去):
+
+- `trigger_timer` 的 `TaskTimeout` 臂 O(1) 拿到 task,搜索与 no-in-flight 分支都删掉;
+- 终结路径按引用**精确**扫那一颗 timer,而非「扫 activity 的所有 timer」;
+- 重试时 attempt ↔ timer 也唯一。
+
+代价仅是 Task 多一个字段(域对象 + 事件 + 测试),不动 storage 子边机制与三条 cascade sweep。(更轻的替代:timer 名由 task 名派生、owner 按名反查 —— 隐式,不推荐。)
+
+### 注意
+
+- 判据一句话:**Timer 的归属应跟着「谁负责终结它」走,而不是跟着「语义上它约束谁」走**。在这套引擎里负责终结它的是 Activity 侧的容器与级联扫荡。ASL 层面 `TimeoutSeconds` 确是 Task state 的字段(且 Task 自身的 `deadline` 已镜像它),但这不构成把 timer 挂到 Task 下的充分理由。
+- 若最终改挂,必须先补齐「Task 终结路径全覆盖扫自身 timer」的清单并逐条验证,再动 storage。
+- 现阶段不做;`Task::claim` / `Task::cancel` / 各 applier 均假定 task 不拥有任何子节点,改动会波及这些不变量。

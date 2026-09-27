@@ -4,8 +4,8 @@ use serde_json::Value;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::id::{FlowName, RequestId};
 use crate::types::meta::{ObjectName, ObjectReference};
-use crate::types::state_path::StatePath;
 use crate::types::task::RetryPolicy;
+use spica_asl::StatePath;
 use spica_machinery::Timestamp;
 
 /// Why an entity (execution or activity) terminated without succeeding.

@@ -22,6 +22,7 @@ use spica_asl::State;
 use spica_machinery::{Clock, CountingIdGenerator, IdGenerator, ManualClock};
 use spica_storage::InMemoryStorage;
 
+use crate::StatePath;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink};
 use crate::handlers::dispatch::build_state_handlers;
@@ -29,7 +30,6 @@ use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::id::EntryId;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
-use crate::types::state_path::StatePath;
 use crate::working::WorkingState;
 use crate::{
     Activity, ActivityState, ActivityStatus, Entry, EntryPayload, Thread, ThreadStatus, Timestamp,
@@ -406,8 +406,8 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
 /// The activity value and the scope variables are read back out of `store` exactly as
 /// `dispatch_child_completed` reads them, so a test seeds the world (see [`seed_container`]) and this
 /// driver only supplies the state definition the production path resolves from the machine document.
-/// That definition lookup (`machine_for_thread` → `resolve_state_for`) is the one seam not exercised
-/// here: it maps a `state_path` into a machine, not into a state's decision.
+/// That definition lookup (`machine_for_thread` → `StateMachine::state_at`) is the one seam not
+/// exercised here: it maps a `state_path` into a machine, not into a state's decision.
 pub async fn child_completed(
     state: &State,
     store: InMemoryStorage,

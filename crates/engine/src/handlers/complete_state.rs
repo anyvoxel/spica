@@ -1,4 +1,3 @@
-use super::resolve_state_for;
 use crate::handler::{Collector, HandlerContext};
 use crate::types::command::CompleteState;
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -70,11 +69,15 @@ impl CompleteStateHandler {
             scope_ref.clone(),
             ctx.machine_for_thread(&thread).await
         );
+        // The state to complete is the one this activity names: its own `state_path` locates the
+        // definition inside the machine the owning thread binds to (a branch/item activity carries
+        // the deeper path, a top-level one `/States/<name>`).
         let state_def = fail_or!(
             out,
             Some(activity.clone()),
             scope_ref.clone(),
-            resolve_state_for(&sm, &thread, &act.value.state_path.state_name()).await
+            sm.state_at(&act.value.state_path)
+                .map_err(ExecutionError::from)
         );
 
         // Every `State` variant has a registered factory (see `build_state_handlers` + the

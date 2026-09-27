@@ -146,11 +146,12 @@ async fn dispatch_child_completed(
         Ok(s) => s,
         Err(_) => return, // definition gone — nothing to decide.
     };
-    let state_def =
-        match super::resolve_state_for(&sm, &thread, &act.value.state_path.state_name()).await {
-            Ok(s) => s,
-            Err(_) => return, // definition gone — nothing to decide.
-        };
+    // The state to replenish is the one this activity names: its own `state_path` locates the
+    // definition inside the machine the owning thread binds to.
+    let state_def = match sm.state_at(&act.value.state_path) {
+        Ok(s) => s,
+        Err(_) => return, // definition gone — nothing to decide.
+    };
     let activity_value = act.value();
     let variables = thread.variables.clone();
     // Every `State` variant has a registered factory (see `build_state_handlers` + the

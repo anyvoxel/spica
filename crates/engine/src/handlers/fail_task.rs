@@ -173,9 +173,8 @@ impl FailTaskHandler {
             _ => return,
         };
         // An activity's owner is always a `Thread` — the derived root Thread for a top-level run, or a
-        // fan-out branch. Resolving it is what lets the state definition be consulted against the
-        // right `state_path`: for a branch, retry/catch then see the per-branch definition at the
-        // pointer location.
+        // fan-out branch. Reading it is what binds the machine revision the task's state (and so its
+        // retry/catch plan) is consulted against.
         let owner = activity
             .value
             .meta
@@ -195,17 +194,17 @@ impl FailTaskHandler {
                 return;
             }
         };
-        let state_def =
-            match super::resolve_state_for(&sm, &thread, &activity.value.state_path.state_name())
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => {
-                    // Definition no longer resolvable — nothing left to consult; terminate.
-                    self.terminate_failure(ctx, out, activity_id, error).await;
-                    return;
-                }
-            };
+        // The state whose `Catch`/`Retry` apply is the one this task activity names: its own
+        // `state_path` locates the definition inside the machine the owning thread binds to — a
+        // branch's per-branch definition, or the top-level one for a root thread.
+        let state_def = match sm.state_at(&activity.value.state_path) {
+            Ok(s) => s,
+            Err(_) => {
+                // Definition no longer resolvable — nothing left to consult; terminate.
+                self.terminate_failure(ctx, out, activity_id, error).await;
+                return;
+            }
+        };
         let State::Task(task_state) = state_def else {
             // A non-Task activity settling a failure can't consult a Task catch; terminate.
             self.terminate_failure(ctx, out, activity_id, error).await;

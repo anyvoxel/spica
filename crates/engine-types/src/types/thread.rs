@@ -4,7 +4,7 @@ use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
-use crate::types::state_path::StatePath;
+use spica_asl::StatePath;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
 /// `Map` item executes.

@@ -24,7 +24,7 @@ impl TerminateExecutionHandler {
         // incarnation guard below) resolves the row regardless of incarnation.
         let probe =
             ObjectReference::new(ObjectKind::Execution, name.clone(), uid.unwrap_or_default());
-        let exec = match super::load_execution(ctx.storage, &probe).await {
+        let exec = match ctx.storage.get_execution(&probe).await {
             Ok(Some(e)) => e,
             Ok(None) => {
                 // Target execution is gone. Refuse with a durable `Reject` — every command must yield

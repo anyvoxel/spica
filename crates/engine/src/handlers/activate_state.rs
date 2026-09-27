@@ -1,4 +1,3 @@
-use super::resolve_state_from_path;
 use crate::handler::{Collector, HandlerContext};
 use crate::types::command::ActivateState;
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -62,11 +61,14 @@ impl ActivateStateHandler {
             execution.clone(),
             ctx.machine_for_thread(&thread).await
         );
+        // `Command::ActivateState` carries the state's full path, so it is self-locating: the
+        // lookup is the document's own walk, and the enclosing `States` table is never inferred
+        // from the owning scope's stored path.
         let state_def = fail_or!(
             out,
             None,
             execution.clone(),
-            resolve_state_from_path(&sm, state_path)
+            sm.state_at(state_path).map_err(ExecutionError::from)
         );
 
         // Every `State` variant has a registered factory (see `build_state_handlers` + the

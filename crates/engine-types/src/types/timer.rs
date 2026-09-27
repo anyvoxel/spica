@@ -54,4 +54,72 @@ impl Timer {
     pub fn reference(&self) -> ObjectReference {
         ObjectReference::new(ObjectKind::Timer, self.meta.name.clone(), self.meta.uid)
     }
+
+    /// Mark this timer cancelled at `at`: the row copies forward with only the terminal status and
+    /// the transition stamp moved.
+    ///
+    /// The whole `meta` must travel unchanged. A timer may be custom-named
+    /// (`{execution.name}-{suffix}`), and re-deriving that name would address a node its owner never
+    /// added as a child — the child edge would then never detach, so the cancelling sweep would leave
+    /// the timer live forever.
+    pub fn cancel(&mut self, at: Timestamp) {
+        self.status = TimerStatus::Cancelled;
+        self.meta.with_update_at(at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::meta::ObjectName;
+
+    fn ts(ms: u64) -> Timestamp {
+        Timestamp::from_millis(ms)
+    }
+
+    /// An `Active` `WaitResume` timer, born at `ts(0)` whose name is **not** the `obj-<uid>` a
+    /// re-derivation would produce — a carried-over name is what the cancel has to preserve.
+    fn active_timer() -> Timer {
+        Timer {
+            meta: ObjectMeta::builder(ObjectKind::Timer, ulid::Ulid::from(7u128))
+                .name(ObjectName::from_parsed("execution-0").expect("a valid object name"))
+                .timestamps(ts(0), ts(0))
+                .build()
+                .with_owner(ObjectReference::nil()),
+            execution: ObjectReference::nil(),
+            purpose: TimerPurpose::WaitResume,
+            status: TimerStatus::Active,
+            deadline: ts(5_000),
+        }
+    }
+
+    /// A cancel moves the status and the transition stamp and nothing else: the identity its owner
+    /// tracks the timer by (`reference` — name and uid together), its deadline, purpose and execution
+    /// all survive, so the applier can still detach the child edge under the name it was added with.
+    #[test]
+    fn cancel_moves_only_the_status_and_the_stamp() {
+        let mut t = active_timer();
+        let before = t.reference();
+        t.cancel(ts(200));
+        assert_eq!(t.status, TimerStatus::Cancelled);
+        assert_eq!(t.meta.created_at, ts(0));
+        assert_eq!(t.meta.updated_at, ts(200));
+        assert_eq!(t.reference(), before);
+        assert!(t.status.is_terminal(), "a cancelled timer is terminal");
+        assert_eq!(t.deadline, ts(5_000));
+        assert_eq!(t.purpose, TimerPurpose::WaitResume);
+        assert_eq!(t.execution, ObjectReference::nil());
+    }
+
+    /// Cancelling an already-cancelled timer is a stamp-only write, never a resurrection — the
+    /// handlers guard on `is_active` before they get here, and this is what that guard protects.
+    #[test]
+    fn a_cancelled_timer_stays_terminal_however_often_it_is_cancelled() {
+        let mut t = active_timer();
+        t.cancel(ts(200));
+        t.cancel(ts(300));
+        assert_eq!(t.status, TimerStatus::Cancelled);
+        assert_eq!(t.meta.updated_at, ts(300), "the later cancel re-stamps");
+        assert!(t.status.is_terminal() && !t.status.is_active());
+    }
 }

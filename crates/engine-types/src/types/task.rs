@@ -215,4 +215,185 @@ impl Task {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => false,
         }
     }
+
+    /// Mark this task claimed: leased to `worker_id` until `lease_expires_at`, stamped as claimed at
+    /// `at`. The single write behind a claim, so every grant leases identically.
+    ///
+    /// No timer is armed for the lease: expiry is decided lazily by whichever poll next observes
+    /// [`Self::is_claimable_at`], so a claim writes no side-effect child and the only durable trace of
+    /// the window is `lease_expires_at` here. The retry backoff gate is spent by the claim — cleared so
+    /// a re-claim after a lapsed lease is immediately claimable rather than inheriting a stale wait.
+    pub fn claim(&mut self, worker_id: &str, lease_expires_at: Timestamp, at: Timestamp) {
+        self.status = TaskStatus::Running;
+        self.worker_id = Some(worker_id.to_string());
+        self.lease_expires_at = Some(lease_expires_at);
+        // `created_at` is already carried on `meta`; only the transition moment moves.
+        self.meta.with_update_at(at);
+        self.retry_state.next_available_at = None;
+    }
+
+    /// Mark this task cancelled at `at`: the row copies forward with only the terminal status and
+    /// the transition stamp moved. The delivery lease is deliberately left as it stands — the worker's
+    /// own call is not disturbed by a cancel, and the terminal status is what withholds the task from
+    /// every future poll.
+    ///
+    /// The whole `meta` must travel unchanged. Re-deriving the name from the kind and uid alone would
+    /// rename the node, and a task's owner matches the child it holds by name — a renamed task never
+    /// drains, so the teardown that cancelled it stalls.
+    pub fn cancel(&mut self, at: Timestamp) {
+        self.status = TaskStatus::Cancelled;
+        self.meta.with_update_at(at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(ms: u64) -> Timestamp {
+        Timestamp::from_millis(ms)
+    }
+
+    /// A task in `status`, born at `ts(0)`, with no lease and no retry gate — each case arms the
+    /// fields it is about.
+    fn at_status(status: TaskStatus) -> Task {
+        Task {
+            meta: ObjectMeta::builder(ObjectKind::Task, ulid::Ulid::new())
+                .timestamps(ts(0), ts(0))
+                .build(),
+            execution: ObjectReference::nil(),
+            resource: "service-a".to_string(),
+            arguments: Value::Null,
+            status,
+            deadline: None,
+            worker_id: None,
+            lease_expires_at: None,
+            retry_plan: Vec::new(),
+            retry_state: RetryState::default(),
+        }
+    }
+
+    /// A `Pending` task is claimable immediately; a retry gate defers it exactly until the gate
+    /// instant — the boundary itself is claimable, since the gate is a *wait-until*, not a
+    /// *wait-past* (a retry may fire the moment its backoff is up).
+    #[test]
+    fn pending_is_claimable_once_its_backoff_gate_is_reached() {
+        let mut t = at_status(TaskStatus::Pending);
+        assert!(
+            t.is_claimable_at(ts(0)),
+            "an ungated task is claimable at once"
+        );
+        t.retry_state.next_available_at = Some(ts(500));
+        assert!(!t.is_claimable_at(ts(499)));
+        assert!(t.is_claimable_at(ts(500)));
+    }
+
+    /// A `Running` task is withheld from every poll until its delivery lease lapses — the boundary
+    /// being claimable is what makes a crashed worker's task recoverable by the next poll. A
+    /// `Running` task carrying no lease is never claimable: it is leased to somebody, with no
+    /// instant at which that lease ends.
+    #[test]
+    fn running_is_claimable_only_once_its_lease_lapses() {
+        let mut t = at_status(TaskStatus::Running);
+        assert!(
+            !t.is_claimable_at(ts(0)),
+            "a Running task with no lease is unclaimable"
+        );
+        t.lease_expires_at = Some(ts(1_000));
+        assert!(!t.is_claimable_at(ts(999)));
+        assert!(t.is_claimable_at(ts(1_000)));
+    }
+
+    /// A settled task is never claimable, however stale its lease and gate look — the terminal
+    /// status is what withholds it, not the fields a claim would have left behind.
+    #[test]
+    fn terminal_tasks_are_never_claimable() {
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut t = at_status(status);
+            t.lease_expires_at = Some(ts(1));
+            t.retry_state.next_available_at = Some(ts(1));
+            assert!(
+                !t.is_claimable_at(ts(10_000)),
+                "{status:?} must not be claimable"
+            );
+        }
+    }
+
+    /// A claim is the whole transition in one write: leased to the worker until the expiry, stamped
+    /// at the claim moment (only `updated_at` moves — the birth stamp is not a claim's to move), and
+    /// the backoff gate is spent by the claim rather than carried into the leased lifetime.
+    #[test]
+    fn claim_leases_stamps_and_spends_the_gate() {
+        let mut t = at_status(TaskStatus::Pending);
+        t.retry_state.next_available_at = Some(ts(500));
+        t.claim("w1", ts(1_000), ts(200));
+        assert_eq!(t.status, TaskStatus::Running);
+        assert_eq!(t.worker_id.as_deref(), Some("w1"));
+        assert_eq!(t.lease_expires_at, Some(ts(1_000)));
+        assert_eq!(t.meta.created_at, ts(0));
+        assert_eq!(t.meta.updated_at, ts(200));
+        assert_eq!(t.retry_state.next_available_at, None);
+    }
+
+    /// The two halves of one contract: a claimed task is exactly what `is_claimable_at` withholds
+    /// until the lease it was just given lapses — and a re-claim moves the lease to the new worker,
+    /// which is how a poll takes over a lapsed lease.
+    #[test]
+    fn a_reclaim_moves_the_lease_and_agrees_with_claimability() {
+        let mut t = at_status(TaskStatus::Running);
+        t.worker_id = Some("stale".to_string());
+        t.lease_expires_at = Some(ts(100));
+        // Lapsed, so a poll may claim it: taking over leaves the new lease and owner behind.
+        assert!(t.is_claimable_at(ts(200)));
+        t.claim("w2", ts(1_000), ts(200));
+        assert_eq!(t.worker_id.as_deref(), Some("w2"));
+        assert_eq!(t.lease_expires_at, Some(ts(1_000)));
+        assert!(!t.is_claimable_at(ts(999)));
+        assert!(t.is_claimable_at(ts(1_000)));
+    }
+
+    /// A cancel moves the status and the transition stamp and nothing else: the identity its owner
+    /// matches the child by (`reference` — name and uid together), the delivery lease, and the retry
+    /// run-state all survive, so the cancelling sweep can still detach the edge it holds.
+    #[test]
+    fn cancel_moves_only_the_status_and_the_stamp() {
+        let mut t = at_status(TaskStatus::Running);
+        t.worker_id = Some("w1".to_string());
+        t.lease_expires_at = Some(ts(1_000));
+        t.retry_state.attempts = 2;
+        let before = t.reference();
+        t.cancel(ts(200));
+        assert_eq!(t.status, TaskStatus::Cancelled);
+        assert_eq!(t.meta.created_at, ts(0));
+        assert_eq!(t.meta.updated_at, ts(200));
+        assert_eq!(t.reference(), before);
+        assert_eq!(
+            t.worker_id.as_deref(),
+            Some("w1"),
+            "the worker's own call is not disturbed by a cancel"
+        );
+        assert_eq!(t.lease_expires_at, Some(ts(1_000)));
+        assert_eq!(t.retry_state.attempts, 2);
+    }
+
+    /// A cancelled task is terminal, so no poll may ever grant it again — including the poll that
+    /// would otherwise see the still-recorded lease lapse. The terminal status outranks the lease
+    /// fields a claim left behind.
+    #[test]
+    fn a_cancelled_task_is_terminal_and_never_claimable() {
+        let mut t = at_status(TaskStatus::Running);
+        t.claim("w1", ts(1_000), ts(0));
+        assert!(!t.is_claimable_at(ts(999)));
+        t.cancel(ts(200));
+        assert!(t.status.is_terminal());
+        assert!(
+            !t.is_claimable_at(ts(1_000)),
+            "a lapsed lease must not free a cancelled task"
+        );
+        assert!(!t.is_claimable_at(ts(10_000)));
+    }
 }

@@ -16,14 +16,15 @@ macro_rules! fail_or {
 
 mod activate_state;
 mod activate_task;
-mod assign_task;
 mod cancel_task;
 mod cancel_timer;
 mod child_completed;
+mod claim_tasks;
 mod complete_execution;
 mod complete_state;
 mod complete_task;
 mod complete_thread;
+pub(crate) mod container;
 mod continue_;
 mod create_execution;
 mod create_flow;
@@ -39,9 +40,9 @@ mod trigger_timer;
 
 pub use activate_state::ActivateStateHandler;
 pub use activate_task::ActivateTaskHandler;
-pub use assign_task::ClaimTasksHandler;
 pub use cancel_task::CancelTaskHandler;
 pub use cancel_timer::CancelTimerHandler;
+pub use claim_tasks::ClaimTasksHandler;
 pub use complete_execution::CompleteExecutionHandler;
 pub use complete_state::CompleteStateHandler;
 pub use complete_task::CompleteTaskHandler;
@@ -58,11 +59,10 @@ pub use trigger_timer::TriggerTimerHandler;
 
 pub(crate) use dispatch::{build_state_handlers, dispatch_command};
 
-use std::collections::HashMap;
-
 use serde_json::Value;
-use spica_asl::{AssignObject, StateMachine};
+use spica_asl::AssignObject;
 
+use crate::StatePath;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
@@ -73,197 +73,9 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::meta::{ObjectKind, ObjectReference};
-use crate::types::state_path::StatePath;
 use crate::{Activity, ActivityStatus};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
-
-/// Resolves a state definition by name from the state machine.
-pub(super) fn resolve_state<'a>(
-    sm: &'a StateMachine,
-    state_name: &str,
-) -> Result<&'a spica_asl::State, ExecutionError> {
-    sm.states
-        .get(state_name)
-        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string())))
-}
-
-/// Resolve a `States` table (a `HashMap<String, State>`) within the shared machine document by a
-/// JSON Pointer of the form `/States` (the machine's own top-level table), or
-/// `/States/<P>/Branches/<i>/States/<P2>/Branches/<j>/States…` for a `Parallel`, or
-/// `/States/<M>/ItemProcessor/States/<P>/Branches/<i>/…` for a `Map` — the exact pointers a thread
-/// carries. Each descent names the container state and the child of it the run descends into (a
-/// `Parallel` branch index, or the `Map`'s single `ItemProcessor`), then that child's `States`
-/// opener; the walk lands on the deepest table in one pass (arbitrary nesting depth). Any mix of
-/// `Parallel` and `Map` steps composes naturally because every step yields a `States` table of the
-/// same type. The tokens are the document's own keys (the constants on [`StatePath`]), compared
-/// case-sensitively: a path recorded against a differently-spelled key is malformed, not a
-/// silently different table.
-///
-/// The machine document stays a **single shared instance** — this walk only *locates* a table inside
-/// it, never copies child state. That is what makes each child execution self-resolving: it carries
-/// a small flat pointer, so resolving its own state never needs to query its parent or the root.
-///
-/// Iteration runs over the pointer's already-decoded tokens ([`jsonptr::Pointer::tokens`] unescapes
-/// `~0`/`~1` for us), so a state name containing `/` or `~` resolves exactly as RFC 6901 intends.
-fn resolve_states_map<'a>(
-    sm: &'a StateMachine,
-    pointer: &jsonptr::Pointer,
-) -> Result<&'a HashMap<String, spica_asl::State>, ExecutionError> {
-    use spica_asl::State as S;
-    let tokens: Vec<jsonptr::Token<'_>> = pointer.tokens().collect();
-    let mut states: &HashMap<String, S> = &sm.states;
-    let mut i = 0usize;
-    loop {
-        // A pointer with nothing left names the table the walk currently stands on. Two shapes land
-        // here: the empty pointer of a thread recorded before this pointer spelled out its `States`
-        // opener (still read, so an old log replays), and the tail of every descent below — the
-        // opener is what a pointer ends *on*, so the table it names is simply where it stopped.
-        if i >= tokens.len() {
-            return Ok(states);
-        }
-        // Each descent begins with the `States` opener naming a container state.
-        if tokens[i].decoded().as_ref() != StatePath::STATES {
-            return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                format!(
-                    "state_path malformed: expected '{}', got '{}'",
-                    StatePath::STATES,
-                    tokens[i].decoded()
-                ),
-            )));
-        }
-        i += 1; // consumed the "States" opener
-        // The opener with nothing behind it *is* the target: `/States` is the machine's top-level
-        // table, `/States/<P>/Branches/<i>/States` that branch's.
-        if i >= tokens.len() {
-            return Ok(states);
-        }
-        let name = tokens[i].decoded();
-        let state = states.get(name.as_ref()).ok_or_else(|| {
-            ExecutionError::Runtime(RuntimeError::StateNotFound(name.as_ref().to_string()))
-        })?;
-        i += 1; // consumed <name>
-        match state {
-            // A `Parallel` descent names a branch: `Branches/<idx>`, whose `States` opener the next
-            // iteration consumes. Consumes `Branches` + <idx>.
-            S::Parallel(p) => {
-                // `Cow<str> == &str` compares the decoded token against the constant without building
-                // a borrowed reference to a temporary.
-                if !tokens
-                    .get(i)
-                    .is_some_and(|t| t.decoded() == StatePath::BRANCHES)
-                {
-                    return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        format!("state_path malformed: expected '{}'", StatePath::BRANCHES),
-                    )));
-                }
-                let idx: usize = tokens
-                    .get(i + 1)
-                    .ok_or_else(|| {
-                        ExecutionError::Runtime(RuntimeError::StateNotFound(
-                            "state_path truncated at branch index".into(),
-                        ))
-                    })?
-                    .decoded()
-                    .parse()
-                    .map_err(|_| {
-                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                            "state_path branch index is not an integer".into(),
-                        ))
-                    })?;
-                let branch = p.branches.get(idx).ok_or_else(|| {
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "branch index {idx} of state {name}"
-                    )))
-                })?;
-                i += 2; // consumed "Branches" + <idx>
-                states = &branch.states;
-            }
-            // A `Map` descent names its single `ItemProcessor` (no index): every item runs the same
-            // processor, so the pointer names the `ItemProcessor` token and its `States` opener the
-            // next iteration consumes. Consumes `ItemProcessor` only.
-            S::Map(m) => {
-                if !tokens
-                    .get(i)
-                    .is_some_and(|t| t.decoded() == StatePath::ITEM_PROCESSOR)
-                {
-                    return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        format!(
-                            "state_path malformed: expected '{}'",
-                            StatePath::ITEM_PROCESSOR
-                        ),
-                    )));
-                }
-                let processor = m.item_processor.as_ref().ok_or_else(|| {
-                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
-                        "Map state '{name}' has no ItemProcessor"
-                    )))
-                })?;
-                i += 1; // consumed "ItemProcessor"
-                states = &processor.states;
-            }
-            // Any other state type cannot be descended into — the pointer must always name a child
-            // of a container state.
-            _ => {
-                return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                    format!("state_path step '{name}' is not a Parallel or Map state"),
-                )));
-            }
-        }
-        // Loop: the next token is either another `States` opener (a nested container) or the pointer
-        // ended — in which case the next iteration returns this child's states.
-    }
-}
-
-/// Resolve a state definition for the thread owning the current activity, honoring that thread's
-/// `state_path`: a `Parallel`-branch / `Map`-item child resolves its state within the shared machine
-/// at the pointer location (one flat lookup, no parent/root query), and a top-level run's root thread
-/// names the machine's own top-level `States` (`/States`), so it lands on the same table through the
-/// same walk. The caller passes the [`ThreadRecord`](crate::storage::ThreadRecord) it already read —
-/// no second storage read.
-pub(super) async fn resolve_state_for<'a>(
-    sm: &'a StateMachine,
-    thread: &crate::storage::ThreadRecord,
-    state_name: &str,
-) -> Result<&'a spica_asl::State, ExecutionError> {
-    let states = resolve_states_map(sm, thread.value.state_path.as_ptr())?;
-    states
-        .get(state_name)
-        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(state_name.to_string())))
-}
-
-/// Resolve a state definition by its full `state_path` (a JSON Pointer from the machine root to the
-/// state: `/States/<name>` for a top-level state, or `/States/.../Branches/<idx>/States/<name>` for
-/// a branch / item). The carried path makes `Command::ActivateState` self-locating — the lookup no
-/// longer infers the enclosing `States` table from the owning scope's stored `state_path`. A
-/// top-level path is exactly `/States/<leaf>` (two tokens) and maps to the machine root; any deeper
-/// path's parent is a container's `States` table, resolved via `resolve_states_map`.
-pub(crate) fn resolve_state_from_path<'a>(
-    sm: &'a StateMachine,
-    state_path: &StatePath,
-) -> Result<&'a spica_asl::State, ExecutionError> {
-    let leaf = state_path.state_name();
-    if state_path.tokens().count() == 2 {
-        // `/States/<leaf>` — a top-level state, resolved against the machine's top-level `States`.
-        return resolve_state(sm, &leaf);
-    }
-    let mut parent = state_path.as_ptr().to_owned();
-    parent.pop_back();
-    let states = resolve_states_map(sm, parent.as_ptr())?;
-    states
-        .get(&leaf)
-        .ok_or_else(|| ExecutionError::Runtime(RuntimeError::StateNotFound(leaf)))
-}
-
-/// Loads the owning [`crate::storage::ExecutionRecord`] for a state-ish command. Returns `Ok(None)` when
-/// the owning node is gone (already terminal) — the caller treats that as an idempotent no-op rather
-/// than a failure.
-pub(super) async fn load_execution<S: crate::storage::ReadonlyStorageTxn + ?Sized>(
-    storage: &S,
-    execution: &ObjectReference,
-) -> Result<Option<crate::storage::ExecutionRecord>, ExecutionError> {
-    storage.get_execution(execution).await
-}
 
 /// Direct a terminal failure (or abort) at the scope that owns the given activity: a top-level run is
 /// an `Execution` (name+uid-addressed `TerminateExecution`), while a `Parallel` branch / `Map` item
@@ -329,24 +141,10 @@ pub(super) async fn cancel_activity_timers(
         if t.value.status != crate::TimerStatus::Active {
             continue; // already terminal — a fired/cancelled timer is no longer a live child.
         }
-        out.append_event(crate::types::event::Event::TimerCancelled {
-            timer: crate::Timer {
-                execution: t.value.execution.clone(),
-                purpose: t.value.purpose,
-                status: crate::TimerStatus::Cancelled,
-                deadline: t.value.deadline,
-                // Carry the timer's full meta (name/uid/created_at/owner) forward. A timer may be
-                // custom-named (`{execution.name}-{suffix}`); reconstructing it via
-                // `placeholder_with_times` would re-derive `obj-<uid>` and break the child-edge
-                // removal. Stamp the cancel moment as `updated_at`.
-                meta: {
-                    let mut m = t.value.meta.clone();
-                    m.with_update_at(ctx.now());
-                    m
-                },
-            },
-        })
-        .await;
+        let mut timer_value = t.value.clone();
+        timer_value.cancel(ctx.now());
+        out.append_event(crate::types::event::Event::TimerCancelled { timer: timer_value })
+            .await;
     }
 }
 

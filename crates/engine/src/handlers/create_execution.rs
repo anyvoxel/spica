@@ -1,10 +1,10 @@
 use crate::RejectionType;
+use crate::StatePath;
 use crate::handler::{Collector, HandlerContext};
 use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
-use crate::types::state_path::StatePath;
 
 /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
 /// arms the state-machine `TimeoutSeconds` timer if configured. Immediately enters the start state
