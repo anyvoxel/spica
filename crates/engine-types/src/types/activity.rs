@@ -9,8 +9,8 @@ use spica_machinery::Timestamp;
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
 use crate::types::command::TerminationReason;
-use crate::types::state_path::StatePath;
 use crate::types::task::RetryState;
+use spica_asl::StatePath;
 
 /// Lifecycle status of an Activity — the execution of a single state within an Execution.
 ///

@@ -18,6 +18,7 @@ pub use spica_machinery::Timestamp;
 pub use storage::{
     ActivityRecord, ExecutionRecord, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
 };
+pub use types::StatePath;
 pub use types::activity::{
     Activity, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
     WaitActivityState,
@@ -40,7 +41,6 @@ pub use types::meta::{
     ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName, ScopeName,
 };
 pub use types::reject::{Reject, RejectionType};
-pub use types::state_path::StatePath;
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
 pub use types::thread::{Thread, ThreadStatus};
 pub use types::timer::{Timer, TimerStatus};

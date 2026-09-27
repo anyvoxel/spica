@@ -188,3 +188,18 @@ impl From<spica_machinery::NameError> for ExecutionError {
         ExecutionError::Runtime(RuntimeError::InvalidDefinition(e.to_string()))
     }
 }
+
+// A failed walk over a machine document (`spica_asl::StateMachine::state_at`) reached
+// with `?` in the engine's definition lookups. The error's own two variants carry the split the
+// engine has always drawn for a bad path — a descent that cannot be spelled at all is a definition
+// defect, while one naming a state the document lacks is a missing state — and its message is
+// already the engine's own phrasing, so it passes through unrewritten.
+impl From<spica_asl::StatePathError> for ExecutionError {
+    fn from(e: spica_asl::StatePathError) -> Self {
+        use spica_asl::StatePathError;
+        ExecutionError::Runtime(match e {
+            StatePathError::Malformed(msg) => RuntimeError::InvalidDefinition(msg),
+            StatePathError::NotFound(msg) => RuntimeError::StateNotFound(msg),
+        })
+    }
+}

@@ -19,8 +19,11 @@ pub mod id;
 #[allow(dead_code)]
 pub mod meta;
 pub mod reject;
-pub mod state_path;
 pub mod task;
 pub mod thread;
 pub mod timer;
 pub mod variables;
+
+// The `States`-hierarchy pointer type is defined in `spica_asl`, next to the walk that resolves it,
+// and re-exported here so the domain values below keep spelling it under this crate's vocabulary.
+pub use spica_asl::StatePath;

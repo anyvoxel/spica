@@ -616,8 +616,8 @@ mod tests {
     use serde_json::Value;
 
     use super::super::dispatch::build_state_handlers;
+    use crate::StatePath;
     use crate::types::meta::{ObjectKind, ObjectReference};
-    use crate::types::state_path::StatePath;
     use crate::{Activity, ActivityStatus};
 
     /// A minimal empty `Activity` sufficient to dispatch an object-safe lifecycle hook — the create

@@ -22,26 +22,13 @@ impl CancelTimerHandler {
             Ok(None) | Err(_) => return,
         };
         if act.value.status != TimerStatus::Active {
+            // TODO：应该返回一个 Reject，而不是直接静默掉，或者再次重试
             return; // already finished; duplicate cancel is a no-op.
         }
-        out.append_event(Event::TimerCancelled {
-            timer: crate::Timer {
-                execution: act.value.execution.clone(),
-                purpose: act.value.purpose,
-                status: crate::TimerStatus::Cancelled,
-                deadline: act.value.deadline,
-                // Carry the timer's full meta (name/uid/created_at/owner) forward. A timer may be
-                // custom-named (`{execution.name}-{suffix}`); reconstructing it via
-                // `placeholder_with_times` would re-derive `obj-<uid>` and break the child-edge
-                // removal. Stamp the cancel moment as `updated_at`.
-                meta: {
-                    let mut m = act.value.meta.clone();
-                    m.with_update_at(ctx.now());
-                    m
-                },
-            },
-        })
-        .await;
+        let mut timer_value = act.value.clone();
+        timer_value.cancel(ctx.now());
+        out.append_event(Event::TimerCancelled { timer: timer_value })
+            .await;
         super::child_completed::child_settled(
             ctx,
             out,

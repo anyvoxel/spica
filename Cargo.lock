@@ -1550,6 +1550,7 @@ name = "spica-asl"
 version = "0.1.0"
 dependencies = [
  "jsonata-core",
+ "jsonptr",
  "serde",
  "serde_json",
  "serde_with",

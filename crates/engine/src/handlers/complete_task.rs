@@ -1,8 +1,8 @@
 use crate::TaskStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::types::command::{Command, CompleteState, CompleteTask};
+use crate::handlers::container::{ActivityContainer, Container};
+use crate::types::command::CompleteTask;
 use crate::types::event::{Event, TaskCompleted};
-use crate::types::meta::ObjectKind;
 use crate::types::reject::RejectionType;
 
 /// Handles `CompleteTask`: a worker reported its claimed task **completed** (Zeebe `CompleteJob`).
@@ -20,9 +20,12 @@ use crate::types::reject::RejectionType;
 /// `Reject`, so the state advances exactly once even under Zeebe's at-least-once re-claims — and the
 /// rejected worker is told *why* instead of hitting a silent no-op.
 ///
-/// On success it emits `TaskCompleted` and resumes the owning state via `CompleteState` (its
-/// `complete` runs the success projection and routes to `Next`/`End`). A *failed* settlement belongs
-/// to `FailTaskHandler` (`Command::FailTask`), which owns the `Retry`/`Catch`/terminate policy.
+/// On success it emits `TaskCompleted` and hands the settle to the owning activity's container, which
+/// resumes the state via `CompleteState` (its `complete` runs the success projection and routes to
+/// `Next`/`End`); that container is resolved *before* the event is emitted, so a task whose owning
+/// activity is gone is refused rather than logged as a settle nothing can resume. A *failed*
+/// settlement belongs to `FailTaskHandler` (`Command::FailTask`), which owns the
+/// `Retry`/`Catch`/terminate policy.
 #[derive(Default)]
 pub struct CompleteTaskHandler;
 
@@ -95,14 +98,19 @@ impl CompleteTaskHandler {
             .owner
             .clone()
             .expect("a completed task is always owned by an activity");
-        if activity_id.kind != ObjectKind::Activity {
+        // The container is resolved *before* anything is emitted: a task's settle has no meaning apart
+        // from the activity it resumes, so an ownerless settle is refused here — while the worker is
+        // still waiting on an answer — rather than discovered as a no-op after `TaskCompleted` is
+        // already on the log, which would strand the owning state with nothing left to resume it.
+        let Some(container) = ActivityContainer::open(ctx.storage, activity_id.clone()).await
+        else {
             out.reject(
                 *request_id,
                 RejectionType::ProcessingError,
-                format!("task {} has no activity owner; internal fault", task),
+                format!("task {task} has no live activity owner {activity_id}; internal fault"),
             );
             return;
-        }
+        };
 
         // Emit the completed task entity (lease cleared, status terminal) and resume the owning Task
         // state's `complete`. The concrete output travels alongside (feeds the activity's raw_output).
@@ -124,12 +132,10 @@ impl CompleteTaskHandler {
         // The activity's own `TaskTimeout` child needs no sweep here: the Task state declares it
         // supervisory, so the base complete step cancels it before it finishes. (A claim leaves no
         // child at all — the delivery lease is a field on the task, not a timer.)
-        out.append_command(Command::CompleteState(CompleteState {
-            activity: activity_id,
-            // The Task's raw result is the worker's payload (its `raw_output` / `$states.result`).
-            // Carrying it on the command makes the complete step self-contained and the log
-            // self-describing, independent of the `TaskCompleted` projection fold.
-            output: output.clone(),
-        }));
+        //
+        // The settle is handed to the activity that owns the task rather than acted on here: what a
+        // settled task means for its owner is the owner's business, so the child only names its owner
+        // and the owner's container decides.
+        container.after_child_completed(ctx, out, task).await;
     }
 }

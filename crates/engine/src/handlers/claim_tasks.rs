@@ -1,9 +1,6 @@
 use std::time::Duration;
 
-use crate::Task;
-use crate::TaskStatus;
 use crate::handler::{Collector, HandlerContext};
-use crate::log::Timestamp;
 use crate::types::command::ClaimTasks;
 use crate::types::event::{Event, TasksClaimed};
 use crate::types::meta::ObjectKind;
@@ -46,6 +43,7 @@ impl ClaimTasksHandler {
         // on arrival — absurd for a pull).
         let now = ctx.now();
         let Some(lease_expires_at) = now.checked_add(Duration::from_secs(*lease_seconds)) else {
+            // TODO：发生这种情况的话，应该回复一个 Reject，而不是直接静默掉
             out.append_event(Event::TasksClaimed(TasksClaimed {
                 request_id: *request_id,
                 tasks: Vec::new(),
@@ -64,6 +62,7 @@ impl ClaimTasksHandler {
             // Discovery is a read; a failure here leaves the pull with nothing granted — the empty
             // debt is still answered, rather than failing the whole worker loop.
             Err(_) => {
+                // TODO：应该返回一个 Reject，而不是直接静默掉
                 out.append_event(Event::TasksClaimed(TasksClaimed {
                     request_id: *request_id,
                     tasks: Vec::new(),
@@ -84,7 +83,11 @@ impl ClaimTasksHandler {
             {
                 continue;
             }
-            claimed.push(emit_lease(t.value, worker_id, lease_expires_at, out).await);
+            let mut value = t.value;
+            // The claim moment is the very reading the lease window was computed from, so the row's
+            // transition stamp and its `lease_expires_at` share one base.
+            value.claim(worker_id, lease_expires_at, now);
+            claimed.push(value);
         }
         // One batched claim fact for the whole poll — every appended `ClaimTasks` answers its awaiting
         // caller with a durable `TasksClaimed` (all entries share this single causal batch).
@@ -94,26 +97,4 @@ impl ClaimTasksHandler {
         }))
         .await;
     }
-}
-
-/// Mark `task_value` claimed (leased to `worker_id` until `lease_expires_at`). The `ClaimTasks` handler
-/// uses it so every claim leases identically. No timer is armed for the lease: expiry is decided
-/// lazily by whichever poll next observes [`Task::is_claimable_at`], so a claim writes no side-effect
-/// child and the only durable trace of the window is `lease_expires_at` on the task itself. Returns the
-/// mutated claim value for the handler to collect into its single batched `TasksClaimed`.
-async fn emit_lease(
-    mut task_value: Task,
-    worker_id: &str,
-    lease_expires_at: Timestamp,
-    out: &mut Collector<'_>,
-) -> Task {
-    task_value.status = TaskStatus::Running;
-    task_value.worker_id = Some(worker_id.to_string());
-    task_value.lease_expires_at = Some(lease_expires_at);
-    // Stamp the claim moment; `created_at` is already carried on `task_value`.
-    task_value.meta.with_update_at(out.now());
-    // Claimed — the backoff gate is spent (cleared so a later re-claim after a lapsed lease is
-    // immediately claimable rather than inheriting a stale waiting period).
-    task_value.retry_state.next_available_at = None;
-    task_value
 }

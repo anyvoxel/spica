@@ -70,9 +70,9 @@ async fn finish_activity_via_state(
     let Ok(sm) = ctx.machine_for_thread(&thread).await else {
         return DeferredFinish::Unresolvable;
     };
-    let Ok(state_def) =
-        super::resolve_state_for(&sm, &thread, &activity_value.state_path.state_name()).await
-    else {
+    // The state to finish is the one this activity names — its own `state_path` locates the
+    // definition inside the machine the owning thread binds to.
+    let Ok(state_def) = sm.state_at(&activity_value.state_path) else {
         return DeferredFinish::Unresolvable;
     };
     let Some(handler) = ctx.state_handlers.create(state_def) else {

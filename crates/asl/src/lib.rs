@@ -10,6 +10,7 @@ mod map;
 mod parallel;
 mod pass;
 mod retry;
+mod state_path;
 mod succeed;
 mod task;
 mod utils;
@@ -30,6 +31,7 @@ pub use map::{
 pub use parallel::{Branch, ParallelState};
 pub use pass::PassState;
 pub use retry::Retrier;
+pub use state_path::{StatePath, StatePathError};
 pub use succeed::SucceedState;
 pub use task::{TaskHeartbeatSeconds, TaskState, TaskTimeoutSeconds};
 pub use utils::{IntOrExpr, JsonataExpr};
