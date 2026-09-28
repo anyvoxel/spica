@@ -1,8 +1,7 @@
 use crate::RejectionType;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
-use crate::types::id::RequestId;
 use crate::types::meta::{ObjectKind, ObjectReference};
 
 /// Handles `TerminateExecution`: begins the abnormal finish of a running execution with `reason`.
@@ -18,27 +17,25 @@ impl TerminateExecutionHandler {
         p: &TerminateExecution,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let TerminateExecution { name, uid, reason } = p;
         // Storage keys executions by name, so a name-only probe (the uid, when present, doubles as the
         // incarnation guard below) resolves the row regardless of incarnation.
         let probe =
             ObjectReference::new(ObjectKind::Execution, name.clone(), uid.unwrap_or_default());
-        let exec = match ctx.storage.get_execution(&probe).await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                // Target execution is gone. Refuse with a durable `Reject` — every command must yield
-                // a followup entry (an event sequence or a Reject), never a silent no-op return.
-                out.reject(
-                    RequestId::nil(),
+        let exec = match ctx.storage.get_execution(&probe).await? {
+            Some(e) => e,
+            None => {
+                // Target execution is gone. Refuse the command — the leader records the single
+                // followup entry (an `Event` sequence or a `Reject`) every command must yield, so
+                // this is a *returned* refusal rather than a silent no-op. Returned rather than
+                // recorded in-band because nothing was emitted before the decision: the batch this
+                // dispatch would have produced is empty, and the refusal is the whole outcome.
+                return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!("terminate_execution: execution {name} not found"),
-                );
-                return;
+                ));
             }
-            // An infrastructure (storage) fault is not a command-level refusal — the fold errors out
-            // rather than recording a misleading Reject.
-            Err(_) => return,
         };
         let exec_ref = exec.reference();
 
@@ -48,30 +45,26 @@ impl TerminateExecutionHandler {
         if let Some(want) = uid
             && want != &exec_ref.uid
         {
-            out.reject(
-                RequestId::nil(),
+            return Err(ProcessingError::Rejected(
                 RejectionType::StateConflict,
                 format!(
                     "terminate_execution: execution {name} is incarnation {}, not {want}",
                     exec_ref.uid
                 ),
-            );
-            return;
+            ));
         }
 
         if !exec.status.is_running() {
             // Not running (already terminal, or Completing/Terminating): the draining pipeline has
             // already decided this execution's outcome — its eventual event wins. Refuse with a
             // durable Reject (the command still gets its followup entry) rather than swallowing.
-            out.reject(
-                RequestId::nil(),
+            return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "terminate_execution: execution {name} is {:?}, not running",
                     exec.status
                 ),
-            );
-            return;
+            ));
         }
 
         let mut terminating_execution = exec.value();
@@ -144,5 +137,7 @@ impl TerminateExecutionHandler {
                 "execution terminating deferred: waiting on owned children"
             );
         }
+
+        Ok(())
     }
 }

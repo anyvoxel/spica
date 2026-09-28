@@ -1,5 +1,5 @@
 use crate::TimerStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::event::Event;
 use crate::types::meta::ObjectReference;
 
@@ -16,14 +16,14 @@ impl CancelTimerHandler {
         timer: &ObjectReference,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
-        let act = match ctx.storage.get_timer(timer).await {
-            Ok(Some(t)) => t,
-            Ok(None) | Err(_) => return,
+    ) -> Result<(), ProcessingError> {
+        let act = match ctx.storage.get_timer(timer).await? {
+            Some(t) => t,
+            None => return Ok(()), // never armed — nothing to cancel.
         };
         if act.value.status != TimerStatus::Active {
             // TODO：应该返回一个 Reject，而不是直接静默掉，或者再次重试
-            return; // already finished; duplicate cancel is a no-op.
+            return Ok(()); // already finished; duplicate cancel is a no-op.
         }
         let mut timer_value = act.value.clone();
         timer_value.cancel(ctx.now());
@@ -40,5 +40,7 @@ impl CancelTimerHandler {
             timer.clone(),
         )
         .await;
+
+        Ok(())
     }
 }

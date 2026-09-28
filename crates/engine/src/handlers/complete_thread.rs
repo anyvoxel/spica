@@ -1,5 +1,5 @@
 use crate::ThreadStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
 use crate::types::meta::ObjectKind;
@@ -23,16 +23,16 @@ impl CompleteThreadHandler {
         p: &CompleteThread,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let CompleteThread { thread, output } = p;
         // Addressed by kind: `CompleteThread` is only ever dispatched for a `Thread`, so the row is
         // read directly.
-        let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
-            return; // gone, or unreadable (the fold errors out) — nothing to complete.
+        let Some(thread_row) = ctx.storage.get_thread(thread).await? else {
+            return Ok(()); // gone already — nothing to complete.
         };
         let thread_ref = thread_row.reference();
         if !thread_row.value.status.is_running() {
-            return; // idempotency: already finishing or terminal.
+            return Ok(()); // idempotency: already finishing or terminal.
         }
 
         let mut completing_thread = thread_row.value();
@@ -80,5 +80,7 @@ impl CompleteThreadHandler {
                 "thread completing deferred: waiting on owned children"
             );
         }
+
+        Ok(())
     }
 }

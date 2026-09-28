@@ -1,7 +1,7 @@
 //! `CreateFlow` command handler: creates a **brand-new flow** with its first version.
 
 use crate::RejectionType;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::CreateFlow;
 use crate::types::event::{Event, FlowCreated, FlowVersionCreated};
 use crate::types::flow::Flow;
@@ -38,7 +38,7 @@ impl CreateFlowHandler {
         p: &CreateFlow,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let CreateFlow {
             request_id,
             name,
@@ -62,7 +62,7 @@ impl CreateFlowHandler {
                 RejectionType::InvalidArgument,
                 format!("create_flow: malformed definition for flow {name}"),
             );
-            return;
+            return Ok(());
         }
 
         // `CreateFlow` creates a **new** flow only. The `Engine` boundary rejects an existing name
@@ -79,7 +79,7 @@ impl CreateFlowHandler {
                 RejectionType::AlreadyExists,
                 format!("create_flow: flow {name} already exists"),
             );
-            return;
+            return Ok(());
         }
 
         // Assign the durable identity (the handler is the sole identity-assigner): both the flow and
@@ -146,5 +146,7 @@ impl CreateFlowHandler {
             },
         });
         out.append_event(version_event).await;
+
+        Ok(())
     }
 }

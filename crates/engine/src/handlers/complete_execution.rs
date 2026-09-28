@@ -1,5 +1,5 @@
 use crate::ExecutionStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
@@ -22,28 +22,26 @@ impl CompleteExecutionHandler {
         p: &CompleteExecution,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let CompleteExecution { execution, output } = p;
         // Addressed by kind: `CompleteExecution` is only ever dispatched for a top-level `Execution`,
         // so the row is read directly.
-        let exec = match ctx.storage.get_execution(execution).await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
+        // A fault reading the row is not a decision about this command — it is returned so the leader
+        // can retry it; a *missing* row still fails the execution in place, as it always has.
+        let exec = match ctx.storage.get_execution(execution).await? {
+            Some(e) => e,
+            None => {
                 out.fail_execution(
                     execution.clone(),
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                         "execution {execution}"
                     ))),
                 );
-                return;
-            }
-            Err(e) => {
-                out.fail_execution(execution.clone(), e);
-                return;
+                return Ok(());
             }
         };
         if !exec.value.status.is_running() {
-            return; // idempotency: already finishing or terminal.
+            return Ok(()); // idempotency: already finishing or terminal.
         }
 
         let mut completing_execution = exec.value();
@@ -82,6 +80,8 @@ impl CompleteExecutionHandler {
                 "execution completing deferred: waiting on owned children"
             );
         }
+
+        Ok(())
     }
 }
 

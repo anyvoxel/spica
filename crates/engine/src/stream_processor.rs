@@ -746,14 +746,20 @@ mod tests {
     use spica_storage::InMemoryStorage;
     use tokio::sync::Mutex;
 
+    use crate::TerminationReason;
     use crate::engine::NoopHook;
+    use crate::leader::MAX_COMMAND_ATTEMPTS;
     use crate::log::{InMemoryLogStream, Timestamp};
-    use crate::types::command::CreateFlow;
+    use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord, TimerRecord};
+    use crate::types::command::{CompleteTask, CreateFlow, TerminateExecution};
+    use crate::types::error::InfraError;
+    use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
     use crate::types::meta::{
         ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName,
     };
+    use crate::types::reject::RejectionType;
 
     use super::*;
 
@@ -1000,6 +1006,423 @@ mod tests {
                 .definition,
             "the residue folded once",
             "no double fold"
+        );
+    }
+
+    /// A store that hands every dispatch a transaction whose row reads can be made to **fault** — the
+    /// infrastructure failure the leader's retry-or-refuse decision is about — and counts them, so a
+    /// test can see how many attempts one command was given.
+    ///
+    /// The fault is injected at the *transaction*, not the store: a handler reads rows through the
+    /// working overlay the leader opens over [`Storage::begin_txn`], so a fault on the store's own
+    /// reads would never be reached by a dispatch. Every other operation passes through.
+    struct FaultingStorage {
+        inner: InMemoryStorage,
+        /// Whether every row read faults (see [`FaultingTxn::read`]).
+        fail_reads: bool,
+        /// How many row reads dispatches asked for — one per attempt that reached a read. Handed to
+        /// each transaction, so a test can hold a clone and read the count after the store is boxed
+        /// away behind the driver's `dyn Storage` handles.
+        reads: Arc<StdMutex<usize>>,
+    }
+
+    impl FaultingStorage {
+        fn new(fail_reads: bool) -> Self {
+            Self {
+                inner: InMemoryStorage::new(),
+                fail_reads,
+                reads: Arc::new(StdMutex::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Storage for FaultingStorage {
+        async fn get_execution(
+            &self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+            self.inner.get_execution(reference).await
+        }
+        async fn get_thread(
+            &self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ThreadRecord>, ExecutionError> {
+            self.inner.get_thread(reference).await
+        }
+        async fn get_activity(
+            &self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ActivityRecord>, ExecutionError> {
+            self.inner.get_activity(reference).await
+        }
+        async fn get_timer(
+            &self,
+            reference: &ObjectReference,
+        ) -> Result<Option<TimerRecord>, ExecutionError> {
+            self.inner.get_timer(reference).await
+        }
+        async fn get_task(
+            &self,
+            reference: &ObjectReference,
+        ) -> Result<Option<TaskRecord>, ExecutionError> {
+            self.inner.get_task(reference).await
+        }
+        async fn get_children(
+            &self,
+            id: ObjectReference,
+        ) -> Result<std::collections::HashSet<ObjectReference>, ExecutionError> {
+            self.inner.get_children(id).await
+        }
+        async fn activatable_tasks(
+            &self,
+            resource: &str,
+            now: Timestamp,
+            limit: usize,
+        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+            self.inner.activatable_tasks(resource, now, limit).await
+        }
+        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+            self.inner.put_execution(exec).await
+        }
+        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+            self.inner.put_thread(thread).await
+        }
+        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+            self.inner.put_activity(act).await
+        }
+        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+            self.inner.put_timer(timer).await
+        }
+        async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+            self.inner.put_task(task).await
+        }
+        async fn remove_child(
+            &mut self,
+            parent: ObjectReference,
+            child: ObjectReference,
+        ) -> Result<(), ExecutionError> {
+            self.inner.remove_child(parent, child).await
+        }
+        async fn add_child(
+            &mut self,
+            parent: ObjectReference,
+            child: ObjectReference,
+        ) -> Result<(), ExecutionError> {
+            self.inner.add_child(parent, child).await
+        }
+        async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+            self.inner.get_flow_by_name(name).await
+        }
+        async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+            self.inner.put_flow(flow).await
+        }
+        async fn get_flow_version(
+            &self,
+            version: &ObjectReference,
+        ) -> Result<Option<FlowVersion>, ExecutionError> {
+            self.inner.get_flow_version(version).await
+        }
+        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), ExecutionError> {
+            self.inner.put_flow_version(version).await
+        }
+        async fn flow_version_of(
+            &self,
+            name: FlowName,
+            version: u32,
+        ) -> Result<Option<FlowVersion>, ExecutionError> {
+            self.inner.flow_version_of(name, version).await
+        }
+        /// The one intercepted operation: the transaction the leader folds into is where handlers
+        /// read, so the fault has to be installed here to be reachable by a dispatch at all.
+        fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
+            Ok(Box::new(FaultingTxn {
+                inner: self.inner.begin_txn()?,
+                fail_reads: self.fail_reads,
+                reads: Arc::clone(&self.reads),
+            }))
+        }
+        async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
+            self.inner.last_processed_position().await
+        }
+        async fn put_last_processed_position(
+            &mut self,
+            position: i64,
+        ) -> Result<(), ExecutionError> {
+            self.inner.put_last_processed_position(position).await
+        }
+        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+            self.inner.next_generated_seq().await
+        }
+    }
+
+    /// [`FaultingStorage`]'s transaction: every row read is counted, and answers with an injected
+    /// infrastructure fault when the store is set to fail them — a store that cannot answer is what a
+    /// dispatch cannot decide around, so the leader retries it and eventually refuses the command over
+    /// it. Everything else (the fold's writes, and the commit) passes through.
+    struct FaultingTxn {
+        inner: Box<dyn StorageTxn>,
+        fail_reads: bool,
+        reads: Arc<StdMutex<usize>>,
+    }
+
+    impl FaultingTxn {
+        fn read(&mut self) -> Result<(), ExecutionError> {
+            *self.reads.lock().expect("the read counter is unpoisoned") += 1;
+            if self.fail_reads {
+                return Err(ExecutionError::Infra(InfraError::Log(
+                    "injected storage fault".to_string(),
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl StorageTxn for FaultingTxn {
+        async fn get_execution(
+            &mut self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.get_execution(reference).await
+        }
+        async fn get_thread(
+            &mut self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ThreadRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.get_thread(reference).await
+        }
+        async fn get_activity(
+            &mut self,
+            reference: &ObjectReference,
+        ) -> Result<Option<ActivityRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.get_activity(reference).await
+        }
+        async fn get_timer(
+            &mut self,
+            reference: &ObjectReference,
+        ) -> Result<Option<TimerRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.get_timer(reference).await
+        }
+        async fn get_task(
+            &mut self,
+            reference: &ObjectReference,
+        ) -> Result<Option<TaskRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.get_task(reference).await
+        }
+        async fn get_children(
+            &mut self,
+            id: ObjectReference,
+        ) -> Result<std::collections::HashSet<ObjectReference>, ExecutionError> {
+            self.read()?;
+            self.inner.get_children(id).await
+        }
+        async fn activatable_tasks(
+            &mut self,
+            resource: &str,
+            now: Timestamp,
+            limit: usize,
+        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+            self.read()?;
+            self.inner.activatable_tasks(resource, now, limit).await
+        }
+        async fn get_flow_by_name(
+            &mut self,
+            name: FlowName,
+        ) -> Result<Option<Flow>, ExecutionError> {
+            self.read()?;
+            self.inner.get_flow_by_name(name).await
+        }
+        async fn get_flow_version(
+            &mut self,
+            version: &ObjectReference,
+        ) -> Result<Option<FlowVersion>, ExecutionError> {
+            self.read()?;
+            self.inner.get_flow_version(version).await
+        }
+        async fn flow_version_of(
+            &mut self,
+            name: FlowName,
+            version: u32,
+        ) -> Result<Option<FlowVersion>, ExecutionError> {
+            self.read()?;
+            self.inner.flow_version_of(name, version).await
+        }
+        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+            self.inner.put_execution(exec).await
+        }
+        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+            self.inner.put_thread(thread).await
+        }
+        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+            self.inner.put_activity(act).await
+        }
+        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+            self.inner.put_timer(timer).await
+        }
+        async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+            self.inner.put_task(task).await
+        }
+        async fn remove_child(
+            &mut self,
+            parent: ObjectReference,
+            child: ObjectReference,
+        ) -> Result<(), ExecutionError> {
+            self.inner.remove_child(parent, child).await
+        }
+        async fn add_child(
+            &mut self,
+            parent: ObjectReference,
+            child: ObjectReference,
+        ) -> Result<(), ExecutionError> {
+            self.inner.add_child(parent, child).await
+        }
+        async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+            self.inner.put_flow(flow).await
+        }
+        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), ExecutionError> {
+            self.inner.put_flow_version(version).await
+        }
+        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+            self.inner.next_generated_seq().await
+        }
+        async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
+            self.inner.put_next_generated_seq(seq).await
+        }
+        fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
+            self.inner.commit(watermark)
+        }
+    }
+
+    /// A worker settling a task it never got. `request_id` is the id its awaiter is keyed by, so the
+    /// refusal the leader records must echo it back or the worker hangs on an acks that never lands.
+    fn complete_task_cmd(request_id: RequestId) -> Command {
+        Command::CompleteTask(CompleteTask {
+            request_id,
+            task: ObjectReference::new(
+                ObjectKind::Task,
+                ObjectName::plain("task_0").expect("a static literal is a valid object name"),
+                ulid::Ulid::nil(),
+            ),
+            worker_id: "w1".to_string(),
+            output: serde_json::json!({}),
+        })
+    }
+
+    /// The leader installs the role and returns it, for a test that drives commands directly.
+    fn leader_of(sp: &mut StreamProcessor) -> &mut Leader {
+        let StateMachine::Leader(leader) = &mut sp.state_machine else {
+            panic!("test requires the leader role")
+        };
+        leader
+    }
+
+    /// A dispatch whose reads fault is an infrastructure failure, not the command's: the leader
+    /// re-dispatches it up to the attempt budget and, that exhausted, records the single `Reject`
+    /// every command must yield — echoing the awaiting worker's own `request_id`.
+    #[tokio::test]
+    async fn a_faulted_dispatch_is_retried_then_refused_once() {
+        let store = FaultingStorage::new(true);
+        let reads = Arc::clone(&store.reads);
+        let storage: Arc<Mutex<Box<dyn Storage>>> = Arc::new(Mutex::new(Box::new(store)));
+        let handles = handles(Arc::clone(&storage));
+        let request_id = RequestId::new();
+
+        let mut sp = StreamProcessor::new();
+        let produced = leader_of(&mut sp)
+            .process_command(EntryId::new(1), &complete_task_cmd(request_id), &handles)
+            .await
+            .expect("a store that cannot read is the command's failure, not the driver's");
+        produced
+            .work
+            .commit(None)
+            .await
+            .expect("the refusal folds through the store's write path");
+
+        assert_eq!(
+            *reads.lock().expect("the read counter is unpoisoned"),
+            MAX_COMMAND_ATTEMPTS as usize,
+            "each of the {MAX_COMMAND_ATTEMPTS} attempts must have reached the faulting read"
+        );
+        assert_eq!(
+            produced.entries.len(),
+            1,
+            "a failed attempt's batch is dropped, leaving only the refusal: {:?}",
+            produced.entries
+        );
+        let EntryPayload::Reject(reject) = &produced.entries[0].payload else {
+            panic!(
+                "the outcome of an exhausted dispatch is a Reject: {:?}",
+                produced.entries
+            );
+        };
+        assert_eq!(
+            reject.request_id, request_id,
+            "the refusal wakes its awaiter"
+        );
+        assert_eq!(reject.rejection_type, RejectionType::ProcessingError);
+        assert!(
+            reject
+                .rejection_reason
+                .contains(&format!("all {MAX_COMMAND_ATTEMPTS} attempts")),
+            "the durable record must say why nothing was produced: {}",
+            reject.rejection_reason
+        );
+        assert!(
+            reject.rejection_reason.contains("injected storage fault"),
+            "the underlying fault is carried into the reason: {}",
+            reject.rejection_reason
+        );
+    }
+
+    /// A refusal the handler decided is not worth a second attempt: the command's own state will not
+    /// change between attempts, so the leader records its single `Reject` after exactly one dispatch.
+    #[tokio::test]
+    async fn a_refused_command_is_not_retried() {
+        let store = FaultingStorage::new(false);
+        let reads = Arc::clone(&store.reads);
+        let storage: Arc<Mutex<Box<dyn Storage>>> = Arc::new(Mutex::new(Box::new(store)));
+        let handles = handles(Arc::clone(&storage));
+
+        let mut sp = StreamProcessor::new();
+        // No execution row is seeded, so the handler refuses on its first read.
+        let cmd = Command::TerminateExecution(TerminateExecution {
+            name: ObjectName::plain("absent").expect("a static literal is a valid object name"),
+            uid: None,
+            reason: TerminationReason::Cancelled,
+        });
+        let produced = leader_of(&mut sp)
+            .process_command(EntryId::new(2), &cmd, &handles)
+            .await
+            .expect("a refusal is an outcome, not a driver error");
+        produced
+            .work
+            .commit(None)
+            .await
+            .expect("the refusal folds through the store's write path");
+
+        assert_eq!(
+            *reads.lock().expect("the read counter is unpoisoned"),
+            1,
+            "a refusal decided by the command's own state must not be re-dispatched"
+        );
+        assert_eq!(produced.entries.len(), 1, "{:?}", produced.entries);
+        let EntryPayload::Reject(reject) = &produced.entries[0].payload else {
+            panic!(
+                "the outcome of a refusal is a Reject: {:?}",
+                produced.entries
+            );
+        };
+        assert_eq!(reject.rejection_type, RejectionType::NotFound);
+        assert_eq!(
+            reject.request_id,
+            RequestId::nil(),
+            "an internal command has nobody awaiting it"
         );
     }
 }

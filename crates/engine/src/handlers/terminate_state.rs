@@ -1,4 +1,4 @@
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{
     Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
@@ -18,11 +18,11 @@ impl TerminateStateHandler {
         p: &TerminateState,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let TerminateState { activity, reason } = p;
-        let act = match ctx.storage.get_activity(activity).await {
-            Ok(Some(a)) => a,
-            Ok(None) | Err(_) => return, // gone already; nothing to terminate.
+        let act = match ctx.storage.get_activity(activity).await? {
+            Some(a) => a,
+            None => return Ok(()), // gone already; nothing to terminate.
         };
         // Status dispatch before the normal path. Anything other than Running is a duplicate —
         // another handler already claimed the close. The Fail + TerminateExecution cascade
@@ -62,15 +62,15 @@ impl TerminateStateHandler {
                     activity.clone(),
                 )
                 .await;
-                return;
+                return Ok(());
             }
             S::Completed => {
                 // A terminated-after-complete duplicate: the completer's drain is in flight.
-                return;
+                return Ok(());
             }
             // Terminating is mid-sweep: a terminate is already in flight, so a second one here is a
             // duplicate — swallow it (the in-flight sweep owns the drain).
-            S::Terminating(_) => return,
+            S::Terminating(_) => return Ok(()),
         }
         let _ = TerminationReason::Cancelled; // referenced above
 
@@ -169,5 +169,7 @@ impl TerminateStateHandler {
                 "state terminating deferred: waiting on owned children"
             );
         }
+
+        Ok(())
     }
 }

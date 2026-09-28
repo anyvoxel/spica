@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ClaimTasks;
 use crate::types::event::{Event, TasksClaimed};
 use crate::types::meta::ObjectKind;
@@ -29,7 +29,7 @@ impl ClaimTasksHandler {
         p: &ClaimTasks,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let ClaimTasks {
             request_id,
             worker_id,
@@ -49,7 +49,7 @@ impl ClaimTasksHandler {
                 tasks: Vec::new(),
             }))
             .await;
-            return;
+            return Ok(());
         };
         // Discover claimable tasks of `resource` under the command arm's storage lock — the same
         // snapshot the fold writes against — so allocation is decided against authoritative state.
@@ -68,7 +68,7 @@ impl ClaimTasksHandler {
                     tasks: Vec::new(),
                 }))
                 .await;
-                return;
+                return Ok(());
             }
         };
         let mut claimed = Vec::new();
@@ -96,5 +96,7 @@ impl ClaimTasksHandler {
             tasks: claimed,
         }))
         .await;
+
+        Ok(())
     }
 }

@@ -444,6 +444,39 @@ pub enum Command {
     ContinueTerminate { owner: ObjectReference },
 }
 
+impl Command {
+    /// The correlation id a **client-originated** command carries, if any: the id whose success
+    /// `Event` (or `Reject`) tells the awaiting caller this command's outcome. `None` for an internal
+    /// follow-up command — the engine's own `ActivateState`/timer traffic has nobody waiting on it.
+    ///
+    /// A dispatch that produces no outcome must still answer its caller, and the caller is keyed by
+    /// this id (see the `Hook`-driven acknowledgement path), so a refusal the engine decides *around*
+    /// the command — rather than in its handler — reads it from here.
+    pub fn request_id(&self) -> Option<RequestId> {
+        match self {
+            Command::CreateFlow(p) => Some(p.request_id),
+            Command::CreateExecution(p) => Some(p.request_id),
+            Command::ClaimTasks(p) => Some(p.request_id),
+            Command::CompleteTask(p) => Some(p.request_id),
+            Command::SpawnThread(_)
+            | Command::CompleteExecution(_)
+            | Command::CompleteThread(_)
+            | Command::TerminateExecution(_)
+            | Command::TerminateThread(_)
+            | Command::ActivateState(_)
+            | Command::CompleteState(_)
+            | Command::TerminateState(_)
+            | Command::ActivateTask(_)
+            | Command::FailTask(_)
+            | Command::TriggerTimer { .. }
+            | Command::CancelTimer { .. }
+            | Command::CancelTask { .. }
+            | Command::ContinueComplete { .. }
+            | Command::ContinueTerminate { .. } => None,
+        }
+    }
+}
+
 /// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s dispatch and is a
 /// placeholder for later per-state `TimeoutSeconds` (M2).
 ///

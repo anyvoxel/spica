@@ -1,7 +1,7 @@
 use crate::RetryState;
 use crate::Task;
 use crate::TaskStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ActivateTask;
 use crate::types::event::Event;
 
@@ -26,7 +26,7 @@ impl ActivateTaskHandler {
         p: &ActivateTask,
         _ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let ActivateTask {
             execution,
             owner,
@@ -66,5 +66,7 @@ impl ActivateTaskHandler {
             },
         })
         .await;
+
+        Ok(())
     }
 }

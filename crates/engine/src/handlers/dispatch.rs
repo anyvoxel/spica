@@ -11,7 +11,7 @@ use super::{
     CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, SpawnThreadHandler,
     TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler, TriggerTimerHandler,
 };
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::Command;
 
 /// Registers one or more `StateHandlerFactory`s into the shared [`StateHandlerRegistry`].
@@ -56,11 +56,15 @@ pub(crate) fn build_state_handlers() -> StateHandlerRegistry {
 /// `else unreachable!` narrowing a handler used to do on a generic `&Command` is now a compile-time
 /// guarantee: each arm hands the handler exactly its own payload/fields, and a new variant fails to
 /// compile here rather than panicking at runtime.
+///
+/// The handler's [`ProcessingError`] is the residual "no outcome was produced" case — every arm's own
+/// decision (an emitted batch, or a refusal recorded in-band) is a success — so it passes through
+/// untouched for the leader to classify.
 pub(crate) async fn dispatch_command(
     command: &Command,
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-) {
+) -> Result<(), ProcessingError> {
     match command {
         Command::CreateFlow(p) => CreateFlowHandler.handle(p, ctx, out).await,
         Command::CreateExecution(p) => CreateExecutionHandler.handle(p, ctx, out).await,
