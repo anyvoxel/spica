@@ -12,7 +12,8 @@
 //! so this hop is where its projection and `Next`/`End` routing actually run (see
 //! [`finish_activity_via_state`]).
 
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::error::ExecutionError;
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, ObjectReference};
 
@@ -20,16 +21,19 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 /// node up to its owner as one hop ([`child_completed::child_settled`]) — which issues the next
 /// Continue command (or replenishes a Running container) rather than recursing. The Continue-issue
 /// invariant guarantees `node` is drained-and-finishing here, so a real terminal is always emitted.
+///
+/// A hop that could not even read the row it was told to close produced no outcome for the `Continue`
+/// command, so its fault is returned rather than swallowed (see [`ProcessingError`]).
 pub(crate) async fn finish_node(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     node: &ObjectReference,
-) {
+) -> Result<(), ProcessingError> {
     match node.kind {
         ObjectKind::Activity => Box::pin(finish_activity(ctx, out, node)).await,
         ObjectKind::Thread => Box::pin(finish_thread(ctx, out, node)).await,
         ObjectKind::Execution => Box::pin(finish_execution(ctx, out, node)).await,
-        _ => {}
+        _ => Ok(()),
     }
 }
 
@@ -56,7 +60,7 @@ async fn finish_activity_via_state(
     out: &mut Collector<'_>,
     node: &ObjectReference,
     act: &crate::storage::ActivityRecord,
-) -> DeferredFinish {
+) -> Result<DeferredFinish, ProcessingError> {
     let activity_value = act.value();
     let owner = activity_value
         .meta
@@ -64,19 +68,25 @@ async fn finish_activity_via_state(
         .clone()
         .expect("an owned activity has an owner");
     // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
-    let Ok(Some(thread)) = ctx.storage.get_thread(&owner).await else {
-        return DeferredFinish::Unresolvable;
+    // A **read** fault is the dispatch's, not the finish's — it is returned so the leader can retry the
+    // hop — while a missing row, definition, or handler is a real unresolvable (closed generically by
+    // the caller). Only the read separates the two; `machine_for_thread` mixes a missing definition
+    // (domain) with the storage fault underneath it, so its `Infra` is split out explicitly.
+    let Some(thread) = ctx.storage.get_thread(&owner).await? else {
+        return Ok(DeferredFinish::Unresolvable);
     };
-    let Ok(sm) = ctx.machine_for_thread(&thread).await else {
-        return DeferredFinish::Unresolvable;
+    let sm = match ctx.machine_for_thread(&thread).await {
+        Ok(sm) => sm,
+        Err(ExecutionError::Infra(e)) => return Err(ProcessingError::Unexpected(e.into())),
+        Err(_) => return Ok(DeferredFinish::Unresolvable),
     };
     // The state to finish is the one this activity names — its own `state_path` locates the
     // definition inside the machine the owning thread binds to.
     let Ok(state_def) = sm.state_at(&activity_value.state_path) else {
-        return DeferredFinish::Unresolvable;
+        return Ok(DeferredFinish::Unresolvable);
     };
     let Some(handler) = ctx.state_handlers.create(state_def) else {
-        return DeferredFinish::Unresolvable; // no registered handler — engine regression.
+        return Ok(DeferredFinish::Unresolvable); // no registered handler — engine regression.
     };
     let variables = thread.variables.clone();
     if let Err(e) = handler
@@ -89,28 +99,30 @@ async fn finish_activity_via_state(
             "deferred state finish failed; terminating the activity"
         );
         out.terminate(Some(node.clone()), activity_value.execution.clone(), e);
-        return DeferredFinish::Terminated;
+        return Ok(DeferredFinish::Terminated);
     }
-    DeferredFinish::Handled
+    Ok(DeferredFinish::Handled)
 }
 
 async fn finish_activity(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     node: &ObjectReference,
-) {
+) -> Result<(), ProcessingError> {
     use crate::ActivityStatus;
-    let Some(act) = ctx.storage.get_activity(node).await.ok().flatten() else {
-        return;
+    // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
+    // "already closed", which this hop answers with nothing.
+    let Some(act) = ctx.storage.get_activity(node).await? else {
+        return Ok(());
     };
     if !act.active_children.is_empty() {
-        return; // not drained — defers to whichever settle triggers the Continue instead.
+        return Ok(()); // not drained — defers to whichever settle triggers the Continue instead.
     }
     match &act.value.status {
         ActivityStatus::Completing => {
-            match finish_activity_via_state(ctx, out, node, &act).await {
+            match finish_activity_via_state(ctx, out, node, &act).await? {
                 DeferredFinish::Handled => {}
-                DeferredFinish::Terminated => return,
+                DeferredFinish::Terminated => return Ok(()),
                 DeferredFinish::Unresolvable => {
                     // Defensive fallback: use the activity's raw result when present, otherwise the
                     // state's processed input remains the default output.
@@ -138,7 +150,7 @@ async fn finish_activity(
             })
             .await;
         }
-        _ => return, // not finishing — nothing to continue.
+        _ => return Ok(()), // not finishing — nothing to continue.
     }
     if let Some(owner) = act.value.meta.owner.clone() {
         Box::pin(super::child_completed::child_settled(
@@ -149,19 +161,22 @@ async fn finish_activity(
         ))
         .await;
     }
+    Ok(())
 }
 
 async fn finish_thread(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     node: &ObjectReference,
-) {
+) -> Result<(), ProcessingError> {
     use crate::types::thread::ThreadStatus;
-    let Some(thread) = ctx.storage.get_thread(node).await.ok().flatten() else {
-        return;
+    // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
+    // "already closed", which this hop answers with nothing.
+    let Some(thread) = ctx.storage.get_thread(node).await? else {
+        return Ok(());
     };
     if !thread.active_children.is_empty() {
-        return;
+        return Ok(());
     }
     match &thread.status {
         ThreadStatus::Completing => {
@@ -184,7 +199,7 @@ async fn finish_thread(
             })
             .await;
         }
-        _ => return,
+        _ => return Ok(()),
     }
     if let Some(owner) = thread.value.meta.owner.clone() {
         Box::pin(super::child_completed::child_settled(
@@ -195,19 +210,22 @@ async fn finish_thread(
         ))
         .await;
     }
+    Ok(())
 }
 
 async fn finish_execution(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     node: &ObjectReference,
-) {
+) -> Result<(), ProcessingError> {
     use crate::ExecutionStatus;
-    let Some(exec) = ctx.storage.get_execution(node).await.ok().flatten() else {
-        return;
+    // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
+    // "already closed", which this hop answers with nothing.
+    let Some(exec) = ctx.storage.get_execution(node).await? else {
+        return Ok(());
     };
     if !exec.active_children.is_empty() {
-        return;
+        return Ok(());
     }
     match &exec.status {
         ExecutionStatus::Completing => {
@@ -230,7 +248,7 @@ async fn finish_execution(
             })
             .await;
         }
-        _ => return,
+        _ => return Ok(()),
     }
     if let Some(owner) = exec.value.meta.owner.clone() {
         Box::pin(super::child_completed::child_settled(
@@ -241,6 +259,7 @@ async fn finish_execution(
         ))
         .await;
     }
+    Ok(())
 }
 
 /// Handles `Command::ContinueComplete`: emits the drained owner's success terminal on this round,
@@ -254,8 +273,8 @@ impl ContinueCompleteHandler {
         owner: &ObjectReference,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
-        finish_node(ctx, out, owner).await;
+    ) -> Result<(), ProcessingError> {
+        finish_node(ctx, out, owner).await
     }
 }
 
@@ -269,7 +288,7 @@ impl ContinueTerminateHandler {
         owner: &ObjectReference,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
-        finish_node(ctx, out, owner).await;
+    ) -> Result<(), ProcessingError> {
+        finish_node(ctx, out, owner).await
     }
 }

@@ -17,14 +17,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use spica_asl::StateMachine;
 use spica_machinery::{Clock, IdGenerator};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::applier::{ApplierContext, dispatch_event};
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext, OverlaySink};
+use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
 use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::handlers::{build_state_handlers, dispatch_command};
 use crate::log::{Entry, EntryPayload, Timestamp};
@@ -33,9 +34,27 @@ use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::types::id::EntryId;
+use crate::types::id::{EntryId, RequestId};
 use crate::types::meta::ObjectReference;
+use crate::types::reject::RejectionType;
 use crate::working::WorkingState;
+
+/// How many times one command's dispatch may be attempted before an unexpected failure is given up
+/// on and the command refused (see [`Leader::process_command`]). A fixed, small budget: each attempt
+/// re-runs the whole dispatch, and a failure that survives three attempts is a persistent condition
+/// rather than a transient one.
+pub(crate) const MAX_COMMAND_ATTEMPTS: u32 = 3;
+
+/// The first retry's backoff, doubling per attempt. Time enters the engine as an input the caller
+/// controls (see [`Clock`]) — but this delay is a real wait between attempts, not a decision read
+/// off the clock, so it is a fixed schedule rather than a `Timestamp` comparison.
+const COMMAND_RETRY_BACKOFF_MS: u64 = 50;
+
+/// The backoff before attempt `attempt + 1` — doubling, so a persistent fault is probed at widening
+/// intervals instead of hammering the backend that is failing.
+fn command_retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(COMMAND_RETRY_BACKOFF_MS << (attempt - 1))
+}
 
 /// The leader processing state machine: owns the per-version machine cache, the eval environment, the
 /// event applier, the resume watermark, and the deferred acknowledgement queue. All of it is
@@ -119,8 +138,21 @@ impl Leader {
             definitions: &mut self.definitions,
             state_handlers: &self.state_handlers,
         };
-        dispatch_command(command, &mut ctx, &mut out).await;
-        Ok(out.into_entries())
+        // A single-shot dispatch is synchronous by contract — the caller reads the entries straight
+        // back — so nothing is retried here: an engine fault is surfaced to the caller (who drives
+        // the retry by dispatching again), and a refusal is already recorded in-band.
+        match dispatch_command(command, &mut ctx, &mut out).await {
+            Ok(()) => Ok(out.into_entries()),
+            Err(ProcessingError::Unexpected(e)) => Err(e),
+            Err(ProcessingError::Rejected(ty, reason)) => {
+                out.reject(
+                    command.request_id().unwrap_or_else(RequestId::nil),
+                    ty,
+                    reason,
+                );
+                Ok(out.into_entries())
+            }
+        }
     }
 }
 
@@ -132,54 +164,149 @@ impl Leader {
         self.watermark = position;
     }
 
+    /// Advance a command to its outcome: dispatch it, and — where that produced none — apply this
+    /// leader's **policy** to the classification it returned ([`ProcessingError`] itself says only
+    /// *whose* failure it was, never what to do about it).
+    ///
+    /// Policy: an **unexpected** failure came out of the engine's own machinery, which makes it worth
+    /// another attempt, so the same command is re-dispatched up to [`MAX_COMMAND_ATTEMPTS`] times with
+    /// a doubling backoff; one that survives the budget is given up on and the command refused with
+    /// [`RejectionType::ProcessingError`]. A **refusal** ([`ProcessingError::Rejected`]) is decided by
+    /// the command's own state, so re-dispatching could only repeat it — it is refused immediately.
+    ///
+    /// Either way a refusal is recorded as the command's **single** response entry, so the engine's
+    /// *every command has a subsequent entry* invariant holds even for a dispatch that produced
+    /// nothing: the awaiting caller is woken by [`Collector::reject`]'s record rather than left
+    /// hanging on a silent return. The failed attempt's own batch is dropped unappended (its working
+    /// txn was never committed), so the refusal is recorded on a fresh batch.
+    ///
+    /// Kept off the caller's stack: the driver's `?` sees only the unexpected failures of the
+    /// *engine* (a store that cannot even open the refusal's transaction), which are not the command's.
     pub(crate) async fn process_command(
         &mut self,
         entry_id: EntryId,
         command: &Command,
         handles: &ProcessingHandles,
     ) -> Result<CommandProcessed, ExecutionError> {
-        let (entries, work) = {
-            // Acquire Storage only for the duration of this command's dispatch (per-entry, not for
-            // the whole run), so the Engine's other threads can read projection state — e.g.
-            // `Engine::start_for` resolving the latest revision — while the driver sits between
-            // entries.
-            //
-            // The working txn is opened inside the Storage lock and returned to the driver *outside*
-            // it: `WorkingState` owns the txn (wrapped in its own mutex), so committing after the
-            // durable append does not need the Storage lock.
-            let storage_guard = handles.storage.lock().await;
-            let mut env_g = self.env.lock().await;
-            let work = WorkingState::new((**storage_guard).begin_txn()?);
-            let overlay = OverlaySink::new(&work);
-            let mut out = Collector::new(
-                entry_id,
-                Some(overlay),
-                Arc::clone(&self.clock),
-                Arc::clone(&self.ids),
-            );
-            let mut ctx = HandlerContext {
-                env: &mut env_g,
-                storage: &work,
-                clock: Arc::clone(&self.clock),
-                ids: Arc::clone(&self.ids),
-                definitions: &mut self.definitions,
-                state_handlers: &self.state_handlers,
-            };
-            dispatch_command(command, &mut ctx, &mut out).await;
-            let entries = out.into_parts();
-            // Record the produced Events for the driver's `after_commit` once this batch is durable
-            // (the Zeebe post-commit report). Set here rather than in `apply_batch` (which no longer
-            // exists on the live path): the fold happened eagerly at `append_event` time.
-            self.last_applied = entries
-                .iter()
-                .filter_map(|e| match &e.payload {
-                    EntryPayload::Event(ev) => Some(ev.clone()),
-                    _ => None,
-                })
-                .collect();
-            (entries, work)
+        let mut attempt = 1u32;
+        loop {
+            match self.dispatch_once(entry_id, command, handles).await {
+                Ok(produced) => return Ok(produced),
+                Err(err) if err.is_unexpected() && attempt < MAX_COMMAND_ATTEMPTS => {
+                    let backoff = command_retry_backoff(attempt);
+                    warn!(
+                        entry_id = entry_id.get(),
+                        attempt,
+                        max_attempts = MAX_COMMAND_ATTEMPTS,
+                        backoff_ms = backoff.as_millis(),
+                        error = %err.rejection_reason(),
+                        "command dispatch failed on the engine's side; retrying"
+                    );
+                    // Between attempts, never inside one: the storage lock and the working txn are
+                    // per-attempt (see `dispatch_once`), so a backoff stalls no reader.
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+                Err(err) => return self.reject_command(entry_id, command, handles, &err).await,
+            }
+        }
+    }
+
+    /// Dispatch `command` once, over a **fresh** working overlay and under the Storage lock held only
+    /// for this attempt — see [`Self::process_command`] for the retry that wraps it.
+    ///
+    /// The lock is taken per-entry (not for the whole run) so the Engine's other threads can read
+    /// projection state — e.g. `Engine::start_for` resolving the latest revision — while the driver
+    /// sits between entries, and the working txn is returned to the driver *outside* it:
+    /// `WorkingState` owns the txn (wrapped in its own mutex), so committing after the durable append
+    /// does not need the Storage lock.
+    async fn dispatch_once(
+        &mut self,
+        entry_id: EntryId,
+        command: &Command,
+        handles: &ProcessingHandles,
+    ) -> Result<CommandProcessed, ProcessingError> {
+        let storage_guard = handles.storage.lock().await;
+        let mut env_g = self.env.lock().await;
+        let work = WorkingState::new((**storage_guard).begin_txn()?);
+        let overlay = OverlaySink::new(&work);
+        let mut out = Collector::new(
+            entry_id,
+            Some(overlay),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.ids),
+        );
+        let mut ctx = HandlerContext {
+            env: &mut env_g,
+            storage: &work,
+            clock: Arc::clone(&self.clock),
+            ids: Arc::clone(&self.ids),
+            definitions: &mut self.definitions,
+            state_handlers: &self.state_handlers,
         };
+        // On the fault path the batch is dropped uncommitted: `out` (and with it every entry the
+        // attempt emitted before the fault) and `work` both go out of scope, so nothing durable — and
+        // nothing in `last_applied` — survives an attempt that produced no outcome.
+        dispatch_command(command, &mut ctx, &mut out).await?;
+        let entries = out.into_parts();
+        // Record the produced Events for the driver's `after_commit` once this batch is durable
+        // (the Zeebe post-commit report). Set here rather than in `apply_batch` (which no longer
+        // exists on the live path): the fold happened eagerly at `append_event` time.
+        self.last_applied = entries
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EntryPayload::Event(ev) => Some(ev.clone()),
+                _ => None,
+            })
+            .collect();
         Ok(CommandProcessed { entries, work })
+    }
+
+    /// Record a dispatch's failure as the command's single response: one [`Reject`] entry, on a fresh
+    /// working txn (no projection is folded for a refusal — see [`Collector::reject`]).
+    ///
+    /// The refusal is keyed by the command's own [`Command::request_id`] where it has one, so a
+    /// client-originated command's awaiter is woken by exactly the id it awaits; an internal command
+    /// (nothing waiting) records the refusal with a nil id, as the in-band refusals do. A handler that
+    /// refuses **in-band** still carries whatever id it received — this path is for the decisions the
+    /// engine itself makes around a command.
+    async fn reject_command(
+        &self,
+        entry_id: EntryId,
+        command: &Command,
+        handles: &ProcessingHandles,
+        err: &ProcessingError,
+    ) -> Result<CommandProcessed, ExecutionError> {
+        let (rejection_type, reason) = match err {
+            ProcessingError::Rejected(ty, reason) => (*ty, reason.clone()),
+            // A failure that outlived the retry budget: reported as a processing failure, with the
+            // budget in the reason so the durable record explains why this command has no outcome.
+            ProcessingError::Unexpected(_) => (
+                RejectionType::ProcessingError,
+                format!(
+                    "dispatch failed on all {MAX_COMMAND_ATTEMPTS} attempts: {}",
+                    err.rejection_reason()
+                ),
+            ),
+        };
+        let storage_guard = handles.storage.lock().await;
+        let work = WorkingState::new((**storage_guard).begin_txn()?);
+        drop(storage_guard);
+        let mut out = Collector::new(
+            entry_id,
+            None,
+            Arc::clone(&self.clock),
+            Arc::clone(&self.ids),
+        );
+        out.reject(
+            command.request_id().unwrap_or_else(RequestId::nil),
+            rejection_type,
+            reason,
+        );
+        Ok(CommandProcessed {
+            entries: out.into_parts(),
+            work,
+        })
     }
 
     pub(crate) async fn apply_event(

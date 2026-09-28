@@ -2,7 +2,21 @@
 /// (`TerminateState` for `$activity` if `Some`, plus `TerminateExecution` for `$execution`) and
 /// `return`. The failure path always goes through `Collector::terminate` so a failing site records
 /// its own outcome cohesively before the lifecycle cascade unwinds.
+///
+/// Two forms, because the failure arm has to return the *caller's* type: the plain form belongs to a
+/// helper whose caller owns the outcome (the state terminated in-band, so the helper returns `()`),
+/// while `result` belongs to a handler's own dispatch body, which ends by telling the leader it
+/// produced no outcome.
 macro_rules! fail_or {
+    (result, $out:expr, $activity:expr, $execution:expr, $expr:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                $out.terminate($activity, $execution, e);
+                return Ok(());
+            }
+        }
+    };
     ($out:expr, $activity:expr, $execution:expr, $expr:expr) => {
         match $expr {
             Ok(v) => v,

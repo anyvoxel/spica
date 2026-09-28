@@ -1,5 +1,5 @@
 use crate::TimerStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteState, FailTask, TerminationReason, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
@@ -17,13 +17,13 @@ impl TriggerTimerHandler {
         timer: &ObjectReference,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
-        let act = match ctx.storage.get_timer(timer).await {
-            Ok(Some(t)) => t,
-            Ok(None) | Err(_) => return, // timer never armed; nothing to do.
+    ) -> Result<(), ProcessingError> {
+        let act = match ctx.storage.get_timer(timer).await? {
+            Some(t) => t,
+            None => return Ok(()), // timer never armed; nothing to do.
         };
         if act.value.status != TimerStatus::Active {
-            return; // already completed/cancelled — a duplicate fire is a no-op.
+            return Ok(()); // already completed/cancelled — a duplicate fire is a no-op.
         }
 
         out.append_event(Event::TimerTriggered {
@@ -56,7 +56,7 @@ impl TriggerTimerHandler {
                     .clone()
                     .expect("a live timer is always owned");
                 if activity_id.kind != ObjectKind::Activity {
-                    return; // a Wait timer without an activity owner is an internal fault.
+                    return Ok(()); // a Wait timer without an activity owner is an internal fault.
                 }
                 // Relay the settle now that the fired timer's edge is gone from the activity. A
                 // `Terminating` activity parked on this timer — a cancel raced the fire — drains only
@@ -89,7 +89,7 @@ impl TriggerTimerHandler {
                     .clone()
                     .expect("a live timer is always owned");
                 if activity_id.kind != ObjectKind::Activity {
-                    return;
+                    return Ok(());
                 }
                 // Same settle relay as `WaitResume`: it must run even when no in-flight task is found,
                 // since that is exactly the case where a cancel already swept the task and only this
@@ -103,7 +103,7 @@ impl TriggerTimerHandler {
                     .ok()
                     .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
                 let Some(task) = in_flight else {
-                    return; // no in-flight task — the timeout no longer applies.
+                    return Ok(()); // no in-flight task — the timeout no longer applies.
                 };
                 // Fail the task with the engine-authoritative timeout: `worker_id` is empty (this is
                 // not a worker report, so no lease-match check applies — the deadline is the engine's
@@ -142,5 +142,7 @@ impl TriggerTimerHandler {
                 super::emit_scope_termination(out, &owner, reason);
             }
         }
+
+        Ok(())
     }
 }

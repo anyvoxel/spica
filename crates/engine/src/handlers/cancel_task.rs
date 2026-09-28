@@ -1,4 +1,4 @@
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::event::Event;
 use crate::types::meta::ObjectReference;
@@ -23,7 +23,7 @@ impl CancelTaskHandler {
         task: &ObjectReference,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let Some(mut task_value) = ctx
             .storage
             .get_task(task)
@@ -32,7 +32,7 @@ impl CancelTaskHandler {
             .flatten()
             .map(|task| task.value())
         else {
-            return;
+            return Ok(());
         };
         let owner = task_value.meta.owner.clone().expect("a live task is owned");
         let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await else {
@@ -41,12 +41,14 @@ impl CancelTaskHandler {
                 owner = %owner,
                 "cancel settle has no live owning activity; cancel dropped"
             );
-            return;
+            return Ok(());
         };
         task_value.cancel(ctx.now());
         out.append_event(Event::TaskCancelled { task: task_value })
             .await;
         container.after_child_terminated(ctx, out, task).await;
+
+        Ok(())
     }
 }
 
@@ -193,7 +195,8 @@ mod tests {
         };
         CancelTaskHandler
             .handle(&task_ref(), &mut ctx, &mut out)
-            .await;
+            .await
+            .expect("the seeded world leaves task cancellation nothing to fault on");
         out.into_entries()
             .into_iter()
             .map(|entry| entry.payload)

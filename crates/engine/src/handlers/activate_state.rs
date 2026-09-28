@@ -1,4 +1,4 @@
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ActivateState;
 use crate::types::error::{ExecutionError, RuntimeError};
 
@@ -25,7 +25,7 @@ impl ActivateStateHandler {
         p: &ActivateState,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let payload = p;
         let ActivateState {
             execution,
@@ -34,28 +34,28 @@ impl ActivateStateHandler {
             ..
         } = payload;
 
-        // TODO：这个名称叫做 Scope 肯定是不合适的，需要修改一下；而且如果 Scope 是不存在的话，是不是不应该是 terminate，而应该是 reject？对 Err 的处理也不对，应该是一个其他的处理方式（因为有些临时的错误应该是可以重试的，而不是直接 terminate 掉）
+        // TODO：owner 解析不到时把整个 execution 终结掉，对于一条本身没有问题的命令来说太重了；
+        // 这里是否应该改为 reject，等 「状态无法绑定 owner」 的语义定下来后再定。
         // Resolve the owning thread + its machine/state definition just far enough to pick the right
         // handler. No activity is minted here — the base `StateHandler::activate` constructs it (and
         // re-checks the scope's liveness), so a resolution failure (thread/definition gone) fails the
         // execution directly: nothing has been persisted to attach a state-level terminate to. An
         // activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
-        let thread = match ctx.storage.get_thread(owner).await {
-            Ok(Some(t)) => t,
-            Ok(None) => {
+        // A fault reading the owning thread is not a decision about this state — it is returned so the
+        // leader can retry the command, or refuse it once the retry budget is spent.
+        let thread = match ctx.storage.get_thread(owner).await? {
+            Some(t) => t,
+            None => {
                 out.terminate(
                     None,
                     execution.clone(),
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!("thread {owner}"))),
                 );
-                return;
-            }
-            Err(e) => {
-                out.terminate(None, execution.clone(), e);
-                return;
+                return Ok(());
             }
         };
         let sm = fail_or!(
+            result,
             out,
             None,
             execution.clone(),
@@ -65,6 +65,7 @@ impl ActivateStateHandler {
         // lookup is the document's own walk, and the enclosing `States` table is never inferred
         // from the owning scope's stored path.
         let state_def = fail_or!(
+            result,
             out,
             None,
             execution.clone(),
@@ -79,5 +80,7 @@ impl ActivateStateHandler {
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
         handler.activate(ctx, out, payload).await;
+
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, SpawnThread};
 use crate::types::event::Event;
 
@@ -31,7 +31,7 @@ impl SpawnThreadHandler {
         p: &SpawnThread,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let SpawnThread {
             owner,
             execution,
@@ -45,14 +45,14 @@ impl SpawnThreadHandler {
         // e.g. a sibling branch failed and drained the Parallel). If it is gone or no longer
         // accepting children, the fan-out is a no-op: the child simply never spawns.
         if owner.kind != crate::types::meta::ObjectKind::Activity {
-            return; // internal fault: a branch owner must be an Activity.
+            return Ok(()); // internal fault: a branch owner must be an Activity.
         }
         let owner_activity = match ctx.storage.get_activity(owner).await {
             Ok(Some(a)) => a,
-            _ => return, // owner gone — the fan-out is dropped.
+            _ => return Ok(()), // owner gone — the fan-out is dropped.
         };
         if !owner_activity.status.is_running() {
-            return; // owner not running — the fan-out is dropped.
+            return Ok(()); // owner not running — the fan-out is dropped.
         }
 
         // The child Thread runs against the *same* machine version as its owner: the owning
@@ -71,8 +71,8 @@ impl SpawnThreadHandler {
         // Thread shares the owner's tree, so the anchor is taken verbatim while the Thread itself is
         // the child's `owner`. An activity's owner is always a `Thread` (see `emit_transition`), so
         // the row is read directly.
-        let Some(owner_thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
-            return; // owning thread gone — nothing to bind the child to.
+        let Some(owner_thread) = ctx.storage.get_thread(&scope_ref).await? else {
+            return Ok(()); // owning thread gone — nothing to bind the child to.
         };
         let root_execution = owner_thread.value.execution.clone();
 
@@ -149,5 +149,7 @@ impl SpawnThreadHandler {
             state_path: branch_states.state(start_at),
             input: input.clone(),
         }));
+
+        Ok(())
     }
 }

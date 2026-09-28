@@ -1,6 +1,6 @@
 use crate::RejectionType;
 use crate::StatePath;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
@@ -18,7 +18,7 @@ impl CreateExecutionHandler {
         p: &CreateExecution,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         // `request_id` is the awaiting caller's correlation key — echoed onto `ExecutionCreated` so
         // the StreamProcessor's request-ack correlator wakes the awaiting `start` operation with the fact
         // that this execution was durably created (see `Event::ExecutionCreated`). The handler
@@ -49,7 +49,7 @@ impl CreateExecutionHandler {
                 RejectionType::AlreadyExists,
                 format!("create_execution: execution {name} already exists"),
             );
-            return;
+            return Ok(());
         }
 
         // Mint the execution's durable identity here: a fresh `uid` plus the caller-supplied `name`.
@@ -62,7 +62,13 @@ impl CreateExecutionHandler {
         // fresh StreamProcessor — it loads the definition (keyed by the version's object reference)
         // from Storage into the cache. If the version is missing (definition GC'd), the execution
         // cannot run and fails before any state is entered.
-        let sm = fail_or!(out, None, id.clone(), ctx.machine(flow_version).await);
+        let sm = fail_or!(
+            result,
+            out,
+            None,
+            id.clone(),
+            ctx.machine(flow_version).await
+        );
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
         // birth event, so the run's own `deadline` and the `ExecutionTimeout` timer that enforces it are
         // written from one computation and cannot disagree. An overflow is a definition error with no
@@ -106,7 +112,7 @@ impl CreateExecutionHandler {
                     "TimeoutSeconds overflows the absolute deadline".into(),
                 )),
             );
-            return;
+            return Ok(());
         }
         if let Some(deadline) = deadline {
             // The ExecutionTimeout timer is generated **here** (inline): mint the
@@ -132,7 +138,7 @@ impl CreateExecutionHandler {
                                 .into(),
                         )),
                     );
-                    return;
+                    return Ok(());
                 }
             };
             // The suffix is this partition's local generated-name counter (see `Storage::next_generated_seq`),
@@ -197,5 +203,7 @@ impl CreateExecutionHandler {
             state_path: root_states.state(&start_at),
             input: input.clone(),
         }));
+
+        Ok(())
     }
 }

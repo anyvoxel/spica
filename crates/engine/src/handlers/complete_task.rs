@@ -1,5 +1,5 @@
 use crate::TaskStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::command::CompleteTask;
 use crate::types::event::{Event, TaskCompleted};
@@ -35,7 +35,7 @@ impl CompleteTaskHandler {
         p: &CompleteTask,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let CompleteTask {
             request_id,
             task,
@@ -53,9 +53,11 @@ impl CompleteTaskHandler {
                     RejectionType::NotFound,
                     format!("task {task} not found or not activated"),
                 );
-                return;
+                return Ok(());
             }
-            Err(_) => return, // storage fault — not a domain decision; surface nothing.
+            // A read fault is the engine's, not the command's: returned so the leader can retry it
+            // rather than answering the awaiting worker with a silent nothing.
+            Err(e) => return Err(e.into()),
         };
         // Settlement guard: must be leased to the reporting worker right now. A task not currently
         // Running (still Pending, or already settled) is a wrong-state refusal; one leased to a
@@ -72,7 +74,7 @@ impl CompleteTaskHandler {
                     act.status
                 ),
             );
-            return;
+            return Ok(());
         }
         if act.worker_id.as_deref() != Some(worker_id.as_str()) || worker_id.is_empty() {
             tracing::warn!(
@@ -90,7 +92,7 @@ impl CompleteTaskHandler {
                     act.worker_id,
                 ),
             );
-            return;
+            return Ok(());
         }
 
         let activity_id = act
@@ -109,7 +111,7 @@ impl CompleteTaskHandler {
                 RejectionType::ProcessingError,
                 format!("task {task} has no live activity owner {activity_id}; internal fault"),
             );
-            return;
+            return Ok(());
         };
 
         // Emit the completed task entity (lease cleared, status terminal) and resume the owning Task
@@ -137,5 +139,7 @@ impl CompleteTaskHandler {
         // settled task means for its owner is the owner's business, so the child only names its owner
         // and the owner's container decides.
         container.after_child_completed(ctx, out, task).await;
+
+        Ok(())
     }
 }

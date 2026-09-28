@@ -353,3 +353,64 @@ impl HandlerContext<'_> {
         self.machine(&flow_version).await
     }
 }
+
+/// Why a handler reached the end of its dispatch without producing an outcome for the command it was
+/// given. A handler that *decided* the command's fate (emitted the batch, or refused it in-band via
+/// [`Collector::reject`]) returns `Ok(())`: this type carries only the residual "no outcome was
+/// produced" case, classified by **whose failure it is** — the command's, or the engine's.
+///
+/// Named after Zeebe's `TypedRecordProcessor.ProcessingError`, which draws the same line — *is this
+/// failure the command's or ours?* — as `EXPECTED_ERROR`/`UNEXPECTED_ERROR`. Zeebe settles what to
+/// *do* about it elsewhere (a refusal is a value on the left of `Either<Rejection, T>`; retrying is an
+/// `OperationToRetry` returning `false` under a `RetryStrategy`'s budget), and so does this engine:
+/// what the leader does with each arm is its policy, stated in [`Leader::process_command`].
+///
+/// Kept engine-private rather than a wire type: nothing here is durable, so unlike [`Reject`] it never
+/// reaches the log or a caller — the leader translates it into the command's single response entry.
+///
+/// [`Leader::process_command`]: crate::leader::Leader::process_command
+#[derive(Debug)]
+pub enum ProcessingError {
+    /// A fault escaped the engine's own machinery (storage/log) — not the command's, and beyond what
+    /// the handler can explain. Carries the fault, both for the leader's retry log and, once the
+    /// leader gives up, as the rejection reason.
+    ///
+    /// Zeebe: `UNEXPECTED_ERROR`.
+    Unexpected(ExecutionError),
+
+    /// The handler knows why the command cannot be applied and says so — a decision, which no amount
+    /// of re-dispatching would change (the leader records the [`Reject`] response entry).
+    ///
+    /// Zeebe: `Either.left(Rejection)`, the case a processor answers with its own real
+    /// `RejectionType` rather than the engine's fallback.
+    Rejected(RejectionType, String),
+}
+
+impl ProcessingError {
+    /// Whether this failure came from outside the command — see the type docs. Deliberately *not*
+    /// named for retrying: whether a fault is worth attempting again is the leader's policy, not a
+    /// property this classification can know (a store that is gone for good is as `Unexpected` as a
+    /// store that hiccuped once).
+    pub fn is_unexpected(&self) -> bool {
+        matches!(self, ProcessingError::Unexpected(_))
+    }
+
+    /// The reason to reject with, once the leader has no outcome to record: the fault's own message,
+    /// or the handler's refusal reason.
+    pub fn rejection_reason(&self) -> String {
+        match self {
+            ProcessingError::Unexpected(e) => e.to_string(),
+            ProcessingError::Rejected(_, reason) => reason.clone(),
+        }
+    }
+}
+
+// The default arm `?` takes in a handler (or its helpers): an error that escaped the engine's own
+// machinery is the engine's, not the command's, unless the handler says otherwise by constructing a
+// refusal. A domain failure is *not* routed through here — handlers decide those in place
+// (`Collector::terminate`), so `?` never silently turns a state error into an engine fault.
+impl From<ExecutionError> for ProcessingError {
+    fn from(e: ExecutionError) -> Self {
+        ProcessingError::Unexpected(e)
+    }
+}

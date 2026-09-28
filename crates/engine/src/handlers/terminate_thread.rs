@@ -1,5 +1,5 @@
 use crate::ThreadStatus;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
 use crate::types::meta::ObjectKind;
@@ -21,16 +21,16 @@ impl TerminateThreadHandler {
         p: &TerminateThread,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let TerminateThread { thread, reason } = p;
         // Addressed by kind: `TerminateThread` is only ever dispatched for a `Thread`, so the row is
         // read directly.
-        let Some(thread_row) = ctx.storage.get_thread(thread).await.ok().flatten() else {
-            return; // gone, or unreadable (the fold errors out) — nothing to terminate.
+        let Some(thread_row) = ctx.storage.get_thread(thread).await? else {
+            return Ok(()); // gone already — nothing to terminate.
         };
         let thread_ref = thread_row.reference();
         if !thread_row.value.status.is_running() {
-            return; // already finishing or terminal — a later event wins.
+            return Ok(()); // already finishing or terminal — a later event wins.
         }
 
         let mut terminating_thread = thread_row.value();
@@ -113,5 +113,7 @@ impl TerminateThreadHandler {
                 "thread terminating deferred: waiting on owned children"
             );
         }
+
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use spica_asl::State;
 
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{FailTask, TerminationReason};
 use crate::types::error::ExecutionError;
 use crate::types::event::{Event, TaskFailed};
@@ -31,19 +31,21 @@ impl FailTaskHandler {
         p: &FailTask,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let FailTask {
             task,
             worker_id,
             error,
         } = p;
 
-        let act = match ctx.storage.get_task(task).await {
-            Ok(Some(t)) => t,
-            Ok(None) | Err(_) => return, // task never activated; nothing to do.
+        let act = match ctx.storage.get_task(task).await? {
+            Some(t) => t,
+            // The task never activated — as far as this command is concerned there is nothing to fail,
+            // and a duplicate is not distinguishable from a lost race (both settle to nothing).
+            None => return Ok(()),
         };
         if act.status.is_terminal() {
-            return; // already settled — a duplicate fail is a no-op.
+            return Ok(()); // already settled — a duplicate fail is a no-op.
         }
         let reported_by_worker = !worker_id.is_empty();
         if reported_by_worker {
@@ -57,7 +59,7 @@ impl FailTaskHandler {
                     leased = ?act.worker_id,
                     "worker tried to fail a task it does not lease; report rejected"
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -67,7 +69,7 @@ impl FailTaskHandler {
             .clone()
             .expect("a task always has an activity owner");
         if activity_id.kind != ObjectKind::Activity {
-            return; // a task without an activity owner is an internal fault.
+            return Ok(()); // a task without an activity owner is an internal fault.
         }
 
         // Build the failing task entity with the lease cleared; the retry decision below mutates it.
@@ -129,7 +131,7 @@ impl FailTaskHandler {
                 // behind). No retry timer is armed — `next_available_at` is the gate, and the
                 // re-claimed attempt re-arms what it needs (TODO(M2): `TaskTimeout`).
                 super::cancel_activity_timers(ctx, out, activity_id.clone()).await;
-                return;
+                return Ok(());
             }
             // Attempt budget exhausted — fall through to `Catch` (a retry that hit `MaxAttempts`
             // no longer applies).
@@ -152,6 +154,8 @@ impl FailTaskHandler {
         // errorOutput + route to the catcher's Next), then terminate. Retry was already decided
         // above (on the task); this activity-level remainder applies only to an exhausted failure.
         self.route_failure(ctx, out, activity_id, error).await;
+
+        Ok(())
     }
 }
 
