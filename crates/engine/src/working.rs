@@ -29,7 +29,7 @@ use crate::storage::{
     ActivityRecord, ExecutionRecord, ReadonlyStorageTxn, StorageTxn, TaskRecord, ThreadRecord,
     TimerRecord,
 };
-use crate::types::error::ExecutionError;
+use crate::types::error::{ExecutionError, StorageError};
 use crate::types::event::Event;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
@@ -112,7 +112,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_execution(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+    ) -> Result<Option<ExecutionRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_execution(reference).await
@@ -120,7 +120,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_thread(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ThreadRecord>, ExecutionError> {
+    ) -> Result<Option<ThreadRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_thread(reference).await
@@ -128,7 +128,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_activity(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ActivityRecord>, ExecutionError> {
+    ) -> Result<Option<ActivityRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_activity(reference).await
@@ -136,7 +136,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_timer(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TimerRecord>, ExecutionError> {
+    ) -> Result<Option<TimerRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_timer(reference).await
@@ -144,7 +144,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_task(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TaskRecord>, ExecutionError> {
+    ) -> Result<Option<TaskRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_task(reference).await
@@ -152,7 +152,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_children(
         &self,
         id: ObjectReference,
-    ) -> Result<std::collections::HashSet<ObjectReference>, ExecutionError> {
+    ) -> Result<std::collections::HashSet<ObjectReference>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_children(id).await
@@ -162,12 +162,12 @@ impl ReadonlyStorageTxn for WorkingState {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.activatable_tasks(resource, now, limit).await
     }
-    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_flow_by_name(name).await
@@ -175,7 +175,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_flow_version(
         &self,
         version: &ObjectReference,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_flow_version(version).await
@@ -184,12 +184,12 @@ impl ReadonlyStorageTxn for WorkingState {
         &self,
         name: FlowName,
         version: u32,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.flow_version_of(name, version).await
     }
-    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+    async fn next_generated_seq(&self) -> Result<i64, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.next_generated_seq().await

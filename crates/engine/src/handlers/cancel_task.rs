@@ -2,6 +2,7 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::event::Event;
 use crate::types::meta::ObjectReference;
+use crate::types::reject::RejectionType;
 
 /// Handles `CancelTask`: an in-flight `Task` is cancelled because its owning activity/execution is
 /// being torn down. Emits `TaskCancelled`, which marks the task `Cancelled` in storage and drains it
@@ -14,6 +15,11 @@ use crate::types::meta::ObjectReference;
 /// the sweep's own last move for a `Task` child and it is what lets the `Terminating` owner that
 /// issued the sweep converge in the same batch. An owner that is already gone makes the cancel
 /// pointless, so it is reported rather than written against a row nothing can drain.
+///
+/// A `Task` row the store has never seen is likewise nothing to cancel, but it is an invariant
+/// violation rather than an idempotent replay — the sweep read that child off a live owner — so it is
+/// refused with a `NotFound` [`Reject`](crate::Reject) rather than dropped silently: every command
+/// owes one followup entry, and this dispatch has no `Event` to give.
 #[derive(Default)]
 pub struct CancelTaskHandler;
 
@@ -24,15 +30,16 @@ impl CancelTaskHandler {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
-        let Some(mut task_value) = ctx
-            .storage
-            .get_task(task)
-            .await
-            .ok()
-            .flatten()
-            .map(|task| task.value())
+        let Some(mut task_value) = ctx.storage.get_task(task).await?.map(|task| task.value())
         else {
-            return Ok(());
+            // A task row that does not exist is not a settled task — that is a `Some` with a terminal
+            // status — so the sweep is naming a child the store never saw. The read fault above is the
+            // engine's (propagated, retried by the leader); this one is the command's, and refusing it
+            // is the single followup entry the dispatch owes.
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("task {task} not found; cancel dropped"),
+            ));
         };
         let owner = task_value.meta.owner.clone().expect("a live task is owned");
         let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await else {
@@ -59,21 +66,19 @@ mod tests {
 
     use serde_json::json;
     use spica_machinery::{Clock, CountingIdGenerator, IdGenerator, ManualClock};
-    use spica_storage::InMemoryStorage;
 
     use super::CancelTaskHandler;
     use crate::StatePath;
     use crate::eval_env::EvalEnv;
-    use crate::handler::{Collector, HandlerContext, OverlaySink};
+    use crate::handler::{Collector, HandlerContext, ProcessingError};
     use crate::handlers::dispatch::build_state_handlers;
-    use crate::storage::{ActivityRecord, Storage, TaskRecord};
-    use crate::types::command::Command;
+    use crate::storage::{ActivityRecord, TaskRecord};
     use crate::types::event::Event;
     use crate::types::id::EntryId;
     use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
-    use crate::working::WorkingState;
+    use crate::types::reject::RejectionType;
     use crate::{
-        Activity, ActivityStatus, EntryPayload, Task, TaskStatus, TerminationReason, Timestamp,
+        Activity, ActivityStatus, EntryPayload, StorageError, Task, TaskStatus, Timestamp,
     };
 
     /// The instant every stamp reads: one `ManualClock` reading serves the seeded rows' meta and the
@@ -153,138 +158,162 @@ mod tests {
         row
     }
 
-    /// Drive one `CancelTask` over a working overlay seeded with whichever rows are wanted — the
-    /// leader's shape, so the assertions read the batch the handler would commit, not a bare intent.
-    async fn cancel(
-        task: Option<TaskRecord>,
-        activity: Option<ActivityRecord>,
-    ) -> Vec<EntryPayload> {
-        let mut store = InMemoryStorage::new();
-        if let Some(task) = task {
-            store
-                .put_task(task)
-                .await
-                .expect("the in-memory store seeds a task row");
-        }
-        if let Some(act) = activity {
-            store
-                .put_activity(act)
-                .await
-                .expect("the in-memory store seeds an activity row");
+    /// The handler exercised against a **mock** read-only store: no `InMemoryStorage`, no working
+    /// overlay, no applier or owner container in the loop — so these pin the handler's *own* decision
+    /// and nothing else. The store answers exactly the reads the handler makes and panics on any
+    /// other, which is itself an assertion about how far the handler got.
+    mod mocked {
+        use super::*;
+        use spica_testing::MockReadonlyStorageTxn;
+
+        /// Run the handler over the mock with a collector that carries **no** overlay: nothing the
+        /// handler emits is folded back into a store, so the entries returned are exactly what the
+        /// handler produced. The owner container reads the same mocked rows and — with the cancelled
+        /// child still attached, since no fold detached it — asks for nothing of its own.
+        async fn cancel_over(
+            store: &MockReadonlyStorageTxn,
+        ) -> Result<Vec<EntryPayload>, ProcessingError> {
+            let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
+            let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
+            let mut out = Collector::new(EntryId::new(1), None, clock.clone(), ids.clone());
+            let mut env = EvalEnv::new();
+            let mut definitions = HashMap::new();
+            let state_handlers = build_state_handlers();
+            let mut ctx = HandlerContext {
+                env: &mut env,
+                storage: store,
+                clock,
+                ids,
+                definitions: &mut definitions,
+                state_handlers: &state_handlers,
+            };
+            CancelTaskHandler
+                .handle(&task_ref(), &mut ctx, &mut out)
+                .await?;
+            Ok(out.into_entries().into_iter().map(|e| e.payload).collect())
         }
 
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
-        let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
-        let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
-        let mut out = Collector::new(
-            EntryId::new(1),
-            Some(OverlaySink::new(&work)),
-            clock.clone(),
-            ids.clone(),
-        );
-        let mut env = EvalEnv::new();
-        let mut definitions = HashMap::new();
-        let state_handlers = build_state_handlers();
-        let mut ctx = HandlerContext {
-            env: &mut env,
-            storage: &work,
-            clock,
-            ids,
-            definitions: &mut definitions,
-            state_handlers: &state_handlers,
-        };
-        CancelTaskHandler
-            .handle(&task_ref(), &mut ctx, &mut out)
+        /// A mocked store whose task read answers `task` and whose owner read answers `activity` on
+        /// **both** reads the handler makes of it: `ActivityContainer::open` resolves the owner, then
+        /// the settle re-reads it — a case that gets past container resolution owes it two answers.
+        fn store_with_owner(
+            task: Result<Option<TaskRecord>, StorageError>,
+            activity: ActivityRecord,
+        ) -> MockReadonlyStorageTxn {
+            let mut store = MockReadonlyStorageTxn::new();
+            store
+                .expect_get_task()
+                .withf(|r| r == &task_ref())
+                .times(1)
+                .return_once(move |_| task);
+            store
+                .expect_get_activity()
+                .withf(|r| r == &activity_ref())
+                .times(2)
+                .return_const(Ok(Some(activity)));
+            store
+        }
+
+        /// A mocked store for a case that must be decided **before** the owner is looked at: the task
+        /// read answers `task`, and any owner read would find no expectation — the mock panics, which
+        /// is the assertion that the refusal came first.
+        fn store_without_owner(
+            task: Result<Option<TaskRecord>, StorageError>,
+        ) -> MockReadonlyStorageTxn {
+            let mut store = MockReadonlyStorageTxn::new();
+            store
+                .expect_get_task()
+                .withf(|r| r == &task_ref())
+                .times(1)
+                .return_once(move |_| task);
+            store
+        }
+
+        /// The live rows the happy-path cases start from: a `Running` task owned by an activity that
+        /// still holds it as a child.
+        fn live_world() -> (TaskRecord, ActivityRecord) {
+            (
+                seeded_task(),
+                seeded_activity(ActivityStatus::Running, HashSet::from([task_ref()])),
+            )
+        }
+
+        /// A live task under a live owner: the handler's own event, and nothing besides — the cancel
+        /// moment stamped, the identity its owner matches the child by preserved.
+        #[tokio::test]
+        async fn a_live_task_emits_its_own_cancel_and_nothing_else() {
+            let (task, activity) = live_world();
+            let chain = cancel_over(&store_with_owner(Ok(Some(task)), activity))
+                .await
+                .expect("a live task under a live owner is a clean settle");
+            assert_eq!(
+                chain.len(),
+                1,
+                "the handler emits its cancel and no follow-up: {chain:?}"
+            );
+            let EntryPayload::Event(Event::TaskCancelled { task }) = &chain[0] else {
+                panic!("a cancelled task emits TaskCancelled: {chain:?}");
+            };
+            assert_eq!(task.status, TaskStatus::Cancelled);
+            assert_eq!(task.meta.name, task_ref().name);
+            assert_eq!(task.meta.owner.as_ref(), Some(&activity_ref()));
+            assert_eq!(task.meta.updated_at, at());
+        }
+
+        /// No row: the *command's* failure, refused with the classification the leader records — and
+        /// the refusal names the task, so the durable entry says what could not be found. The owner is
+        /// never read: a refusal must not depend on the container resolving.
+        #[tokio::test]
+        async fn a_missing_row_is_the_commands_own_refusal() {
+            let err = cancel_over(&store_without_owner(Ok(None)))
+                .await
+                .expect_err("a cancel with no task row must be refused");
+            let ProcessingError::Rejected(ty, reason) = err else {
+                panic!("a missing row is the command's failure, not the engine's: {err:?}");
+            };
+            assert_eq!(ty, RejectionType::NotFound);
+            assert!(
+                reason.contains(&task_ref().to_string()),
+                "the refusal names the task it could not find: {reason}"
+            );
+        }
+
+        /// A fault on the read is the *engine's* failure: the handler must not fold it into a domain
+        /// answer, so it surfaces as `Unexpected` — what the leader retries before refusing (see
+        /// `Leader::process_command`). Nothing may be emitted on the way out, and the owner is never
+        /// read either.
+        #[tokio::test]
+        async fn a_faulted_read_surfaces_as_unexpected() {
+            let err = cancel_over(&store_without_owner(Err(StorageError::Backend(
+                "injected storage fault".to_string(),
+            ))))
             .await
-            .expect("the seeded world leaves task cancellation nothing to fault on");
-        out.into_entries()
-            .into_iter()
-            .map(|entry| entry.payload)
-            .collect()
-    }
+            .expect_err("a store that cannot read is not the command's failure");
+            assert!(
+                matches!(err, ProcessingError::Unexpected(_)),
+                "a read fault is the engine's, never a refusal: {err:?}"
+            );
+        }
 
-    /// A cancelled task keeps its own identity — the reference its owner matches children by — and
-    /// carries the cancel moment rather than the row's older stamp.
-    #[tokio::test]
-    async fn a_cancelled_task_keeps_its_own_name_and_owner() {
-        let chain = cancel(
-            Some(seeded_task()),
-            Some(seeded_activity(
-                ActivityStatus::Running,
-                HashSet::from([task_ref()]),
-            )),
-        )
-        .await;
-        let EntryPayload::Event(Event::TaskCancelled { task }) = &chain[0] else {
-            panic!("a cancelled task emits TaskCancelled first: {chain:?}");
-        };
-        assert_eq!(task.status, TaskStatus::Cancelled);
-        assert_eq!(task.meta.name, task_ref().name);
-        assert_eq!(task.meta.owner.as_ref(), Some(&activity_ref()));
-        assert_eq!(task.meta.updated_at, at());
-    }
-
-    /// The whole point of handing the settle to the owner: the cancel drains the task from its
-    /// `Terminating` owner *within the same batch*, so a sweep whose last child was this task
-    /// converges instead of waiting forever for a child that is already gone.
-    #[tokio::test]
-    async fn a_cancelled_task_converges_its_drained_terminating_owner() {
-        let chain = cancel(
-            Some(seeded_task()),
-            Some(seeded_activity(
-                ActivityStatus::Terminating(TerminationReason::Cancelled),
-                HashSet::from([task_ref()]),
-            )),
-        )
-        .await;
-        assert!(
-            matches!(chain[0], EntryPayload::Event(Event::TaskCancelled { .. })),
-            "the cancel is recorded before its owner is advanced: {chain:?}"
-        );
-        assert_eq!(
-            chain.last(),
-            Some(&EntryPayload::Command(Command::ContinueTerminate {
-                owner: activity_ref(),
-            })),
-            "a drained terminating owner must be advanced: {chain:?}"
-        );
-    }
-
-    /// A `Running` owner being torn down is the anomalous case — whatever is finishing it owns the
-    /// next move, so the settle only records the cancel.
-    #[tokio::test]
-    async fn a_cancelled_task_leaves_a_running_owner_alone() {
-        let chain = cancel(
-            Some(seeded_task()),
-            Some(seeded_activity(
-                ActivityStatus::Running,
-                HashSet::from([task_ref()]),
-            )),
-        )
-        .await;
-        assert_eq!(chain.len(), 1, "no owner reaction is asked for: {chain:?}");
-    }
-
-    /// An owner that is already gone is caught at container resolution, *before* the cancel is
-    /// written: a `TaskCancelled` against a row nothing can drain would only orphan the task in a
-    /// terminal state its owner can never observe.
-    #[tokio::test]
-    async fn a_task_whose_owner_is_gone_is_not_cancelled() {
-        let chain = cancel(Some(seeded_task()), None).await;
-        assert!(chain.is_empty(), "nothing may be written: {chain:?}");
-    }
-
-    /// A cancel for a task that was never written is a no-op, like every other guard on this path.
-    #[tokio::test]
-    async fn a_missing_task_emits_nothing() {
-        let chain = cancel(
-            None,
-            Some(seeded_activity(
-                ActivityStatus::Running,
-                HashSet::from([task_ref()]),
-            )),
-        )
-        .await;
-        assert!(chain.is_empty(), "nothing may be written: {chain:?}");
+        /// An owner that is gone has nothing to drain the task, so the cancel is dropped — no entry
+        /// at all, not even a refusal — rather than written against a row nothing can detach. The
+        /// owner is read exactly **once** here: resolution finds nothing, so the settle never re-reads.
+        #[tokio::test]
+        async fn a_gone_owner_drops_the_cancel() {
+            let (task, _) = live_world();
+            let mut store = MockReadonlyStorageTxn::new();
+            store
+                .expect_get_task()
+                .times(1)
+                .return_once(move |_| Ok(Some(task)));
+            store
+                .expect_get_activity()
+                .times(1)
+                .return_const(Ok::<_, StorageError>(None));
+            let chain = cancel_over(&store)
+                .await
+                .expect("a gone owner is a decision, not a fault");
+            assert!(chain.is_empty(), "nothing may be written: {chain:?}");
+        }
     }
 }

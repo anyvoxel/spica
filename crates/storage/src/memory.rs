@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use spica_engine_types::{
-    ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind,
-    ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
+    ActivityRecord, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind, ObjectName,
+    ObjectReference, Storage, StorageError, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
     Timestamp,
 };
 
@@ -149,35 +149,35 @@ impl Storage for InMemoryStorage {
     async fn get_execution(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+    ) -> Result<Option<ExecutionRecord>, StorageError> {
         Ok(self.db().executions.get(&reference.name).cloned())
     }
 
     async fn get_thread(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ThreadRecord>, ExecutionError> {
+    ) -> Result<Option<ThreadRecord>, StorageError> {
         Ok(self.db().threads.get(&reference.name).cloned())
     }
 
     async fn get_activity(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ActivityRecord>, ExecutionError> {
+    ) -> Result<Option<ActivityRecord>, StorageError> {
         Ok(self.db().activities.get(&reference.name).cloned())
     }
 
     async fn get_timer(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TimerRecord>, ExecutionError> {
+    ) -> Result<Option<TimerRecord>, StorageError> {
         Ok(self.db().timers.get(&reference.name).cloned())
     }
 
     async fn get_task(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TaskRecord>, ExecutionError> {
+    ) -> Result<Option<TaskRecord>, StorageError> {
         Ok(self.db().tasks.get(&reference.name).cloned())
     }
 
@@ -186,7 +186,7 @@ impl Storage for InMemoryStorage {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         // A linear scan of the task map — no per-resource queue index in M1 (see the trait doc).
         let db = self.db();
         Ok(db
@@ -201,7 +201,7 @@ impl Storage for InMemoryStorage {
     async fn get_children(
         &self,
         id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, ExecutionError> {
+    ) -> Result<HashSet<ObjectReference>, StorageError> {
         Ok(self.db().children(&id))
     }
 
@@ -210,7 +210,7 @@ impl Storage for InMemoryStorage {
         kind: ObjectKind,
         start_after: Option<&ObjectName>,
         limit: usize,
-    ) -> Result<Vec<(ObjectName, Vec<u8>)>, ExecutionError> {
+    ) -> Result<Vec<(ObjectName, Vec<u8>)>, StorageError> {
         // Mirror the persisted RocksDB range scan at the map level: gather the kind's rows, order
         // by the addressing name (stable key order, matching Rocks), then apply the strict-after
         // pagination offset and page cutoff. Values are serialized to their JSON bytes exactly as
@@ -249,27 +249,27 @@ impl Storage for InMemoryStorage {
             .collect())
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
         self.db().executions.insert(exec.meta.name.clone(), exec);
         Ok(())
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
         self.db().threads.insert(thread.meta.name.clone(), thread);
         Ok(())
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
         self.db().activities.insert(act.meta.name.clone(), act);
         Ok(())
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
         self.db().timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
         self.db().tasks.insert(task.meta.name.clone(), task);
         Ok(())
     }
@@ -278,7 +278,7 @@ impl Storage for InMemoryStorage {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         self.db().remove_child(&parent, &child);
         Ok(())
     }
@@ -287,16 +287,16 @@ impl Storage for InMemoryStorage {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         self.db().add_child(&parent, child);
         Ok(())
     }
 
-    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {
         Ok(self.db().flows.get(&name).cloned())
     }
 
-    async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+    async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
         self.db().flows.insert(
             flow.meta
                 .name
@@ -311,11 +311,11 @@ impl Storage for InMemoryStorage {
     async fn get_flow_version(
         &self,
         version: &ObjectReference,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         Ok(self.db().flow_versions.get(&version.name).cloned())
     }
 
-    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), ExecutionError> {
+    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
         let mut db = self.db();
         // Canonical row keyed by the version's own addressing name (`{flow}-{version}`).
         db.flow_versions.insert(ver.meta.name.clone(), ver);
@@ -326,7 +326,7 @@ impl Storage for InMemoryStorage {
         &self,
         name: FlowName,
         version: u32,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         // Address the version by its derived name (`{flow}-{version}`) — a single point read.
         let db = self.db();
         Ok(db
@@ -335,19 +335,19 @@ impl Storage for InMemoryStorage {
             .cloned())
     }
 
-    async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
+    async fn last_processed_position(&self) -> Result<i64, StorageError> {
         Ok(self.db().last_processed_position)
     }
 
-    async fn put_last_processed_position(&mut self, position: i64) -> Result<(), ExecutionError> {
+    async fn put_last_processed_position(&mut self, position: i64) -> Result<(), StorageError> {
         self.db().last_processed_position = position;
         Ok(())
     }
-    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+    async fn next_generated_seq(&self) -> Result<i64, StorageError> {
         Ok(self.db().next_generated_seq)
     }
 
-    fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
+    fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, StorageError> {
         // Hand the StreamProcessor an **owned** fold transaction: a clone of the shared interior plus an
         // empty buffered batch. The transaction owns its interior handle (not a borrow of this store),
         // so it can outlive any lock on it and span multiple log entries before committing. Subsequent
@@ -394,7 +394,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_execution(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+    ) -> Result<Option<ExecutionRecord>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
         if let Some(exec) = self.batch.executions.get(&reference.name) {
             return Ok(Some(exec.clone()));
@@ -411,7 +411,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_thread(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ThreadRecord>, ExecutionError> {
+    ) -> Result<Option<ThreadRecord>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
         if let Some(thread) = self.batch.threads.get(&reference.name) {
             return Ok(Some(thread.clone()));
@@ -428,7 +428,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_activity(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ActivityRecord>, ExecutionError> {
+    ) -> Result<Option<ActivityRecord>, StorageError> {
         if let Some(act) = self.batch.activities.get(&reference.name) {
             return Ok(Some(act.clone()));
         }
@@ -444,7 +444,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_timer(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<TimerRecord>, ExecutionError> {
+    ) -> Result<Option<TimerRecord>, StorageError> {
         if let Some(timer) = self.batch.timers.get(&reference.name) {
             return Ok(Some(timer.clone()));
         }
@@ -460,7 +460,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_task(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<TaskRecord>, ExecutionError> {
+    ) -> Result<Option<TaskRecord>, StorageError> {
         if let Some(task) = self.batch.tasks.get(&reference.name) {
             return Ok(Some(task.clone()));
         }
@@ -478,7 +478,7 @@ impl StorageTxn for InMemoryTxn {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         // read-your-writes: the committed rows, with the pending batch winning by name — so a task
         // folded earlier in this batch is seen (and its replacement status supersedes the committed one).
         let mut tasks: HashMap<ObjectName, TaskRecord> = self
@@ -501,7 +501,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_children(
         &mut self,
         id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, ExecutionError> {
+    ) -> Result<HashSet<ObjectReference>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
                 .get_execution(&id)
@@ -525,27 +525,27 @@ impl StorageTxn for InMemoryTxn {
         })
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
         self.batch.executions.insert(exec.meta.name.clone(), exec);
         Ok(())
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
         self.batch.threads.insert(thread.meta.name.clone(), thread);
         Ok(())
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
         self.batch.activities.insert(act.meta.name.clone(), act);
         Ok(())
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
         self.batch.timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
         self.batch.tasks.insert(task.meta.name.clone(), task);
         Ok(())
     }
@@ -556,7 +556,7 @@ impl StorageTxn for InMemoryTxn {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         self.buffer_child_mutation(&parent, &child, false);
         Ok(())
     }
@@ -567,12 +567,12 @@ impl StorageTxn for InMemoryTxn {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         self.buffer_child_mutation(&parent, &child, true);
         Ok(())
     }
 
-    async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+    async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError> {
         if let Some(flow) = self.batch.flows.get(&name) {
             return Ok(Some(flow.clone()));
         }
@@ -585,7 +585,7 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
-    async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+    async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
         // Keyed by the flow's own name, derived from `meta.name` (its sole name carrier).
         let name = flow
             .meta
@@ -600,7 +600,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_flow_version(
         &mut self,
         version: &ObjectReference,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         if let Some(ver) = self.batch.flow_versions.get(&version.name) {
             return Ok(Some(ver.clone()));
         }
@@ -613,7 +613,7 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
-    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), ExecutionError> {
+    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
         // Canonical row keyed by the version's own addressing name (`{flow}-{version}`).
         self.batch.flow_versions.insert(ver.meta.name.clone(), ver);
         Ok(())
@@ -623,7 +623,7 @@ impl StorageTxn for InMemoryTxn {
         &mut self,
         name: FlowName,
         version: u32,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         // Address the version by its derived name (`{flow}-{version}`), read-your-writes: batch first.
         let vname = FlowVersion::version_name(&name, version);
         if let Some(ver) = self.batch.flow_versions.get(&vname) {
@@ -638,7 +638,7 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
-    async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+    async fn next_generated_seq(&mut self) -> Result<i64, StorageError> {
         // Overlay-first: a fold must see its own earlier bump within the same batch.
         if let Some(seq) = self.batch.next_generated_seq {
             return Ok(seq);
@@ -650,12 +650,12 @@ impl StorageTxn for InMemoryTxn {
             .next_generated_seq)
     }
 
-    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
+    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), StorageError> {
         self.batch.next_generated_seq = Some(seq);
         Ok(())
     }
 
-    fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
+    fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), StorageError> {
         let batch = self.batch;
         let mut db = self.inner.lock().expect("in-memory storage lock poisoned");
         // Land the whole fold all-or-nothing, then the watermark advance in the same atomic unit.

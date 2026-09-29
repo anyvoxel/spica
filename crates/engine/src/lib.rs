@@ -88,7 +88,7 @@ pub use types::command::{
     CompleteTask, CompleteThread, CreateExecution, CreateFlow, FailTask, SpawnThread,
     TerminateExecution, TerminateState, TerminateThread, TerminationReason, TimerPurpose,
 };
-pub use types::error::{ExecutionError, InfraError, RuntimeError};
+pub use types::error::{ExecutionError, InfraError, RuntimeError, StorageError};
 pub use types::event::{
     Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
     TaskFailed, TasksClaimed, VariablesAssigned,

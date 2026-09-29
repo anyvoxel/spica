@@ -31,5 +31,6 @@ ulid.workspace = true
 spica-client.workspace = true
 spica-scheduler = { workspace = true }
 spica-storage = { workspace = true }
+spica-testing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-stream.workspace = true
