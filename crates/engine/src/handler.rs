@@ -11,7 +11,7 @@ use crate::storage::ReadonlyStorageTxn;
 use crate::types::command::{
     Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
-use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::error::{ExecutionError, RuntimeError, StorageError};
 use crate::types::event::Event;
 use crate::types::id::{EntryId, RequestId, StreamId};
 use crate::types::meta::{ObjectKind, ObjectReference};
@@ -412,5 +412,14 @@ impl ProcessingError {
 impl From<ExecutionError> for ProcessingError {
     fn from(e: ExecutionError) -> Self {
         ProcessingError::Unexpected(e)
+    }
+}
+
+// The same arm for a storage read: the `Storage` contract now fails as `StorageError`, and a handler
+// propagating one with `?` means exactly what the façade hop above means — a fault of ours, not the
+// command's. `From` does not chain, so this hop is spelled out rather than inherited.
+impl From<StorageError> for ProcessingError {
+    fn from(e: StorageError) -> Self {
+        ProcessingError::Unexpected(ExecutionError::from(e))
     }
 }

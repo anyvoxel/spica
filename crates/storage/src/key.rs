@@ -14,9 +14,9 @@
 //!   range-scan over `/<t>/<ns>/<kind>/` addresses exactly one kind in one scope — never a
 //!   variable-structure ambiguity (contrast a filesystem-style key where scope depth varies).
 //! - **`/` is the segment separator**, so no segment value may contain `/` (and none may be empty).
-//!   `FlowName` already forbids `/` (its charset is `[A-Za-z0-9_]`); `Scope` validation enforces the
-//!   same rule for tenant/namespace plus a lowercase `[a-z0-9_-]` charset so ordering/scans stay
-//!   deterministic and case-collisions are impossible.
+//!   `FlowName` already forbids `/` (its charset is `[A-Za-z0-9_]`), and tenant/namespace are
+//!   [`ScopeName`]s — the same `PlainName` charset, so they ban `/` too. Both facts hold **by type**:
+//!   neither segment is ever a bare `String` at this layer, so no second check exists to drift.
 //! - **Kinds are flat, single-address-space.** Entity rows never nest under another entity, so no
 //!   prefix scan is polluted by foreign rows.
 //!
@@ -46,38 +46,30 @@
 //! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
 //! by the `version` field, never by key order.
 
-use spica_engine_types::{
-    ExecutionError, FlowName, ObjectKind, ObjectName, ObjectReference, RuntimeError,
-};
+use spica_engine_types::{FlowName, ObjectKind, ObjectName, ObjectReference, ScopeName};
 
 /// The two fixed scope segments of every key (tenant + namespace).
 ///
-/// Segment values must be non-empty, at most 64 chars, `[a-z0-9_-]`, and never contain `/` (which is
-/// the key's segment separator). Enforced in [`Scope::new`] so an invalid scope fails fast at the
-/// builder boundary rather than producing an ambiguous/possibly-colliding key.
+/// Both segments are [`ScopeName`]s, so the key rules hold **by construction**: a `ScopeName` is
+/// already a 4..=64 plain name over `[A-Za-z0-9_]` with `-` reserved, and `/` (the key's segment
+/// separator) is not in that alphabet. `Scope::new` therefore has nothing left to check and cannot
+/// fail — the validation lives in the type, not in a second check here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Scope {
-    tenant: String,
-    namespace: String,
+    tenant: ScopeName,
+    namespace: ScopeName,
 }
 
 impl Scope {
-    /// Construct a scope, validating both segments against the key rules.
-    // Returns the engine façade when a segment is invalid. `ExecutionError` is 128B (it embeds the
-    // per-concern `RuntimeError`/`InfraError`/`Reject`), so the `result_large_err` size lint is allowed.
-    #[allow(clippy::result_large_err)]
-    pub fn new(tenant: &str, namespace: &str) -> Result<Self, ExecutionError> {
-        validate_segment("tenant", tenant)?;
-        validate_segment("namespace", namespace)?;
-        Ok(Self {
-            tenant: tenant.to_string(),
-            namespace: namespace.to_string(),
-        })
+    pub fn new(tenant: ScopeName, namespace: ScopeName) -> Self {
+        Self { tenant, namespace }
     }
 
     /// The single default scope used in **Phase A** until per-call tenant plumbing lands (Phase B).
-    /// Every Phase-A row is tenant data, so one scope suffices; the placeholder `_`/`default` keeps
-    /// the two-segment shape explicit without implying a real tenant.
+    /// Every Phase-A row is tenant data, so one scope suffices; the placeholder pair keeps the
+    /// two-segment shape explicit without implying a real tenant. It is the same pair
+    /// [`ObjectMetaBuilder`](spica_engine_types::ObjectMetaBuilder) stamps on an object, so a row's
+    /// key prefix and its record's own `meta.tenant`/`meta.namespace` never disagree.
     ///
     /// TODO(scope-addressing): Phase A works only because every row lives under this one pinned
     /// scope — the id-keyed reads (`get_flow_version`, `get_execution`, …) "don't need" a scope only
@@ -89,36 +81,17 @@ impl Scope {
     /// Two self-consistent models: (1) every `Storage` method takes a scope; (2) per-tenant store
     /// instances behind a `Scope -> Storage` router, scope coming from the command either way.
     pub fn default_scope() -> Self {
-        Self::new("_", "default").expect("default scope is a valid key prefix")
+        let default = || ScopeName::new("default").expect("`default` is a valid plain name");
+        Self::new(default(), default())
     }
 
     pub fn tenant(&self) -> &str {
-        &self.tenant
+        self.tenant.as_str()
     }
 
     pub fn namespace(&self) -> &str {
-        &self.namespace
+        self.namespace.as_str()
     }
-}
-
-/// Validate a single scope segment: non-empty, ≤64 chars, lowercase `[a-z0-9_-]`, no `/`.
-// Returns the engine façade (`InvalidDefinition`); `ExecutionError` is 128B — allow the size lint.
-#[allow(clippy::result_large_err)]
-fn validate_segment(kind: &str, raw: &str) -> Result<(), ExecutionError> {
-    let bytes = raw.as_bytes();
-    let valid = !raw.is_empty()
-        && raw.len() <= 64
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-');
-    if !valid {
-        return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-            format!(
-                "invalid {kind} {raw:?}: must be 1..=64 chars of [a-z0-9_-] and never contain '/'"
-            ),
-        )));
-    }
-    Ok(())
 }
 
 /// The entity kinds addressable as flat rows. `_index` and `_global` are *reserved spellings* — no
@@ -318,11 +291,11 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine_types::{ObjectKind, PlainName};
+    use spica_engine_types::{ObjectKind, ObjectMeta, PlainName};
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
-        Scope::new(tenant, ns).unwrap()
+        Scope::new(ScopeName::new(tenant).unwrap(), ScopeName::new(ns).unwrap())
     }
 
     /// An execution reference for the given uid (`obj-<uid>` generated name), matching
@@ -461,21 +434,22 @@ mod tests {
     }
 
     #[test]
-    fn scope_validates_segments() {
-        assert!(Scope::new("acme", "prod").is_ok());
-        assert!(Scope::new("", "prod").is_err()); // empty tenant
-        assert!(Scope::new("acme", "").is_err()); // empty ns
-        assert!(Scope::new("ac/e", "prod").is_err()); // slash forbidden
-        assert!(Scope::new("Acme", "prod").is_err()); // uppercase forbidden
-        assert!(Scope::new("ac me", "prod").is_err()); // space forbidden
-        assert!(Scope::new(&"a".repeat(65), "prod").is_err()); // too long
-        // The Phase-A default scope is valid and emits the two-segment prefix.
+    fn the_default_scope_is_the_object_meta_scope() {
+        // A `Scope` no longer has rules to enforce: its segments are `ScopeName`s, so the key's
+        // segment rules (4..=64 plain names, `-` reserved, no `/`) hold by construction — pinned
+        // by `PlainName`'s own tests in `spica-machinery`, not restated here. What is left to check
+        // is that the Phase-A default scope is *representable* and that it is the same pair
+        // `ObjectMetaBuilder` stamps, so a row's key prefix and its record's own scope agree.
+        let stamped = ObjectMeta::builder(ObjectKind::Execution, Ulid::nil()).build();
+        let default = Scope::default_scope();
+        assert_eq!(default.tenant(), stamped.tenant.as_str());
+        assert_eq!(default.namespace(), stamped.namespace.as_str());
         assert_eq!(
             String::from_utf8(
                 KeyBuilder::new(Scope::default_scope()).execution(&exec_ref(Ulid::nil()))
             )
             .unwrap(),
-            "/_/default/execution/child-0"
+            "/default/default/execution/child-0"
         );
     }
 }

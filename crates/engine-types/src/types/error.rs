@@ -102,6 +102,42 @@ impl RuntimeError {
     }
 }
 
+/// The [`Storage`](crate::storage::Storage) contract's own failure set — what the storage concern
+/// can fail *as*.
+///
+/// The traits return this instead of the [`ExecutionError`] façade, so a backend can only fail in
+/// storage-shaped ways: a domain defect ([`RuntimeError::InvalidDefinition`]) or a command-layer
+/// verdict ([`Reject`]) is not expressible here, and therefore cannot leak out of `Storage`. Before
+/// the split the storage boundary reported its own key validation as `RuntimeError::InvalidDefinition`
+/// — a storage check wearing the domain's face.
+///
+/// No variant names a `rocksdb` type, and none mirrors the engine's `Code`/`Status` taxonomy: a
+/// mirrored classification with no consumer is a taxonomy kept for its own sake. The one consumer a
+/// kind field would have had — "retry or not" — is the leader's policy, not a claim the storage layer
+/// makes (see `ProcessingError::is_unexpected`).
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum StorageError {
+    /// A durable-backend operation failed (open / read / write / scan / commit).
+    #[error("storage backend: {0}")]
+    Backend(String),
+
+    /// A stored row did not encode, or its bytes did not match its typed projection — a durability
+    /// defect rather than a transient one: the row is not what the schema says it is.
+    #[error("storage row: {0}")]
+    Codec(String),
+
+    /// A key the engine asked for is not well-formed: the stored key bytes are not a legal key, or
+    /// the kind's name cannot be parsed back out of them.
+    #[error("storage key: {0}")]
+    InvalidKey(String),
+
+    /// The backend does not implement the requested operation at all (a default-method refusal such
+    /// as [`Storage::list_kind`](crate::storage::Storage::list_kind)). Not a fault of the store, but
+    /// of the request's fit to this backend — the only variant here a caller can *act* on.
+    #[error("storage operation unsupported: {0}")]
+    Unsupported(String),
+}
+
 /// Engine-**infrastructure** failures — the durable log or storage backend 故障 when the engine
 /// cannot continue its own machinery. These are not ASL-catchable and never carry an ASL
 /// `error_name`; a caller is expected to **bubble** them (type-erased to the bug-facing config/
@@ -110,7 +146,9 @@ impl RuntimeError {
 ///
 /// `Log` carries the [`LogError`](spica_logstream::LogError)'s message as a `String`, not the error
 /// value itself: the error type is non-`Clone`/non-`Serialize`, while `ExecutionError` (in which this
-/// is embedded, and which flows across the engine/API boundary) is both.
+/// is embedded, and which flows across the engine/API boundary) is both. `Storage` carries the
+/// per-concern [`StorageError`] for the same reason it is its own type: the storage boundary gets a
+/// failure set that cannot express a domain defect.
 #[derive(Debug, Clone, PartialEq, Error, Serialize, Deserialize)]
 pub enum InfraError {
     /// A log/stream protocol violation or backend fault — e.g. an out-of-order, non-contiguous,
@@ -118,6 +156,10 @@ pub enum InfraError {
     /// durable read/write failure.
     #[error("log/storage error: {0}")]
     Log(String),
+
+    /// A storage-layer fault — see [`StorageError`].
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
 impl From<spica_logstream::LogError> for InfraError {
@@ -175,6 +217,15 @@ impl ExecutionError {
 // error surface. (`From` does not chain, hence this explicit hop.)
 impl From<spica_logstream::LogError> for ExecutionError {
     fn from(e: spica_logstream::LogError) -> Self {
+        ExecutionError::Infra(InfraError::from(e))
+    }
+}
+
+// A storage fault reached with `?` in a fn returning `Result<_, ExecutionError>` — a *consumer* of
+// the narrowed `Storage` contract (a handler or an applier) does not restate `StorageError`, so each
+// hops through `InfraError` here. `From` does not chain, hence this explicit hop.
+impl From<StorageError> for ExecutionError {
+    fn from(e: StorageError) -> Self {
         ExecutionError::Infra(InfraError::from(e))
     }
 }

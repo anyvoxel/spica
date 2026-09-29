@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/asl", "crates/client", "crates/engine-types", "crates/engine", "crates/logstream", "crates/machinery", "crates/proto", "crates/scheduler", "crates/server", "crates/storage", "crates/cli"]
+members = ["crates/asl", "crates/client", "crates/engine-types", "crates/engine", "crates/logstream", "crates/machinery", "crates/proto", "crates/scheduler", "crates/server", "crates/storage", "crates/testing", "crates/cli"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,7 @@ crc = "3"
 derive_more = { version = "1", features = ["from", "into"] }
 jsonata-core = "2"
 jsonptr = { version = "0.8", features = ["serde"] }
+mockall = "0.15"
 prost = "0.13"
 prost-build = "0.13"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -31,6 +32,7 @@ spica-machinery = { path = "crates/machinery" }
 spica-proto = { path = "crates/proto" }
 spica-scheduler = { path = "crates/scheduler" }
 spica-storage = { path = "crates/storage" }
+spica-testing = { path = "crates/testing" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = "0.1"

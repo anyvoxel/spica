@@ -422,7 +422,7 @@ pub trait StateHandler: Send + Sync {
                 return;
             }
             Err(e) => {
-                out.terminate(Some(activity.clone()), execution.clone(), e);
+                out.terminate(Some(activity.clone()), execution.clone(), e.into());
                 return;
             }
         };
@@ -522,7 +522,7 @@ pub trait StateHandler: Send + Sync {
                 return;
             }
             Err(e) => {
-                out.terminate(Some(activity.clone()), ObjectReference::nil(), e);
+                out.terminate(Some(activity.clone()), ObjectReference::nil(), e.into());
                 return;
             }
         };

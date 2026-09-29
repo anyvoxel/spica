@@ -43,85 +43,12 @@ use async_trait::async_trait;
 use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
 use spica_engine_types::{
-    ActivityRecord, ExecutionError, ExecutionRecord, Flow, FlowName, FlowVersion, InfraError,
-    ObjectKind, ObjectName, ObjectReference, Storage, StorageTxn, TaskRecord, ThreadRecord,
-    TimerRecord, Timestamp,
+    ActivityRecord, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind, ObjectName,
+    ObjectReference, Storage, StorageError, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
+    Timestamp,
 };
 
 use crate::{KeyBuilder, Kind, Scope};
-
-/// Read a single committed row: deserialize `T` from the value at `key`, or `None` if absent.
-// Storage-boundary helper returning the engine façade (see `open` for the `result_large_err` rationale).
-#[allow(clippy::result_large_err)]
-fn get_row<T: serde::de::DeserializeOwned>(
-    db: &OptimisticTransactionDB,
-    key: Vec<u8>,
-) -> Result<Option<T>, ExecutionError> {
-    match db
-        .get(key)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("rocksdb read: {e}"))))?
-    {
-        Some(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("deserialize row: {e}")))),
-        None => Ok(None),
-    }
-}
-
-/// Read one row inside an open fold from a RockSDB [`Transaction`]. `Transaction::get` resolves
-/// **read-your-writes** natively: it checks the transaction's own pending writes first, then the
-/// committed store. This is what lets read-modify-write appliers compose on a single base row within
-/// one fold (e.g. `add_child` then `put_execution` of the same ExecutionRecord row, as `StateActivating`
-/// does) without clobbering each other's buffered mutations.
-// Storage-boundary helper returning the engine façade (see `open` for the `result_large_err` rationale).
-#[allow(clippy::result_large_err)]
-fn txn_get<T: serde::de::DeserializeOwned>(
-    txn: &Transaction<'_, OptimisticTransactionDB>,
-    key: Vec<u8>,
-) -> Result<Option<T>, ExecutionError> {
-    match txn
-        .get(key)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("txn read: {e}"))))?
-    {
-        Some(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("deserialize row: {e}")))),
-        None => Ok(None),
-    }
-}
-
-/// Buffer one row into an open fold's [`Transaction`]: serialize `value` and record the write at
-/// `key`. Nothing is visible to the committed store until [`StorageTxn::commit`].
-// Storage-boundary helper returning the engine façade (see `open` for the `result_large_err` rationale).
-#[allow(clippy::result_large_err)]
-fn txn_put<T: serde::Serialize>(
-    txn: &Transaction<'_, OptimisticTransactionDB>,
-    key: Vec<u8>,
-    value: &T,
-) -> Result<(), ExecutionError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("serialize row: {e}"))))?;
-    txn.put(key, bytes)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("txn write: {e}"))))?;
-    Ok(())
-}
-
-/// Write one row straight to the store: serialize `value` and upsert it at `key` through the default
-/// (WAL, no-fsync) write path as a single-row write. Used by the raw [`Storage`] write methods
-/// (outside a fold); the transactional path buffers rows into a [`Transaction`] instead.
-// Storage-boundary helper returning the engine façade (see `open` for the `result_large_err` rationale).
-#[allow(clippy::result_large_err)]
-fn put_row<T: serde::Serialize>(
-    db: &OptimisticTransactionDB,
-    key: Vec<u8>,
-    value: &T,
-) -> Result<(), ExecutionError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("serialize row: {e}"))))?;
-    db.put(key, bytes)
-        .map_err(|e| ExecutionError::Infra(InfraError::Log(format!("rocksdb write: {e}"))))?;
-    Ok(())
-}
 
 /// A [`Storage`](spica_engine_types::Storage) whose rows are durably stored in RocksDB. Holds no internal
 /// lock: the `Storage` trait already grants the sole writer exclusive `&mut self` (the `StreamProcessor`'s
@@ -147,18 +74,43 @@ impl RocksStorage {
     /// NOTE: `RocksStorage` and `RocksLogStream` each open their own RocksDB handle/path today. A
     /// future refactor could fuse them into one DB with two column families (see the module docs) so
     /// the log and its projection share crash-recovery and `fsync` localities.
-    //
-    // `ExecutionError` (128B) trips `result_large_err`: the façade intentionally embeds the
-    // per-concern `RuntimeError`/`InfraError`/`Reject` (the point of the error split), and these
-    // storage-boundary helpers legitimately surface it — boxing would forfeit the match ergonomics.
-    #[allow(clippy::result_large_err)]
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
-        let db =
-            Arc::new(OptimisticTransactionDB::open_default(path).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb open: {e}")))
-            })?);
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let db = Arc::new(
+            OptimisticTransactionDB::open_default(path)
+                .map_err(|e| StorageError::Backend(format!("rocksdb open: {e}")))?,
+        );
         let keys = KeyBuilder::new(Scope::default_scope());
         Ok(Self { db, keys })
+    }
+
+    /// Read a single committed row outside any fold: deserialize `T` from the value at `key`, or `None`
+    /// if absent.
+    fn get_row<T: serde::de::DeserializeOwned>(
+        &self,
+        key: Vec<u8>,
+    ) -> Result<Option<T>, StorageError> {
+        match self
+            .db
+            .get(key)
+            .map_err(|e| StorageError::Backend(format!("rocksdb read: {e}")))?
+        {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| StorageError::Codec(format!("deserialize row: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Write one row straight to the store: serialize `value` and upsert it at `key` through the default
+    /// (WAL, no-fsync) write path as a single-row write. Used by the raw [`Storage`] write methods
+    /// (outside a fold); the transactional path buffers rows into a [`Transaction`] instead.
+    fn put_row<T: serde::Serialize>(&self, key: Vec<u8>, value: &T) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| StorageError::Codec(format!("serialize row: {e}")))?;
+        self.db
+            .put(key, bytes)
+            .map_err(|e| StorageError::Backend(format!("rocksdb write: {e}")))?;
+        Ok(())
     }
 }
 
@@ -167,36 +119,36 @@ impl Storage for RocksStorage {
     async fn get_execution(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-        get_row(&self.db, self.keys.execution(reference))
+    ) -> Result<Option<ExecutionRecord>, StorageError> {
+        self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ThreadRecord>, ExecutionError> {
-        get_row(&self.db, self.keys.thread(reference))
+    ) -> Result<Option<ThreadRecord>, StorageError> {
+        self.get_row(self.keys.thread(reference))
     }
 
     async fn get_activity(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<ActivityRecord>, ExecutionError> {
-        get_row(&self.db, self.keys.activity(reference))
+    ) -> Result<Option<ActivityRecord>, StorageError> {
+        self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TimerRecord>, ExecutionError> {
-        get_row(&self.db, self.keys.timer(reference))
+    ) -> Result<Option<TimerRecord>, StorageError> {
+        self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &self,
         reference: &ObjectReference,
-    ) -> Result<Option<TaskRecord>, ExecutionError> {
-        get_row(&self.db, self.keys.task(reference))
+    ) -> Result<Option<TaskRecord>, StorageError> {
+        self.get_row(self.keys.task(reference))
     }
 
     async fn activatable_tasks(
@@ -204,18 +156,16 @@ impl Storage for RocksStorage {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         // A forward prefix scan over the `task` kind (no per-resource queue index in M1 — see the
         // trait doc). Row values are their JSON encoding, decoded and filtered by resource+status.
         let prefix = self.keys.task_prefix();
         let mut out: Vec<TaskRecord> = Vec::new();
         for item in self.db.prefix_iterator(prefix) {
-            let (_, value) = item.map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb task scan: {e}")))
-            })?;
-            let task: TaskRecord = serde_json::from_slice(&value).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb task decode: {e}")))
-            })?;
+            let (_, value) =
+                item.map_err(|e| StorageError::Backend(format!("rocksdb task scan: {e}")))?;
+            let task: TaskRecord = serde_json::from_slice(&value)
+                .map_err(|e| StorageError::Codec(format!("rocksdb task decode: {e}")))?;
             if task.value.resource == resource && task.value.is_claimable_at(now) {
                 // The cap counts rows already collected, so it is tested *before* the row joins
                 // them: `limit == 0` yields an empty page on every backend.
@@ -233,7 +183,7 @@ impl Storage for RocksStorage {
         kind: ObjectKind,
         start_after: Option<&ObjectName>,
         limit: usize,
-    ) -> Result<Vec<(ObjectName, Vec<u8>)>, ExecutionError> {
+    ) -> Result<Vec<(ObjectName, Vec<u8>)>, StorageError> {
         // A forward prefix scan over one kind's range (k8s-style LIST). Keys are byte-ordered text,
         // so the pure-ASCII name suffix compares lexicographically — a `>`-from-`start_after` filter
         // and the page cutoff are both plain string/bounds checks; the raw value bytes are returned
@@ -242,22 +192,19 @@ impl Storage for RocksStorage {
         let after = start_after.as_ref().map(|n| n.as_str());
         let mut out: Vec<(ObjectName, Vec<u8>)> = Vec::new();
         for item in self.db.prefix_iterator(prefix.clone()) {
-            let (key, value) = item.map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} scan: {e}")))
-            })?;
+            let (key, value) =
+                item.map_err(|e| StorageError::Backend(format!("rocksdb {kind:?} scan: {e}")))?;
             let name = &key[prefix.len()..];
-            let name = std::str::from_utf8(name).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} name: {e}")))
-            })?;
+            let name = std::str::from_utf8(name)
+                .map_err(|e| StorageError::InvalidKey(format!("rocksdb {kind:?} name: {e}")))?;
             if after
                 .as_ref()
                 .is_some_and(|a| name.as_bytes() <= a.as_bytes())
             {
                 continue;
             }
-            let name = ObjectName::from_parsed(name).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb {kind:?} name: {e}")))
-            })?;
+            let name = ObjectName::from_parsed(name)
+                .map_err(|e| StorageError::InvalidKey(format!("rocksdb {kind:?} name: {e}")))?;
             out.push((name, value.to_vec()));
             if out.len() >= limit {
                 break;
@@ -271,7 +218,7 @@ impl Storage for RocksStorage {
     async fn get_children(
         &self,
         id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, ExecutionError> {
+    ) -> Result<HashSet<ObjectReference>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
                 .get_execution(&id)
@@ -295,24 +242,24 @@ impl Storage for RocksStorage {
         })
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
-        put_row(&self.db, self.keys.execution(&exec.reference()), &exec)
+    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.execution(&exec.reference()), &exec)
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
-        put_row(&self.db, self.keys.thread(&thread.reference()), &thread)
+    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.thread(&thread.reference()), &thread)
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
-        put_row(&self.db, self.keys.activity(&act.reference()), &act)
+    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.activity(&act.reference()), &act)
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
-        put_row(&self.db, self.keys.timer(&timer.reference()), &timer)
+    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.timer(&timer.reference()), &timer)
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
-        put_row(&self.db, self.keys.task(&task.reference()), &task)
+    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.task(&task.reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`, exactly like
@@ -321,7 +268,7 @@ impl Storage for RocksStorage {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(mut exec) = self.get_execution(&parent).await? {
@@ -352,7 +299,7 @@ impl Storage for RocksStorage {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(mut exec) = self.get_execution(&parent).await? {
@@ -378,11 +325,11 @@ impl Storage for RocksStorage {
         Ok(())
     }
 
-    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
-        get_row(&self.db, self.keys.flow(&name))
+    async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {
+        self.get_row(self.keys.flow(&name))
     }
 
-    async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+    async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
         // Canonical row, addressed by the immutable name (the primary key) — derived from
         // `meta.name`, the flow's sole name carrier.
         let name = flow
@@ -391,20 +338,20 @@ impl Storage for RocksStorage {
             .as_plain()
             .expect("a Flow's meta.name is always a user FlowName")
             .clone();
-        put_row(&self.db, self.keys.flow(&name), &flow)
+        self.put_row(self.keys.flow(&name), &flow)
     }
 
     async fn get_flow_version(
         &self,
         version: &ObjectReference,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
-        get_row(&self.db, self.keys.flow_version(&version.name))
+    ) -> Result<Option<FlowVersion>, StorageError> {
+        self.get_row(self.keys.flow_version(&version.name))
     }
 
-    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), ExecutionError> {
+    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
         // Canonical version row, keyed by the version's own addressing name
         // (`{flow_name}-{version}`, which doubles as its storage address — no separate index).
-        put_row(&self.db, self.keys.flow_version(&ver.meta.name), &ver)?;
+        self.put_row(self.keys.flow_version(&ver.meta.name), &ver)?;
         Ok(())
     }
 
@@ -412,32 +359,33 @@ impl Storage for RocksStorage {
         &self,
         name: FlowName,
         version: u32,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         // Address the version by its derived name (`{flow}-{version}`) — a single point read.
-        get_row(
-            &self.db,
+        self.get_row(
             self.keys
                 .flow_version(&FlowVersion::version_name(&name, version)),
         )
     }
 
-    async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
+    async fn last_processed_position(&self) -> Result<i64, StorageError> {
         // A global scalar: absent key ⇒ nothing processed yet, so 0 (the "resume from position 1"
         // default) — no stored row means a fresh store, indistinguishable from the initial state.
-        Ok(get_row(&self.db, self.keys.last_processed_position())?.unwrap_or(0))
+        Ok(self
+            .get_row(self.keys.last_processed_position())?
+            .unwrap_or(0))
     }
 
-    async fn put_last_processed_position(&mut self, position: i64) -> Result<(), ExecutionError> {
+    async fn put_last_processed_position(&mut self, position: i64) -> Result<(), StorageError> {
         // A standalone watermark write, used outside a fold; inside a fold the StreamProcessor passes the
         // advance to `StorageTxn::commit` so it lands in the same atomic batch as the projection.
-        put_row(&self.db, self.keys.last_processed_position(), &position)
+        self.put_row(self.keys.last_processed_position(), &position)
     }
 
-    async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
-        Ok(get_row(&self.db, self.keys.next_generated_seq())?.unwrap_or(0))
+    async fn next_generated_seq(&self) -> Result<i64, StorageError> {
+        Ok(self.get_row(self.keys.next_generated_seq())?.unwrap_or(0))
     }
 
-    fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
+    fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, StorageError> {
         // Hand the StreamProcessor an **owned** fold transaction backed by a native RocksDB
         // `Transaction` begun on this store's DB (which reads its own pending writes — read-your-
         // writes — for free). The transaction holds an `Arc` clone of the DB, so it can outlive
@@ -476,41 +424,73 @@ struct RocksTxn {
     _db: Arc<OptimisticTransactionDB>,
 }
 
+impl RocksTxn {
+    /// Read one row through this fold's [`Transaction`]. Read-your-writes (see the type docs) is what
+    /// lets the read-modify-write appliers compose on one base row inside a fold — `add_child` followed
+    /// by `put_execution` of the same ExecutionRecord row, as `StateActivating` does.
+    fn get_row<T: serde::de::DeserializeOwned>(
+        &self,
+        key: Vec<u8>,
+    ) -> Result<Option<T>, StorageError> {
+        match self
+            .txn
+            .get(key)
+            .map_err(|e| StorageError::Backend(format!("txn read: {e}")))?
+        {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| StorageError::Codec(format!("deserialize row: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Buffer one row into this fold's [`Transaction`]: serialize `value` and record the write at
+    /// `key`. Nothing is visible to the committed store until [`StorageTxn::commit`].
+    fn put_row<T: serde::Serialize>(&self, key: Vec<u8>, value: &T) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| StorageError::Codec(format!("serialize row: {e}")))?;
+        self.txn
+            .put(key, bytes)
+            .map_err(|e| StorageError::Backend(format!("txn write: {e}")))?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl StorageTxn for RocksTxn {
     async fn get_execution(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
-        txn_get(&self.txn, self.keys.execution(reference))
+    ) -> Result<Option<ExecutionRecord>, StorageError> {
+        self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ThreadRecord>, ExecutionError> {
-        txn_get(&self.txn, self.keys.thread(reference))
+    ) -> Result<Option<ThreadRecord>, StorageError> {
+        self.get_row(self.keys.thread(reference))
     }
 
     async fn get_activity(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<ActivityRecord>, ExecutionError> {
-        txn_get(&self.txn, self.keys.activity(reference))
+    ) -> Result<Option<ActivityRecord>, StorageError> {
+        self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<TimerRecord>, ExecutionError> {
-        txn_get(&self.txn, self.keys.timer(reference))
+    ) -> Result<Option<TimerRecord>, StorageError> {
+        self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &mut self,
         reference: &ObjectReference,
-    ) -> Result<Option<TaskRecord>, ExecutionError> {
-        txn_get(&self.txn, self.keys.task(reference))
+    ) -> Result<Option<TaskRecord>, StorageError> {
+        self.get_row(self.keys.task(reference))
     }
 
     async fn activatable_tasks(
@@ -518,7 +498,7 @@ impl StorageTxn for RocksTxn {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, ExecutionError> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         // A forward prefix scan through the transaction iterator, which applies the pending
         // WriteBatch over the committed store (read-your-writes): a task folded earlier in this
         // batch is seen, with its buffered status winning. No per-resource queue index in M1.
@@ -528,15 +508,13 @@ impl StorageTxn for RocksTxn {
             .iterator(IteratorMode::From(&prefix, Direction::Forward));
         let mut out: Vec<TaskRecord> = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb txn task scan: {e}")))
-            })?;
+            let (key, value) =
+                item.map_err(|e| StorageError::Backend(format!("rocksdb txn task scan: {e}")))?;
             if !key.starts_with(&prefix) {
                 break;
             }
-            let task: TaskRecord = serde_json::from_slice(&value).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("rocksdb txn task decode: {e}")))
-            })?;
+            let task: TaskRecord = serde_json::from_slice(&value)
+                .map_err(|e| StorageError::Codec(format!("rocksdb txn task decode: {e}")))?;
             if task.value.resource == resource && task.value.is_claimable_at(now) {
                 // Same cap-before-collect ordering as the committed-store scan above.
                 if out.len() >= limit {
@@ -551,7 +529,7 @@ impl StorageTxn for RocksTxn {
     async fn get_children(
         &mut self,
         id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, ExecutionError> {
+    ) -> Result<HashSet<ObjectReference>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
                 .get_execution(&id)
@@ -575,24 +553,24 @@ impl StorageTxn for RocksTxn {
         })
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.execution(&exec.reference()), &exec)
+    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.execution(&exec.reference()), &exec)
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.thread(&thread.reference()), &thread)
+    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.thread(&thread.reference()), &thread)
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.activity(&act.reference()), &act)
+    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.activity(&act.reference()), &act)
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.timer(&timer.reference()), &timer)
+    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.timer(&timer.reference()), &timer)
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.task(&task.reference()), &task)
+    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+        self.put_row(self.keys.task(&task.reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`: read the (read-your-writes)
@@ -601,7 +579,7 @@ impl StorageTxn for RocksTxn {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(mut exec) = self.get_execution(&parent).await? {
@@ -633,7 +611,7 @@ impl StorageTxn for RocksTxn {
         &mut self,
         parent: ObjectReference,
         child: ObjectReference,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(mut exec) = self.get_execution(&parent).await? {
@@ -659,11 +637,11 @@ impl StorageTxn for RocksTxn {
         Ok(())
     }
 
-    async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
-        txn_get(&self.txn, self.keys.flow(&name))
+    async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError> {
+        self.get_row(self.keys.flow(&name))
     }
 
-    async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+    async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
         // Keyed by the flow's own name, derived from `meta.name` (its sole name carrier).
         let name = flow
             .meta
@@ -671,20 +649,20 @@ impl StorageTxn for RocksTxn {
             .as_plain()
             .expect("a Flow's meta.name is always a user FlowName")
             .clone();
-        txn_put(&self.txn, self.keys.flow(&name), &flow)
+        self.put_row(self.keys.flow(&name), &flow)
     }
 
     async fn get_flow_version(
         &mut self,
         version: &ObjectReference,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
-        txn_get(&self.txn, self.keys.flow_version(&version.name))
+    ) -> Result<Option<FlowVersion>, StorageError> {
+        self.get_row(self.keys.flow_version(&version.name))
     }
 
-    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), ExecutionError> {
+    async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
         // Canonical version row, keyed by the version's own addressing name
         // (`{flow_name}-{version}`, which doubles as its storage address — no separate index).
-        txn_put(&self.txn, self.keys.flow_version(&ver.meta.name), &ver)?;
+        self.put_row(self.keys.flow_version(&ver.meta.name), &ver)?;
         Ok(())
     }
 
@@ -692,46 +670,38 @@ impl StorageTxn for RocksTxn {
         &mut self,
         name: FlowName,
         version: u32,
-    ) -> Result<Option<FlowVersion>, ExecutionError> {
+    ) -> Result<Option<FlowVersion>, StorageError> {
         // Address the version by its derived name (`{flow}-{version}`) — a single point read.
-        txn_get(
-            &self.txn,
+        self.get_row(
             self.keys
                 .flow_version(&FlowVersion::version_name(&name, version)),
         )
     }
 
-    async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+    async fn next_generated_seq(&mut self) -> Result<i64, StorageError> {
         // The native RocksDB Transaction reads its own pending writes (read-your-writes for free),
         // so a fold sees its own earlier bump within the same batch.
-        Ok(txn_get(&self.txn, self.keys.next_generated_seq())?.unwrap_or(0))
+        Ok(self.get_row(self.keys.next_generated_seq())?.unwrap_or(0))
     }
 
-    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
-        txn_put(&self.txn, self.keys.next_generated_seq(), &seq)?;
+    async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), StorageError> {
+        self.put_row(self.keys.next_generated_seq(), &seq)?;
         Ok(())
     }
 
-    fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
-        // Move the transaction out of the box (and drop the DB clone with it).
-        let RocksTxn { txn, keys, .. } = *self;
+    fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), StorageError> {
         // Fold the watermark advance into the same transaction as the projection, so it can never run
         // ahead of the projection (the invariant that makes restart-from-W+1 safe).
         if let Some(w) = watermark {
-            let bytes = serde_json::to_vec(&w).map_err(|e| {
-                ExecutionError::Infra(InfraError::Log(format!("serialize watermark: {e}")))
-            })?;
-            txn.put(keys.last_processed_position(), bytes)
-                .map_err(|e| {
-                    ExecutionError::Infra(InfraError::Log(format!("txn write watermark: {e}")))
-                })?;
+            self.put_row(self.keys.last_processed_position(), &w)?;
         }
+        // Move the transaction out of the box (and drop the DB clone with it).
+        let RocksTxn { txn, .. } = *self;
         // Atomic all-or-nothing commit of the whole fold (projection + watermark) through the default
         // (WAL, no-fsync) write path — a half-applied fold is impossible. Dropping the box instead of
         // committing aborts: the transaction is never written.
-        txn.commit().map_err(|e| {
-            ExecutionError::Infra(InfraError::Log(format!("rocksdb txn commit: {e}")))
-        })?;
+        txn.commit()
+            .map_err(|e| StorageError::Backend(format!("rocksdb txn commit: {e}")))?;
         Ok(())
     }
 }
@@ -1103,6 +1073,48 @@ mod tests {
             let store = RocksStorage::open(&path).unwrap();
             assert_eq!(store.last_processed_position().await.unwrap(), 7);
         }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Pins the absent-key contract of both read seats: RocksDB reports a miss as a null value, **not**
+    /// as a `NotFound` status, so `db.get`/`txn.get` answer `Ok(None)` and the backend-error mapping on
+    /// each path stays reserved for genuine faults. If a miss ever became an `Err`, every
+    /// read-modify-write applier and `ActivityContainer::open`'s optional answer would break — hence the
+    /// `Ok(None)` shape is asserted with `matches!` rather than an `is_none()` on an unwrapped value, so
+    /// an `Err` cannot masquerade as a miss.
+    #[tokio::test]
+    async fn an_absent_key_reads_as_none_not_as_a_backend_fault() {
+        let path = temp_path("absent");
+        let store = RocksStorage::open(&path).unwrap();
+        let absent = test_exec_ref();
+
+        // Committed-store seat: a key the store never saw.
+        let read = store.get_execution(&absent).await;
+        assert!(
+            matches!(read, Ok(None)),
+            "an absent row is Ok(None), not a backend fault: {read:?}"
+        );
+
+        // Fold seat: the fold holds a pending write of its own, and the queried key is not among them —
+        // a miss inside a populated fold is still a miss, resolved from the committed store (which also
+        // has nothing), and still not an error.
+        let present = test_exec_ref();
+        let mut txn = store.begin_txn().unwrap();
+        txn.put_execution(sample_execution(present.clone()))
+            .await
+            .unwrap();
+        let hit = txn.get_execution(&present).await;
+        assert!(
+            matches!(hit, Ok(Some(_))),
+            "the fold's own pending write is readable (read-your-writes): {hit:?}"
+        );
+        let read = txn.get_execution(&absent).await;
+        assert!(
+            matches!(read, Ok(None)),
+            "an absent row inside a fold is Ok(None), not a backend fault: {read:?}"
+        );
+
+        drop(txn);
         let _ = std::fs::remove_dir_all(&path);
     }
 }

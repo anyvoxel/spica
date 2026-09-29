@@ -752,7 +752,7 @@ mod tests {
     use crate::log::{InMemoryLogStream, Timestamp};
     use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord, TimerRecord};
     use crate::types::command::{CompleteTask, CreateFlow, TerminateExecution};
-    use crate::types::error::InfraError;
+    use crate::types::error::StorageError;
     use crate::types::flow::Flow;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
@@ -1041,37 +1041,37 @@ mod tests {
         async fn get_execution(
             &self,
             reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+        ) -> Result<Option<ExecutionRecord>, StorageError> {
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &self,
             reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
+        ) -> Result<Option<ThreadRecord>, StorageError> {
             self.inner.get_thread(reference).await
         }
         async fn get_activity(
             &self,
             reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
+        ) -> Result<Option<ActivityRecord>, StorageError> {
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &self,
             reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
+        ) -> Result<Option<TimerRecord>, StorageError> {
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &self,
             reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
+        ) -> Result<Option<TaskRecord>, StorageError> {
             self.inner.get_task(reference).await
         }
         async fn get_children(
             &self,
             id: ObjectReference,
-        ) -> Result<std::collections::HashSet<ObjectReference>, ExecutionError> {
+        ) -> Result<std::collections::HashSet<ObjectReference>, StorageError> {
             self.inner.get_children(id).await
         }
         async fn activatable_tasks(
@@ -1079,79 +1079,76 @@ mod tests {
             resource: &str,
             now: Timestamp,
             limit: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+        ) -> Result<Vec<TaskRecord>, StorageError> {
             self.inner.activatable_tasks(resource, now, limit).await
         }
-        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
             self.inner.put_execution(exec).await
         }
-        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
             self.inner.put_thread(thread).await
         }
-        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
         }
-        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
             self.inner.put_timer(timer).await
         }
-        async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+        async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
             self.inner.put_task(task).await
         }
         async fn remove_child(
             &mut self,
             parent: ObjectReference,
             child: ObjectReference,
-        ) -> Result<(), ExecutionError> {
+        ) -> Result<(), StorageError> {
             self.inner.remove_child(parent, child).await
         }
         async fn add_child(
             &mut self,
             parent: ObjectReference,
             child: ObjectReference,
-        ) -> Result<(), ExecutionError> {
+        ) -> Result<(), StorageError> {
             self.inner.add_child(parent, child).await
         }
-        async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, ExecutionError> {
+        async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {
             self.inner.get_flow_by_name(name).await
         }
-        async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+        async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
             self.inner.put_flow(flow).await
         }
         async fn get_flow_version(
             &self,
             version: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
+        ) -> Result<Option<FlowVersion>, StorageError> {
             self.inner.get_flow_version(version).await
         }
-        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), ExecutionError> {
+        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), StorageError> {
             self.inner.put_flow_version(version).await
         }
         async fn flow_version_of(
             &self,
             name: FlowName,
             version: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
+        ) -> Result<Option<FlowVersion>, StorageError> {
             self.inner.flow_version_of(name, version).await
         }
         /// The one intercepted operation: the transaction the leader folds into is where handlers
         /// read, so the fault has to be installed here to be reachable by a dispatch at all.
-        fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, ExecutionError> {
+        fn begin_txn(&self) -> Result<Box<dyn StorageTxn>, StorageError> {
             Ok(Box::new(FaultingTxn {
                 inner: self.inner.begin_txn()?,
                 fail_reads: self.fail_reads,
                 reads: Arc::clone(&self.reads),
             }))
         }
-        async fn last_processed_position(&self) -> Result<i64, ExecutionError> {
+        async fn last_processed_position(&self) -> Result<i64, StorageError> {
             self.inner.last_processed_position().await
         }
-        async fn put_last_processed_position(
-            &mut self,
-            position: i64,
-        ) -> Result<(), ExecutionError> {
+        async fn put_last_processed_position(&mut self, position: i64) -> Result<(), StorageError> {
             self.inner.put_last_processed_position(position).await
         }
-        async fn next_generated_seq(&self) -> Result<i64, ExecutionError> {
+        async fn next_generated_seq(&self) -> Result<i64, StorageError> {
             self.inner.next_generated_seq().await
         }
     }
@@ -1167,12 +1164,10 @@ mod tests {
     }
 
     impl FaultingTxn {
-        fn read(&mut self) -> Result<(), ExecutionError> {
+        fn read(&mut self) -> Result<(), StorageError> {
             *self.reads.lock().expect("the read counter is unpoisoned") += 1;
             if self.fail_reads {
-                return Err(ExecutionError::Infra(InfraError::Log(
-                    "injected storage fault".to_string(),
-                )));
+                return Err(StorageError::Backend("injected storage fault".to_string()));
             }
             Ok(())
         }
@@ -1183,42 +1178,42 @@ mod tests {
         async fn get_execution(
             &mut self,
             reference: &ObjectReference,
-        ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+        ) -> Result<Option<ExecutionRecord>, StorageError> {
             self.read()?;
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &mut self,
             reference: &ObjectReference,
-        ) -> Result<Option<ThreadRecord>, ExecutionError> {
+        ) -> Result<Option<ThreadRecord>, StorageError> {
             self.read()?;
             self.inner.get_thread(reference).await
         }
         async fn get_activity(
             &mut self,
             reference: &ObjectReference,
-        ) -> Result<Option<ActivityRecord>, ExecutionError> {
+        ) -> Result<Option<ActivityRecord>, StorageError> {
             self.read()?;
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &mut self,
             reference: &ObjectReference,
-        ) -> Result<Option<TimerRecord>, ExecutionError> {
+        ) -> Result<Option<TimerRecord>, StorageError> {
             self.read()?;
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &mut self,
             reference: &ObjectReference,
-        ) -> Result<Option<TaskRecord>, ExecutionError> {
+        ) -> Result<Option<TaskRecord>, StorageError> {
             self.read()?;
             self.inner.get_task(reference).await
         }
         async fn get_children(
             &mut self,
             id: ObjectReference,
-        ) -> Result<std::collections::HashSet<ObjectReference>, ExecutionError> {
+        ) -> Result<std::collections::HashSet<ObjectReference>, StorageError> {
             self.read()?;
             self.inner.get_children(id).await
         }
@@ -1227,21 +1222,18 @@ mod tests {
             resource: &str,
             now: Timestamp,
             limit: usize,
-        ) -> Result<Vec<TaskRecord>, ExecutionError> {
+        ) -> Result<Vec<TaskRecord>, StorageError> {
             self.read()?;
             self.inner.activatable_tasks(resource, now, limit).await
         }
-        async fn get_flow_by_name(
-            &mut self,
-            name: FlowName,
-        ) -> Result<Option<Flow>, ExecutionError> {
+        async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError> {
             self.read()?;
             self.inner.get_flow_by_name(name).await
         }
         async fn get_flow_version(
             &mut self,
             version: &ObjectReference,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
+        ) -> Result<Option<FlowVersion>, StorageError> {
             self.read()?;
             self.inner.get_flow_version(version).await
         }
@@ -1249,52 +1241,52 @@ mod tests {
             &mut self,
             name: FlowName,
             version: u32,
-        ) -> Result<Option<FlowVersion>, ExecutionError> {
+        ) -> Result<Option<FlowVersion>, StorageError> {
             self.read()?;
             self.inner.flow_version_of(name, version).await
         }
-        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), ExecutionError> {
+        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
             self.inner.put_execution(exec).await
         }
-        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), ExecutionError> {
+        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
             self.inner.put_thread(thread).await
         }
-        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), ExecutionError> {
+        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
         }
-        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), ExecutionError> {
+        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
             self.inner.put_timer(timer).await
         }
-        async fn put_task(&mut self, task: TaskRecord) -> Result<(), ExecutionError> {
+        async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
             self.inner.put_task(task).await
         }
         async fn remove_child(
             &mut self,
             parent: ObjectReference,
             child: ObjectReference,
-        ) -> Result<(), ExecutionError> {
+        ) -> Result<(), StorageError> {
             self.inner.remove_child(parent, child).await
         }
         async fn add_child(
             &mut self,
             parent: ObjectReference,
             child: ObjectReference,
-        ) -> Result<(), ExecutionError> {
+        ) -> Result<(), StorageError> {
             self.inner.add_child(parent, child).await
         }
-        async fn put_flow(&mut self, flow: Flow) -> Result<(), ExecutionError> {
+        async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError> {
             self.inner.put_flow(flow).await
         }
-        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), ExecutionError> {
+        async fn put_flow_version(&mut self, version: FlowVersion) -> Result<(), StorageError> {
             self.inner.put_flow_version(version).await
         }
-        async fn next_generated_seq(&mut self) -> Result<i64, ExecutionError> {
+        async fn next_generated_seq(&mut self) -> Result<i64, StorageError> {
             self.inner.next_generated_seq().await
         }
-        async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), ExecutionError> {
+        async fn put_next_generated_seq(&mut self, seq: i64) -> Result<(), StorageError> {
             self.inner.put_next_generated_seq(seq).await
         }
-        fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), ExecutionError> {
+        fn commit(self: Box<Self>, watermark: Option<i64>) -> Result<(), StorageError> {
             self.inner.commit(watermark)
         }
     }

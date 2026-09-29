@@ -1,0 +1,12 @@
+[package]
+name = "spica-testing"
+version.workspace = true
+edition.workspace = true
+# Not published: a test double is only meaningful against the exact revision of the traits it
+# restates, so handing one to a consumer outside this workspace would be handing them drift.
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+mockall.workspace = true
+spica-engine-types.workspace = true

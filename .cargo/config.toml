@@ -16,3 +16,13 @@ jobs = 4
 # biggest per-crate debug overhead). Set `debug = 2` locally (or a crate-level
 # `[profile.dev]`) when full variable inspection is needed.
 debug = "line-tables-only"
+
+[profile.dev.package.librocksdb-sys]
+# RocksDB's C++ side is the single biggest artifact in this workspace: the
+# `librocksdb.a` that the build script produces is ~1 GiB, and the rlib that
+# statically embeds it is the same again. Most of that is C++ DWARF, which
+# `debug = "line-tables-only"` above cannot remove -- cc-rs decides whether to
+# pass `-g` from the `DEBUG` variable Cargo hands the build script, and a
+# non-zero debug level still reads as "on". Dropping this crate to `false` is
+# what actually shrinks the archive.
+debug = false
