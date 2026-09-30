@@ -810,12 +810,9 @@ mod tests {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine_types::ObjectMeta::builder(
-                    spica_engine_types::ObjectKind::Execution,
-                    id.uid,
-                )
-                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                .build(),
+                meta: spica_engine_types::ObjectMeta::builder(id.uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build(),
             },
             variables: Variables::new(),
             active_children: HashSet::new(),
@@ -861,7 +858,7 @@ mod tests {
                     retrier_attempts: vec![],
                     next_available_at,
                 },
-                meta: spica_engine_types::ObjectMeta::builder(ObjectKind::Task, id)
+                meta: spica_engine_types::ObjectMeta::builder(id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .build(),
             },

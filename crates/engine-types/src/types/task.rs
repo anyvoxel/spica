@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_machinery::Timestamp;
 
 /// Per-retrier retry bookkeeping for a single `Retry` entry, carried **on the task** (Zeebe-style
@@ -137,6 +137,14 @@ impl TaskStatus {
     }
 }
 
+/// The [`ObjectKindMarker`] tying a [`Task`]'s meta to [`ObjectKind::Task`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskKind;
+
+impl ObjectKindMarker for TaskKind {
+    const KIND: ObjectKind = ObjectKind::Task;
+}
+
 /// The event-/domain-carried value of a Task.
 ///
 /// A task is an in-flight external call invoked by a `Task` state (`"Type": "Task"`) — a call to
@@ -148,7 +156,7 @@ impl TaskStatus {
 pub struct Task {
     /// Shared identity + timing metadata. The domain `created_at`/`updated_at` (stamped at each
     /// lifecycle-transition emit) live inside `meta`, whose `uid` is the task's stable identity.
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<TaskKind>,
     /// The owning top-level run (the flat execution anchor), always carried so a task (wherever it
     /// lives in a branch) is traceable to, and nameable from, its root run — the same ownership
     /// channel an `Activity`/`Timer` carries. `meta.owner` is the immediate invoking activity; this
@@ -189,13 +197,6 @@ pub struct Task {
 }
 
 impl Task {
-    /// The task's stable identity, derived from `meta` — the canonical `obj-<uid>` reference a
-    /// caller uses to address the task. Retries re-use the same entity, so `meta` (and hence this
-    /// reference) is stable across retry attempts.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(ObjectKind::Task, self.meta.name.clone(), self.meta.uid)
-    }
-
     /// Whether a worker may claim this task *at* `now`: a `Pending` task whose retry backoff gate has
     /// lapsed, or a `Running` task whose delivery lease has expired.
     ///
@@ -258,7 +259,7 @@ mod tests {
     /// fields it is about.
     fn at_status(status: TaskStatus) -> Task {
         Task {
-            meta: ObjectMeta::builder(ObjectKind::Task, ulid::Ulid::new())
+            meta: ObjectMeta::builder(ulid::Ulid::new())
                 .timestamps(ts(0), ts(0))
                 .build(),
             execution: ObjectReference::nil(),
@@ -365,12 +366,12 @@ mod tests {
         t.worker_id = Some("w1".to_string());
         t.lease_expires_at = Some(ts(1_000));
         t.retry_state.attempts = 2;
-        let before = t.reference();
+        let before = t.meta.reference();
         t.cancel(ts(200));
         assert_eq!(t.status, TaskStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
-        assert_eq!(t.reference(), before);
+        assert_eq!(t.meta.reference(), before);
         assert_eq!(
             t.worker_id.as_deref(),
             Some("w1"),

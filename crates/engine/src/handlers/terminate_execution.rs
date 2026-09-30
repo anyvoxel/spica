@@ -37,7 +37,7 @@ impl TerminateExecutionHandler {
                 ));
             }
         };
-        let exec_ref = exec.reference();
+        let exec_ref = exec.meta.reference();
 
         // Optional incarnation guard: with a caller-supplied `uid`, only that exact incarnation may be
         // terminated. A mismatch means the name now points at a different execution than the caller

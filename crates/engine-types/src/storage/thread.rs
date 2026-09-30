@@ -93,7 +93,7 @@ pub async fn resolve_thread_flow_version<S: ReadonlyStorageTxn + ?Sized>(
         .ok_or_else(|| {
             ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                 "thread {} lost its owning execution {}",
-                thread.value.reference(),
+                thread.value.meta.reference(),
                 thread.value.execution
             )))
         })?;

@@ -195,9 +195,10 @@ impl Hook for CompositeHook {
         match event {
             Event::TimerActivated { timer } => {
                 // The durable event carries the timer's absolute deadline; re-arm from that moment.
-                self.scheduler.schedule(&timer.reference(), timer.deadline);
+                self.scheduler
+                    .schedule(&timer.meta.reference(), timer.deadline);
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.reference()),
+            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.reference()),
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -309,8 +310,8 @@ impl Gateway {
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        tracing::info!(name = %name_log, flow_version = %flow_version.reference(), version = flow_version.version, "flow created, acked");
-        Ok(flow_version.reference())
+        tracing::info!(name = %name_log, flow_version = %flow_version.meta.reference(), version = flow_version.version, "flow created, acked");
+        Ok(flow_version.meta.reference())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id **at birth** (settling
@@ -337,7 +338,7 @@ impl Gateway {
         };
         match event {
             Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
-                Ok(execution.reference())
+                Ok(execution.meta.reference())
             }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }

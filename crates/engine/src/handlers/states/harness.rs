@@ -32,7 +32,8 @@ use crate::types::id::EntryId;
 use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
 use crate::working::WorkingState;
 use crate::{
-    Activity, ActivityState, ActivityStatus, Entry, EntryPayload, Thread, ThreadStatus, Timestamp,
+    Activity, ActivityKind, ActivityState, ActivityStatus, Entry, EntryPayload, Thread,
+    ThreadStatus, Timestamp,
 };
 
 // ── deterministic inputs ────────────────────────────────────────────────────
@@ -92,8 +93,8 @@ pub fn minted_activity_ref() -> ObjectReference {
 
 /// The meta `activate` mints for that activity: `created_at == updated_at == at()` (the birth
 /// moment), owned by the scope the command named.
-pub fn minted_activity_meta() -> ObjectMeta {
-    ObjectMeta::builder(ObjectKind::Activity, uid(1))
+pub fn minted_activity_meta() -> ObjectMeta<ActivityKind> {
+    ObjectMeta::builder(uid(1))
         .name(obj_name("execution-0"))
         .at(at())
         .build()
@@ -143,7 +144,7 @@ pub fn complete_cmd(output: Value) -> CompleteState {
 /// liveness before it does anything else, and the owner `complete` loads the scope variables from.
 pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
     let thread = Thread {
-        meta: ObjectMeta::builder(ObjectKind::Thread, thread_ref().uid)
+        meta: ObjectMeta::builder(thread_ref().uid)
             .name(thread_ref().name)
             .at(at())
             .build()
@@ -219,7 +220,7 @@ pub fn seeded_child_thread(
 ) -> ThreadRecord {
     let reference = child_ref(index);
     let thread = Thread {
-        meta: ObjectMeta::builder(ObjectKind::Thread, reference.uid)
+        meta: ObjectMeta::builder(reference.uid)
             .name(reference.name)
             .at(at())
             .build()

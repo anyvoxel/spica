@@ -21,7 +21,7 @@ impl StateActivatingApplier {
         // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_activity(row).await?;
-        super::bump_generated_seq(ctx.storage, &activity.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &activity.meta.reference().name).await?;
         ctx.storage
             .add_child(
                 activity
@@ -29,7 +29,7 @@ impl StateActivatingApplier {
                     .owner
                     .clone()
                     .expect("an owned activity has an owner"),
-                activity.reference(),
+                activity.meta.reference(),
             )
             .await?;
         Ok(())

@@ -13,7 +13,11 @@ impl ExecutionCompletingApplier {
         ctx: &mut ApplierContext<'_>,
         execution: &Execution,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
+        if let Some(mut exec) = ctx
+            .storage
+            .get_execution(&execution.meta.reference())
+            .await?
+        {
             exec.status = ExecutionStatus::Completing;
             exec.output = execution.output.clone();
             // Keep the projected domain value's `updated_at` in step with the event's (which the

@@ -70,7 +70,7 @@ impl CompleteTaskHandler {
                 RejectionType::InvalidState,
                 format!(
                     "task {} is not currently Running (status {:?}); settlement refused",
-                    act.value.reference(),
+                    act.value.meta.reference(),
                     act.status
                 ),
             );
@@ -78,7 +78,7 @@ impl CompleteTaskHandler {
         }
         if act.worker_id.as_deref() != Some(worker_id.as_str()) || worker_id.is_empty() {
             tracing::warn!(
-                task = %act.value.reference(),
+                task = %act.value.meta.reference(),
                 reported = %worker_id,
                 leased = ?act.worker_id,
                 "worker tried to complete a task it does not lease; report rejected"
@@ -88,7 +88,7 @@ impl CompleteTaskHandler {
                 RejectionType::StateConflict,
                 format!(
                     "task {} is leased to {:?}, not {worker_id}; settlement refused",
-                    act.value.reference(),
+                    act.value.meta.reference(),
                     act.worker_id,
                 ),
             );

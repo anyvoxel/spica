@@ -30,7 +30,7 @@ impl CompleteThreadHandler {
         let Some(thread_row) = ctx.storage.get_thread(thread).await? else {
             return Ok(()); // gone already — nothing to complete.
         };
-        let thread_ref = thread_row.reference();
+        let thread_ref = thread_row.meta.reference();
         if !thread_row.value.status.is_running() {
             return Ok(()); // idempotency: already finishing or terminal.
         }

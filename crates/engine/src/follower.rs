@@ -156,7 +156,7 @@ mod tests {
             Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: ObjectMeta::builder(ObjectKind::FlowVersion, ulid::Ulid::new())
+                    meta: ObjectMeta::builder(ulid::Ulid::new())
                         .name(FlowVersion::version_name(
                             &FlowName::new("flow").expect("literal name is valid"),
                             version,
@@ -181,7 +181,7 @@ mod tests {
         let Event::FlowVersionCreated(created) = event else {
             panic!("the fixture emits a flow-version create; got {event:?}");
         };
-        created.flow_version.reference()
+        created.flow_version.meta.reference()
     }
 
     /// Read a row through the store's **committed** face — the only face the Noop commit writes, so a

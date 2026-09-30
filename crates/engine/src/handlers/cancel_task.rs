@@ -32,10 +32,6 @@ impl CancelTaskHandler {
     ) -> Result<(), ProcessingError> {
         let Some(mut task_value) = ctx.storage.get_task(task).await?.map(|task| task.value())
         else {
-            // A task row that does not exist is not a settled task — that is a `Some` with a terminal
-            // status — so the sweep is naming a child the store never saw. The read fault above is the
-            // engine's (propagated, retried by the leader); this one is the command's, and refusing it
-            // is the single followup entry the dispatch owes.
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("task {task} not found; cancel dropped"),
@@ -108,7 +104,7 @@ mod tests {
     /// The live task the sweep cancels, owned by [`activity_ref`] and leased to `w1`.
     fn seeded_task() -> TaskRecord {
         let value = Task {
-            meta: ObjectMeta::builder(ObjectKind::Task, task_ref().uid)
+            meta: ObjectMeta::builder(task_ref().uid)
                 .name(task_ref().name)
                 .at(at())
                 .build()
@@ -138,7 +134,7 @@ mod tests {
         path.push_back("States");
         path.push_back("P");
         let activity = Activity {
-            meta: ObjectMeta::builder(ObjectKind::Activity, activity_ref().uid)
+            meta: ObjectMeta::builder(activity_ref().uid)
                 .name(activity_ref().name)
                 .at(at())
                 .build()

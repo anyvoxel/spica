@@ -101,9 +101,11 @@ fn to_proto_object(obj: &QueryObject) -> spica_proto::v1::Object {
 }
 
 /// The `meta` shared by every mirror — kind/tenant/namespace/name/uid + timing + owner.
-fn proto_meta(meta: &spica_engine::ObjectMeta) -> spica_proto::v1::ObjectMeta {
+fn proto_meta<K: spica_engine::ObjectKindMarker>(
+    meta: &spica_engine::ObjectMeta<K>,
+) -> spica_proto::v1::ObjectMeta {
     spica_proto::v1::ObjectMeta {
-        kind: meta.kind.as_str().to_string(),
+        kind: K::KIND.as_str().to_string(),
         tenant: meta.tenant.as_str().to_string(),
         namespace: meta.namespace.as_str().to_string(),
         name: meta.name.as_str(),

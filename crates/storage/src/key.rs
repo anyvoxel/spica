@@ -291,7 +291,7 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine_types::{ObjectKind, ObjectMeta, PlainName};
+    use spica_engine_types::{ExecutionKind, ObjectKind, ObjectMeta, PlainName};
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
@@ -440,7 +440,8 @@ mod tests {
         // by `PlainName`'s own tests in `spica-machinery`, not restated here. What is left to check
         // is that the Phase-A default scope is *representable* and that it is the same pair
         // `ObjectMetaBuilder` stamps, so a row's key prefix and its record's own scope agree.
-        let stamped = ObjectMeta::builder(ObjectKind::Execution, Ulid::nil()).build();
+        // The kind is irrelevant here (only the scope is read), so any marker serves.
+        let stamped = ObjectMeta::<ExecutionKind>::builder(Ulid::nil()).build();
         let default = Scope::default_scope();
         assert_eq!(default.tenant(), stamped.tenant.as_str());
         assert_eq!(default.namespace(), stamped.namespace.as_str());

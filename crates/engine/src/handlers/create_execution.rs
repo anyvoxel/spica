@@ -93,7 +93,7 @@ impl CreateExecutionHandler {
                 deadline,
                 input: input.clone(),
                 output: None,
-                meta: ObjectMeta::builder(ObjectKind::Execution, uid)
+                meta: ObjectMeta::builder(uid)
                     .name(name.clone())
                     .at(ctx.now())
                     .build(),
@@ -146,7 +146,7 @@ impl CreateExecutionHandler {
             // `TimerActivated` applier bumps the counter past it in the same fold.
             let name = base.generated_from_key(out.next_generated_seq().await);
             let timer = crate::Timer {
-                meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, uid)
+                meta: crate::types::meta::ObjectMeta::builder(uid)
                     .name(name)
                     .at(ctx.now())
                     .build()
@@ -178,7 +178,7 @@ impl CreateExecutionHandler {
         let start_at = sm.start_at.clone();
         out.append_event(Event::ThreadCreated {
             thread: crate::Thread {
-                meta: ObjectMeta::builder(ObjectKind::Thread, root_uid)
+                meta: ObjectMeta::builder(root_uid)
                     .name(root_name)
                     .at(ctx.now())
                     .build()

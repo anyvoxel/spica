@@ -117,7 +117,7 @@ impl StateHandler for MapStateHandler<'_> {
         } else {
             progress.max_concurrency.min(progress.total)
         };
-        let activity = activity_value.reference();
+        let activity = activity_value.meta.reference();
         let owner = activity.clone();
         let pointer = activity_value.state_path.item_processor();
         let start_at = self
@@ -461,7 +461,7 @@ impl MapStateHandler<'_> {
         reason: TerminationReason,
     ) {
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.reference(),
+            activity: activity.meta.reference(),
             reason: reason.clone(),
         }));
         super::super::emit_scope_termination(
@@ -491,7 +491,7 @@ impl MapStateHandler<'_> {
         variables: &Variables,
         aggregated: Value,
     ) {
-        let activity_ref = activity.reference();
+        let activity_ref = activity.meta.reference();
         let owner = activity
             .meta
             .owner

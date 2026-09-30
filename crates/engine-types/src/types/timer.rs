@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TimerPurpose;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of a Timer. Kept separate from `ExecutionStatus` / `ActivityStatus` because a
@@ -25,6 +25,14 @@ impl TimerStatus {
     }
 }
 
+/// The [`ObjectKindMarker`] tying a [`Timer`]'s meta to [`ObjectKind::Timer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerKind;
+
+impl ObjectKindMarker for TimerKind {
+    const KIND: ObjectKind = ObjectKind::Timer;
+}
+
 /// The event-/domain-carried value of a Timer.
 ///
 /// A timer is a leaf side-effect node armed by an `Execution` (`ExecutionTimeout`) or an
@@ -36,7 +44,7 @@ impl TimerStatus {
 pub struct Timer {
     /// Shared identity + timing metadata. `meta.uid` is the timer's stable identity; the domain
     /// `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside `meta`.
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<TimerKind>,
     /// The execution this timer belongs to — the scope (and, at `StartExecution`'s
     /// `ExecutionTimeout`, the name-prefix) of the timer.
     pub execution: ObjectReference,
@@ -49,12 +57,6 @@ pub struct Timer {
 }
 
 impl Timer {
-    /// The timer's stable identity: `meta.uid` is the same ULID that previously stood alone as
-    /// `id`, so a retry/cancel that re-emits the same timer keeps its identity.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(ObjectKind::Timer, self.meta.name.clone(), self.meta.uid)
-    }
-
     /// Mark this timer cancelled at `at`: the row copies forward with only the terminal status and
     /// the transition stamp moved.
     ///
@@ -81,7 +83,7 @@ mod tests {
     /// re-derivation would produce — a carried-over name is what the cancel has to preserve.
     fn active_timer() -> Timer {
         Timer {
-            meta: ObjectMeta::builder(ObjectKind::Timer, ulid::Ulid::from(7u128))
+            meta: ObjectMeta::builder(ulid::Ulid::from(7u128))
                 .name(ObjectName::from_parsed("execution-0").expect("a valid object name"))
                 .timestamps(ts(0), ts(0))
                 .build()
@@ -99,12 +101,12 @@ mod tests {
     #[test]
     fn cancel_moves_only_the_status_and_the_stamp() {
         let mut t = active_timer();
-        let before = t.reference();
+        let before = t.meta.reference();
         t.cancel(ts(200));
         assert_eq!(t.status, TimerStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
-        assert_eq!(t.reference(), before);
+        assert_eq!(t.meta.reference(), before);
         assert!(t.status.is_terminal(), "a cancelled timer is terminal");
         assert_eq!(t.deadline, ts(5_000));
         assert_eq!(t.purpose, TimerPurpose::WaitResume);

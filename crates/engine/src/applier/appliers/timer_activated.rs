@@ -22,7 +22,7 @@ impl TimerActivatedApplier {
         // Birth: `created_at`/`updated_at` stamped with the `TimerActivated` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_timer(row).await?;
-        super::bump_generated_seq(ctx.storage, &timer.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &timer.meta.reference().name).await?;
         ctx.storage
             .add_child(
                 timer
@@ -30,7 +30,7 @@ impl TimerActivatedApplier {
                     .owner
                     .clone()
                     .expect("an armed timer is always owned"),
-                timer.reference(),
+                timer.meta.reference(),
             )
             .await?;
         // The physical deadline arm is not folded here — a consumer re-derives `schedule` from the

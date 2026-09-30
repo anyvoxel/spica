@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_machinery::Timestamp;
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
@@ -125,6 +125,14 @@ pub struct MapActivityState {
     pub children: HashMap<usize, ObjectReference>,
 }
 
+/// The [`ObjectKindMarker`] tying an [`Activity`]'s meta to [`ObjectKind::Activity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityKind;
+
+impl ObjectKindMarker for ActivityKind {
+    const KIND: ObjectKind = ObjectKind::Activity;
+}
+
 /// The event-carried domain value of an Activity.
 ///
 /// This is the entity-shaped payload Activity lifecycle events carry. It intentionally excludes
@@ -136,7 +144,7 @@ pub struct Activity {
     /// Shared identity + timing metadata. `meta.uid` is the activity's identity (durable object uid);
     /// the domain `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside
     /// `meta`. Use [`Activity::reference`] to obtain the canonical [`ObjectReference`].
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<ActivityKind>,
     /// The execution this activity belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s reference
     /// (the flat query anchor shared by the whole tree), regardless of how deep the activity sits in
     /// a `Parallel` branch / `Map` item. The activity's *immediate* container — the scope it lives
@@ -195,12 +203,6 @@ pub struct Activity {
 }
 
 impl Activity {
-    /// The canonical [`ObjectReference`] for this activity, derived from its `meta` (kind, generated
-    /// `obj-<uid>` name, and uid) — the identity every other object uses to reference the activity.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(ObjectKind::Activity, self.meta.name.clone(), self.meta.uid)
-    }
-
     /// The total retry count, exposed to `$states.context.State.RetryCount` — `0` until a retry has
     /// occurred (the field is `None` then).
     pub fn retry_count(&self) -> u32 {

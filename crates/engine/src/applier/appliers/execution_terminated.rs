@@ -13,7 +13,11 @@ impl ExecutionTerminatedApplier {
         ctx: &mut ApplierContext<'_>,
         execution: &Execution,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
+        if let Some(mut exec) = ctx
+            .storage
+            .get_execution(&execution.meta.reference())
+            .await?
+        {
             exec.status = execution.status.clone();
             exec.value.meta.updated_at = execution.meta.updated_at;
             let parent = exec.value.meta.owner.clone();
@@ -21,7 +25,7 @@ impl ExecutionTerminatedApplier {
             ctx.storage.put_execution(exec).await?;
             if let Some(owner) = parent {
                 ctx.storage
-                    .remove_child(owner, execution.reference())
+                    .remove_child(owner, execution.meta.reference())
                     .await?;
             }
         }

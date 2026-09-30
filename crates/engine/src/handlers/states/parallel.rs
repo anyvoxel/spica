@@ -95,7 +95,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         variables: &Variables,
         _states: &Value,
     ) -> Result<(), ExecutionError> {
-        let activity = activity_value.reference();
+        let activity = activity_value.meta.reference();
         let owner = activity.clone();
         for (index, branch) in self.state.branches.iter().enumerate() {
             let pointer = activity_value.state_path.branch(index);
@@ -306,7 +306,7 @@ impl ParallelStateHandler<'_> {
         // duplicate — so the surviving branch threads, and the timers they armed, are never stopped
         // and outlive a run that has already ended. The state's own terminate handler sweeps them.
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.reference(),
+            activity: activity.meta.reference(),
             reason: reason.clone(),
         }));
         super::super::emit_scope_termination(
