@@ -13,7 +13,7 @@ use crate::types::command::TerminationReason;
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ObjectReference, OwnerScope};
 
 pub struct FailStateHandlerFactory;
 
@@ -82,18 +82,13 @@ impl StateHandler for FailStateHandler<'_> {
         })
         .await;
 
-        // Route the terminal failure to the *owning scope*. A top-level run is an `Execution`
-        // (reached via name-addressed `TerminateExecution`); a `Fail` inside a `Parallel` branch /
-        // `Map` item is owned by a `Thread`, which lives in *thread* storage and is only reachable
-        // via the reference-addressed `TerminateThread` — a bare `TerminateExecution` here would
-        // silently miss it and leave the branch Running, wedging its container.
+        // Route the terminal failure to the *owning scope*. An activity is always owned by a
+        // `Thread`: the root Thread for a top-level run — whose own termination then relays up to the
+        // `Execution` — or the branch/item Thread of a `Parallel`/`Map`, which lives in *thread*
+        // storage and is only reachable via the reference-addressed `TerminateThread`.
         super::super::emit_scope_termination(
             out,
-            terminated
-                .meta
-                .owner
-                .as_ref()
-                .expect("an owned activity has an owner"),
+            &OwnerScope::Thread(terminated.meta.owner.clone()),
             reason,
         );
         Ok(())

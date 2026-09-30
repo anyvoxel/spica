@@ -1,7 +1,7 @@
 use crate::TimerStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ErasedOwner, ObjectReference};
 
 /// Handles `CancelTimer`: marks an armed timer cancelled. Idempotent — a no-op for a timer that
 /// already fired or was already cancelled. After recording the timer's terminal state, runs the
@@ -32,11 +32,7 @@ impl CancelTimerHandler {
         super::child_completed::child_settled(
             ctx,
             out,
-            act.value
-                .meta
-                .owner
-                .clone()
-                .expect("a live timer is always owned"),
+            act.value.meta.owner.clone().into_erased(),
             timer.clone(),
         )
         .await;

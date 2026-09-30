@@ -2,7 +2,7 @@ use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
-use crate::types::meta::ObjectKind;
+use crate::types::meta::{ErasedOwner, ThreadOwner};
 
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
@@ -57,20 +57,29 @@ impl CompleteThreadHandler {
                 thread: completed_thread,
             })
             .await;
-            if let Some(owner) = thread_row.value.meta.owner.clone() {
-                if owner.kind == ObjectKind::Execution {
-                    // Root thread (owned by the Execution): its success *is* the run's success. The
-                    // `ThreadCompleted` applier has already drained the root thread from the
-                    // execution's `active_children`, so `CompleteExecution` now closes the run.
+            let owner = thread_row.value.meta.owner.clone();
+            // Which parent the settled thread reports to is decided by the *type* of its owner, not by
+            // a kind comparison: the two parents converge a thread's result in entirely different ways.
+            match owner {
+                // Root thread (owned by the Execution): its success *is* the run's success. The
+                // `ThreadCompleted` applier has already drained the root thread from the execution's
+                // `active_children`, so `CompleteExecution` now closes the run.
+                ThreadOwner::Execution(execution) => {
                     out.append_command(Command::CompleteExecution(CompleteExecution {
-                        execution: owner,
+                        execution: execution.into_erased(),
                         output: output.clone(),
                     }));
-                } else {
-                    // A fan-out thread is owned by its container Activity; run the inline reaction
-                    // so the parallel/map converges once its last branch/item drains.
-                    super::child_completed::child_settled(ctx, out, owner, thread_ref.clone())
-                        .await;
+                }
+                // A fan-out thread is owned by its container Activity; run the inline reaction so the
+                // parallel/map converges once its last branch/item drains.
+                ThreadOwner::Activity(activity) => {
+                    super::child_completed::child_settled(
+                        ctx,
+                        out,
+                        activity.into_erased(),
+                        thread_ref.clone(),
+                    )
+                    .await;
                 }
             }
         } else {

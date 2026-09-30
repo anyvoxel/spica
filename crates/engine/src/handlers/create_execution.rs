@@ -4,7 +4,7 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{NoOwner, ObjectKind, ObjectMeta, ObjectReference, OwnerRef, OwnerScope};
 
 /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
 /// arms the state-machine `TimeoutSeconds` timer if configured. Immediately enters the start state
@@ -66,7 +66,7 @@ impl CreateExecutionHandler {
             result,
             out,
             None,
-            id.clone(),
+            OwnerScope::of_reference(&id),
             ctx.machine(flow_version).await
         );
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
@@ -96,7 +96,8 @@ impl CreateExecutionHandler {
                 meta: ObjectMeta::builder(uid)
                     .name(name.clone())
                     .at(ctx.now())
-                    .build(),
+                    // A top-level run is its own root: its owner slot is `NoOwner` by type.
+                    .with_owner(NoOwner::new()),
             },
         });
         // The birth `ExecutionCreated` echoes the awaiting `start` caller's request id; the `AckHook`
@@ -107,7 +108,7 @@ impl CreateExecutionHandler {
 
         if overflowed {
             out.fail_execution(
-                id.clone(),
+                &id,
                 ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                     "TimeoutSeconds overflows the absolute deadline".into(),
                 )),
@@ -132,7 +133,7 @@ impl CreateExecutionHandler {
                 Some(p) => p,
                 None => {
                     out.fail_execution(
-                        id.clone(),
+                        &id,
                         ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                             "cannot derive a child name: execution name is not a plain user name"
                                 .into(),
@@ -149,8 +150,11 @@ impl CreateExecutionHandler {
                 meta: crate::types::meta::ObjectMeta::builder(uid)
                     .name(name)
                     .at(ctx.now())
-                    .build()
-                    .with_owner(id.clone()),
+                    // An execution timeout is armed by the run itself — the `Execution` variant of the
+                    // timer slot, never an activity's.
+                    .with_owner(crate::types::meta::TimerOwner::Execution(
+                        crate::types::meta::OwnerRef::new(id.name.clone(), id.uid),
+                    )),
                 execution: id.clone(),
                 purpose: TimerPurpose::ExecutionTimeout,
                 status: crate::TimerStatus::Active,
@@ -181,8 +185,12 @@ impl CreateExecutionHandler {
                 meta: ObjectMeta::builder(root_uid)
                     .name(root_name)
                     .at(ctx.now())
-                    .build()
-                    .with_owner(id.clone()),
+                    // A root thread's owner is the run it stands in for — the `Execution` variant, the
+                    // one a fan-out thread (owned by its container activity) never carries.
+                    .with_owner(crate::types::meta::ThreadOwner::Execution(OwnerRef::new(
+                        id.name.clone(),
+                        id.uid,
+                    ))),
                 execution: id.clone(),
                 state_path: root_states.clone(),
                 start_at: start_at.clone(),

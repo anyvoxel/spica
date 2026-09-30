@@ -29,7 +29,11 @@ use crate::handlers::dispatch::build_state_handlers;
 use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::id::EntryId;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
+use crate::types::meta::{
+    ErasedOwner, ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef, ThreadOwner,
+    TimerOwner,
+};
+use crate::types::thread::ThreadKind;
 use crate::working::WorkingState;
 use crate::{
     Activity, ActivityKind, ActivityState, ActivityStatus, Entry, EntryPayload, Thread,
@@ -85,10 +89,49 @@ pub fn thread_ref() -> ObjectReference {
     ObjectReference::new(ObjectKind::Thread, obj_name("execution-0"), uid(91))
 }
 
+/// [`thread_ref`] in the type an activity's owner slot holds — the same address through the slot's own
+/// checked conversion.
+pub fn thread_owner() -> OwnerRef<ThreadKind> {
+    thread_ref()
+        .try_into()
+        .expect("the scope fixture is a thread")
+}
+
 /// The reference `activate` mints on a clean store: the injected generator's first id, named from the
 /// partition counter's first free suffix over the execution's plain base name.
 pub fn minted_activity_ref() -> ObjectReference {
     ObjectReference::new(ObjectKind::Activity, obj_name("execution-0"), uid(1))
+}
+
+/// The owner slot of a **thread** whose scope is the top-level run: a root thread is owned by its
+/// `Execution` (see `ThreadOwner`), and the slot's own checked conversion runs here — a fixture naming
+/// a kind the slot does not admit fails at its own construction.
+pub fn root_thread_owner(execution: ObjectReference) -> ThreadOwner {
+    ThreadOwner::Execution(
+        execution
+            .try_into()
+            .expect("the run fixture is an execution"),
+    )
+}
+
+/// The owner slot of a **thread** fanned out by a container activity — the `Activity` variant of
+/// [`ThreadOwner`], the parent a fan-out branch or item hangs off.
+pub fn fanout_thread_owner(activity: ObjectReference) -> ThreadOwner {
+    ThreadOwner::Activity(
+        activity
+            .try_into()
+            .expect("the container fixture is an activity"),
+    )
+}
+
+/// The owner slot of a **timer** armed by the waiting activity (a `WaitResume` or task timeout): the
+/// `Activity` variant of [`TimerOwner`].
+pub fn activity_timer_owner(activity: ObjectReference) -> TimerOwner {
+    TimerOwner::Activity(
+        activity
+            .try_into()
+            .expect("the waiting fixture is an activity"),
+    )
 }
 
 /// The meta `activate` mints for that activity: `created_at == updated_at == at()` (the birth
@@ -97,8 +140,7 @@ pub fn minted_activity_meta() -> ObjectMeta<ActivityKind> {
     ObjectMeta::builder(uid(1))
         .name(obj_name("execution-0"))
         .at(at())
-        .build()
-        .with_owner(thread_ref())
+        .with_owner(thread_owner())
 }
 
 /// The activity value `activate` mints on a clean store: [`minted_activity_ref`] with the given
@@ -147,8 +189,7 @@ pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
         meta: ObjectMeta::builder(thread_ref().uid)
             .name(thread_ref().name)
             .at(at())
-            .build()
-            .with_owner(execution_ref()),
+            .with_owner(root_thread_owner(execution_ref())),
         execution: execution_ref(),
         state_path: path("/States"),
         start_at: "P".to_string(),
@@ -223,8 +264,7 @@ pub fn seeded_child_thread(
         meta: ObjectMeta::builder(reference.uid)
             .name(reference.name)
             .at(at())
-            .build()
-            .with_owner(minted_activity_ref()),
+            .with_owner(fanout_thread_owner(minted_activity_ref())),
         execution: execution_ref(),
         state_path,
         start_at: "I0".to_string(),
@@ -351,10 +391,14 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: Option<ThreadRe
             definitions: &mut definitions,
             state_handlers: &state_handlers,
         };
+        // The leader's dispatcher owns this conversion; here the fixture's command is trusted, so
+        // the driver performs the same checked conversion its dispatch would.
+        let owner = OwnerRef::<ThreadKind>::try_from(cmd.owner.clone())
+            .expect("the fixture's scope is a thread");
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")
-            .activate(&mut ctx, &mut out, cmd)
+            .activate(&mut ctx, &mut out, cmd, owner)
             .await;
     }
     let entries = out.into_entries();
@@ -442,16 +486,12 @@ pub async fn child_completed(
             .await
             .expect("the in-memory store reads")
             .expect("the container activity row is seeded");
-        let scope_ref = activity_value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
+        let scope_ref = activity_value.meta.owner.clone();
         // The owner is always a `Thread` — read it directly, as `dispatch_child_completed` does; the
         // driver needs only the scope variables it evaluates against.
         let thread = ctx
             .storage
-            .get_thread(&scope_ref)
+            .get_thread(scope_ref.erased())
             .await
             .expect("the in-memory store reads")
             .expect("the owning thread is seeded");

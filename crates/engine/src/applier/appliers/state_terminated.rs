@@ -1,6 +1,7 @@
 //! `StateTerminated` event projection: folds the `Event::StateTerminated` activity value into Storage.
 
 use crate::types::error::ExecutionError;
+use crate::types::meta::ErasedOwner;
 use crate::{Activity, ApplierContext};
 
 #[derive(Default)]
@@ -17,7 +18,9 @@ impl StateTerminatedApplier {
                 .meta
                 .owner
                 .clone()
-                .expect("an owned activity has an owner");
+                // A thread is the only thing that can own an activity, so the storage seam needs no
+                // `kind` guard — and storage speaks flat addresses.
+                .into_erased();
             // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
             let mut row =
                 crate::storage::ActivityRecord::from_value(activity.clone(), act.active_children);
@@ -25,7 +28,7 @@ impl StateTerminatedApplier {
             row.updated_at = ctx.timestamp;
             ctx.storage.put_activity(row).await?;
             ctx.storage
-                .remove_child(parent.clone(), activity.meta.reference())
+                .remove_child(parent, activity.meta.reference())
                 .await?;
         }
         Ok(())

@@ -139,9 +139,10 @@ duplicated across `Execution`/`Activity`/`Timer`/`Task`).
 
 ```rust
 // types/objectmeta.rs (new)
-pub struct ObjectMeta {
-    /// Kind (k8s GVK "Kind"). Broader than the existing node-only `NodeKind`: includes Flow.
-    pub kind: ObjectKind,
+pub struct ObjectMeta<K: ObjectKindMarker> {
+    /// Kind (k8s GVK "Kind"). Broader than the existing node-only `NodeKind`: includes Flow. Carried
+    /// as a zero-sized `KindTag<K>` so the kind and the owner slot are pinned by the same parameter.
+    pub kind: KindTag<K>,
     /// Top-level isolation boundary.
     pub tenant: ScopeName,
     /// Scoping within the tenant.
@@ -156,9 +157,11 @@ pub struct ObjectMeta {
     /// When this object was born / last touched (the domain timestamps moved here).
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// The owning parent in the object tree, if any (k8s `OwnerReference`-style: kind + name + uid,
-    /// same tenant/namespace scope inherited). None for roots.
-    pub owner: Option<OwnerReference>,   // OwnerReference { kind, name, uid }
+    /// The owning parent in the object tree (k8s `OwnerReference`-style: kind + name + uid, same
+    /// tenant/namespace scope inherited). The slot is typed by the object's own kind — a `Task` is
+    /// always owned by an `Activity`, a `Flow` never owned — so a root object's slot is the empty
+    /// `NoOwner` rather than an absent one; only the wire form drops the field for roots.
+    pub owner: K::OwnedBy,   // OwnerReference { kind, name, uid } for an owned kind
     // pub resource_version: u64,   // TODO(meta): optimistic concurrency for projection CAS
 }
 ```

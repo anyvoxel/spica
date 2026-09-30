@@ -5,7 +5,7 @@ use crate::types::error::ExecutionError;
 use crate::types::event::TaskFailed;
 
 use crate::TaskStatus;
-use crate::types::meta::ObjectKind;
+use crate::types::meta::ErasedOwner;
 
 /// Applies `TaskFailed`, whose **task entity's `status` is the outcome**:
 ///
@@ -34,7 +34,9 @@ impl TaskFailedApplier {
                 .meta
                 .owner
                 .clone()
-                .expect("an owned task always has an owner");
+                // See `task_completed`: the slot's type admits only an activity owner, and storage
+                // speaks flat addresses.
+                .into_erased();
             // Fold the entity verbatim (status, cleared worker/lease, + the retry bookkeeping the
             // handler stamped: `attempts`, `retrier_attempts`, `next_available_at`).
             t.value = task.clone();
@@ -44,9 +46,7 @@ impl TaskFailedApplier {
                 // The reused task stays a child (claimable again after `next_available_at` lapses).
                 // Mirror its total attempt count onto the owning activity's `$states` RetryCount so
                 // the shared projection / Catch path sees the accumulated retries.
-                if parent.kind == ObjectKind::Activity
-                    && let Some(mut act) = ctx.storage.get_activity(&parent).await?
-                {
+                if let Some(mut act) = ctx.storage.get_activity(&parent).await? {
                     act.retry_state.get_or_insert_default().attempts = task.retry_state.attempts;
                     act.with_update_at(ctx.timestamp);
                     ctx.storage.put_activity(act).await?;

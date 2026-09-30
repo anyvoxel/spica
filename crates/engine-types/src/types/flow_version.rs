@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
+use crate::types::flow::FlowKind;
 use crate::types::id::FlowName;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, OwnerRef};
 
 /// The [`ObjectKindMarker`] tying a [`FlowVersion`]'s meta to [`ObjectKind::FlowVersion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,10 @@ pub struct FlowVersionKind;
 
 impl ObjectKindMarker for FlowVersionKind {
     const KIND: ObjectKind = ObjectKind::FlowVersion;
+    /// A version is published by exactly one flow — it *is* that flow's snapshot, and a version is
+    /// never re-parented — so the slot names that one kind rather than a union: a version owned by
+    /// anything but a [`Flow`](crate::Flow) is unrepresentable.
+    type OwnedBy = OwnerRef<FlowKind>;
 }
 
 /// One immutable, published version of a logical flow — the durable object `Storage` persists and
@@ -68,12 +73,22 @@ impl FlowVersion {
         flow.generated_from_key(u64::from(version))
     }
 
-    /// The owning flow's addressing name, read from this version's `meta.owner` (the owner's
-    /// `name` is the flow's user name — see [`crate::types::meta::ObjectReference`]). `None` only for
-    /// a version constructed without an owner (the applier's dispatch placeholder); a **persisted**
-    /// version always carries one (set in `create_flow`), so storage keys on it with `expect`.
-    pub fn flow_name(&self) -> Option<FlowName> {
-        self.meta.owner.as_ref()?.name.as_plain().cloned()
+    /// The owning flow, read from this version's `meta.owner` — the one owner read. A version is
+    /// minted together with its owner (`create_flow`) and the slot is never cleared, so the slot's own
+    /// type already guarantees a flow is there.
+    pub fn flow_owner(&self) -> &OwnerRef<FlowKind> {
+        &self.meta.owner
+    }
+
+    /// The owning flow's addressing name — the flow's **user** name, read off the owner. It is not
+    /// derivable from the version's own name, which is the *generated* `{flow_name}-{version}` (that
+    /// is why the owner is where the flow's identity is read from).
+    pub fn flow_name(&self) -> FlowName {
+        self.flow_owner()
+            .name()
+            .as_plain()
+            .cloned()
+            .expect("a Flow's name is a user plain name, never a generated one")
     }
 
     /// A CRC-64/ECMA checksum of the raw definition bytes, as its native 64-bit value. A content
@@ -90,7 +105,7 @@ impl FlowVersion {
 mod tests {
     use super::*;
     use crate::types::flow::Flow;
-    use crate::types::meta::OwnerReference;
+    use crate::types::meta::{ObjectName, OwnerRef};
     use spica_machinery::Timestamp;
 
     #[test]
@@ -116,12 +131,7 @@ mod tests {
             meta: ObjectMeta::builder(uid)
                 .name(FlowVersion::version_name(&flow, 1))
                 .at(Timestamp::from_millis(0))
-                .build()
-                .with_owner(OwnerReference::new(
-                    ObjectKind::Flow,
-                    ObjectName::plain("order").unwrap(),
-                    flow_uid,
-                )),
+                .with_owner(OwnerRef::new(ObjectName::plain("order").unwrap(), flow_uid)),
             version: 1,
             definition: String::new(),
             checksum: FlowVersion::definition_checksum(""),
@@ -130,8 +140,40 @@ mod tests {
         assert_eq!(r.kind, ObjectKind::FlowVersion);
         assert_eq!(r.name, version.meta.name);
         assert_eq!(r.uid, uid);
-        // flow_name derives from the owner reference, not the version's own name.
-        assert_eq!(version.flow_name(), Some(flow));
+        // The flow's identity is read off the version's owner, never parsed out of the version's own
+        // (generated) name.
+        assert_eq!(version.flow_name(), flow);
+        assert_eq!(version.flow_owner().uid(), flow_uid);
+    }
+
+    /// A version's owner slot admits a `Flow` and nothing else — a version *is* a flow's snapshot, and
+    /// the flow it belongs to is read off this slot ([`FlowVersion::flow_owner`]), so a row whose
+    /// owner carries another kind is refused rather than read into a version with a foreign parent.
+    #[test]
+    fn a_version_slot_admits_only_its_flow() {
+        let flow = FlowName::new("order").unwrap();
+        let owner = OwnerRef::new(ObjectName::plain("order").unwrap(), ulid::Ulid::new());
+        let version = FlowVersion {
+            meta: ObjectMeta::builder(ulid::Ulid::new())
+                .name(FlowVersion::version_name(&flow, 1))
+                .at(Timestamp::from_millis(0))
+                .with_owner(owner.clone()),
+            version: 1,
+            definition: String::new(),
+            checksum: FlowVersion::definition_checksum(""),
+        };
+        let mut json = serde_json::to_value(&version).expect("version serializes");
+        assert_eq!(json["meta"]["owner"]["kind"], serde_json::json!("Flow"));
+        let back: FlowVersion =
+            serde_json::from_value(json.clone()).expect("the slot admits its own kind");
+        assert_eq!(back.meta.owner, owner);
+
+        json["meta"]["owner"]["kind"] = serde_json::json!("Execution");
+        let err = serde_json::from_value::<FlowVersion>(json)
+            .expect_err("a version is never owned by an execution");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Flow owners"), "{msg}");
     }
 
     #[test]
@@ -141,7 +183,10 @@ mod tests {
             meta: ObjectMeta::builder(ulid::Ulid::new())
                 .name(FlowVersion::version_name(&flow, 1))
                 .at(Timestamp::from_millis(0))
-                .build(),
+                .with_owner(OwnerRef::new(
+                    ObjectName::plain("order").unwrap(),
+                    ulid::Ulid::new(),
+                )),
             version: 1,
             definition: String::new(),
             checksum: FlowVersion::definition_checksum(""),

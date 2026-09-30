@@ -1,6 +1,7 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, SpawnThread};
 use crate::types::event::Event;
+use crate::types::meta::ErasedOwner;
 
 /// Handles `SpawnThread`: fans out one branch of a `Parallel` state — or one item of a `Map` state —
 /// into a new child **Thread** (a scoped sub-run, distinct from a top-level `Execution`).
@@ -41,13 +42,21 @@ impl SpawnThreadHandler {
             input,
         } = p;
 
+        // A fan-out is spawned by a container state, so the command's flat owner must name the
+        // Parallel/Map activity it fans out from. The kind is checked once, here, where the payload
+        // crosses into the slot: a foreign kind is the command's fault and is refused rather than
+        // quietly dropped, so a fan-out never silently loses its parent.
+        let owner = crate::types::meta::OwnerRef::<crate::ActivityKind>::try_from(owner.clone())
+            .map_err(|e| {
+                ProcessingError::Rejected(
+                    crate::RejectionType::InvalidArgument,
+                    format!("spawn_thread: {e}"),
+                )
+            })?;
         // The `owner` Parallel activity must still be running (it may have since been terminated —
         // e.g. a sibling branch failed and drained the Parallel). If it is gone or no longer
         // accepting children, the fan-out is a no-op: the child simply never spawns.
-        if owner.kind != crate::types::meta::ObjectKind::Activity {
-            return Ok(()); // internal fault: a branch owner must be an Activity.
-        }
-        let owner_activity = match ctx.storage.get_activity(owner).await {
+        let owner_activity = match ctx.storage.get_activity(owner.erased()).await {
             Ok(Some(a)) => a,
             _ => return Ok(()), // owner gone — the fan-out is dropped.
         };
@@ -61,17 +70,11 @@ impl SpawnThreadHandler {
         // does **not** re-record `flow_version` (derived via its `execution` later, see `Thread`) —
         // it only inherits the tree's top-level anchor verbatim, so its states resolve against the
         // same shared machine doc.
-        let scope_ref = owner_activity
-            .value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
+        let scope_ref = owner_activity.value.meta.owner.clone();
         // Resolve the owning thread to inherit the tree's top-level anchor (`execution`): the child
         // Thread shares the owner's tree, so the anchor is taken verbatim while the Thread itself is
-        // the child's `owner`. An activity's owner is always a `Thread` (see `emit_transition`), so
-        // the row is read directly.
-        let Some(owner_thread) = ctx.storage.get_thread(&scope_ref).await? else {
+        // the child's `owner`. The slot admits only a `Thread`, so the row is read directly.
+        let Some(owner_thread) = ctx.storage.get_thread(scope_ref.erased()).await? else {
             return Ok(()); // owning thread gone — nothing to bind the child to.
         };
         let root_execution = owner_thread.value.execution.clone();
@@ -127,12 +130,12 @@ impl SpawnThreadHandler {
                 input: input.clone(),
                 output: None,
                 // Birth: `created_at == now` (fan-out moment). The owner is the SpawnThread command's
-                // `parent` Parallel/Map activity, converted to the reference form stored in meta.
+                // `parent` Parallel/Map activity — its checked conversion above is what makes the
+                // `Activity` variant the only one a fan-out thread can carry.
                 meta: crate::types::meta::ObjectMeta::builder(uid)
                     .name(thread_name)
                     .at(ctx.now())
-                    .build()
-                    .with_owner(owner.clone()),
+                    .with_owner(crate::types::meta::ThreadOwner::Activity(owner.clone())),
             },
         })
         .await;

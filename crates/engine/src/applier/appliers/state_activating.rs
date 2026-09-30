@@ -4,6 +4,7 @@ use crate::types::error::ExecutionError;
 use crate::{Activity, ApplierContext};
 
 use crate::storage::ActivityRecord;
+use crate::types::meta::ErasedOwner;
 
 #[derive(Default)]
 pub(crate) struct StateActivatingApplier;
@@ -28,7 +29,9 @@ impl StateActivatingApplier {
                     .meta
                     .owner
                     .clone()
-                    .expect("an owned activity has an owner"),
+                    // A thread is the only thing that can own an activity, so the storage seam needs
+                    // no `kind` guard — and storage speaks flat addresses.
+                    .into_erased(),
                 activity.meta.reference(),
             )
             .await?;

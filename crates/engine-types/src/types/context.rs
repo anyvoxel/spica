@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+// TODO：这个为什么会在 types 里？这个感觉是 Runtime 的东西啊
 /// Builds the `$states` object exposed to JSONata expressions during a state's evaluation.
 ///
 /// Shape (M2 subset):

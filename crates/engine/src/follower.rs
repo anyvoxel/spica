@@ -134,7 +134,7 @@ mod tests {
     use crate::types::event::FlowVersionCreated;
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
-    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference};
+    use crate::types::meta::{ObjectMeta, ObjectName, ObjectReference, OwnerRef};
 
     use super::*;
 
@@ -162,9 +162,7 @@ mod tests {
                             version,
                         ))
                         .at(Timestamp::now())
-                        .build()
-                        .with_owner(OwnerReference::new(
-                            ObjectKind::Flow,
+                        .with_owner(OwnerRef::new(
                             ObjectName::plain("flow").expect("literal name is valid"),
                             ulid::Ulid::nil(),
                         )),

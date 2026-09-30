@@ -12,7 +12,8 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
 use crate::types::id::RequestId;
-use crate::types::meta::{ObjectMeta, ObjectReference};
+use crate::types::meta::{ErasedOwner, ObjectMeta, ObjectReference, OwnerRef, OwnerScope};
+use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
@@ -278,13 +279,16 @@ pub trait StateHandler: Send + Sync {
         .with_assign_ctx(Some(&activity_value.raw_input))
         .build();
         let mut local_scope = variables.clone();
-        let owner = activity_value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
-        self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
-            .await?;
+        let owner = activity_value.meta.owner.clone();
+        self.apply_assign(
+            out,
+            env,
+            owner.erased(),
+            self.assign(),
+            &states,
+            &mut local_scope,
+        )
+        .await?;
         let output_value = self
             .project_output(env, self.output(), &states, &local_scope, result)
             .await?;
@@ -293,7 +297,7 @@ pub trait StateHandler: Send + Sync {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            owner,
+            owner.into_erased(),
             activity,
             &activity_value.state_path,
             &output_value,
@@ -367,15 +371,18 @@ pub trait StateHandler: Send + Sync {
     /// [`ActivateState`] payload; the bound definition supplies the typed state and the activity is
     /// constructed here, so the actual fan-out/owner/meta derivation lives once. Receiving the
     /// payload by its own type (not `&Command`) makes the dispatch a compile-time guarantee.
+    /// `owner` is that payload's owner in the slot's own type: the dispatcher already refused a
+    /// foreign kind, so the base never has to guard it (and a command's owner is checked once).
     async fn activate(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &ActivateState,
+        owner: OwnerRef<ThreadKind>,
     ) {
         let ActivateState {
             execution,
-            owner,
+            owner: _,
             state_path,
             input,
         } = cmd;
@@ -402,27 +409,33 @@ pub trait StateHandler: Send + Sync {
                         .generated_from_key(out.next_generated_seq().await),
                 )
                 .at(ctx.now())
-                .build()
                 .with_owner(owner.clone()),
         };
         let activity = activity_value.meta.reference();
 
         // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
-        // fan-out thread for a branch/item (see `emit_transition`, which only ever names a `Thread`).
-        // Reading the concrete row is exactly what yields the variables the hooks evaluate against and
-        // confirms the thread still accepts transitions.
-        let scope = match ctx.storage.get_thread(owner).await {
+        // fan-out thread for a branch/item — which the slot's own type guarantees, so this read needs
+        // no `kind` guard. Reading the concrete row is exactly what yields the variables the hooks
+        // evaluate against and confirms the thread still accepts transitions.
+        let scope = match ctx.storage.get_thread(owner.erased()).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 out.terminate(
                     Some(activity.clone()),
-                    execution.clone(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!("thread {owner}"))),
+                    OwnerScope::of_reference(execution),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "thread {}",
+                        owner.erased()
+                    ))),
                 );
                 return;
             }
             Err(e) => {
-                out.terminate(Some(activity.clone()), execution.clone(), e.into());
+                out.terminate(
+                    Some(activity.clone()),
+                    OwnerScope::of_reference(execution),
+                    e.into(),
+                );
                 return;
             }
         };
@@ -458,7 +471,7 @@ pub trait StateHandler: Send + Sync {
         {
             Ok(input) => input,
             Err(e) => {
-                out.terminate(Some(activity), owner.clone(), e);
+                out.terminate(Some(activity), Some(OwnerScope::Thread(owner.clone())), e);
                 return;
             }
         };
@@ -478,7 +491,7 @@ pub trait StateHandler: Send + Sync {
             .after_activated(ctx.env, out, &activity_value, &variables, &states)
             .await
         {
-            out.terminate(Some(activity), owner.clone(), e);
+            out.terminate(Some(activity), Some(OwnerScope::Thread(owner.clone())), e);
             return;
         }
 
@@ -512,9 +525,11 @@ pub trait StateHandler: Send + Sync {
         let act = match ctx.storage.get_activity(activity).await {
             Ok(Some(a)) => a,
             Ok(None) => {
+                // The row that would name the owning scope is the very thing that is missing, so the
+                // failure is recorded at the activity level alone and the log names the address.
                 out.terminate(
                     Some(activity.clone()),
-                    ObjectReference::nil(),
+                    None,
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                         "activity {activity}"
                     ))),
@@ -522,7 +537,7 @@ pub trait StateHandler: Send + Sync {
                 return;
             }
             Err(e) => {
-                out.terminate(Some(activity.clone()), ObjectReference::nil(), e.into());
+                out.terminate(Some(activity.clone()), None, e.into());
                 return;
             }
         };
@@ -585,13 +600,8 @@ pub trait StateHandler: Send + Sync {
         // The activity's owner is always a `Thread` (see `activate`), so — as there — the concrete row
         // is read directly. The owner is taken from the *persisted row* rather than from the command,
         // so this read is also what supplies the variables `finish` evaluates against.
-        let owner = act
-            .value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
-        let scope = match ctx.storage.get_thread(&owner).await {
+        let owner = act.value.meta.owner.clone();
+        let scope = match ctx.storage.get_thread(owner.erased()).await {
             Ok(Some(t)) => t,
             Ok(None) => return, // owning thread already gone — nothing to complete into.
             Err(_) => return,
@@ -608,7 +618,12 @@ pub trait StateHandler: Send + Sync {
         let finished = self
             .finish(ctx.env, out, activity.clone(), &activity_value, &variables)
             .await;
-        fail_or!(out, Some(activity.clone()), owner, finished);
+        fail_or!(
+            out,
+            Some(activity.clone()),
+            Some(OwnerScope::Thread(owner)),
+            finished
+        );
     }
 }
 #[cfg(test)]
@@ -624,7 +639,13 @@ mod tests {
     /// contract only cares that the hook *dispatches*, not what it does.
     fn empty_activity() -> Activity {
         Activity {
-            meta: crate::types::meta::ObjectMeta::builder(ulid::Ulid::new()).build(),
+            meta: crate::types::meta::ObjectMeta::builder(ulid::Ulid::new()).with_owner(
+                crate::types::meta::OwnerRef::new(
+                    crate::types::meta::ObjectName::plain("execution")
+                        .expect("a valid object name"),
+                    ulid::Ulid::new(),
+                ),
+            ),
             execution: ObjectReference::nil(),
             state_path: StatePath::from(jsonptr::PointerBuf::new()),
             status: ActivityStatus::Running,

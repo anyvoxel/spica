@@ -12,7 +12,7 @@ use crate::types::command::{Command, SpawnThread, TerminateState, TerminationRea
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ErasedOwner, ObjectReference, OwnerScope};
 use crate::{Activity, ActivityState, ActivityStatus, MapActivityState, Variables};
 
 /// The `Map` state: iterates an `Items` array, running the `ItemProcessor` sub-state-machine once
@@ -191,11 +191,7 @@ impl StateHandler for MapStateHandler<'_> {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
+            activity_value.meta.owner.clone().into_erased(),
             activity,
             &activity_value.state_path,
             &activity_value.raw_input,
@@ -466,11 +462,7 @@ impl MapStateHandler<'_> {
         }));
         super::super::emit_scope_termination(
             out,
-            activity
-                .meta
-                .owner
-                .as_ref()
-                .expect("an owned activity has an owner"),
+            &OwnerScope::Thread(activity.meta.owner.clone()),
             reason,
         );
     }
@@ -496,7 +488,9 @@ impl MapStateHandler<'_> {
             .meta
             .owner
             .clone()
-            .expect("an owned activity has an owner");
+            // A thread is the only thing that can own an activity (the slot's own type), and every
+            // consumer below takes the flat address storage and commands speak — erased once here.
+            .into_erased();
         // `$states.result` / the default state result is the aggregated per-item output array;
         // `Output`, when present, projects over it (so a Map can reshape that array).
         let states = States::new(
@@ -511,14 +505,14 @@ impl MapStateHandler<'_> {
         fail_or!(
             out,
             Some(activity_ref.clone()),
-            owner.clone(),
+            OwnerScope::of_reference(&owner),
             self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
                 .await
         );
         let output_value = fail_or!(
             out,
             Some(activity_ref),
-            owner.clone(),
+            OwnerScope::of_reference(&owner),
             self.project_output(env, self.output(), &states, &local_scope, aggregated)
                 .await
         );
@@ -539,11 +533,7 @@ impl MapStateHandler<'_> {
         emit_transition(
             out,
             activity.execution.clone(),
-            activity
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
+            activity.meta.owner.clone().into_erased(),
             activity_ref,
             &activity.state_path,
             &output_value,

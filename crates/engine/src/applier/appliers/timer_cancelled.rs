@@ -5,6 +5,7 @@
 use crate::ApplierContext;
 use crate::Timer;
 use crate::types::error::ExecutionError;
+use crate::types::meta::ErasedOwner;
 
 use crate::TimerStatus;
 
@@ -18,19 +19,14 @@ impl TimerCancelledApplier {
         timer: &Timer,
     ) -> Result<(), ExecutionError> {
         if let Some(mut t) = ctx.storage.get_timer(&timer.meta.reference()).await? {
-            let parent = t
-                .value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned timer always has an owner");
+            let parent = t.value.meta.owner.clone();
             t.value.status = TimerStatus::Cancelled;
             // Sync the domain value's transition stamp from the event (see timer_triggered.rs).
             t.value.meta.with_update_at(timer.meta.updated_at);
             t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
             ctx.storage
-                .remove_child(parent, timer.meta.reference())
+                .remove_child(parent.into_erased(), timer.meta.reference())
                 .await?;
         }
         // The physical descheduling is not folded here — a consumer re-derives `cancel` from the

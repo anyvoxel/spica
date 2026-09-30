@@ -2,6 +2,7 @@
 
 use crate::ApplierContext;
 use crate::types::error::ExecutionError;
+use crate::types::meta::ErasedOwner;
 
 use crate::{Task, TaskStatus};
 
@@ -21,7 +22,8 @@ impl TaskCancelledApplier {
                 .meta
                 .owner
                 .clone()
-                .expect("an owned task always has an owner");
+                // The slot is an `OwnerRef<ActivityKind>` and `active_children` speaks flat addresses.
+                .into_erased();
             t.status = TaskStatus::Cancelled;
             // Sync the domain value's transition stamp from the event (see task_completed.rs).
             t.value.meta.with_update_at(task.meta.updated_at);

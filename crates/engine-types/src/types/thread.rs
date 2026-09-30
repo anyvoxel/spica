@@ -3,7 +3,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, ThreadOwner};
 use spica_asl::StatePath;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
@@ -55,6 +55,9 @@ pub struct ThreadKind;
 
 impl ObjectKindMarker for ThreadKind {
     const KIND: ObjectKind = ObjectKind::Thread;
+    /// A thread runs in one of two scopes: the container activity that fanned it out, or — for a
+    /// **root** thread — the top-level `Execution` whose machine it runs. See [`ThreadOwner`].
+    type OwnedBy = ThreadOwner;
 }
 
 /// The event-/domain-carried value of a **Thread** — one scoped sub-run of the shared state machine,
@@ -135,5 +138,56 @@ impl Thread {
     /// by this reference and reads it back by reference.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::meta::{ObjectName, OwnerRef};
+    use crate::types::thread::ThreadKind;
+    use spica_machinery::Timestamp;
+
+    /// A thread's owner slot is the union of the two scopes it can hang off, and only those two: a
+    /// root thread reads back under its `Execution`, a fan-out thread under its container `Activity`,
+    /// and a payload carrying any other kind is refused at the slot (naming `ThreadOwner`) — so no
+    /// reader has to ask at runtime which parent a thread row holds.
+    #[test]
+    fn a_thread_slot_admits_only_the_two_scopes_a_thread_hangs_off() {
+        let owners = [
+            ThreadOwner::Execution(OwnerRef::new(
+                ObjectName::plain("execution").unwrap(),
+                ulid::Ulid::new(),
+            )),
+            ThreadOwner::Activity(OwnerRef::new(
+                ObjectName::plain("parallel").unwrap(),
+                ulid::Ulid::new(),
+            )),
+        ];
+        for owner in owners {
+            let meta = ObjectMeta::<ThreadKind>::builder(ulid::Ulid::new())
+                .at(Timestamp::from_millis(0))
+                .with_owner(owner.clone());
+            let json = serde_json::to_value(&meta).expect("meta serializes");
+            let back: ObjectMeta<ThreadKind> =
+                serde_json::from_value(json).expect("the slot admits both of its scopes");
+            assert_eq!(back.owner, owner);
+        }
+
+        let mut json = serde_json::to_value(
+            ObjectMeta::<ThreadKind>::builder(ulid::Ulid::new())
+                .at(Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Activity(OwnerRef::new(
+                    ObjectName::plain("parallel").unwrap(),
+                    ulid::Ulid::new(),
+                ))),
+        )
+        .expect("meta serializes");
+        json["owner"]["kind"] = serde_json::json!("Task");
+        let err = serde_json::from_value::<ObjectMeta<ThreadKind>>(json)
+            .expect_err("a thread is never owned by a task");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("ThreadOwner"), "{msg}");
     }
 }

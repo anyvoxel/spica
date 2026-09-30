@@ -4,7 +4,7 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{FailTask, TerminationReason};
 use crate::types::error::ExecutionError;
 use crate::types::event::{Event, TaskFailed};
-use crate::types::meta::ObjectKind;
+use crate::types::meta::{ErasedOwner, OwnerScope};
 use crate::{ActivityStatus, RetrierAttemptState, TaskStatus};
 
 /// Handles `FailTask`: a claimed task was reported **failed** (Zeebe `FailJob`), or the engine's own
@@ -63,14 +63,10 @@ impl FailTaskHandler {
             }
         }
 
-        let activity_id = act
-            .meta
-            .owner
-            .clone()
-            .expect("a task always has an activity owner");
-        if activity_id.kind != ObjectKind::Activity {
-            return Ok(()); // a task without an activity owner is an internal fault.
-        }
+        // The slot is an `OwnerRef<ActivityKind>`, so "the owner is an activity" is a type fact, not a
+        // runtime check. Both consumers below (the timer sweep and the failure route) take a flat
+        // address, so the owner crosses the erasure seam here, once.
+        let activity_id = act.meta.owner.clone().into_erased();
 
         // Build the failing task entity with the lease cleared; the retry decision below mutates it.
         let mut task_value = act.value();
@@ -179,13 +175,8 @@ impl FailTaskHandler {
         // An activity's owner is always a `Thread` — the derived root Thread for a top-level run, or a
         // fan-out branch. Reading it is what binds the machine revision the task's state (and so its
         // retry/catch plan) is consulted against.
-        let owner = activity
-            .value
-            .meta
-            .owner
-            .clone()
-            .expect("a completing activity is owned by a thread");
-        let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
+        let owner = activity.value.meta.owner.clone();
+        let Some(thread) = ctx.storage.get_thread(owner.erased()).await.ok().flatten() else {
             return; // owning thread gone — nothing to consult.
         };
         // The owning thread binds to a machine revision; resolve it (cached by the Processor)
@@ -288,16 +279,11 @@ impl FailTaskHandler {
             activity: terminated_activity,
         })
         .await;
-        // Route the terminal failure at the owning scope: an activity's owner is always a `Thread`, the
-        // root Thread for a top-level run (which relays onward to `TerminateExecution`) or a fan-out
-        // branch (reachable only via `TerminateThread`).
-        let owner = activity
-            .value
-            .meta
-            .owner
-            .clone()
-            .expect("a completing activity is owned by a scope");
-        super::emit_scope_termination(out, &owner, reason);
+        // Route the terminal failure at the owning scope: an activity is always owned by a `Thread` —
+        // the root Thread for a top-level run (which relays onward to the run's own termination) or a
+        // fan-out branch (reachable only via `TerminateThread`).
+        let owner = activity.value.meta.owner.clone();
+        super::emit_scope_termination(out, &OwnerScope::Thread(owner), reason);
     }
 }
 

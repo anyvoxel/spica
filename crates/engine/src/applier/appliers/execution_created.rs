@@ -21,14 +21,8 @@ impl ExecutionCreatedApplier {
         // moment (deterministic across replicas — see `ApplierContext::timestamp`).
         exec.born(ctx.timestamp);
         ctx.storage.put_execution(exec).await?;
-        // A child execution (a Parallel branch) is added to its owner's `active_children` so the
-        // owner drains (Completing/Terminating) waits on it via the shared cascade, and the inline
-        // drain reaction notices it as in-flight. The top-level run (no owner) is owned by nothing.
-        if let Some(owner) = execution.meta.owner.clone() {
-            ctx.storage
-                .add_child(owner, execution.meta.reference())
-                .await?;
-        }
+        // No child edge to add: a run is the root of its own tree (its owner slot is `NoOwner`), and
+        // everything it owns — its root thread, activities and timers — hangs below it.
         Ok(())
     }
 }

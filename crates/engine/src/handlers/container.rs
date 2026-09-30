@@ -200,7 +200,8 @@ mod tests {
     use crate::storage::{ActivityRecord, Storage};
     use crate::types::command::{Command, CompleteState, TerminationReason};
     use crate::types::id::EntryId;
-    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
+    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef};
+    use crate::types::thread::ThreadKind;
     use crate::working::WorkingState;
     use crate::{Activity, ActivityStatus, EntryPayload, Timestamp};
 
@@ -222,6 +223,14 @@ mod tests {
         reference(ObjectKind::Activity, "execution-0", 90)
     }
 
+    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits, so the
+    /// fixture cannot seed a row the engine could not represent.
+    fn thread_owner() -> OwnerRef<ThreadKind> {
+        reference(ObjectKind::Thread, "execution-1", 80)
+            .try_into()
+            .expect("an activity's owner is a thread")
+    }
+
     /// The child handed to the container — a settled `Task`, the only kind that routes here so far.
     fn task_ref() -> ObjectReference {
         reference(ObjectKind::Task, "execution-0", 91)
@@ -241,8 +250,7 @@ mod tests {
             meta: ObjectMeta::builder(activity_ref().uid)
                 .name(activity_ref().name)
                 .at(at())
-                .build()
-                .with_owner(reference(ObjectKind::Thread, "execution-1", 80)),
+                .with_owner(thread_owner()),
             execution: reference(ObjectKind::Execution, "execution", 70),
             state_path: StatePath::from(path),
             status,

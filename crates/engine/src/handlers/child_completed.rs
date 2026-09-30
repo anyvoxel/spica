@@ -16,7 +16,7 @@
 
 use crate::handler::{Collector, HandlerContext};
 use crate::types::command::Command;
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference};
 use crate::types::thread::ThreadStatus;
 use crate::{ActivityStatus, ExecutionStatus};
 
@@ -133,13 +133,14 @@ async fn dispatch_child_completed(
     child: ObjectReference,
 ) {
     // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
-    let scope_ref = act
-        .value
-        .meta
-        .owner
-        .clone()
-        .expect("an owned activity has an owner");
-    let Some(thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
+    let scope_ref = act.value.meta.owner.clone();
+    let Some(thread) = ctx
+        .storage
+        .get_thread(scope_ref.erased())
+        .await
+        .ok()
+        .flatten()
+    else {
         return; // owning scope gone — nothing to replenish into.
     };
     let sm = match ctx.machine_for_thread(&thread).await {

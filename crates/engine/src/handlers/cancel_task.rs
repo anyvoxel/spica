@@ -1,7 +1,7 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::event::Event;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ErasedOwner, ObjectReference};
 use crate::types::reject::RejectionType;
 
 /// Handles `CancelTask`: an in-flight `Task` is cancelled because its owning activity/execution is
@@ -37,7 +37,9 @@ impl CancelTaskHandler {
                 format!("task {task} not found; cancel dropped"),
             ));
         };
-        let owner = task_value.meta.owner.clone().expect("a live task is owned");
+        // The slot is an `OwnerRef<ActivityKind>`; the container lookup and the log line below both
+        // take flat addresses, so the owner crosses the erasure seam here, once.
+        let owner = task_value.meta.owner.clone().into_erased();
         let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await else {
             tracing::warn!(
                 task = %task,
@@ -71,10 +73,11 @@ mod tests {
     use crate::storage::{ActivityRecord, TaskRecord};
     use crate::types::event::Event;
     use crate::types::id::EntryId;
-    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
+    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef};
     use crate::types::reject::RejectionType;
     use crate::{
-        Activity, ActivityStatus, EntryPayload, StorageError, Task, TaskStatus, Timestamp,
+        Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Task, TaskStatus,
+        ThreadKind, Timestamp,
     };
 
     /// The instant every stamp reads: one `ManualClock` reading serves the seeded rows' meta and the
@@ -95,6 +98,22 @@ mod tests {
         reference(ObjectKind::Activity, "execution-0", 90)
     }
 
+    /// [`activity_ref`] in the type a task's owner slot holds — the same address, through the slot's
+    /// own checked conversion, so the fixture cannot seed a task whose owner is not an activity.
+    fn activity_owner() -> OwnerRef<ActivityKind> {
+        activity_ref()
+            .try_into()
+            .expect("a task's owner is an activity")
+    }
+
+    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits, so the
+    /// fixture cannot seed a row the engine could not represent.
+    fn thread_owner() -> OwnerRef<ThreadKind> {
+        reference(ObjectKind::Thread, "execution-1", 80)
+            .try_into()
+            .expect("an activity's owner is a thread")
+    }
+
     /// The cancel target. Its name is load-bearing: the cancelled task keeps its own meta, and a
     /// renamed task is one its owner can no longer match against the child it owns.
     fn task_ref() -> ObjectReference {
@@ -107,8 +126,7 @@ mod tests {
             meta: ObjectMeta::builder(task_ref().uid)
                 .name(task_ref().name)
                 .at(at())
-                .build()
-                .with_owner(activity_ref()),
+                .with_owner(activity_owner()),
             execution: reference(ObjectKind::Execution, "execution", 70),
             resource: "service-a".to_string(),
             arguments: json!({ "in": 1 }),
@@ -137,8 +155,7 @@ mod tests {
             meta: ObjectMeta::builder(activity_ref().uid)
                 .name(activity_ref().name)
                 .at(at())
-                .build()
-                .with_owner(reference(ObjectKind::Thread, "execution-1", 80)),
+                .with_owner(thread_owner()),
             execution: reference(ObjectKind::Execution, "execution", 70),
             state_path: StatePath::from(path),
             status,
@@ -252,7 +269,7 @@ mod tests {
             };
             assert_eq!(task.status, TaskStatus::Cancelled);
             assert_eq!(task.meta.name, task_ref().name);
-            assert_eq!(task.meta.owner.as_ref(), Some(&activity_ref()));
+            assert_eq!(task.meta.owner, activity_owner());
             assert_eq!(task.meta.updated_at, at());
         }
 

@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::activity::ActivityKind;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, OwnerRef};
 use spica_machinery::Timestamp;
 
 /// Per-retrier retry bookkeeping for a single `Retry` entry, carried **on the task** (Zeebe-style
@@ -143,6 +144,9 @@ pub struct TaskKind;
 
 impl ObjectKindMarker for TaskKind {
     const KIND: ObjectKind = ObjectKind::Task;
+    /// A task is always invoked by the `Task` state's activity — exactly one kind, so the slot is an
+    /// [`OwnerRef`] rather than a union: a task whose owner is not an activity is unrepresentable.
+    type OwnedBy = OwnerRef<ActivityKind>;
 }
 
 /// The event-/domain-carried value of a Task.
@@ -250,6 +254,7 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::meta::ObjectName;
 
     fn ts(ms: u64) -> Timestamp {
         Timestamp::from_millis(ms)
@@ -261,7 +266,10 @@ mod tests {
         Task {
             meta: ObjectMeta::builder(ulid::Ulid::new())
                 .timestamps(ts(0), ts(0))
-                .build(),
+                .with_owner(OwnerRef::new(
+                    ObjectName::plain("invoke").unwrap(),
+                    ulid::Ulid::new(),
+                )),
             execution: ObjectReference::nil(),
             resource: "service-a".to_string(),
             arguments: Value::Null,
@@ -396,5 +404,25 @@ mod tests {
             "a lapsed lease must not free a cancelled task"
         );
         assert!(!t.is_claimable_at(ts(10_000)));
+    }
+
+    /// A task's owner slot admits an `Activity` and nothing else: the row reads back with the same
+    /// owner, and a payload whose `owner` carries another kind is refused — so no reader ever holds a
+    /// task whose owner is not the activity that invoked it.
+    #[test]
+    fn a_task_slot_admits_only_an_activity_owner() {
+        let owner =
+            OwnerRef::<ActivityKind>::new(ObjectName::plain("invoke").unwrap(), ulid::Ulid::new());
+        let mut task = at_status(TaskStatus::Pending);
+        task.meta = task.meta.with_owner(owner.clone());
+        let mut json = serde_json::to_value(&task).expect("task serializes");
+        assert_eq!(json["meta"]["owner"]["kind"], serde_json::json!("Activity"));
+        let back: Task = serde_json::from_value(json.clone()).expect("the slot admits its kind");
+        assert_eq!(back.meta.owner, owner);
+
+        json["meta"]["owner"]["kind"] = serde_json::json!("Thread");
+        let err =
+            serde_json::from_value::<Task>(json).expect_err("a task is never owned by a thread");
+        assert!(err.to_string().contains("owner kind mismatch"), "{err}");
     }
 }

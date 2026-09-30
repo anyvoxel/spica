@@ -1,6 +1,7 @@
 //! `ThreadCompleted` event projection: folds the `Event::ThreadCompleted` into Storage.
 
 use crate::types::error::ExecutionError;
+use crate::types::meta::ErasedOwner;
 use crate::{ApplierContext, Thread, ThreadStatus};
 
 #[derive(Default)]
@@ -19,11 +20,9 @@ impl ThreadCompletedApplier {
             let parent = row.value.meta.owner.clone();
             row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
-            if let Some(owner) = parent {
-                ctx.storage
-                    .remove_child(owner, thread.meta.reference())
-                    .await?;
-            }
+            ctx.storage
+                .remove_child(parent.into_erased(), thread.meta.reference())
+                .await?;
         }
         Ok(())
     }

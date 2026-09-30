@@ -1,6 +1,9 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ActivateState;
 use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::meta::{ErasedOwner, OwnerRef, OwnerScope};
+use crate::types::reject::RejectionType;
+use crate::types::thread::ThreadKind;
 
 /// Dispatches `Command::ActivateState` to the matching
 /// [`StateHandlerRegistry::create`](crate::handlers::state_handler::StateHandlerRegistry::create)
@@ -33,23 +36,36 @@ impl ActivateStateHandler {
             state_path,
             ..
         } = payload;
+        // A command payload carries the owner as a flat address, so this is the one place an
+        // activity's slot can be handed the wrong kind. A foreign kind is the *command's* fault, and
+        // a command fault is refused — never propagated as an engine fault, which the leader would
+        // retry. The typed owner flows on from here, so the slot is checked exactly once per command.
+        let owner = OwnerRef::<ThreadKind>::try_from(owner.clone()).map_err(|e| {
+            ProcessingError::Rejected(
+                RejectionType::InvalidArgument,
+                format!("activate_state: {e}"),
+            )
+        })?;
 
         // TODO：owner 解析不到时把整个 execution 终结掉，对于一条本身没有问题的命令来说太重了；
         // 这里是否应该改为 reject，等 「状态无法绑定 owner」 的语义定下来后再定。
         // Resolve the owning thread + its machine/state definition just far enough to pick the right
         // handler. No activity is minted here — the base `StateHandler::activate` constructs it (and
         // re-checks the scope's liveness), so a resolution failure (thread/definition gone) fails the
-        // execution directly: nothing has been persisted to attach a state-level terminate to. An
-        // activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
+        // execution directly: nothing has been persisted to attach a state-level terminate to. The
+        // slot admits only a `Thread`, so the row is read directly.
         // A fault reading the owning thread is not a decision about this state — it is returned so the
         // leader can retry the command, or refuse it once the retry budget is spent.
-        let thread = match ctx.storage.get_thread(owner).await? {
+        let thread = match ctx.storage.get_thread(owner.erased()).await? {
             Some(t) => t,
             None => {
                 out.terminate(
                     None,
-                    execution.clone(),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!("thread {owner}"))),
+                    OwnerScope::of_reference(execution),
+                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
+                        "thread {}",
+                        owner.erased()
+                    ))),
                 );
                 return Ok(());
             }
@@ -58,7 +74,7 @@ impl ActivateStateHandler {
             result,
             out,
             None,
-            execution.clone(),
+            OwnerScope::of_reference(execution),
             ctx.machine_for_thread(&thread).await
         );
         // `Command::ActivateState` carries the state's full path, so it is self-locating: the
@@ -68,7 +84,7 @@ impl ActivateStateHandler {
             result,
             out,
             None,
-            execution.clone(),
+            OwnerScope::of_reference(execution),
             sm.state_at(state_path).map_err(ExecutionError::from)
         );
 
@@ -79,7 +95,7 @@ impl ActivateStateHandler {
             .state_handlers
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
-        handler.activate(ctx, out, payload).await;
+        handler.activate(ctx, out, payload, owner).await;
 
         Ok(())
     }

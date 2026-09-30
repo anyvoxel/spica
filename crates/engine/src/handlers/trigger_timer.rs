@@ -3,7 +3,7 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteState, FailTask, TerminationReason, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope, TimerOwner};
 
 /// Handles `TriggerTimer`: a timer's deadline elapsed. Idempotent (a no-op if the timer is gone or
 /// already terminal). Dispatches by `purpose`: `WaitResume` fires the owning state;
@@ -49,29 +49,31 @@ impl TriggerTimerHandler {
         match act.value.purpose {
             TimerPurpose::WaitResume => {
                 // Resume the owning state: the activity's `CompleteState` runs its `complete`.
-                let activity_id = act
-                    .value
-                    .meta
-                    .owner
-                    .clone()
-                    .expect("a live timer is always owned");
-                if activity_id.kind != ObjectKind::Activity {
-                    return Ok(()); // a Wait timer without an activity owner is an internal fault.
-                }
+                // A resume timer is armed by the activity whose deadline it is, so the slot's
+                // `Activity` variant is the only one this purpose can carry — a timer owned by
+                // anything else has no state to resume, and the fire is dropped as an internal fault.
+                let TimerOwner::Activity(activity) = act.value.meta.owner.clone() else {
+                    return Ok(());
+                };
                 // Relay the settle now that the fired timer's edge is gone from the activity. A
                 // `Terminating` activity parked on this timer — a cancel raced the fire — drains only
                 // here: its own `CancelTimer` sweep no-ops on an already-fired timer, and the
                 // `CompleteState` below is refused by a non-Running activity.
-                super::child_completed::child_settled(ctx, out, activity_id.clone(), timer.clone())
-                    .await;
+                super::child_completed::child_settled(
+                    ctx,
+                    out,
+                    activity.erased().clone(),
+                    timer.clone(),
+                )
+                .await;
                 // A Wait's raw result is its processed input (no distinct raw output). Load it so the
                 // `CompleteState` command carries the raw result, keeping the command self-describing.
-                let raw_result = match ctx.storage.get_activity(&activity_id).await {
+                let raw_result = match ctx.storage.get_activity(activity.erased()).await {
                     Ok(Some(act)) => act.value().input.clone().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null, // owner gone — the handler will no-op.
                 };
                 out.append_command(Command::CompleteState(CompleteState {
-                    activity: activity_id,
+                    activity: activity.into_erased(),
                     output: raw_result,
                 }));
             }
@@ -82,23 +84,23 @@ impl TriggerTimerHandler {
                 // parented on the owning activity (like `WaitResume`), so its deadline is enforced
                 // by the scheduler and swept when the activity terminates; we discover the in-flight
                 // task by asking the activity for its active child task.
-                let activity_id = act
-                    .value
-                    .meta
-                    .owner
-                    .clone()
-                    .expect("a live timer is always owned");
-                if activity_id.kind != ObjectKind::Activity {
+                // Parented on the owning activity, like `WaitResume` — the same single-variant slot.
+                let TimerOwner::Activity(activity) = act.value.meta.owner.clone() else {
                     return Ok(());
-                }
+                };
                 // Same settle relay as `WaitResume`: it must run even when no in-flight task is found,
                 // since that is exactly the case where a cancel already swept the task and only this
                 // fired timer is holding the activity open.
-                super::child_completed::child_settled(ctx, out, activity_id.clone(), timer.clone())
-                    .await;
+                super::child_completed::child_settled(
+                    ctx,
+                    out,
+                    activity.erased().clone(),
+                    timer.clone(),
+                )
+                .await;
                 let in_flight = ctx
                     .storage
-                    .get_children(activity_id)
+                    .get_children(activity.erased().clone())
                     .await
                     .ok()
                     .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
@@ -122,15 +124,13 @@ impl TriggerTimerHandler {
             TimerPurpose::ExecutionTimeout => {
                 // The execution ran past its `TimeoutSeconds` deadline. Drive it to a `TimedOut`
                 // termination; any in-flight children drain via the cascade started by the
-                // terminate command. The timer's owner is the *scope* — a top-level `Execution` (via
-                // `TerminateExecution`) or a `Parallel`-branch / `Map`-item `Thread` (via
-                // `TerminateThread`, which the name-addressed form would miss).
-                let owner = act
-                    .value
-                    .meta
-                    .owner
-                    .clone()
-                    .expect("a live timer is always owned");
+                // terminate command. Only `create_execution` arms this purpose, for the run itself,
+                // so the slot's `Execution` variant is the only one it can carry — the *scope*
+                // termination helper is still the route here because its other callers terminate a
+                // branch's `Thread`.
+                let TimerOwner::Execution(execution) = act.value.meta.owner.clone() else {
+                    return Ok(());
+                };
                 let reason = TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::TimedOut {
                         message: format!(
@@ -139,7 +139,7 @@ impl TriggerTimerHandler {
                         ),
                     }),
                 };
-                super::emit_scope_termination(out, &owner, reason);
+                super::emit_scope_termination(out, &OwnerScope::Execution(execution), reason);
             }
         }
 

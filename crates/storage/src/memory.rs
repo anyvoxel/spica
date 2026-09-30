@@ -781,8 +781,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine_types::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, PlainName, RetryState, Task,
-        TaskStatus, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectKind, ObjectReference, OwnerRef, PlainName, RetryState,
+        Task, TaskStatus, Timestamp, Variables,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
@@ -812,7 +812,7 @@ mod tests {
                 output: None,
                 meta: spica_engine_types::ObjectMeta::builder(id.uid)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build(),
+                    .with_owner(spica_engine_types::NoOwner::new()),
             },
             variables: Variables::new(),
             active_children: HashSet::new(),
@@ -860,7 +860,10 @@ mod tests {
                 },
                 meta: spica_engine_types::ObjectMeta::builder(id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build(),
+                    .with_owner(OwnerRef::new(
+                        PlainName::new("invoke").unwrap().generated_from_key(1),
+                        ulid::Ulid::nil(),
+                    )),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),

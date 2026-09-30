@@ -22,14 +22,9 @@ impl ExecutionCompletedApplier {
             exec.output = execution.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
             exec.value.meta.updated_at = execution.meta.updated_at;
-            let parent = exec.value.meta.owner.clone();
             exec.with_update_at(ctx.timestamp);
+            // No parent edge to detach: a run has no owner (its slot is `NoOwner`).
             ctx.storage.put_execution(exec).await?;
-            if let Some(owner) = parent {
-                ctx.storage
-                    .remove_child(owner, execution.meta.reference())
-                    .await?;
-            }
         }
         Ok(())
     }

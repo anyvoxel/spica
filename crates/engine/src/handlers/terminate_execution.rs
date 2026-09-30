@@ -103,7 +103,7 @@ impl TerminateExecutionHandler {
                     }));
                     pending += 1;
                 }
-                // A Parallel-branch child *execution* and a `Task` are owned by a container
+                // A Parallel-branch or Map-item *Thread* and a `Task` are owned by a container
                 // *Activity*, never directly by an Execution — so they are reached transitively
                 // through the sweeps above, and there is nothing to sweep at this level. (An Execution
                 // directly owns only its root thread, its activities, and its timers.)
@@ -122,14 +122,6 @@ impl TerminateExecutionHandler {
                 execution: terminated_execution,
             };
             out.append_event(terminated_event).await;
-            // A terminating child execution (a Parallel branch that failed) runs the inline reaction
-            // to its owning node — the `Parallel` activity — the same way a successful branch does
-            // (see `CompleteExecutionHandler`). Without this the failed branch drains `P`'s
-            // `active_children` but nobody converges `P`, so a failed Parallel never finishes and the
-            // tree wedges. The top-level run (`parent: None`) has no owner and reacts to nothing.
-            if let Some(owner) = exec.value.meta.owner.clone() {
-                super::child_completed::child_settled(ctx, out, owner, exec_ref.clone()).await;
-            }
         } else {
             tracing::debug!(
                 execution = %exec_ref,

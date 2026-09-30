@@ -19,7 +19,10 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::types::activity::ActivityKind;
 use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::execution::ExecutionKind;
+use crate::types::thread::ThreadKind;
 use spica_machinery::Timestamp;
 
 pub use spica_machinery::name::{ObjectName, PlainName, ScopeName};
@@ -81,16 +84,451 @@ impl std::fmt::Display for ObjectKind {
     }
 }
 
-/// The compile-time map from an object type to its [`ObjectKind`], declared once per object type by a
-/// zero-sized marker (`ActivityKind`, `TaskKind`, …).
+/// The compile-time map from an object type to its [`ObjectKind`] and to what may own it, declared
+/// once per object type by a zero-sized marker (`ActivityKind`, `TaskKind`, …).
 ///
 /// [`ObjectMeta`] is parameterised by it, so a meta cannot be built for one kind and read back as
 /// another: the kind is never a stored value that could drift from the record holding it, and
-/// [`ObjectMeta::reference`] derives it from the type alone. The marker is also the extension slot for
-/// typing an object's owning reference (`OwnerReference<O>`), where an object type will name the marker
-/// its owner must carry.
+/// [`ObjectMeta::reference`] derives it from the type alone. [`Self::OwnedBy`] applies the same
+/// discipline one edge up the tree, so reading an owner never means branching on a runtime kind.
 pub trait ObjectKindMarker {
     const KIND: ObjectKind;
+
+    /// What stands in this object's owner slot: exactly one kind ([`OwnerRef`]), one of a fixed set
+    /// (an entity's own sum type), or nothing at all ([`NoOwner`] — a root object).
+    type OwnedBy: OwnerKindMarker;
+}
+
+/// What may stand in an owner slot, and how it crosses the wire — the bound on
+/// [`ObjectKindMarker::OwnedBy`].
+///
+/// A slot's whole optionality lives here: [`Self::as_reference`] is the only owner read that may
+/// answer "no address" (a root's [`NoOwner`]), and [`Self::from_wire`] is the only place an absent
+/// `owner` is admitted. Erasure to the flat reference is one level up, in [`ErasedOwner`], which an
+/// empty slot deliberately does not implement — so the engine's owner reads are total on owned
+/// objects and unrepresentable on roots.
+pub trait OwnerKindMarker: Clone + std::fmt::Debug + PartialEq {
+    /// The flat owner address, or `None` for a slot that holds no address at all.
+    fn as_reference(&self) -> Option<&ObjectReference>;
+
+    /// Fold the wire's optional `owner` into the slot. The absent form is admitted only where the
+    /// slot's own type says so, so "an owned object always names its owner" is refused at the read
+    /// instead of being trusted by every later reader.
+    fn from_wire(kind: ObjectKind, owner: Option<Self>) -> Result<Self, MissingOwner>
+    where
+        Self: Sized,
+    {
+        owner.ok_or(MissingOwner {
+            kind,
+            slot: std::any::type_name::<Self>(),
+        })
+    }
+}
+
+mod sealed {
+    /// Restricts [`super::ErasedOwner`] to the slots this module defines: a foreign impl could claim
+    /// an erasure its own type does not have.
+    pub trait Sealed {}
+}
+
+/// An owner slot that carries an **address** — the engine's face of an owner, where
+/// [`OwnerKindMarker`] is the wire's.
+///
+/// This is the single **erasure seam**: [`Self::erased`] is the one way a typed owner becomes the flat
+/// reference the storage contract, `active_children` and command payloads speak. A `Deref` to
+/// [`ObjectReference`] would hide that seam and re-open `.kind` — the read a slot exists to forbid —
+/// so the trait deliberately exposes no `kind()`: an owner's kind is either matched at compile time
+/// through the slot's own type, or dropped at this one greppable call.
+///
+/// [`NoOwner`] is not one, and the omission is load-bearing: `meta.owner.into_erased()` compiles on an
+/// owned object and does not compile on a root's meta, so "a root has no owner" needs no `expect`, no
+/// `Option`, and no runtime kind check anywhere.
+pub trait ErasedOwner: OwnerKindMarker + sealed::Sealed {
+    /// Erase to the flat reference form — where the type stops being carried.
+    fn erased(&self) -> &ObjectReference;
+
+    /// The same erasure for an owner the caller owns: the seam sites (storage's `add_child`/
+    /// `remove_child`, command payloads) take the flat reference by value, and cloning it out of a
+    /// borrow only to move it again is the borrow checker's business leaking into every caller.
+    fn into_erased(self) -> ObjectReference;
+}
+
+/// A flat reference whose kind is not the one the slot it was read into admits.
+///
+/// Its own type rather than an [`ExecutionError`](crate::ExecutionError) on purpose: a mismatch is
+/// the *payload's* fault, so a caller must refuse the command — while an `ExecutionError` propagated
+/// with a bare `?` lands in the engine's internal-fault arm, which the leader **retries**. Not being
+/// convertible means the wrong classification cannot be written by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerKindMismatch {
+    /// The kind the flat reference carried.
+    seen: ObjectKind,
+    /// The one kind the slot admits.
+    expected: ObjectKind,
+    /// The marker type naming the slot (`OwnerRef<ActivityKind>` …), so the fault names the *type*
+    /// that was expected, not merely a kind constant it admits.
+    slot: &'static str,
+}
+
+impl std::fmt::Display for OwnerKindMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "owner kind mismatch: the payload carries kind {:?}, but this slot admits only {:?} \
+             owners ({})",
+            self.seen, self.expected, self.slot,
+        )
+    }
+}
+
+impl std::error::Error for OwnerKindMismatch {}
+
+/// A payload that carries no `owner`, read into a slot that only ever holds one.
+///
+/// Its own type, like [`OwnerKindMismatch`]: the fault is the *payload's* — an object whose slot names
+/// an owner is minted together with it and never loses it, so a row without one cannot be read. Not an
+/// [`ExecutionError`](crate::ExecutionError) for the same reason a mismatch is not: propagating it
+/// with `?` would land it in the internal-fault arm, which the leader retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingOwner {
+    /// The kind of the object whose slot was left empty.
+    kind: ObjectKind,
+    /// The slot type that requires an owner (`OwnerRef<ActivityKind>` …), so the fault names the type
+    /// that was expected rather than only the object that came up short.
+    slot: &'static str,
+}
+
+impl std::fmt::Display for MissingOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "owner is missing: a {:?} is always owned (its slot is {}), but the payload carries no \
+             `owner`",
+            self.kind, self.slot,
+        )
+    }
+}
+
+impl std::error::Error for MissingOwner {}
+
+/// The owner slot of a **root** object: no owner at all.
+///
+/// "A top-level `Execution` has no parent" is the *type* of its slot rather than an empty `Option`, so
+/// no reader unwraps to learn it: the slot is [`Self`], and [`Self`] is not an [`ErasedOwner`] — there
+/// is no address to read and none to set. It is constructible because a root's meta must be built;
+/// it cannot stand in an owned slot, which admits only references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoOwner(());
+
+impl NoOwner {
+    /// The one value of a root's owner slot.
+    pub fn new() -> Self {
+        Self(())
+    }
+}
+
+/// A typed owner reference — the single-kind slot, holding a reference **of kind `K::KIND`**.
+///
+/// The kind is still a value in memory (the wire carries it, and rows written before the slot was
+/// typed stay readable), but it is private and written through exactly two gates: the checked
+/// conversion from an [`ObjectReference`] and `Deserialize`. Every other path — including reading it
+/// back — goes through [`OwnerKindMarker::erased`].
+pub struct OwnerRef<K: ObjectKindMarker>(ObjectReference, PhantomData<fn() -> K>);
+
+// Hand-written so `K` needs no `Clone`/`Debug`/`PartialEq` of its own: the marker is a
+// `PhantomData<fn() -> K>`, present only to name `K::KIND`, and every value lives in the inner
+// `ObjectReference`. A derive would demand those bounds from every marker for nothing.
+impl<K: ObjectKindMarker> Clone for OwnerRef<K> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), PhantomData)
+    }
+}
+
+impl<K: ObjectKindMarker> std::fmt::Debug for OwnerRef<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(std::any::type_name::<K>())
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl<K: ObjectKindMarker> PartialEq for OwnerRef<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<K: ObjectKindMarker> Eq for OwnerRef<K> {}
+
+impl<K: ObjectKindMarker> OwnerRef<K> {
+    /// Build from already-known parts. The kind comes from `K`, so it cannot be passed wrong.
+    pub fn new(name: ObjectName, uid: ulid::Ulid) -> Self {
+        Self(ObjectReference::new(K::KIND, name, uid), PhantomData)
+    }
+
+    /// The referenced object's name.
+    pub fn name(&self) -> &ObjectName {
+        &self.0.name
+    }
+
+    /// The referenced object's incarnation id.
+    pub fn uid(&self) -> ulid::Ulid {
+        self.0.uid
+    }
+}
+
+impl<K: ObjectKindMarker> TryFrom<ObjectReference> for OwnerRef<K> {
+    type Error = OwnerKindMismatch;
+
+    /// Checked entry from the flat form: the one place a foreign kind is rejected instead of being
+    /// carried along until some later reader guesses wrong.
+    fn try_from(reference: ObjectReference) -> Result<Self, Self::Error> {
+        if reference.kind != K::KIND {
+            return Err(OwnerKindMismatch {
+                seen: reference.kind,
+                expected: K::KIND,
+                slot: std::any::type_name::<K>(),
+            });
+        }
+        Ok(Self(reference, PhantomData))
+    }
+}
+
+impl<K: ObjectKindMarker> OwnerKindMarker for OwnerRef<K> {
+    fn as_reference(&self) -> Option<&ObjectReference> {
+        Some(&self.0)
+    }
+}
+
+impl<K: ObjectKindMarker> sealed::Sealed for OwnerRef<K> {}
+
+impl<K: ObjectKindMarker> ErasedOwner for OwnerRef<K> {
+    fn erased(&self) -> &ObjectReference {
+        &self.0
+    }
+
+    fn into_erased(self) -> ObjectReference {
+        self.0
+    }
+}
+
+impl<K: ObjectKindMarker> Serialize for OwnerRef<K> {
+    /// Writes exactly the `{kind, name, uid}` object the slot held before it was typed.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de, K: ObjectKindMarker> Deserialize<'de> for OwnerRef<K> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let seen = ObjectReference::deserialize(d)?;
+        // Rejected here, on the way in, rather than repaired into a slot that cannot hold it: a row
+        // naming a foreign owner is a row this type cannot read, and a log entry is no different.
+        OwnerRef::try_from(seen).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The owner slot of a **Thread**: the one scope a thread runs in, of the two that exist.
+///
+/// A fan-out thread is owned by the container `Parallel`/`Map` activity that spawned it; a **root**
+/// thread is the scope a whole top-level run executes in, so it is owned by the `Execution` itself.
+/// The two are different *kinds*, and the drain cascade sends each to a different parent, so the slot
+/// is a sum rather than a widened reference: dispatch is an exhaustive `match` and no reader compares
+/// a runtime kind to learn which parent it holds. The wire's `kind` decides a variant exactly once,
+/// on the way in ([`Self::deserialize`]) — parse, don't validate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreadOwner {
+    Execution(OwnerRef<ExecutionKind>),
+    Activity(OwnerRef<ActivityKind>),
+}
+
+impl Serialize for ThreadOwner {
+    /// The variant's own reference — the union adds no field of its own, so the wire keeps the
+    /// `{kind, name, uid}` object the slot held before it was typed.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ThreadOwner::Execution(r) => r.serialize(s),
+            ThreadOwner::Activity(r) => r.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThreadOwner {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let seen = ObjectReference::deserialize(d)?;
+        Ok(match seen.kind {
+            ObjectKind::Execution => {
+                ThreadOwner::Execution(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+            }
+            ObjectKind::Activity => {
+                ThreadOwner::Activity(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+            }
+            // A kind outside the union is a payload no thread could have carried: refused here rather
+            // than repaired into a slot with no variant for it.
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "owner kind mismatch: the payload carries kind {other:?}, but this slot admits \
+                     only Execution or Activity owners ({})",
+                    std::any::type_name::<ThreadOwner>(),
+                )));
+            }
+        })
+    }
+}
+
+impl OwnerKindMarker for ThreadOwner {
+    fn as_reference(&self) -> Option<&ObjectReference> {
+        Some(self.erased())
+    }
+}
+
+impl sealed::Sealed for ThreadOwner {}
+
+impl ErasedOwner for ThreadOwner {
+    fn erased(&self) -> &ObjectReference {
+        match self {
+            ThreadOwner::Execution(r) => r.erased(),
+            ThreadOwner::Activity(r) => r.erased(),
+        }
+    }
+
+    fn into_erased(self) -> ObjectReference {
+        match self {
+            ThreadOwner::Execution(r) => r.into_erased(),
+            ThreadOwner::Activity(r) => r.into_erased(),
+        }
+    }
+}
+
+/// The owner slot of a **Timer**: the scope whose deadline it is, of the two scopes that arm one.
+///
+/// An `ExecutionTimeout` is armed by the top-level run itself, while a `WaitResume`, a task retry or a
+/// task timeout is armed by the activity that is waiting — so the slot is the same `Execution`-or-
+/// `Activity` sum as a thread's, kept as its own type because *which* two scopes may own a timer is a
+/// fact about timers: widening a timer's owner later must not widen a thread's by accident.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimerOwner {
+    Execution(OwnerRef<ExecutionKind>),
+    Activity(OwnerRef<ActivityKind>),
+}
+
+impl Serialize for TimerOwner {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TimerOwner::Execution(r) => r.serialize(s),
+            TimerOwner::Activity(r) => r.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimerOwner {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let seen = ObjectReference::deserialize(d)?;
+        Ok(match seen.kind {
+            ObjectKind::Execution => {
+                TimerOwner::Execution(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+            }
+            ObjectKind::Activity => {
+                TimerOwner::Activity(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+            }
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "owner kind mismatch: the payload carries kind {other:?}, but this slot admits \
+                     only Execution or Activity owners ({})",
+                    std::any::type_name::<TimerOwner>(),
+                )));
+            }
+        })
+    }
+}
+
+impl OwnerKindMarker for TimerOwner {
+    fn as_reference(&self) -> Option<&ObjectReference> {
+        Some(self.erased())
+    }
+}
+
+impl sealed::Sealed for TimerOwner {}
+
+impl ErasedOwner for TimerOwner {
+    fn erased(&self) -> &ObjectReference {
+        match self {
+            TimerOwner::Execution(r) => r.erased(),
+            TimerOwner::Activity(r) => r.erased(),
+        }
+    }
+
+    fn into_erased(self) -> ObjectReference {
+        match self {
+            TimerOwner::Execution(r) => r.into_erased(),
+            TimerOwner::Activity(r) => r.into_erased(),
+        }
+    }
+}
+
+/// A terminal-failure scope: the two kinds a run's teardown can be directed at.
+///
+/// Not an owner slot — no object declares it as its [`ObjectKindMarker::OwnedBy`]; it names the two
+/// roles whose addressing differs, so a caller holding "the scope above me" cannot reach for the
+/// wrong verb. A `Thread` (the branch/item that must be stopped) terminates by reference via
+/// `TerminateThread`, while an `Execution` is addressed by name+uid and is reached only for the run
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerScope {
+    Execution(OwnerRef<ExecutionKind>),
+    Thread(OwnerRef<ThreadKind>),
+}
+
+impl OwnerScope {
+    /// Recover the scope a flat reference names: the one seam where an address the engine carries
+    /// *erased* (a command's `execution`, an activity's `execution` anchor or owner) becomes a scope
+    /// type again. Those anchors are minted by the engine itself, so a reference that names no scope
+    /// is an anomaly, not a decision: it yields `None` — the caller records the failure without a
+    /// scope and the log names the address — rather than panicking the processor on a corrupt payload.
+    pub fn of_reference(reference: &ObjectReference) -> Option<Self> {
+        match reference.kind {
+            ObjectKind::Execution => OwnerRef::<ExecutionKind>::try_from(reference.clone())
+                .ok()
+                .map(OwnerScope::Execution),
+            ObjectKind::Thread => OwnerRef::<ThreadKind>::try_from(reference.clone())
+                .ok()
+                .map(OwnerScope::Thread),
+            _ => None,
+        }
+    }
+}
+
+impl OwnerKindMarker for NoOwner {
+    fn as_reference(&self) -> Option<&ObjectReference> {
+        None
+    }
+
+    /// The empty slot has nothing to fold: a payload that *carries* an `owner` never reaches here,
+    /// because no [`NoOwner`] deserializes from one (see its `Deserialize`) — that refusal happens one
+    /// step earlier, at the value.
+    fn from_wire(_kind: ObjectKind, owner: Option<Self>) -> Result<Self, MissingOwner> {
+        debug_assert!(
+            owner.is_none(),
+            "an owner cannot be read into an empty slot"
+        );
+        Ok(NoOwner::new())
+    }
+}
+
+impl Serialize for NoOwner {
+    /// Unreachable through an [`ObjectMeta`], which omits an empty owner entirely
+    /// ([`owner_is_absent`]); present so the type carries no panic of its own.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_unit()
+    }
+}
+
+impl<'de> Deserialize<'de> for NoOwner {
+    fn deserialize<D: Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a root object cannot be owned: the payload carries an `owner`",
+        ))
+    }
 }
 
 /// The wire anchor of an [`ObjectMeta`]'s kind: a zero-sized value that holds no state of its own.
@@ -141,14 +579,19 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for KindTag<K> {
 /// - [`Self::uid`] is the **sameness** key — a name can be re-used across delete+recreate, so `uid`
 ///   is what tells two references to the same *object* apart. It is opaque and never reused.
 ///
-/// [`Self::owner`] links each object to its single owning parent in the object tree (a node is owned
-/// by its execution; a child execution by the container that spawned it). `owner` is the **single
-/// parent edge** for every entity — the former ad-hoc `Execution.parent`/`Activity.parent`/
-/// `Task.parent`/`Timer.parent` handle fields have migrated into it, and the parent is read back
-/// from the reference's [`ObjectKind`]. `root_execution` is a
-/// separate flat top-of-tree query anchor, **not** the owner (the owner is the direct parent).
+/// [`Self::owner`] links each object to its single owning parent in the object tree. `owner` is the
+/// **single parent edge** for every entity — the former ad-hoc `Execution.parent`/`Activity.parent`/
+/// `Task.parent`/`Timer.parent` handle fields have migrated into it — and its type is
+/// [`ObjectKindMarker::OwnedBy`], so which kinds may occupy it is fixed by the object type: no reader
+/// has to branch on a runtime kind to know who owns what. A root object (a top-level `Execution`)
+/// declares [`NoOwner`], so it has no parent *by type*. `root_execution` is a separate flat
+/// top-of-tree query anchor, **not** the owner (the owner is the direct parent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound = "")]
+#[serde(try_from = "MetaRepr<K>")]
+#[serde(bound(
+    serialize = "K::OwnedBy: Serialize",
+    deserialize = "K::OwnedBy: Deserialize<'de>"
+))]
 pub struct ObjectMeta<K: ObjectKindMarker> {
     /// The kind, emitted as `K::KIND` and validated against `K` on read (see [`KindTag`]). Declared
     /// first so the wire keeps the field order it had before this meta was parameterised.
@@ -165,13 +608,54 @@ pub struct ObjectMeta<K: ObjectKindMarker> {
     pub created_at: Timestamp,
     /// When the object was last updated; see [`Self::with_update_at`].
     pub updated_at: Timestamp,
-    // TODO(OwnerReference<O>)：K 是 owner 强类型化的落点——让 owner 的 marker 由本类型决定，
-    // 例如 Task 的 owner 必须是 Activity，从而消掉 container.rs 里那类运行时 kind 判断。
-    /// The object that owns this one, if any. Same `tenant`/`namespace` scope is *inherited* from
-    /// this object's own scope (spica ownership never crosses a scope), so the reference carries
-    /// only `kind`/`name`/`uid`. `None` for roots (a top-level `Execution` with no container parent).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<OwnerReference>,
+    /// The object that owns this one, typed by [`ObjectKindMarker::OwnedBy`] — **always a value**: a
+    /// slot that names an owner holds its reference outright, and a root's slot is [`NoOwner`], so
+    /// "no owner" is a type rather than a missing field. Same `tenant`/`namespace` scope is
+    /// *inherited* from this object's own scope (spica ownership never crosses a scope), so the
+    /// reference carries only `kind`/`name`/`uid`. Serialized away exactly where the slot is empty
+    /// ([`owner_is_absent`]), so a root's row still carries no `owner` key.
+    #[serde(skip_serializing_if = "owner_is_absent")]
+    pub owner: K::OwnedBy,
+}
+
+/// Whether an owner slot holds no address at all — the one case the wire omits `owner` for.
+fn owner_is_absent<T: OwnerKindMarker>(owner: &T) -> bool {
+    owner.as_reference().is_none()
+}
+
+/// The **wire form** of an [`ObjectMeta`]: `owner` is optional *there* (a root's row carries none),
+/// and this is where that optionality is read out and folded into the slot's own type
+/// ([`OwnerKindMarker::from_wire`]). A separate mirror is unavoidable: serde's derive admits an absent
+/// field only through `Option`/`Default`, and an owner slot must never default to "no owner".
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "K::OwnedBy: Deserialize<'de>"))]
+struct MetaRepr<K: ObjectKindMarker> {
+    kind: KindTag<K>,
+    tenant: ScopeName,
+    namespace: ScopeName,
+    name: ObjectName,
+    uid: ulid::Ulid,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    #[serde(default)]
+    owner: Option<K::OwnedBy>,
+}
+
+impl<K: ObjectKindMarker> TryFrom<MetaRepr<K>> for ObjectMeta<K> {
+    type Error = MissingOwner;
+
+    fn try_from(repr: MetaRepr<K>) -> Result<Self, Self::Error> {
+        Ok(ObjectMeta {
+            kind: repr.kind,
+            tenant: repr.tenant,
+            namespace: repr.namespace,
+            name: repr.name,
+            uid: repr.uid,
+            created_at: repr.created_at,
+            updated_at: repr.updated_at,
+            owner: K::OwnedBy::from_wire(K::KIND, repr.owner)?,
+        })
+    }
 }
 
 impl<K: ObjectKindMarker> ObjectMeta<K> {
@@ -192,11 +676,11 @@ impl<K: ObjectKindMarker> ObjectMeta<K> {
         self.updated_at = at;
     }
 
-    /// Attach the owning object (consumes `self` so it composes with construction credit flows):
-    /// `ObjectMeta::builder(...).build().with_owner(owner)`. The reference is same-scope by
-    /// construction — see [`Self::owner`].
-    pub fn with_owner(mut self, owner: OwnerReference) -> Self {
-        self.owner = Some(owner);
+    /// Re-parent this object: `owner` is this object's slot type, so a wrong-kind owner cannot be
+    /// passed, and an ownerless object cannot be detached (`NoOwner` is not an owned slot). The
+    /// reference is same-scope by construction — see [`Self::owner`].
+    pub fn with_owner(mut self, owner: K::OwnedBy) -> Self {
+        self.owner = owner;
         self
     }
 }
@@ -272,7 +756,11 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
         self
     }
 
-    pub fn build(self) -> ObjectMeta<K> {
+    /// Finish the object with the owner its slot admits — the **only** way out of the builder, because
+    /// a slot that names an owner has no valid value without one. A root (a `Flow`, a top-level
+    /// `Execution`) passes [`NoOwner::new`], the value its own slot admits; any other owner cannot be
+    /// passed to it, and a meta for an owned kind cannot be built without one.
+    pub fn with_owner(self, owner: K::OwnedBy) -> ObjectMeta<K> {
         ObjectMeta {
             kind: KindTag(PhantomData),
             tenant: self.tenant,
@@ -281,7 +769,7 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
             uid: self.uid,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            owner: None,
+            owner,
         }
     }
 }
@@ -379,11 +867,13 @@ mod tests {
         Timestamp::from_millis(ms)
     }
 
-    /// A stand-in marker so the meta's own tests need no real object type.
+    /// A stand-in marker so the meta's own tests need no real object type. Its slot is
+    /// [`NoOwner`] — these markers exist to be *owners*, never to have one.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct TestKind;
     impl ObjectKindMarker for TestKind {
         const KIND: ObjectKind = ObjectKind::Execution;
+        type OwnedBy = NoOwner;
     }
 
     /// A second marker, so the mismatch case has somewhere to mismatch to.
@@ -391,6 +881,16 @@ mod tests {
     struct OtherTestKind;
     impl ObjectKindMarker for OtherTestKind {
         const KIND: ObjectKind = ObjectKind::Task;
+        type OwnedBy = NoOwner;
+    }
+
+    /// A marker whose owner slot is **typed**, so the slot is exercised end-to-end through the meta
+    /// (the root test markers above cannot: their slot is uninhabited).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct OwnedTestKind;
+    impl ObjectKindMarker for OwnedTestKind {
+        const KIND: ObjectKind = ObjectKind::Execution;
+        type OwnedBy = OwnerRef<OtherTestKind>;
     }
 
     #[test]
@@ -437,9 +937,9 @@ mod tests {
                     .generated_from_key(123_456),
             )
             .at(ts(1000))
-            .build();
+            .with_owner(NoOwner::new());
         assert_eq!(meta.created_at, meta.updated_at);
-        assert_eq!(meta.owner, None); // roots have no owner
+        assert_eq!(meta.owner, NoOwner::new()); // roots have no owner — as a type, not a missing field
         assert_eq!(meta.reference().kind, ObjectKind::Execution); // the kind is `K`'s, not a field
         meta.with_update_at(ts(2000));
         assert_eq!(meta.updated_at, ts(2000));
@@ -450,7 +950,7 @@ mod tests {
     fn object_meta_roundtrips_with_the_kind_on_the_wire() {
         let meta = ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
             .at(ts(1000))
-            .build();
+            .with_owner(NoOwner::new());
         let json = serde_json::to_value(&meta).expect("meta serializes");
         // The spelling is load-bearing: `"Execution"` is what the wire carried before the meta was
         // parameterised, so pinning it keeps rows written earlier readable.
@@ -459,6 +959,9 @@ mod tests {
             Some(&serde_json::json!("Execution")),
             "wire: {json}"
         );
+        // A root's owner slot holds no address, so the key is omitted entirely — the wire shape a
+        // reader of pre-typing rows already expects.
+        assert_eq!(json.get("owner"), None, "wire: {json}");
         let back: ObjectMeta<TestKind> = serde_json::from_value(json).expect("meta deserializes");
         assert_eq!(back, meta);
         assert_eq!(back.reference().kind, ObjectKind::Execution);
@@ -468,7 +971,7 @@ mod tests {
     fn object_meta_rejects_a_foreign_kind_on_the_wire() {
         let meta = ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
             .at(ts(1000))
-            .build();
+            .with_owner(NoOwner::new());
         let json = serde_json::to_value(&meta).expect("meta serializes");
         let err = serde_json::from_value::<ObjectMeta<OtherTestKind>>(json)
             .expect_err("a Task-typed meta must not read an Execution payload");
@@ -483,7 +986,7 @@ mod tests {
         let mut json = serde_json::to_value(
             ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
                 .at(ts(1000))
-                .build(),
+                .with_owner(NoOwner::new()),
         )
         .expect("meta serializes");
         json.as_object_mut()
@@ -550,5 +1053,241 @@ mod tests {
                 ulid::Ulid::new(),
             )
         );
+    }
+
+    #[test]
+    fn owner_ref_pins_the_kind_on_the_wire() {
+        let owner = OwnerRef::<OtherTestKind>::new(
+            PlainName::new("checkout").unwrap().generated_from_key(7),
+            ulid::Ulid::new(),
+        );
+        let json = serde_json::to_value(&owner).expect("owner serializes");
+        // The wire is the same flat reference the slot held before it was typed — no wrapper, no
+        // extra key: an `OwnerRef` is an `ObjectReference` plus a type.
+        assert_eq!(json, serde_json::to_value(owner.erased()).unwrap());
+
+        let back: OwnerRef<OtherTestKind> =
+            serde_json::from_value(json).expect("a matching owner deserializes");
+        assert_eq!(back, owner);
+        assert_eq!(back.name(), owner.name());
+        assert_eq!(back.uid(), owner.uid());
+        assert_eq!(back.erased().kind, ObjectKind::Task);
+    }
+
+    #[test]
+    fn owner_ref_rejects_a_foreign_kind_on_the_wire() {
+        let owner =
+            OwnerRef::<TestKind>::new(ObjectName::plain("checkout").unwrap(), ulid::Ulid::new());
+        let json = serde_json::to_value(&owner).expect("owner serializes");
+        let err = serde_json::from_value::<OwnerRef<OtherTestKind>>(json)
+            .expect_err("a Task-typed slot must not read an Execution owner");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("carries kind Execution"), "{msg}");
+        assert!(msg.contains("admits only Task owners"), "{msg}");
+        // The fault names the slot *type*, so the reader learns which marker admitted the wrong kind.
+        assert!(msg.contains("OtherTestKind"), "{msg}");
+    }
+
+    #[test]
+    fn owner_ref_conversion_checks_the_kind() {
+        let foreign = ObjectReference::new(
+            ObjectKind::Task,
+            ObjectName::plain("checkout").unwrap(),
+            ulid::Ulid::new(),
+        );
+        let err = OwnerRef::<TestKind>::try_from(foreign)
+            .expect_err("a Task cannot stand in an Execution-typed slot");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Execution owners"), "{msg}");
+
+        let matching = ObjectReference::new(
+            ObjectKind::Execution,
+            ObjectName::plain("checkout").unwrap(),
+            ulid::Ulid::new(),
+        );
+        let owner = OwnerRef::<TestKind>::try_from(matching).expect("the kind matches");
+        assert_eq!(owner.erased().kind, ObjectKind::Execution);
+    }
+
+    /// Every flat anchor a failure site holds (a command's `execution`, an activity's owner) reads
+    /// back as the scope it names, and one that names no scope answers `None` — the disposition the
+    /// fail paths give a leaf address, which must never be a panic: a corrupt payload cannot be
+    /// allowed to wedge the processor into a retry loop.
+    #[test]
+    fn a_flat_reference_is_read_back_as_the_scope_it_names() {
+        let run = ObjectReference::new(
+            ObjectKind::Execution,
+            ObjectName::plain("execution").unwrap(),
+            ulid::Ulid::new(),
+        );
+        assert_eq!(
+            OwnerScope::of_reference(&run),
+            Some(OwnerScope::Execution(OwnerRef::new(
+                run.name.clone(),
+                run.uid
+            )))
+        );
+
+        let thread = ObjectReference::new(
+            ObjectKind::Thread,
+            ObjectName::plain("parallel").unwrap(),
+            ulid::Ulid::new(),
+        );
+        assert_eq!(
+            OwnerScope::of_reference(&thread),
+            Some(OwnerScope::Thread(OwnerRef::new(
+                thread.name.clone(),
+                thread.uid
+            )))
+        );
+
+        // A nil reference is a `FlowVersion` placeholder: no scope, so no scope termination.
+        assert_eq!(OwnerScope::of_reference(&ObjectReference::nil()), None);
+    }
+
+    /// A thread's owner slot admits exactly the two scopes a thread can hang off, and the union adds
+    /// nothing to the wire: each variant serializes as the flat reference it replaced, so a row written
+    /// before the slot was typed still reads.
+    #[test]
+    fn thread_owner_roundtrips_both_of_its_scopes() {
+        let cases = [
+            ThreadOwner::Execution(OwnerRef::new(
+                ObjectName::plain("execution").unwrap(),
+                ulid::Ulid::new(),
+            )),
+            ThreadOwner::Activity(OwnerRef::new(
+                ObjectName::plain("parallel").unwrap(),
+                ulid::Ulid::new(),
+            )),
+        ];
+        for owner in cases {
+            let json = serde_json::to_value(&owner).expect("the union serializes");
+            assert_eq!(json, serde_json::to_value(owner.erased()).unwrap());
+            let back: ThreadOwner = serde_json::from_value(json).expect("the union deserializes");
+            assert_eq!(back, owner);
+        }
+    }
+
+    /// A kind no thread could hang off is refused on the way in, naming the slot's own type — the
+    /// reader learns which union admitted the kinds it did, not merely that the payload was odd.
+    #[test]
+    fn thread_owner_refuses_a_foreign_kind() {
+        let owner = OwnerRef::<OtherTestKind>::new(
+            ObjectName::plain("checkout").unwrap(),
+            ulid::Ulid::new(),
+        );
+        let err = serde_json::from_value::<ThreadOwner>(
+            serde_json::to_value(owner).expect("owner serializes"),
+        )
+        .expect_err("a thread is never owned by a task");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("carries kind Task"), "{msg}");
+        assert!(msg.contains("admits only Execution or Activity"), "{msg}");
+        assert!(msg.contains("ThreadOwner"), "{msg}");
+    }
+
+    /// A timer's slot is its own type over the same two scopes, and refusing what *it* does not admit
+    /// names `TimerOwner`: the two unions are deliberately separate, so widening one never widens the
+    /// other silently.
+    #[test]
+    fn timer_owner_refuses_a_kind_it_does_not_admit() {
+        let thread = ObjectReference::new(
+            ObjectKind::Thread,
+            ObjectName::plain("branch").unwrap(),
+            ulid::Ulid::new(),
+        );
+        let err = serde_json::from_value::<TimerOwner>(serde_json::to_value(&thread).unwrap())
+            .expect_err("no thread ever arms a timer");
+        let msg = err.to_string();
+        assert!(msg.contains("carries kind Thread"), "{msg}");
+        assert!(msg.contains("admits only Execution or Activity"), "{msg}");
+        assert!(msg.contains("TimerOwner"), "{msg}");
+
+        // A thread is a node, never a scope: neither union takes one, so a thread's own owner slot
+        // (`ThreadOwner`) refuses this payload too — the two unions overlap only where reality does.
+        assert!(
+            serde_json::from_value::<ThreadOwner>(serde_json::to_value(&thread).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn a_typed_slot_is_enforced_through_the_meta() {
+        let meta = ObjectMeta::<OwnedTestKind>::builder(ulid::Ulid::new())
+            .at(ts(1000))
+            .with_owner(OwnerRef::<OtherTestKind>::new(
+                PlainName::new("checkout").unwrap().generated_from_key(7),
+                ulid::Ulid::new(),
+            ));
+        let json = serde_json::to_value(&meta).expect("meta serializes");
+        assert_eq!(json["owner"]["kind"], serde_json::json!("Task"));
+        let back: ObjectMeta<OwnedTestKind> =
+            serde_json::from_value(json.clone()).expect("the slot accepts its own owner kind");
+        assert_eq!(back, meta);
+
+        // A payload whose owner kind the slot does not allow is refused at the slot — after the
+        // meta's own kind guard has already passed.
+        let mut foreign = json;
+        foreign["owner"]["kind"] = serde_json::json!("Activity");
+        let err = serde_json::from_value::<ObjectMeta<OwnedTestKind>>(foreign)
+            .expect_err("the slot accepts only a Task owner");
+        assert!(err.to_string().contains("owner kind mismatch"), "{err}");
+    }
+
+    /// The other half of the slot's wire contract: a row that *omits* an owner read into a slot that
+    /// only holds one is refused at the read — an owned object is minted together with its owner, so
+    /// a row without one is a payload no event ever wrote.
+    #[test]
+    fn an_owned_slot_refuses_an_absent_owner_on_the_wire() {
+        let owner = OwnerRef::<OtherTestKind>::new(
+            PlainName::new("checkout").unwrap().generated_from_key(7),
+            ulid::Ulid::new(),
+        );
+        let mut json = serde_json::to_value(
+            ObjectMeta::<OwnedTestKind>::builder(ulid::Ulid::new())
+                .at(ts(1000))
+                .with_owner(owner),
+        )
+        .expect("meta serializes");
+        json.as_object_mut()
+            .expect("meta is an object")
+            .remove("owner");
+        let err = serde_json::from_value::<ObjectMeta<OwnedTestKind>>(json)
+            .expect_err("an owner-carrying slot has no value without an owner");
+        let msg = err.to_string();
+        assert!(msg.contains("owner is missing"), "{msg}");
+        assert!(msg.contains("always owned"), "{msg}");
+        // The fault names the slot *type*, so the reader learns which slot came up short.
+        assert!(msg.contains("OtherTestKind"), "{msg}");
+    }
+
+    #[test]
+    fn a_root_slot_cannot_be_owned() {
+        let payload = serde_json::json!({
+            "kind": "Execution",
+            "name": "checkout",
+            "uid": ulid::Ulid::new().to_string(),
+        });
+        let err = serde_json::from_value::<NoOwner>(payload)
+            .expect_err("no value can stand in a root's owner slot");
+        assert!(err.to_string().contains("cannot be owned"), "{err}");
+    }
+
+    /// A root's meta refuses a payload that carries an `owner` just as the value does — the refusal is
+    /// reached through the meta, which is where every row is read.
+    #[test]
+    fn a_root_meta_refuses_a_payload_that_carries_an_owner() {
+        let owned = ObjectMeta::<OwnedTestKind>::builder(ulid::Ulid::new())
+            .at(ts(1000))
+            .with_owner(OwnerRef::<OtherTestKind>::new(
+                PlainName::new("checkout").unwrap().generated_from_key(7),
+                ulid::Ulid::new(),
+            ));
+        let json = serde_json::to_value(owned).expect("meta serializes");
+        let err = serde_json::from_value::<ObjectMeta<TestKind>>(json)
+            .expect_err("a root's slot admits no owner");
+        assert!(err.to_string().contains("cannot be owned"), "{err}");
     }
 }

@@ -1,5 +1,5 @@
 /// Evaluate `$expr` (a `Result`); on `Ok` yield the value, on `Err` emit the failure to `$out`
-/// (`TerminateState` for `$activity` if `Some`, plus `TerminateExecution` for `$execution`) and
+/// (`TerminateState` for `$activity` if `Some`, plus the scope termination of `$scope`) and
 /// `return`. The failure path always goes through `Collector::terminate` so a failing site records
 /// its own outcome cohesively before the lifecycle cascade unwinds.
 ///
@@ -8,20 +8,20 @@
 /// while `result` belongs to a handler's own dispatch body, which ends by telling the leader it
 /// produced no outcome.
 macro_rules! fail_or {
-    (result, $out:expr, $activity:expr, $execution:expr, $expr:expr) => {
+    (result, $out:expr, $activity:expr, $scope:expr, $expr:expr) => {
         match $expr {
             Ok(v) => v,
             Err(e) => {
-                $out.terminate($activity, $execution, e);
+                $out.terminate($activity, $scope, e);
                 return Ok(());
             }
         }
     };
-    ($out:expr, $activity:expr, $execution:expr, $expr:expr) => {
+    ($out:expr, $activity:expr, $scope:expr, $expr:expr) => {
         match $expr {
             Ok(v) => v,
             Err(e) => {
-                $out.terminate($activity, $execution, e);
+                $out.terminate($activity, $scope, e);
                 return;
             }
         }
@@ -86,39 +86,36 @@ use crate::types::command::{
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope};
 use crate::{Activity, ActivityStatus};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
-/// Direct a terminal failure (or abort) at the scope that owns the given activity: a top-level run is
-/// an `Execution` (name+uid-addressed `TerminateExecution`), while a `Parallel` branch / `Map` item
-/// is owned by a `Thread`, which lives in **thread** storage and is only reachable via the
-/// reference-addressed `TerminateThread`. Centralizing this branch keeps every terminal-fail site
-/// (state `Fail`, parallel/map converge-fail, task fail, timer abort) from re-discovering that the
-/// two store kinds address differently — a bare `TerminateExecution` silently misses a Thread and
-/// leaves the branch Running, wedging its container.
+/// Direct a terminal failure (or abort) at the scope that owns the given activity: the top-level run
+/// is an [`OwnerScope::Execution`] (name+uid-addressed `TerminateExecution`), while a `Parallel`
+/// branch / `Map` item's scope is an [`OwnerScope::Thread`], which lives in **thread** storage and is
+/// only reachable via the reference-addressed `TerminateThread`. The two roles are a *type*, not a
+/// runtime kind test: a caller that only holds "the scope above me" cannot reach for the verb the
+/// other store answers to — a bare `TerminateExecution` silently misses a Thread and leaves the
+/// branch Running, wedging its container.
 pub(super) fn emit_scope_termination(
     out: &mut Collector<'_>,
-    scope: &ObjectReference,
+    scope: &OwnerScope,
     reason: TerminationReason,
 ) {
-    match scope.kind {
-        ObjectKind::Execution => {
+    match scope {
+        OwnerScope::Execution(execution) => {
             out.append_command(Command::TerminateExecution(TerminateExecution {
-                name: scope.name.clone(),
-                uid: Some(scope.uid),
+                name: execution.name().clone(),
+                uid: Some(execution.uid()),
                 reason,
             }))
         }
-        ObjectKind::Thread => out.append_command(Command::TerminateThread(TerminateThread {
-            thread: scope.clone(),
-            reason,
-        })),
-        _ => {
-            // An activity is always owned by a scope; terminating into any other owner is an
-            // internal fault with nowhere to route — nothing to emit, the failure is dropped.
-            tracing::error!(owner = %scope, "terminal fail on a non-scope owner; cannot terminate");
+        OwnerScope::Thread(thread) => {
+            out.append_command(Command::TerminateThread(TerminateThread {
+                thread: thread.erased().clone(),
+                reason,
+            }))
         }
     }
 }
@@ -227,7 +224,7 @@ pub(super) async fn emit_transition(
     } else {
         out.terminate(
             Some(activity),
-            execution,
+            OwnerScope::of_reference(&execution),
             ExecutionError::Runtime(RuntimeError::NoTerminal),
         );
     }
@@ -263,7 +260,7 @@ pub(super) async fn emit_state_completed(
 pub(super) async fn emit_timer(
     out: &mut Collector<'_>,
     execution: ObjectReference,
-    owner: ObjectReference,
+    owner: &Activity,
     purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
@@ -281,8 +278,12 @@ pub(super) async fn emit_timer(
             meta: crate::types::meta::ObjectMeta::builder(timer_uid)
                 .name(timer_name)
                 .at(out.now())
-                .build()
-                .with_owner(owner),
+                // An inline timer is always armed by the activity whose deadline it is, so the slot's
+                // `Activity` variant is built here from the activity's own identity — no flat
+                // reference is passed in, and a wrong kind cannot reach the slot.
+                .with_owner(crate::types::meta::TimerOwner::Activity(
+                    crate::types::meta::OwnerRef::new(owner.meta.name.clone(), owner.meta.uid),
+                )),
         },
     })
     .await;
@@ -333,17 +334,17 @@ pub(super) async fn complete_activity(
     .with_error_output(error_output)
     .build();
     let mut local_scope = variables.clone();
+    // A thread is the only thing that can own an activity (the slot's own type), so the owners below
+    // need no `kind` guard; the emitters take the flat address storage and commands speak, so the
+    // erasure happens once here instead of at each of them.
+    let owner = activity_value.meta.owner.clone().into_erased();
 
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
             Some(activity),
-            activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
+            OwnerScope::of_reference(&owner),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -353,11 +354,7 @@ pub(super) async fn complete_activity(
                         local_scope.insert(k, v);
                     }
                     out.append_event(Event::VariablesAssigned(VariablesAssigned {
-                        scope: activity_value
-                            .meta
-                            .owner
-                            .clone()
-                            .expect("an owned activity has an owner"),
+                        scope: owner.clone(),
                         variables: local_scope.clone(),
                     }))
                     .await;
@@ -366,11 +363,7 @@ pub(super) async fn complete_activity(
             _ => {
                 out.terminate(
                     Some(activity),
-                    activity_value
-                        .meta
-                        .owner
-                        .clone()
-                        .expect("an owned activity has an owner"),
+                    OwnerScope::of_reference(&owner),
                     ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     )),
@@ -384,11 +377,7 @@ pub(super) async fn complete_activity(
         Some(o) => fail_or!(
             out,
             Some(activity),
-            activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
+            OwnerScope::of_reference(&owner),
             env.eval_json(o, &states, &local_scope)
         ),
         None => raw_result.clone(),
@@ -411,11 +400,7 @@ pub(super) async fn complete_activity(
     emit_transition(
         out,
         activity_value.execution.clone(),
-        activity_value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner"),
+        owner.clone(),
         activity,
         &activity_value.state_path,
         &output_value,

@@ -15,7 +15,7 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope};
 
 /// Emit a drained-and-finishing `node`'s terminal (by kind and status), then deliver the settled
 /// node up to its owner as one hop ([`child_completed::child_settled`]) — which issues the next
@@ -62,17 +62,13 @@ async fn finish_activity_via_state(
     act: &crate::storage::ActivityRecord,
 ) -> Result<DeferredFinish, ProcessingError> {
     let activity_value = act.value();
-    let owner = activity_value
-        .meta
-        .owner
-        .clone()
-        .expect("an owned activity has an owner");
-    // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
+    let owner = activity_value.meta.owner.clone();
+    // An activity's owner slot admits only a `Thread`, so the row is read directly.
     // A **read** fault is the dispatch's, not the finish's — it is returned so the leader can retry the
     // hop — while a missing row, definition, or handler is a real unresolvable (closed generically by
     // the caller). Only the read separates the two; `machine_for_thread` mixes a missing definition
     // (domain) with the storage fault underneath it, so its `Infra` is split out explicitly.
-    let Some(thread) = ctx.storage.get_thread(&owner).await? else {
+    let Some(thread) = ctx.storage.get_thread(owner.erased()).await? else {
         return Ok(DeferredFinish::Unresolvable);
     };
     let sm = match ctx.machine_for_thread(&thread).await {
@@ -98,7 +94,11 @@ async fn finish_activity_via_state(
             error = %e,
             "deferred state finish failed; terminating the activity"
         );
-        out.terminate(Some(node.clone()), activity_value.execution.clone(), e);
+        out.terminate(
+            Some(node.clone()),
+            OwnerScope::of_reference(&activity_value.execution),
+            e,
+        );
         return Ok(DeferredFinish::Terminated);
     }
     Ok(DeferredFinish::Handled)
@@ -152,15 +152,13 @@ async fn finish_activity(
         }
         _ => return Ok(()), // not finishing — nothing to continue.
     }
-    if let Some(owner) = act.value.meta.owner.clone() {
-        Box::pin(super::child_completed::child_settled(
-            ctx,
-            out,
-            owner,
-            node.clone(),
-        ))
-        .await;
-    }
+    Box::pin(super::child_completed::child_settled(
+        ctx,
+        out,
+        act.value.meta.owner.clone().into_erased(),
+        node.clone(),
+    ))
+    .await;
     Ok(())
 }
 
@@ -201,15 +199,13 @@ async fn finish_thread(
         }
         _ => return Ok(()),
     }
-    if let Some(owner) = thread.value.meta.owner.clone() {
-        Box::pin(super::child_completed::child_settled(
-            ctx,
-            out,
-            owner,
-            node.clone(),
-        ))
-        .await;
-    }
+    Box::pin(super::child_completed::child_settled(
+        ctx,
+        out,
+        thread.value.meta.owner.clone().into_erased(),
+        node.clone(),
+    ))
+    .await;
     Ok(())
 }
 
@@ -250,15 +246,7 @@ async fn finish_execution(
         }
         _ => return Ok(()),
     }
-    if let Some(owner) = exec.value.meta.owner.clone() {
-        Box::pin(super::child_completed::child_settled(
-            ctx,
-            out,
-            owner,
-            node.clone(),
-        ))
-        .await;
-    }
+    // Nothing to relay: a run is the root of its object tree, so it has no owner to settle up to.
     Ok(())
 }
 

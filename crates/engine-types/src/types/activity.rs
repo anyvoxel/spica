@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, OwnerRef};
 use spica_machinery::Timestamp;
 // `RetryState` is the shared retry run-state defined alongside the task types it references
 // (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
 use crate::types::command::TerminationReason;
 use crate::types::task::RetryState;
+use crate::types::thread::ThreadKind;
 use spica_asl::StatePath;
 
 /// Lifecycle status of an Activity — the execution of a single state within an Execution.
@@ -131,6 +132,10 @@ pub struct ActivityKind;
 
 impl ObjectKindMarker for ActivityKind {
     const KIND: ObjectKind = ObjectKind::Activity;
+    /// A state runs inside exactly one scope, and that scope is always a [`Thread`](crate::Thread) —
+    /// the derived root thread for a top-level run, or a fan-out branch's thread. So the slot is an
+    /// [`OwnerRef`] rather than a union: an activity owned by an `Execution` directly is unrepresentable.
+    type OwnedBy = OwnerRef<ThreadKind>;
 }
 
 /// The event-carried domain value of an Activity.
@@ -148,11 +153,10 @@ pub struct Activity {
     /// The execution this activity belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s reference
     /// (the flat query anchor shared by the whole tree), regardless of how deep the activity sits in
     /// a `Parallel` branch / `Map` item. The activity's *immediate* container — the scope it lives
-    /// inside (`Execution` or `Thread`) — is **not** stored here; it is `meta.owner`. So `execution`
-    /// names a real `Execution` by construction: a top-level run owns its own activities directly,
-    /// and a nested activity's owner is a `Thread`, never another `Execution`. (Renamed from
-    /// `root_execution`: the old `execution` duplicated `meta.owner` and could hold a `Thread`,
-    /// which the field's name lied about.)
+    /// inside — is **not** stored here; it is `meta.owner`, and it is always a [`Thread`](crate::Thread)
+    /// (see [`ActivityKind::OwnedBy`]): a top-level run's states are owned by the run's derived root
+    /// thread, a fan-out branch's by that branch's thread. So `execution` names a real `Execution` by
+    /// construction, while the scope edge carries its own type.
     pub execution: ObjectReference,
     /// The complete JSON Pointer (RFC 6901) to this state's definition within the shared machine
     /// document, e.g. `/States/P2` (top-level) or `/States/P1/Branches/0/States/P2` (inside a
@@ -207,5 +211,39 @@ impl Activity {
     /// occurred (the field is `None` then).
     pub fn retry_count(&self) -> u32 {
         self.retry_state.as_ref().map(|r| r.attempts).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::meta::ObjectName;
+    use crate::types::thread::ThreadKind;
+    use spica_machinery::Timestamp;
+
+    /// An activity's owner slot admits a `Thread` and nothing else: it reads back with the same
+    /// owner, and a payload whose `owner` carries another kind is refused at the slot — an activity
+    /// is always owned by the scope whose machine it runs in, never by a run or a timer.
+    #[test]
+    fn an_activity_slot_admits_only_a_thread_owner() {
+        let owner =
+            OwnerRef::<ThreadKind>::new(ObjectName::plain("execution").unwrap(), ulid::Ulid::new());
+        let mut json = serde_json::to_value(
+            ObjectMeta::<ActivityKind>::builder(ulid::Ulid::new())
+                .at(Timestamp::from_millis(0))
+                .with_owner(owner.clone()),
+        )
+        .expect("meta serializes");
+        assert_eq!(json["owner"]["kind"], serde_json::json!("Thread"));
+        let back: ObjectMeta<ActivityKind> =
+            serde_json::from_value(json.clone()).expect("the slot admits its own kind");
+        assert_eq!(back.owner, owner);
+
+        json["owner"]["kind"] = serde_json::json!("Execution");
+        let err = serde_json::from_value::<ObjectMeta<ActivityKind>>(json)
+            .expect_err("an activity is never owned by a run");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Thread owners"), "{msg}");
     }
 }
