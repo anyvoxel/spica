@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::ObjectMeta;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta};
 
 /// The lifecycle status of a [`Flow`]. Deletion is a `TODO` (M1/M2): a flow is created `Active`
 /// and may become `Deleted` once a delete (cascade) operation lands — currently nothing transitions
@@ -18,6 +18,14 @@ pub enum FlowStatus {
     /// flow can never alias a surviving revision or execution onto it).
     // TODO(delete): implement the cascade-delete command + the `Deleted` transition.
     Deleted,
+}
+
+/// The [`ObjectKindMarker`] tying a [`Flow`]'s meta to [`ObjectKind::Flow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowKind;
+
+impl ObjectKindMarker for FlowKind {
+    const KIND: ObjectKind = ObjectKind::Flow;
 }
 
 /// One logical flow — a named aggregate that groups a monotone sequence of immutable
@@ -38,7 +46,7 @@ pub struct Flow {
     /// the flow's independent never-reused incarnation id (minted at creation in `create_flow`).
     /// The domain `created_at`/`updated_at` live inside `meta` (`created_at` stamped at version
     /// creation, `updated_at` advanced by the applier from the applied entry's timestamp).
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<FlowKind>,
     pub status: FlowStatus,
     /// The highest [`FlowVersion`](crate::FlowVersion) ordinal published under this flow so far;
     /// publishing a new version increments it (see the `FlowVersionCreated` applier). Kept as an

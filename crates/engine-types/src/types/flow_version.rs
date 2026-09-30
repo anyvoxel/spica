@@ -4,7 +4,15 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::types::id::FlowName;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName};
+
+/// The [`ObjectKindMarker`] tying a [`FlowVersion`]'s meta to [`ObjectKind::FlowVersion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowVersionKind;
+
+impl ObjectKindMarker for FlowVersionKind {
+    const KIND: ObjectKind = ObjectKind::FlowVersion;
+}
 
 /// One immutable, published version of a logical flow — the durable object `Storage` persists and
 /// executions bind to. It is the Zeebe analogue of a deployed `Process` (a specific
@@ -35,7 +43,7 @@ pub struct FlowVersion {
     /// **`meta.uid` IS the version's never-reused identity ulid**. `meta.owner` names the owning
     /// `Flow` (a persisted version always carries one). The domain `created_at` lives inside `meta`
     /// (versions are immutable — no `updated_at`).
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<FlowVersionKind>,
     /// This version's ordinal within its flow (1, 2, 3, … — incremented on each create).
     pub version: u32,
     /// The ASL state machine definition this version publishes, as its raw JSON string form.
@@ -60,16 +68,6 @@ impl FlowVersion {
         flow.generated_from_key(u64::from(version))
     }
 
-    /// This version's canonical [`ObjectReference`] — the `(name, uid)` pair a consumer uses to
-    /// address it: `kind = FlowVersion`, `name = meta.name`, `uid = meta.uid`.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(
-            ObjectKind::FlowVersion,
-            self.meta.name.clone(),
-            self.meta.uid,
-        )
-    }
-
     /// The owning flow's addressing name, read from this version's `meta.owner` (the owner's
     /// `name` is the flow's user name — see [`crate::types::meta::ObjectReference`]). `None` only for
     /// a version constructed without an owner (the applier's dispatch placeholder); a **persisted**
@@ -91,6 +89,7 @@ impl FlowVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::flow::Flow;
     use crate::types::meta::OwnerReference;
     use spica_machinery::Timestamp;
 
@@ -114,7 +113,7 @@ mod tests {
         let flow_uid = ulid::Ulid::new();
         let uid = ulid::Ulid::new();
         let version = FlowVersion {
-            meta: ObjectMeta::builder(ObjectKind::FlowVersion, uid)
+            meta: ObjectMeta::builder(uid)
                 .name(FlowVersion::version_name(&flow, 1))
                 .at(Timestamp::from_millis(0))
                 .build()
@@ -127,12 +126,35 @@ mod tests {
             definition: String::new(),
             checksum: FlowVersion::definition_checksum(""),
         };
-        let r = version.reference();
+        let r = version.meta.reference();
         assert_eq!(r.kind, ObjectKind::FlowVersion);
         assert_eq!(r.name, version.meta.name);
         assert_eq!(r.uid, uid);
         // flow_name derives from the owner reference, not the version's own name.
         assert_eq!(version.flow_name(), Some(flow));
+    }
+
+    #[test]
+    fn a_foreign_kind_row_is_rejected_at_the_meta() {
+        let flow = FlowName::new("order").unwrap();
+        let version = FlowVersion {
+            meta: ObjectMeta::builder(ulid::Ulid::new())
+                .name(FlowVersion::version_name(&flow, 1))
+                .at(Timestamp::from_millis(0))
+                .build(),
+            version: 1,
+            definition: String::new(),
+            checksum: FlowVersion::definition_checksum(""),
+        };
+        let json = serde_json::to_value(&version).expect("version serializes");
+        // Every entity declares `meta` first, so the kind guard fires before any other field
+        // mismatch: a row read through the wrong type names the two kinds, not a random field.
+        let err =
+            serde_json::from_value::<Flow>(json).expect_err("a FlowVersion row is not a Flow");
+        let msg = err.to_string();
+        assert!(msg.contains("kind mismatch"), "{msg}");
+        assert!(msg.contains("carries kind FlowVersion"), "{msg}");
+        assert!(msg.ends_with("expects Flow"), "{msg}");
     }
 
     #[test]

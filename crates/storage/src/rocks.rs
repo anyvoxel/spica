@@ -243,23 +243,23 @@ impl Storage for RocksStorage {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.reference()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.reference()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.reference()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.reference()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.reference()), &task)
+        self.put_row(self.keys.task(&task.meta.reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`, exactly like
@@ -554,23 +554,23 @@ impl StorageTxn for RocksTxn {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.reference()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.reference()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.reference()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.reference()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.reference()), &task)
+        self.put_row(self.keys.task(&task.meta.reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`: read the (read-your-writes)
@@ -757,12 +757,9 @@ mod tests {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine_types::ObjectMeta::builder(
-                    spica_engine_types::ObjectKind::Execution,
-                    id.uid,
-                )
-                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                .build(),
+                meta: spica_engine_types::ObjectMeta::builder(id.uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build(),
             },
             variables: Variables::new(),
             active_children: HashSet::new(),
@@ -783,13 +780,19 @@ mod tests {
                 .await
                 .unwrap();
             let got = store.get_execution(&id).await.unwrap().unwrap();
-            assert_eq!(got.reference(), id);
+            assert_eq!(got.meta.reference(), id);
         }
         // Reopened store must still see the row (durability via RocksDB WAL across a drop/reopen).
         {
             let store = RocksStorage::open(&path).unwrap();
             assert_eq!(
-                store.get_execution(&id).await.unwrap().unwrap().reference(),
+                store
+                    .get_execution(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .meta
+                    .reference(),
                 id
             );
         }
@@ -856,13 +859,10 @@ mod tests {
                 purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
-                meta: spica_engine_types::ObjectMeta::builder(
-                    spica_engine_types::ObjectKind::Timer,
-                    uid,
-                )
-                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                .build()
-                .with_owner(id.clone()),
+                meta: spica_engine_types::ObjectMeta::builder(uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .build()
+                    .with_owner(id.clone()),
             });
             store.put_timer(t.clone()).await.unwrap();
             assert_eq!(
@@ -871,12 +871,19 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
+                    .meta
                     .reference(),
                 timer_ref
             );
             // the execution row is untouched by writing a timer
             assert_eq!(
-                store.get_execution(&id).await.unwrap().unwrap().reference(),
+                store
+                    .get_execution(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .meta
+                    .reference(),
                 id
             );
         }
@@ -908,7 +915,7 @@ mod tests {
                     retrier_attempts: vec![],
                     next_available_at,
                 },
-                meta: spica_engine_types::ObjectMeta::builder(ObjectKind::Task, id)
+                meta: spica_engine_types::ObjectMeta::builder(id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .build(),
             },

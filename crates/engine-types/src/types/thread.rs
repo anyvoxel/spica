@@ -3,7 +3,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_asl::StatePath;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
@@ -49,6 +49,14 @@ impl ThreadStatus {
     }
 }
 
+/// The [`ObjectKindMarker`] tying a [`Thread`]'s meta to [`ObjectKind::Thread`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadKind;
+
+impl ObjectKindMarker for ThreadKind {
+    const KIND: ObjectKind = ObjectKind::Thread;
+}
+
 /// The event-/domain-carried value of a **Thread** — one scoped sub-run of the shared state machine,
 /// created for each `Parallel` branch or `Map` item by a container activity.
 ///
@@ -71,7 +79,7 @@ pub struct Thread {
     /// top-level `Execution` (which has no owner), `meta.owner` is **always** the container
     /// `Parallel`/`Map` activity that fanned this thread out — the drain cascade and the container's
     /// `active_children` rely on that owning edge.
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<ThreadKind>,
     /// The execution this thread belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s
     /// `ObjectReference`, regardless of nesting depth (a tree holds exactly one `Execution`, and it
     /// is always the root). This is the flat grouping key for "all events of one top-level run" (the
@@ -125,10 +133,6 @@ impl Thread {
     /// to address it (`kind = Thread`, `name = meta.name`, `uid = meta.uid`). Mirrors
     /// [`Execution::reference`](crate::types::execution::Execution::reference); Storage keys the row
     /// by this reference and reads it back by reference.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(ObjectKind::Thread, self.meta.name.clone(), self.meta.uid)
-    }
-
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
     }

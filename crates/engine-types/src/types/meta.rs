@@ -13,6 +13,10 @@
 //!
 //! See `docs/identity-and-partitioning-design.md` for the full design.
 
+use std::marker::PhantomData;
+
+use serde::de::Deserializer;
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -53,11 +57,16 @@ impl ObjectKind {
     }
 
     /// Parse the lowercase string form back into a kind; `None` for an unknown string.
+    ///
+    /// Must mirror [`Self::as_str`] arm for arm: the two are a hand-maintained inverse pair, so a kind
+    /// added to one silently loses its round-trip in the other (as `Thread` once did) — the
+    /// `object_kind_roundtrips_via_string` test is what keeps them in step.
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "flow" => ObjectKind::Flow,
             "flowversion" => ObjectKind::FlowVersion,
             "execution" => ObjectKind::Execution,
+            "thread" => ObjectKind::Thread,
             "activity" => ObjectKind::Activity,
             "timer" => ObjectKind::Timer,
             "task" => ObjectKind::Task,
@@ -72,7 +81,55 @@ impl std::fmt::Display for ObjectKind {
     }
 }
 
+/// The compile-time map from an object type to its [`ObjectKind`], declared once per object type by a
+/// zero-sized marker (`ActivityKind`, `TaskKind`, …).
+///
+/// [`ObjectMeta`] is parameterised by it, so a meta cannot be built for one kind and read back as
+/// another: the kind is never a stored value that could drift from the record holding it, and
+/// [`ObjectMeta::reference`] derives it from the type alone. The marker is also the extension slot for
+/// typing an object's owning reference (`OwnerReference<O>`), where an object type will name the marker
+/// its owner must carry.
+pub trait ObjectKindMarker {
+    const KIND: ObjectKind;
+}
+
+/// The wire anchor of an [`ObjectMeta`]'s kind: a zero-sized value that holds no state of its own.
+///
+/// Writing it emits `K::KIND`; reading it rejects a payload whose `kind` disagrees with `K`. The kind
+/// therefore stays on the wire — a foreign-kind row cannot be silently re-typed into the record that
+/// read it — while remaining impossible to drift: there is no stored value that could disagree with
+/// the type, only the type's own constant round-tripped. The error names the offending type via
+/// [`std::any::type_name`], because the fault is a wrong *type*, not wrong data.
+#[derive(Debug, Clone, PartialEq)]
+struct KindTag<K>(PhantomData<fn() -> K>);
+
+impl<K: ObjectKindMarker> Serialize for KindTag<K> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        K::KIND.serialize(s)
+    }
+}
+
+impl<'de, K: ObjectKindMarker> Deserialize<'de> for KindTag<K> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let seen = ObjectKind::deserialize(d)?;
+        if seen != K::KIND {
+            return Err(serde::de::Error::custom(format!(
+                "object meta kind mismatch: the payload carries kind {seen:?}, but this meta is \
+                 typed as {} and expects {:?}",
+                std::any::type_name::<K>(),
+                K::KIND,
+            )));
+        }
+        Ok(KindTag(PhantomData))
+    }
+}
+
 /// Common metadata shared by every spica object (k8s-style `ObjectMeta` reuse).
+///
+/// The object's kind is the `K` parameter, not a mutable field: `ObjectMeta<TaskKind>` *is* a task's
+/// meta, so the kind cannot be edited into disagreement with the record that holds it, the per-object
+/// `Task::reference`/`Timer::reference`/… helpers collapse into one [`Self::reference`], and a payload
+/// whose `kind` disagrees with the reading type is rejected rather than silently re-typed.
 ///
 /// Consolidates the identity, scoping, and timing facts that were historically copied across the
 /// domain entities, so future shared fields (e.g. optimistic-concurrency `resource_version`) land
@@ -91,9 +148,11 @@ impl std::fmt::Display for ObjectKind {
 /// from the reference's [`ObjectKind`]. `root_execution` is a
 /// separate flat top-of-tree query anchor, **not** the owner (the owner is the direct parent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ObjectMeta {
-    /// The object's kind (k8s "Kind").
-    pub kind: ObjectKind,
+#[serde(bound = "")]
+pub struct ObjectMeta<K: ObjectKindMarker> {
+    /// The kind, emitted as `K::KIND` and validated against `K` on read (see [`KindTag`]). Declared
+    /// first so the wire keeps the field order it had before this meta was parameterised.
+    kind: KindTag<K>,
     /// Top-level isolation boundary — which organization owns the object.
     pub tenant: ScopeName,
     /// Scoping within the tenant — a project / team / environment.
@@ -106,6 +165,8 @@ pub struct ObjectMeta {
     pub created_at: Timestamp,
     /// When the object was last updated; see [`Self::with_update_at`].
     pub updated_at: Timestamp,
+    // TODO(OwnerReference<O>)：K 是 owner 强类型化的落点——让 owner 的 marker 由本类型决定，
+    // 例如 Task 的 owner 必须是 Activity，从而消掉 container.rs 里那类运行时 kind 判断。
     /// The object that owns this one, if any. Same `tenant`/`namespace` scope is *inherited* from
     /// this object's own scope (spica ownership never crosses a scope), so the reference carries
     /// only `kind`/`name`/`uid`. `None` for roots (a top-level `Execution` with no container parent).
@@ -113,10 +174,17 @@ pub struct ObjectMeta {
     pub owner: Option<OwnerReference>,
 }
 
-impl ObjectMeta {
-    /// Start building fresh meta with only `kind` + `uid` required — see [`ObjectMetaBuilder`].
-    pub fn builder(kind: ObjectKind, uid: ulid::Ulid) -> ObjectMetaBuilder {
-        ObjectMetaBuilder::new(kind, uid)
+impl<K: ObjectKindMarker> ObjectMeta<K> {
+    /// Start building fresh meta for a `K` — the kind is `K`'s, never an argument. See
+    /// [`ObjectMetaBuilder`].
+    pub fn builder(uid: ulid::Ulid) -> ObjectMetaBuilder<K> {
+        ObjectMetaBuilder::new(uid)
+    }
+
+    /// The canonical reference to this object — the one implementation for every kind, replacing the
+    /// per-object `reference()` helpers that each hard-coded their own kind.
+    pub fn reference(&self) -> ObjectReference {
+        ObjectReference::new(K::KIND, self.name.clone(), self.uid)
     }
 
     /// Record a mutation at `at`: advances `updated_at`, leaves `created_at`.
@@ -133,41 +201,43 @@ impl ObjectMeta {
     }
 }
 
-/// A fluent constructor for [`ObjectMeta`], replacing the four small variant constructors
+/// A fluent constructor for `ObjectMeta<K>`, replacing the four small variant constructors
 /// (`born` / `born_placeholder` / `born_named` / `placeholder_with_times`) that varied along three
-/// orthogonal axes (name source, scope, time split). `kind` + `uid` are required up front; a
-/// `default`/`default` scope and a `child-<uid>` generated name are the **defaults** — so the
-/// placeholder case is the zero-config path and real naming is one `.name(...)` setter. That single
-/// seam keeps ~50 call sites stable when P2 user naming lands (the former
-/// `born_placeholder`/`placeholder_with_times` TODO), instead of a fourth constructor variant.
-pub struct ObjectMetaBuilder {
-    kind: ObjectKind,
+/// orthogonal axes (name source, scope, time split). `uid` is the one required input — the kind comes
+/// from `K`, so it cannot be passed wrong or overwritten; a `default`/`default` scope and a
+/// `child-<uid>` generated name are the **defaults** — so the placeholder case is the zero-config path
+/// and real naming is one `.name(...)` setter. That single seam keeps ~50 call sites stable when P2
+/// user naming lands (the former `born_placeholder`/`placeholder_with_times` TODO), instead of a
+/// fourth constructor variant.
+pub struct ObjectMetaBuilder<K: ObjectKindMarker> {
     tenant: ScopeName,
     namespace: ScopeName,
     name: ObjectName,
     uid: ulid::Ulid,
     created_at: Timestamp,
     updated_at: Timestamp,
+    /// Present only to keep `K` a parameter of the builder (E0392) — the kind it stands for is `K::KIND`.
+    _kind: PhantomData<fn() -> K>,
 }
 
-impl ObjectMetaBuilder {
-    /// Start building fresh meta. The `default`/`default` scope, the uid-derived `child-<uid>` name
-    /// and `created_at == updated_at` are defaults — override them with the setters. The static
+impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
+    /// Start building fresh meta for a `K`. The `default`/`default` scope, the uid-derived `child-<uid>`
+    /// name and `created_at == updated_at` are defaults — override them with the setters. The static
     /// scope/name `expect`s cannot panic.
-    pub fn new(kind: ObjectKind, uid: ulid::Ulid) -> Self {
+    pub fn new(uid: ulid::Ulid) -> Self {
         let tenant = ScopeName::new("default").expect("static literal is a valid segment");
         let namespace = ScopeName::new("default").expect("static literal is a valid segment");
         let name = PlainName::new("child")
             .expect("static literal is a valid segment")
             .generated_from_key(uid.0 as u64);
         Self {
-            kind,
             tenant,
             namespace,
             name,
             uid,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
+            _kind: PhantomData,
         }
     }
 
@@ -202,9 +272,9 @@ impl ObjectMetaBuilder {
         self
     }
 
-    pub fn build(self) -> ObjectMeta {
+    pub fn build(self) -> ObjectMeta<K> {
         ObjectMeta {
-            kind: self.kind,
+            kind: KindTag(PhantomData),
             tenant: self.tenant,
             namespace: self.namespace,
             name: self.name,
@@ -309,16 +379,46 @@ mod tests {
         Timestamp::from_millis(ms)
     }
 
+    /// A stand-in marker so the meta's own tests need no real object type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestKind;
+    impl ObjectKindMarker for TestKind {
+        const KIND: ObjectKind = ObjectKind::Execution;
+    }
+
+    /// A second marker, so the mismatch case has somewhere to mismatch to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct OtherTestKind;
+    impl ObjectKindMarker for OtherTestKind {
+        const KIND: ObjectKind = ObjectKind::Task;
+    }
+
     #[test]
     fn object_kind_roundtrips_via_string() {
-        for k in [
+        // `all` and the index arms below are one enumeration split in two, so a new variant cannot
+        // escape the round-trip the way `Thread` once did: the match is exhaustive (a new variant
+        // breaks the compile), and the arm's index must hold that same variant — a variant left out
+        // of `all` fails `all[i] == k` instead of silently skipping its assertions.
+        let all = [
             ObjectKind::Flow,
             ObjectKind::FlowVersion,
             ObjectKind::Execution,
+            ObjectKind::Thread,
             ObjectKind::Activity,
             ObjectKind::Timer,
             ObjectKind::Task,
-        ] {
+        ];
+        for k in all {
+            let i = match k {
+                ObjectKind::Flow => 0,
+                ObjectKind::FlowVersion => 1,
+                ObjectKind::Execution => 2,
+                ObjectKind::Thread => 3,
+                ObjectKind::Activity => 4,
+                ObjectKind::Timer => 5,
+                ObjectKind::Task => 6,
+            };
+            assert_eq!(all[i], k);
             assert_eq!(ObjectKind::parse(k.as_str()), Some(k));
             assert_eq!(format!("{k}"), k.as_str());
         }
@@ -327,7 +427,8 @@ mod tests {
 
     #[test]
     fn object_meta_born_and_with_update_at() {
-        let mut meta = ObjectMeta::builder(ObjectKind::Execution, ulid::Ulid::new())
+        // The kind is only known from the type, so a meta no longer fed to a record must be annotated.
+        let mut meta = ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
             .tenant(ScopeName::new("myco").unwrap())
             .namespace(ScopeName::new("default").unwrap())
             .name(
@@ -339,9 +440,58 @@ mod tests {
             .build();
         assert_eq!(meta.created_at, meta.updated_at);
         assert_eq!(meta.owner, None); // roots have no owner
+        assert_eq!(meta.reference().kind, ObjectKind::Execution); // the kind is `K`'s, not a field
         meta.with_update_at(ts(2000));
         assert_eq!(meta.updated_at, ts(2000));
         assert_eq!(meta.created_at, ts(1000)); // created_at is immutable
+    }
+
+    #[test]
+    fn object_meta_roundtrips_with_the_kind_on_the_wire() {
+        let meta = ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
+            .at(ts(1000))
+            .build();
+        let json = serde_json::to_value(&meta).expect("meta serializes");
+        // The spelling is load-bearing: `"Execution"` is what the wire carried before the meta was
+        // parameterised, so pinning it keeps rows written earlier readable.
+        assert_eq!(
+            json.get("kind"),
+            Some(&serde_json::json!("Execution")),
+            "wire: {json}"
+        );
+        let back: ObjectMeta<TestKind> = serde_json::from_value(json).expect("meta deserializes");
+        assert_eq!(back, meta);
+        assert_eq!(back.reference().kind, ObjectKind::Execution);
+    }
+
+    #[test]
+    fn object_meta_rejects_a_foreign_kind_on_the_wire() {
+        let meta = ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
+            .at(ts(1000))
+            .build();
+        let json = serde_json::to_value(&meta).expect("meta serializes");
+        let err = serde_json::from_value::<ObjectMeta<OtherTestKind>>(json)
+            .expect_err("a Task-typed meta must not read an Execution payload");
+        let msg = err.to_string();
+        assert!(msg.contains("kind mismatch"), "{msg}");
+        assert!(msg.contains("carries kind Execution"), "{msg}");
+        assert!(msg.ends_with("expects Task"), "{msg}");
+    }
+
+    #[test]
+    fn object_meta_rejects_a_missing_kind_on_the_wire() {
+        let mut json = serde_json::to_value(
+            ObjectMeta::<TestKind>::builder(ulid::Ulid::new())
+                .at(ts(1000))
+                .build(),
+        )
+        .expect("meta serializes");
+        json.as_object_mut()
+            .expect("meta is an object")
+            .remove("kind");
+        let err = serde_json::from_value::<ObjectMeta<TestKind>>(json)
+            .expect_err("the kind is required, never defaulted");
+        assert!(err.to_string().contains("kind"), "{err}");
     }
 
     #[test]

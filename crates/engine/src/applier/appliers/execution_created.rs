@@ -25,7 +25,9 @@ impl ExecutionCreatedApplier {
         // owner drains (Completing/Terminating) waits on it via the shared cascade, and the inline
         // drain reaction notices it as in-flight. The top-level run (no owner) is owned by nothing.
         if let Some(owner) = execution.meta.owner.clone() {
-            ctx.storage.add_child(owner, execution.reference()).await?;
+            ctx.storage
+                .add_child(owner, execution.meta.reference())
+                .await?;
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ impl StateCompletedApplier {
         ctx: &mut ApplierContext<'_>,
         activity: &Activity,
     ) -> Result<(), ExecutionError> {
-        if let Some(act) = ctx.storage.get_activity(&activity.reference()).await? {
+        if let Some(act) = ctx.storage.get_activity(&activity.meta.reference()).await? {
             let parent = act
                 .value
                 .meta
@@ -25,7 +25,7 @@ impl StateCompletedApplier {
             row.updated_at = ctx.timestamp;
             ctx.storage.put_activity(row).await?;
             ctx.storage
-                .remove_child(parent.clone(), activity.reference())
+                .remove_child(parent.clone(), activity.meta.reference())
                 .await?;
         }
         Ok(())

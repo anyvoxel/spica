@@ -17,7 +17,7 @@ impl TimerCancelledApplier {
         ctx: &mut ApplierContext<'_>,
         timer: &Timer,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut t) = ctx.storage.get_timer(&timer.reference()).await? {
+        if let Some(mut t) = ctx.storage.get_timer(&timer.meta.reference()).await? {
             let parent = t
                 .value
                 .meta
@@ -29,7 +29,9 @@ impl TimerCancelledApplier {
             t.value.meta.with_update_at(timer.meta.updated_at);
             t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
-            ctx.storage.remove_child(parent, timer.reference()).await?;
+            ctx.storage
+                .remove_child(parent, timer.meta.reference())
+                .await?;
         }
         // The physical descheduling is not folded here — a consumer re-derives `cancel` from the
         // durable `TimerCancelled` event once it is committed.

@@ -90,7 +90,7 @@ impl StateHandler for TaskStateHandler<'_> {
             Err(e) => (None, Some(e)),
         };
 
-        let activity = activity_value.reference();
+        let activity = activity_value.meta.reference();
         let task_uid = out.mint();
         // The task's reference is minted with a name derived from the owning execution's plain base
         // (finding #13), exactly like the activity (#3) and timer (#11) names — not the opaque
@@ -268,7 +268,7 @@ mod tests {
             purpose: TimerPurpose::TaskTimeout,
             status: TimerStatus::Active,
             deadline,
-            meta: ObjectMeta::builder(ObjectKind::Timer, uid(3))
+            meta: ObjectMeta::builder(uid(3))
                 .name(obj_name("execution-2"))
                 .at(at())
                 .build()

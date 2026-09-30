@@ -24,7 +24,7 @@ impl TaskCompletedApplier {
         // is folded into the activity's `raw_output`: it is the state's raw result before the
         // complete step's `Output` projection, distinct from the immutable processed input recorded
         // during `StateActivated`.
-        if let Some(mut t) = ctx.storage.get_task(&task.reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await? {
             let parent = t
                 .meta
                 .owner
@@ -43,7 +43,9 @@ impl TaskCompletedApplier {
                 act.with_update_at(ctx.timestamp);
                 ctx.storage.put_activity(act).await?;
             }
-            ctx.storage.remove_child(parent, task.reference()).await?;
+            ctx.storage
+                .remove_child(parent, task.meta.reference())
+                .await?;
         }
         Ok(())
     }

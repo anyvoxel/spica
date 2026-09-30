@@ -35,7 +35,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(ObjectKind::Flow, uid(1), "lifecycle_flow"),
+                    meta: meta(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -43,7 +43,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             EntryPayload::Event(Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: request(0),
                 flow_version: FlowVersion {
-                    meta: meta(ObjectKind::FlowVersion, uid(2), "lifecycle_flow-1")
+                    meta: meta(uid(2), "lifecycle_flow-1")
                         .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
@@ -60,7 +60,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -69,7 +69,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -88,7 +88,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P1"),
@@ -103,7 +103,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P1"),
@@ -122,7 +122,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P1"),
@@ -137,7 +137,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             }),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P1"),
@@ -162,7 +162,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(6), "lifecycle_execution-2")
+                    meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P2"),
@@ -177,7 +177,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(6), "lifecycle_execution-2")
+                    meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P2"),
@@ -196,7 +196,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(6), "lifecycle_execution-2")
+                    meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P2"),
@@ -211,7 +211,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             }),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(6), "lifecycle_execution-2")
+                    meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P2"),
@@ -230,7 +230,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -243,7 +243,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             }),
             EntryPayload::Event(Event::ThreadCompleted {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -261,7 +261,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
@@ -271,7 +271,7 @@ async fn pass_hops_to_a_sibling_then_ends() {
             EntryPayload::Event(Event::ExecutionCompleted {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
@@ -304,7 +304,7 @@ async fn pass_without_output_passes_its_input_through() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(ObjectKind::Flow, uid(1), "lifecycle_flow"),
+                    meta: meta(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -312,7 +312,7 @@ async fn pass_without_output_passes_its_input_through() {
             EntryPayload::Event(Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: request(0),
                 flow_version: FlowVersion {
-                    meta: meta(ObjectKind::FlowVersion, uid(2), "lifecycle_flow-1")
+                    meta: meta(uid(2), "lifecycle_flow-1")
                         .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
@@ -329,7 +329,7 @@ async fn pass_without_output_passes_its_input_through() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -338,7 +338,7 @@ async fn pass_without_output_passes_its_input_through() {
             })),
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -357,7 +357,7 @@ async fn pass_without_output_passes_its_input_through() {
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -372,7 +372,7 @@ async fn pass_without_output_passes_its_input_through() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -391,7 +391,7 @@ async fn pass_without_output_passes_its_input_through() {
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -406,7 +406,7 @@ async fn pass_without_output_passes_its_input_through() {
             }),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -425,7 +425,7 @@ async fn pass_without_output_passes_its_input_through() {
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -438,7 +438,7 @@ async fn pass_without_output_passes_its_input_through() {
             }),
             EntryPayload::Event(Event::ThreadCompleted {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -456,7 +456,7 @@ async fn pass_without_output_passes_its_input_through() {
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
@@ -466,7 +466,7 @@ async fn pass_without_output_passes_its_input_through() {
             EntryPayload::Event(Event::ExecutionCompleted {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
@@ -506,7 +506,7 @@ async fn pass_assign_then_jsonata_output() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(ObjectKind::Flow, uid(1), "lifecycle_flow"),
+                    meta: meta(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -514,7 +514,7 @@ async fn pass_assign_then_jsonata_output() {
             EntryPayload::Event(Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: request(0),
                 flow_version: FlowVersion {
-                    meta: meta(ObjectKind::FlowVersion, uid(2), "lifecycle_flow-1")
+                    meta: meta(uid(2), "lifecycle_flow-1")
                         .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
@@ -531,7 +531,7 @@ async fn pass_assign_then_jsonata_output() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -540,7 +540,7 @@ async fn pass_assign_then_jsonata_output() {
             })),
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -559,7 +559,7 @@ async fn pass_assign_then_jsonata_output() {
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -574,7 +574,7 @@ async fn pass_assign_then_jsonata_output() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -593,7 +593,7 @@ async fn pass_assign_then_jsonata_output() {
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -612,7 +612,7 @@ async fn pass_assign_then_jsonata_output() {
             })),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta(ObjectKind::Activity, uid(5), "lifecycle_execution-1")
+                    meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/P"),
@@ -631,7 +631,7 @@ async fn pass_assign_then_jsonata_output() {
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -644,7 +644,7 @@ async fn pass_assign_then_jsonata_output() {
             }),
             EntryPayload::Event(Event::ThreadCompleted {
                 thread: Thread {
-                    meta: meta(ObjectKind::Thread, uid(4), "lifecycle_execution-0")
+                    meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
@@ -662,7 +662,7 @@ async fn pass_assign_then_jsonata_output() {
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
@@ -672,7 +672,7 @@ async fn pass_assign_then_jsonata_output() {
             EntryPayload::Event(Event::ExecutionCompleted {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(ObjectKind::Execution, uid(3), "lifecycle_execution"),
+                    meta: meta(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),

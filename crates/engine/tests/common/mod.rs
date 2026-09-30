@@ -25,9 +25,9 @@ use spica_engine::{
     ActivatedTask, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow, Engine,
     EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
     ExecutionError, ExecutionStatus, FailTask, FlowName, FlowVersionCreated, Hook, LogStream,
-    ObjectKind, ObjectMeta, ObjectName, ObjectReference, PlainName, Reject, RequestId,
-    RuntimeError, StatePath, StreamId, Task, TaskApi, TaskCompleted, TasksClaimed, Timestamp,
-    Variables,
+    ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, ObjectReference, PlainName, Reject,
+    RequestId, RuntimeError, StatePath, StreamId, Task, TaskApi, TaskCompleted, TasksClaimed,
+    Timestamp, Variables,
 };
 use spica_machinery::{
     Clock, CountingIdGenerator, IdGenerator, ManualClock, SystemClock, SystemIdGenerator,
@@ -548,12 +548,13 @@ pub fn flow_name(name: &str) -> FlowName {
     FlowName::new(name).expect("a static literal is a valid flow name")
 }
 
-/// The metadata a timer-free run mints for the object `object_name` of kind `kind`, identified by the
-/// `n`-th uid: every object's own name plus the injected identity, stamped at the clock's single
-/// instant ([`epoch`]). A case whose clock has been advanced builds its `ObjectMeta` through
+/// The metadata a timer-free run mints for the object `object_name`, identified by the `n`-th uid:
+/// every object's own name plus the injected identity, stamped at the clock's single instant
+/// ([`epoch`]). The kind is the caller's business — it comes from `K`, resolved at the record the
+/// meta is written into. A case whose clock has been advanced builds its `ObjectMeta` through
 /// [`ObjectMeta::builder`] instead, since these stamps would be wrong for it.
-pub fn meta(kind: ObjectKind, uid: ulid::Ulid, object_name: &str) -> ObjectMeta {
-    ObjectMeta::builder(kind, uid)
+pub fn meta<K: ObjectKindMarker>(uid: ulid::Ulid, object_name: &str) -> ObjectMeta<K> {
+    ObjectMeta::builder(uid)
         .name(name(object_name))
         .at(epoch())
         .build()
@@ -562,14 +563,13 @@ pub fn meta(kind: ObjectKind, uid: ulid::Ulid, object_name: &str) -> ObjectMeta 
 /// [`meta`] with both stamps spelled out — for a case whose clock has been advanced (see
 /// [`TypedCase::acts`]), where an object minted before the move and updated by it carries two
 /// different instants.
-pub fn meta_span(
-    kind: ObjectKind,
+pub fn meta_span<K: ObjectKindMarker>(
     uid: ulid::Ulid,
     object_name: &str,
     created: Timestamp,
     updated: Timestamp,
-) -> ObjectMeta {
-    ObjectMeta::builder(kind, uid)
+) -> ObjectMeta<K> {
+    ObjectMeta::builder(uid)
         .name(name(object_name))
         .timestamps(created, updated)
         .build()
@@ -1336,9 +1336,10 @@ impl Hook for CompositeHook {
             Event::TimerActivated { timer } => {
                 // The durable event carries the timer's absolute deadline; re-arm the physical
                 // schedule from that persisted moment.
-                self.scheduler.schedule(&timer.reference(), timer.deadline);
+                self.scheduler
+                    .schedule(&timer.meta.reference(), timer.deadline);
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.reference()),
+            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.reference()),
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -1574,7 +1575,7 @@ impl LocalClient {
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        Ok(flow_version.reference())
+        Ok(flow_version.meta.reference())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id at birth.
@@ -1614,7 +1615,7 @@ impl LocalClient {
         };
         match event {
             Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
-                Ok(execution.reference())
+                Ok(execution.meta.reference())
             }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }

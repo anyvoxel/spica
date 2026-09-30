@@ -12,7 +12,7 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
 use crate::types::id::RequestId;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectMeta, ObjectReference};
 use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
@@ -394,7 +394,7 @@ pub trait StateHandler: Send + Sync {
             activity_state: None,
             retry_state: None,
             output: None,
-            meta: ObjectMeta::builder(ObjectKind::Activity, ctx.mint())
+            meta: ObjectMeta::builder(ctx.mint())
                 .name(
                     execution
                         .name
@@ -405,7 +405,7 @@ pub trait StateHandler: Send + Sync {
                 .build()
                 .with_owner(owner.clone()),
         };
-        let activity = activity_value.reference();
+        let activity = activity_value.meta.reference();
 
         // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
         // fan-out thread for a branch/item (see `emit_transition`, which only ever names a `Thread`).
@@ -617,15 +617,14 @@ mod tests {
 
     use super::super::dispatch::build_state_handlers;
     use crate::StatePath;
-    use crate::types::meta::{ObjectKind, ObjectReference};
+    use crate::types::meta::ObjectReference;
     use crate::{Activity, ActivityStatus};
 
     /// A minimal empty `Activity` sufficient to dispatch an object-safe lifecycle hook — the create
     /// contract only cares that the hook *dispatches*, not what it does.
     fn empty_activity() -> Activity {
         Activity {
-            meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Activity, ulid::Ulid::new())
-                .build(),
+            meta: crate::types::meta::ObjectMeta::builder(ulid::Ulid::new()).build(),
             execution: ObjectReference::nil(),
             state_path: StatePath::from(jsonptr::PointerBuf::new()),
             status: ActivityStatus::Running,

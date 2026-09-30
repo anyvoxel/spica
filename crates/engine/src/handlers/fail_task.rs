@@ -54,7 +54,7 @@ impl FailTaskHandler {
             // report and drops.
             if !act.status.is_running() || act.worker_id.as_deref() != Some(worker_id.as_str()) {
                 tracing::warn!(
-                    task = %act.value.reference(),
+                    task = %act.value.meta.reference(),
                     reported = %worker_id,
                     leased = ?act.worker_id,
                     "worker tried to fail a task it does not lease; report rejected"

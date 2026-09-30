@@ -76,7 +76,7 @@ impl StateHandler for WaitStateHandler<'_> {
             // the immediate owner scope — it drives `Timer::execution` and the timer's
             // `{execution.name}-{suffix}` generated name, so a branch Wait still names its root run.
             activity_value.execution.clone(),
-            activity_value.reference(),
+            activity_value.meta.reference(),
             TimerPurpose::WaitResume,
             wait.resume_at,
         )
@@ -218,7 +218,7 @@ mod tests {
         ActivateState, Command, TerminateState, TerminateThread, TerminationReason,
     };
     use crate::types::event::{Event, StateTransitioned};
-    use crate::types::meta::{ObjectKind, ObjectMeta};
+    use crate::types::meta::ObjectMeta;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
 
     // A `Wait`'s activation product: the deadline is resolved in `process_input` (so it is a property
@@ -259,7 +259,7 @@ mod tests {
             purpose: TimerPurpose::WaitResume,
             status: TimerStatus::Active,
             deadline: resume_at,
-            meta: ObjectMeta::builder(ObjectKind::Timer, uid(2))
+            meta: ObjectMeta::builder(uid(2))
                 .name(obj_name("execution-1"))
                 .at(at())
                 .build()
@@ -297,7 +297,7 @@ mod tests {
 
         // The timer is folded as the waiting activity's child — the edge the complete step reads to
         // decide whether the state may finish yet.
-        let timer = resume_timer(resume_at).reference();
+        let timer = resume_timer(resume_at).meta.reference();
         assert!(
             activated
                 .children(&minted_activity_ref())

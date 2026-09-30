@@ -46,16 +46,13 @@ impl FlowVersionCreatedApplier {
         let mut flow = match ctx.storage.get_flow_by_name(flow_name.clone()).await? {
             Some(existing) => existing,
             None => Flow {
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Flow,
-                    flow_uid,
-                )
-                .name(
-                    crate::types::meta::ObjectName::plain(flow_name.as_str())
-                        .expect("a valid FlowName is a valid user object name"),
-                )
-                .at(flow_version.meta.created_at)
-                .build(),
+                meta: crate::types::meta::ObjectMeta::builder(flow_uid)
+                    .name(
+                        crate::types::meta::ObjectName::plain(flow_name.as_str())
+                            .expect("a valid FlowName is a valid user object name"),
+                    )
+                    .at(flow_version.meta.created_at)
+                    .build(),
                 status: FlowStatus::Active,
                 latest_version: flow_version.version,
             },

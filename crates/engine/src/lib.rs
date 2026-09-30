@@ -80,7 +80,7 @@ pub use stream_processor::StreamProcessor;
 pub use task_api::{ActivatedTask, TaskApi};
 pub use types::StatePath;
 pub use types::activity::{
-    Activity, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
+    Activity, ActivityKind, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,
     WaitActivityState,
 };
 pub use types::command::{
@@ -93,17 +93,18 @@ pub use types::event::{
     Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
     TaskFailed, TasksClaimed, VariablesAssigned,
 };
-pub use types::execution::{Execution, ExecutionStatus};
-pub use types::flow::{Flow, FlowStatus};
-pub use types::flow_version::FlowVersion;
+pub use types::execution::{Execution, ExecutionKind, ExecutionStatus};
+pub use types::flow::{Flow, FlowKind, FlowStatus};
+pub use types::flow_version::{FlowVersion, FlowVersionKind};
 pub use types::id::{EntryId, FlowName, RequestId, StreamId};
 pub use types::meta::{
-    ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName, ScopeName,
+    ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, ObjectReference, OwnerReference,
+    PlainName, ScopeName,
 };
 pub use types::reject::{Reject, RejectionType};
-pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskStatus};
-pub use types::thread::{Thread, ThreadStatus};
-pub use types::timer::{Timer, TimerStatus};
+pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskKind, TaskStatus};
+pub use types::thread::{Thread, ThreadKind, ThreadStatus};
+pub use types::timer::{Timer, TimerKind, TimerStatus};
 pub use types::variables::Variables;
 
 // Re-export the ASL state types the public API references (so callers need only depend on

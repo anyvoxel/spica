@@ -11,7 +11,7 @@ impl ThreadCompletedApplier {
         ctx: &mut ApplierContext<'_>,
         thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut row) = ctx.storage.get_thread(&thread.reference()).await? {
+        if let Some(mut row) = ctx.storage.get_thread(&thread.meta.reference()).await? {
             row.status = ThreadStatus::Completed;
             row.output = thread.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
@@ -20,7 +20,9 @@ impl ThreadCompletedApplier {
             row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
             if let Some(owner) = parent {
-                ctx.storage.remove_child(owner, thread.reference()).await?;
+                ctx.storage
+                    .remove_child(owner, thread.meta.reference())
+                    .await?;
             }
         }
         Ok(())

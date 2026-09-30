@@ -559,7 +559,7 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::FlowVersionCreated(FlowVersionCreated { flow_version, .. }) => {
             info!(
-                flow_version = %flow_version.reference(),
+                flow_version = %flow_version.meta.reference(),
                 name = ?flow_version.flow_name(),
                 version = flow_version.version,
                 "flow version created"
@@ -567,61 +567,61 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
             info!(
-                execution = %execution.reference(),
+                execution = %execution.meta.reference(),
                 input = %execution.input,
                 "execution created"
             );
         }
         Event::ExecutionCompleting { execution } => {
             debug!(
-                execution = %execution.reference(),
+                execution = %execution.meta.reference(),
                 output = %execution.output.as_ref().unwrap_or(&serde_json::Value::Null),
                 "execution completing"
             );
         }
         Event::ExecutionCompleted { execution } => {
             info!(
-                execution = %execution.reference(),
+                execution = %execution.meta.reference(),
                 output = %execution.output.as_ref().unwrap_or(&serde_json::Value::Null),
                 "execution completed"
             );
         }
         Event::ExecutionTerminating { execution } => {
             warn!(
-                execution = %execution.reference(),
+                execution = %execution.meta.reference(),
                 reason = %format!("{:?}", execution.status),
                 "execution terminating"
             );
         }
         Event::ExecutionTerminated { execution } => {
             warn!(
-                execution = %execution.reference(),
+                execution = %execution.meta.reference(),
                 reason = %format!("{:?}", execution.status),
                 "execution terminated"
             );
         }
         Event::ThreadCreated { thread, .. } => {
             info!(
-                thread = %thread.reference(),
+                thread = %thread.meta.reference(),
                 root = %thread.execution,
                 "thread created (fan-out child)"
             );
         }
         Event::ThreadCompleting { thread } => {
-            debug!(thread = %thread.reference(), output = %thread.output.as_ref().unwrap_or(&serde_json::Value::Null), "thread completing");
+            debug!(thread = %thread.meta.reference(), output = %thread.output.as_ref().unwrap_or(&serde_json::Value::Null), "thread completing");
         }
         Event::ThreadCompleted { thread } => {
-            info!(thread = %thread.reference(), output = %thread.output.as_ref().unwrap_or(&serde_json::Value::Null), "thread completed");
+            info!(thread = %thread.meta.reference(), output = %thread.output.as_ref().unwrap_or(&serde_json::Value::Null), "thread completed");
         }
         Event::ThreadTerminating { thread } => {
-            warn!(thread = %thread.reference(), reason = %format!("{:?}", thread.status), "thread terminating");
+            warn!(thread = %thread.meta.reference(), reason = %format!("{:?}", thread.status), "thread terminating");
         }
         Event::ThreadTerminated { thread } => {
-            warn!(thread = %thread.reference(), reason = %format!("{:?}", thread.status), "thread terminated");
+            warn!(thread = %thread.meta.reference(), reason = %format!("{:?}", thread.status), "thread terminated");
         }
         Event::StateActivating { activity } => {
             info!(
-                activity = %activity.reference(),
+                activity = %activity.meta.reference(),
                 state = %activity.state_path.state_name(),
                 // `input` is pinned to Null on the entering event (the processed view lands only on
                 // `StateActivated`), so log the raw input — the meaningful value at this moment.
@@ -630,35 +630,35 @@ pub(crate) fn log_event(event: &Event) {
             );
         }
         Event::StateActivated { activity } => {
-            debug!(activity = %activity.reference(), "state activated");
+            debug!(activity = %activity.meta.reference(), "state activated");
         }
         Event::StateCompleting { activity } => {
-            debug!(activity = %activity.reference(), "state completing");
+            debug!(activity = %activity.meta.reference(), "state completing");
         }
         Event::StateCompleted { activity } => {
             debug!(
-                activity = %activity.reference(),
+                activity = %activity.meta.reference(),
                 output = %activity.output.as_ref().unwrap_or(&serde_json::Value::Null),
                 "state completed"
             );
         }
         Event::StateTerminating { activity } => {
             warn!(
-                activity = %activity.reference(),
+                activity = %activity.meta.reference(),
                 reason = %format!("{:?}", activity.status),
                 "state terminating"
             );
         }
         Event::StateTerminated { activity } => {
             warn!(
-                activity = %activity.reference(),
+                activity = %activity.meta.reference(),
                 reason = %format!("{:?}", activity.status),
                 "state terminated"
             );
         }
         Event::TimerActivated { timer } => {
             debug!(
-                timer = %timer.reference(),
+                timer = %timer.meta.reference(),
                 parent = ?timer.meta.owner,
                 purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
@@ -667,7 +667,7 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::TimerTriggered { timer } => {
             debug!(
-                timer = %timer.reference(),
+                timer = %timer.meta.reference(),
                 parent = ?timer.meta.owner,
                 purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
@@ -676,7 +676,7 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::TimerCancelled { timer } => {
             debug!(
-                timer = %timer.reference(),
+                timer = %timer.meta.reference(),
                 parent = ?timer.meta.owner,
                 purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
@@ -685,7 +685,7 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::TaskActivated { task } => {
             debug!(
-                task = %task.reference(),
+                task = %task.meta.reference(),
                 parent = ?task.meta.owner,
                 resource = %task.resource,
                 "task activated"
@@ -708,25 +708,25 @@ pub(crate) fn log_event(event: &Event) {
             output,
         }) => {
             // A settled task (status Completed); `output` feeds the owning activity's raw_output.
-            debug!(task = %task.reference(), output = %output, "task completed");
+            debug!(task = %task.meta.reference(), output = %output, "task completed");
         }
         Event::TaskFailed(TaskFailed { task, error }) => {
             // The task entity's `status` distinguishes a scheduled retry (`Pending` — the task
             // re-queues, claimable after `next_available_at`) from a terminal failure (`Failed`).
             if task.status == TaskStatus::Pending {
                 warn!(
-                    task = %task.reference(),
+                    task = %task.meta.reference(),
                     error = %format!("{error:?}"),
                     attempts = task.retry_state.attempts,
                     next_available_at = ?task.retry_state.next_available_at,
                     "task failed; retry scheduled"
                 );
             } else {
-                warn!(task = %task.reference(), error = %format!("{error:?}"), "task failed (terminal)");
+                warn!(task = %task.meta.reference(), error = %format!("{error:?}"), "task failed (terminal)");
             }
         }
         Event::TaskCancelled { task } => {
-            debug!(task = %task.reference(), "task cancelled");
+            debug!(task = %task.meta.reference(), "task cancelled");
         }
         Event::VariablesAssigned(VariablesAssigned { variables, .. }) => {
             let keys: Vec<&String> = variables.keys().collect();
@@ -837,7 +837,7 @@ mod tests {
             Event::FlowVersionCreated(FlowVersionCreated {
                 request_id: RequestId::new(),
                 flow_version: FlowVersion {
-                    meta: ObjectMeta::builder(ObjectKind::FlowVersion, ulid::Ulid::new())
+                    meta: ObjectMeta::builder(ulid::Ulid::new())
                         .name(FlowVersion::version_name(
                             &FlowName::new("flow").expect("literal name is valid"),
                             1,
@@ -862,7 +862,7 @@ mod tests {
         let Event::FlowVersionCreated(created) = event else {
             panic!("the fixture emits a flow-version create; got {event:?}");
         };
-        created.flow_version.reference()
+        created.flow_version.meta.reference()
     }
 
     /// Read a row through the store's **committed** face — a `None` here is what "this entry has not

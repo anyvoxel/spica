@@ -85,8 +85,8 @@ impl SpawnThreadHandler {
         // verbatim through every nesting level — so a branch thread still names its root run — and
         // its suffix is a random tail via `PlainName::to_generated`, decoupled from the thread's own
         // `uid`. Not the opaque `child-<uid>` placeholder. Minted once and reused for the reference
-        // and the serialized `meta.name`, so the storage row key (`thread.reference()`) matches the
-        // sibling `ActivateState` owner.
+        // and the serialized `meta.name`, so the storage row key (`thread.meta.reference()`) matches
+        // the sibling `ActivateState` owner.
         let thread_name = execution
             .name
             .base()
@@ -128,14 +128,11 @@ impl SpawnThreadHandler {
                 output: None,
                 // Birth: `created_at == now` (fan-out moment). The owner is the SpawnThread command's
                 // `parent` Parallel/Map activity, converted to the reference form stored in meta.
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Thread,
-                    uid,
-                )
-                .name(thread_name)
-                .at(ctx.now())
-                .build()
-                .with_owner(owner.clone()),
+                meta: crate::types::meta::ObjectMeta::builder(uid)
+                    .name(thread_name)
+                    .at(ctx.now())
+                    .build()
+                    .with_owner(owner.clone()),
             },
         })
         .await;

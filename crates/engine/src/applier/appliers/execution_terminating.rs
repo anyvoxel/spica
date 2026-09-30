@@ -13,7 +13,11 @@ impl ExecutionTerminatingApplier {
         ctx: &mut ApplierContext<'_>,
         execution: &Execution,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
+        if let Some(mut exec) = ctx
+            .storage
+            .get_execution(&execution.meta.reference())
+            .await?
+        {
             exec.status = execution.status.clone();
             exec.value.meta.updated_at = execution.meta.updated_at;
             exec.with_update_at(ctx.timestamp);

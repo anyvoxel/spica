@@ -21,14 +21,14 @@ impl TaskActivatedApplier {
         // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_task(row).await?;
-        super::bump_generated_seq(ctx.storage, &task.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &task.meta.reference().name).await?;
         ctx.storage
             .add_child(
                 task.meta
                     .owner
                     .clone()
                     .expect("an activated task is always owned"),
-                task.reference(),
+                task.meta.reference(),
             )
             .await?;
         // No handler is invoked here (M1 used to `invoke` as a post-commit side effect). The task is

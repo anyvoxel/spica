@@ -278,7 +278,7 @@ pub(super) async fn emit_timer(
             purpose,
             status: crate::TimerStatus::Active,
             deadline,
-            meta: crate::types::meta::ObjectMeta::builder(ObjectKind::Timer, timer_uid)
+            meta: crate::types::meta::ObjectMeta::builder(timer_uid)
                 .name(timer_name)
                 .at(out.now())
                 .build()

@@ -55,14 +55,11 @@ impl ActivateTaskHandler {
                 // carried from the command's task reference (already execution-based per finding
                 // #13), not re-derived as `child-<uid>`; the owner is the invoking activity carried
                 // on the command, converted to the meta owner reference.
-                meta: crate::types::meta::ObjectMeta::builder(
-                    crate::types::meta::ObjectKind::Task,
-                    task.uid,
-                )
-                .name(task.name.clone())
-                .at(out.now())
-                .build()
-                .with_owner(owner.clone()),
+                meta: crate::types::meta::ObjectMeta::builder(task.uid)
+                    .name(task.name.clone())
+                    .at(out.now())
+                    .build()
+                    .with_owner(owner.clone()),
             },
         })
         .await;

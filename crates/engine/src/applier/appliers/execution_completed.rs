@@ -13,7 +13,11 @@ impl ExecutionCompletedApplier {
         ctx: &mut ApplierContext<'_>,
         execution: &Execution,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut exec) = ctx.storage.get_execution(&execution.reference()).await? {
+        if let Some(mut exec) = ctx
+            .storage
+            .get_execution(&execution.meta.reference())
+            .await?
+        {
             exec.status = ExecutionStatus::Completed;
             exec.output = execution.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
@@ -23,7 +27,7 @@ impl ExecutionCompletedApplier {
             ctx.storage.put_execution(exec).await?;
             if let Some(owner) = parent {
                 ctx.storage
-                    .remove_child(owner, execution.reference())
+                    .remove_child(owner, execution.meta.reference())
                     .await?;
             }
         }

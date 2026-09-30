@@ -29,7 +29,7 @@ impl TaskFailedApplier {
     ) -> Result<(), ExecutionError> {
         let TaskFailed { task, .. } = event;
         let retryable = task.status == TaskStatus::Pending;
-        if let Some(mut t) = ctx.storage.get_task(&task.reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await? {
             let parent = t
                 .meta
                 .owner
@@ -54,7 +54,9 @@ impl TaskFailedApplier {
             } else {
                 // Terminal failure: drain the task from its owning activity (the sweep + duplicate
                 // guard). `error` is not folded — it drives the state's `Catch`/`TerminateState`.
-                ctx.storage.remove_child(parent, task.reference()).await?;
+                ctx.storage
+                    .remove_child(parent, task.meta.reference())
+                    .await?;
             }
         }
         Ok(())

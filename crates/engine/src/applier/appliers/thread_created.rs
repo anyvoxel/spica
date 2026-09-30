@@ -44,13 +44,13 @@ impl ThreadCreatedApplier {
             }
         }
         ctx.storage.put_thread(row).await?;
-        super::bump_generated_seq(ctx.storage, &thread.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &thread.meta.reference().name).await?;
         // A thread is always a fan-out child, owned by its container Activity. It is added to that
         // owner's `active_children` so the owner drains (Completing/Terminating) waits on it via the
         // shared cascade, and the inline drain reaction notices it as in-flight.
         if let Some(owner) = thread.meta.owner.clone() {
             ctx.storage
-                .add_child(owner.clone(), thread.reference())
+                .add_child(owner.clone(), thread.meta.reference())
                 .await?;
             // Fold the thread's own `index` into the container's ordered fan-out map, so the owning
             // `Parallel`/`Map` aggregates branch/item outputs in declaration order at its
@@ -61,10 +61,14 @@ impl ThreadCreatedApplier {
             if let Some(mut act) = ctx.storage.get_activity(&owner).await? {
                 match &mut act.value.activity_state {
                     Some(ActivityState::Map(progress)) => {
-                        progress.children.insert(thread.index, thread.reference());
+                        progress
+                            .children
+                            .insert(thread.index, thread.meta.reference());
                     }
                     Some(ActivityState::Parallel(progress)) => {
-                        progress.branches.insert(thread.index, thread.reference());
+                        progress
+                            .branches
+                            .insert(thread.index, thread.meta.reference());
                     }
                     // A `Wait` owns no fan-out — its only child is its resume timer — so no thread is
                     // ever spawned under one and there is nothing to fold. Leaving the row untouched
@@ -78,7 +82,9 @@ impl ThreadCreatedApplier {
                         else {
                             unreachable!()
                         };
-                        progress.branches.insert(thread.index, thread.reference());
+                        progress
+                            .branches
+                            .insert(thread.index, thread.meta.reference());
                     }
                 }
                 act.with_update_at(ctx.timestamp);

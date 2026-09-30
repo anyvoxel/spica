@@ -3,7 +3,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{ObjectKind, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of an [`Execution`].
@@ -51,6 +51,14 @@ impl ExecutionStatus {
     }
 }
 
+/// The [`ObjectKindMarker`] tying an [`Execution`]'s meta to [`ObjectKind::Execution`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionKind;
+
+impl ObjectKindMarker for ExecutionKind {
+    const KIND: ObjectKind = ObjectKind::Execution;
+}
+
 /// The event-/domain-carried value of an execution.
 ///
 /// This is the execution entity shape the lifecycle stream carries. It is intentionally limited to
@@ -73,7 +81,7 @@ pub struct Execution {
     /// generated placeholder (`obj-<uid>`) until user naming (P2); the domain
     /// `created_at`/`updated_at` live here likewise. A top-level execution has **no owner** — the
     /// tree's root is owned by nothing.
-    pub meta: ObjectMeta,
+    pub meta: ObjectMeta<ExecutionKind>,
     /// The flow version this execution is bound to (its state machine definition), addressed as a
     /// full [`ObjectReference`] (`{kind: FlowVersion, name: <flow>-<version>, uid}`). This is the
     /// CCES analogue of Zeebe's `processDefinitionKey`: the execution references a **never-reused,
@@ -100,14 +108,5 @@ pub struct Execution {
 impl Execution {
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
-    }
-
-    /// This execution's canonical [`ObjectReference`] — the `(kind, name, uid)` triple a consumer
-    /// uses to address it: `kind = Execution`, `name = meta.name`, `uid = meta.uid`. Mirrors
-    /// [`FlowVersion::reference`](crate::types::flow_version::FlowVersion::reference): the storage row
-    /// is keyed by the reference's `uid`, and Storage reads it back by reference (see
-    /// `Storage::get_execution`).
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(ObjectKind::Execution, self.meta.name.clone(), self.meta.uid)
     }
 }

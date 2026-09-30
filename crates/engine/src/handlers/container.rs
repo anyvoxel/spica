@@ -19,11 +19,15 @@ use crate::types::meta::{ObjectKind, ObjectReference};
 /// from the owner's *kind* at the call site (a task's owner is always an `Activity`, a root thread's
 /// is the `Execution`, …), so the concrete type is known statically and this is never used as `dyn`.
 pub(crate) trait Container {
-    /// Resolve the container that owns `owner`'s children, `None` when no such owner exists.
+    /// Resolve the container that owns `owner`'s children, `None` when the owner's row is missing.
     ///
     /// The caller runs this *before* producing the settle's effects, so an ownerless settle is caught
     /// while it can still be answered — a `Reject` for a worker-reported settle — rather than
     /// discovered as a silent no-op after the terminal event is already on the log.
+    ///
+    /// `None` answers a *missing row* only. Which impl runs is decided by the owner's kind at the call
+    /// site, so an owner of another kind is a broken invariant rather than an ownerless settle, and an
+    /// impl meets it by panicking instead of folding it into the `None` the caller reports.
     ///
     /// This read is the *existence* check only. The hooks re-read the row: the settle's own batch
     /// rewrites it (draining the child, folding the payload), so the row read here is stale by the
@@ -86,12 +90,17 @@ impl ActivityContainer {
 
 impl Container for ActivityContainer {
     async fn open(storage: &dyn ReadonlyStorageTxn, owner: ObjectReference) -> Option<Self> {
-        // An activity's children only settle while the activity row is live, so an owner that is
-        // missing — or is not an `Activity` at all — is an internal fault the caller reports rather
-        // than one this container swallows.
+        // The call site picks this impl from the owner's kind, so an owner of another kind means the
+        // tree itself is corrupt: a programming error with no answer to give, unlike a missing row,
+        // which is a real state the caller reports.
         if owner.kind != ObjectKind::Activity {
-            return None;
+            // TODO：这里是应该使用 unreachable 还是应该返回一个错误然后走 Reject，还没想清楚
+            unreachable!(
+                "a {:?} owner {owner} cannot own activity children",
+                owner.kind
+            );
         }
+        // TODO：如果 owner 不存在，是不是也应该是一个 Reject？
         storage.get_activity(&owner).await.ok().flatten()?;
         Some(Self { activity: owner })
     }
@@ -229,7 +238,7 @@ mod tests {
         path.push_back("States");
         path.push_back("P");
         let activity = Activity {
-            meta: ObjectMeta::builder(ObjectKind::Activity, activity_ref().uid)
+            meta: ObjectMeta::builder(activity_ref().uid)
                 .name(activity_ref().name)
                 .at(at())
                 .build()
@@ -302,8 +311,7 @@ mod tests {
     }
 
     /// A settle with no live owner has no container at all: that `None` is what a handler answers
-    /// *before* it writes the terminal event, and it is why the resolution happens up front. A row of
-    /// the wrong kind names no activity container either — the kind is what picks this impl.
+    /// *before* it writes the terminal event, and it is why the resolution happens up front.
     #[tokio::test]
     async fn an_owner_that_does_not_exist_has_no_container() {
         let store = InMemoryStorage::new();
@@ -314,10 +322,17 @@ mod tests {
                 .is_none(),
             "a missing activity row must not yield a container"
         );
-        assert!(
-            ActivityContainer::open(&work, task_ref()).await.is_none(),
-            "a non-activity owner must not yield an activity container"
-        );
+    }
+
+    /// A row of the wrong kind is a broken invariant, not an ownerless settle: the kind is what picks
+    /// this impl, so folding it into the same `None` a missing row answers with would hide a corrupt
+    /// tree behind a case the caller is expected to survive.
+    #[tokio::test]
+    #[should_panic(expected = "cannot own activity children")]
+    async fn a_non_activity_owner_panics() {
+        let store = InMemoryStorage::new();
+        let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
+        ActivityContainer::open(&work, task_ref()).await;
     }
 
     /// A settled `Task` under a `Running` activity completes that activity, carrying the payload the
