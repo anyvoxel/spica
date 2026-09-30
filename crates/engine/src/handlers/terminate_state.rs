@@ -3,7 +3,7 @@ use crate::types::command::{
     Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
 use crate::types::event::Event;
-use crate::types::meta::ObjectKind;
+use crate::types::meta::{ErasedOwner, ObjectKind};
 
 /// Handles `Command::TerminateState`: the abnormal finish of the activity bound to it, with
 /// `reason`. Emits `StateTerminating`, sweeps the activity's owned children (M1: only timers —
@@ -54,11 +54,7 @@ impl TerminateStateHandler {
                 super::child_completed::child_settled(
                     ctx,
                     out,
-                    act.value
-                        .meta
-                        .owner
-                        .clone()
-                        .expect("an owned activity has an owner"),
+                    act.value.meta.owner.clone().into_erased(),
                     activity.clone(),
                 )
                 .await;
@@ -154,11 +150,7 @@ impl TerminateStateHandler {
             super::child_completed::child_settled(
                 ctx,
                 out,
-                act.value
-                    .meta
-                    .owner
-                    .clone()
-                    .expect("an owned activity has an owner"),
+                act.value.meta.owner.clone().into_erased(),
                 activity.clone(),
             )
             .await;

@@ -32,7 +32,7 @@ impl CompleteExecutionHandler {
             Some(e) => e,
             None => {
                 out.fail_execution(
-                    execution.clone(),
+                    execution,
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                         "execution {execution}"
                     ))),

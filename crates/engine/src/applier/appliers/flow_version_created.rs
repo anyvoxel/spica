@@ -29,30 +29,27 @@ impl FlowVersionCreatedApplier {
         // (with its initial counter), so `get_flow_by_name` normally finds it; get-or-create is a
         // defensive fallback for a directly-applied (non-batch) stream where the birth event may not
         // have preceded — kept replay-safe by keying the fallback off the version's own name/ids.
-        // A persisted version always carries its owning flow in `meta.owner`; read its name once to
-        // locate — or, as a defensive fallback, reconstruct — the owning `Flow` row.
-        let flow_name = flow_version
-            .flow_name()
-            .expect("a persisted FlowVersion always carries its owning Flow");
-        // The owning flow's uid comes from the version's owner reference, which (post-`create_flow`)
-        // carries the flow's real incarnation uid — every object has its own uid, so a reconstructed
-        // row must use the same one, not a nil sentinel, to stay consistent with the normal path.
-        let flow_uid = flow_version
-            .meta
-            .owner
-            .as_ref()
-            .map(|o| o.uid)
-            .unwrap_or_else(ulid::Ulid::nil);
-        let mut flow = match ctx.storage.get_flow_by_name(flow_name.clone()).await? {
+        // A persisted version always carries its owning flow, so this read is the one place the owner
+        // is taken: its name locates — or, as a defensive fallback, names the reconstructed — `Flow`
+        // row, and its uid is that flow's incarnation.
+        let owner = flow_version.flow_owner();
+        // The owning flow's uid (post-`create_flow`) is the flow's real incarnation uid — every object
+        // has its own uid, so a reconstructed row must use the same one, not a nil sentinel, to stay
+        // consistent with the normal path.
+        let mut flow = match ctx
+            .storage
+            .get_flow_by_name(flow_version.flow_name())
+            .await?
+        {
             Some(existing) => existing,
             None => Flow {
-                meta: crate::types::meta::ObjectMeta::builder(flow_uid)
-                    .name(
-                        crate::types::meta::ObjectName::plain(flow_name.as_str())
-                            .expect("a valid FlowName is a valid user object name"),
-                    )
+                meta: crate::types::meta::ObjectMeta::builder(owner.uid())
+                    // The flow's name IS its owner's name (a plain user name), so the reconstructed row
+                    // takes it verbatim rather than re-parsing it back out of the version's address.
+                    .name(owner.name().clone())
                     .at(flow_version.meta.created_at)
-                    .build(),
+                    // A flow is a root of its own tree: its owner slot is `NoOwner` by type.
+                    .with_owner(crate::types::meta::NoOwner::new()),
                 status: FlowStatus::Active,
                 latest_version: flow_version.version,
             },

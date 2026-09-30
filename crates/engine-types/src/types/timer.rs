@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TimerPurpose;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, TimerOwner};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of a Timer. Kept separate from `ExecutionStatus` / `ActivityStatus` because a
@@ -31,6 +31,10 @@ pub struct TimerKind;
 
 impl ObjectKindMarker for TimerKind {
     const KIND: ObjectKind = ObjectKind::Timer;
+    /// A timer is armed by the scope whose deadline it is: the top-level `Execution` for an
+    /// execution timeout, the waiting `Activity` for a `WaitResume` or a task retry/timeout. See
+    /// [`TimerOwner`].
+    type OwnedBy = TimerOwner;
 }
 
 /// The event-/domain-carried value of a Timer.
@@ -73,7 +77,7 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::meta::ObjectName;
+    use crate::types::meta::{ObjectName, OwnerRef, TimerOwner};
 
     fn ts(ms: u64) -> Timestamp {
         Timestamp::from_millis(ms)
@@ -86,8 +90,10 @@ mod tests {
             meta: ObjectMeta::builder(ulid::Ulid::from(7u128))
                 .name(ObjectName::from_parsed("execution-0").expect("a valid object name"))
                 .timestamps(ts(0), ts(0))
-                .build()
-                .with_owner(ObjectReference::nil()),
+                .with_owner(TimerOwner::Activity(OwnerRef::new(
+                    ObjectName::from_parsed("execution-0").expect("a valid object name"),
+                    ulid::Ulid::from(7u128),
+                ))),
             execution: ObjectReference::nil(),
             purpose: TimerPurpose::WaitResume,
             status: TimerStatus::Active,
@@ -111,6 +117,42 @@ mod tests {
         assert_eq!(t.deadline, ts(5_000));
         assert_eq!(t.purpose, TimerPurpose::WaitResume);
         assert_eq!(t.execution, ObjectReference::nil());
+    }
+
+    /// A timer's slot admits the two scopes that arm one and nothing else: a `WaitResume` round-trips
+    /// with its waiting activity (the fixture's own owner), an execution timeout with its run, and a
+    /// payload carrying any other kind is refused at the slot — so a fire never has to ask at runtime
+    /// which kind of scope it belongs to.
+    #[test]
+    fn a_timer_slot_admits_only_the_scopes_that_arm_one() {
+        let timer = active_timer();
+        let mut json = serde_json::to_value(&timer).expect("timer serializes");
+        assert_eq!(json["meta"]["owner"]["kind"], serde_json::json!("Activity"));
+        assert_eq!(
+            serde_json::from_value::<Timer>(json.clone())
+                .expect("the slot admits its own kind")
+                .meta
+                .owner,
+            timer.meta.owner
+        );
+
+        let mut run_owned = timer.clone();
+        run_owned.meta = run_owned
+            .meta
+            .with_owner(TimerOwner::Execution(OwnerRef::new(
+                ObjectName::from_parsed("execution-0").expect("a valid object name"),
+                ulid::Ulid::from(7u128),
+            )));
+        let roundtripped: Timer =
+            serde_json::from_value(serde_json::to_value(&run_owned).expect("timer serializes"))
+                .expect("an execution timeout's owner round-trips");
+        assert_eq!(roundtripped.meta.owner, run_owned.meta.owner);
+
+        json["meta"]["owner"]["kind"] = serde_json::json!("Thread");
+        let err = serde_json::from_value::<Timer>(json).expect_err("a thread never arms a timer");
+        let msg = err.to_string();
+        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Execution or Activity"), "{msg}");
     }
 
     /// Cancelling an already-cancelled timer is a stamp-only write, never a resurrection — the

@@ -76,7 +76,7 @@ impl StateHandler for WaitStateHandler<'_> {
             // the immediate owner scope — it drives `Timer::execution` and the timer's
             // `{execution.name}-{suffix}` generated name, so a branch Wait still names its root run.
             activity_value.execution.clone(),
-            activity_value.meta.reference(),
+            activity_value,
             TimerPurpose::WaitResume,
             wait.resume_at,
         )
@@ -262,8 +262,7 @@ mod tests {
             meta: ObjectMeta::builder(uid(2))
                 .name(obj_name("execution-1"))
                 .at(at())
-                .build()
-                .with_owner(minted_activity_ref()),
+                .with_owner(activity_timer_owner(minted_activity_ref())),
         }
     }
 

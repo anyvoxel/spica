@@ -3,6 +3,7 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::command::CompleteTask;
 use crate::types::event::{Event, TaskCompleted};
+use crate::types::meta::ErasedOwner;
 use crate::types::reject::RejectionType;
 
 /// Handles `CompleteTask`: a worker reported its claimed task **completed** (Zeebe `CompleteJob`).
@@ -95,11 +96,9 @@ impl CompleteTaskHandler {
             return Ok(());
         }
 
-        let activity_id = act
-            .meta
-            .owner
-            .clone()
-            .expect("a completed task is always owned by an activity");
+        // The slot is an `OwnerRef<ActivityKind>`; the container lookup and the refusal below both
+        // take a flat address, so the owner crosses the erasure seam here, once.
+        let activity_id = act.meta.owner.clone().into_erased();
         // The container is resolved *before* anything is emitted: a task's settle has no meaning apart
         // from the activity it resumes, so an ownerless settle is refused here — while the worker is
         // still waiting on an answer — rather than discovered as a no-op after `TaskCompleted` is

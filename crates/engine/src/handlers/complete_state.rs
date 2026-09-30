@@ -1,6 +1,7 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::CompleteState;
 use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::meta::{ErasedOwner, OwnerScope};
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching
@@ -34,9 +35,11 @@ impl CompleteStateHandler {
         let act = match ctx.storage.get_activity(activity).await? {
             Some(a) => a,
             None => {
+                // The row that would name the owning scope is the very thing that is missing, so the
+                // failure is recorded at the activity level alone and the log names the address.
                 out.terminate(
                     Some(activity.clone()),
-                    crate::types::meta::ObjectReference::nil(),
+                    None,
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                         "activity {activity}"
                     ))),
@@ -44,14 +47,10 @@ impl CompleteStateHandler {
                 return Ok(());
             }
         };
-        // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read
-        // directly.
-        let scope_ref = act
-            .value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
+        // An activity's owner slot admits only a `Thread`, so the row is read directly — no `kind`
+        // guard. Every consumer below takes the flat address storage and commands speak, so the
+        // erasure happens once here.
+        let scope_ref = act.value.meta.owner.clone().into_erased();
         let Some(thread) = ctx.storage.get_thread(&scope_ref).await? else {
             return Ok(()); // owning scope gone — nothing to complete into.
         };
@@ -59,7 +58,7 @@ impl CompleteStateHandler {
             result,
             out,
             Some(activity.clone()),
-            scope_ref.clone(),
+            OwnerScope::of_reference(&scope_ref),
             ctx.machine_for_thread(&thread).await
         );
         // The state to complete is the one this activity names: its own `state_path` locates the
@@ -69,7 +68,7 @@ impl CompleteStateHandler {
             result,
             out,
             Some(activity.clone()),
-            scope_ref.clone(),
+            OwnerScope::of_reference(&scope_ref),
             sm.state_at(&act.value.state_path)
                 .map_err(ExecutionError::from)
         );

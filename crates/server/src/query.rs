@@ -3,7 +3,9 @@
 //! Both are non-blocking point-in-time reads delegated to the engine's read facade; this module is
 //! the single place engine rows cross into their wire mirrors.
 
-use spica_engine::{ObjectKind, ObjectName, ObjectReference, QueryObject, TerminationReason};
+use spica_engine::{
+    ObjectKind, ObjectName, ObjectReference, OwnerKindMarker, QueryObject, TerminationReason,
+};
 use spica_proto::v1::{
     GetObjectRequest, GetObjectResponse, ListObjectsRequest, ListObjectsResponse,
     query_server::Query as QueryServiceTrait,
@@ -112,7 +114,9 @@ fn proto_meta<K: spica_engine::ObjectKindMarker>(
         uid: meta.uid.to_string(),
         created_at_millis: meta.created_at.as_millis() as i64,
         updated_at_millis: meta.updated_at.as_millis() as i64,
-        owner: meta.owner.as_ref().map(proto_ref),
+        // The mirror is a flat address, so the owner crosses the wire seam here — the only way a
+        // typed slot leaves the engine's type vocabulary. A root object's `NoOwner` reads as absent.
+        owner: meta.owner.as_reference().map(proto_ref),
     }
 }
 

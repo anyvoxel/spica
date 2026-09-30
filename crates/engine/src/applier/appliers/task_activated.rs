@@ -3,6 +3,7 @@
 
 use crate::ApplierContext;
 use crate::types::error::ExecutionError;
+use crate::types::meta::ErasedOwner;
 
 use crate::Task;
 
@@ -27,7 +28,9 @@ impl TaskActivatedApplier {
                 task.meta
                     .owner
                     .clone()
-                    .expect("an activated task is always owned"),
+                    // The slot is an `OwnerRef<ActivityKind>`; `active_children` speaks flat addresses,
+                    // so the owner crosses the erasure seam here.
+                    .into_erased(),
                 task.meta.reference(),
             )
             .await?;

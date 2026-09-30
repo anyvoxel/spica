@@ -3,7 +3,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of an [`Execution`].
@@ -57,6 +57,9 @@ pub struct ExecutionKind;
 
 impl ObjectKindMarker for ExecutionKind {
     const KIND: ObjectKind = ObjectKind::Execution;
+    /// A run is the root of its own object tree — a branch or item is a `Thread`, never an
+    /// `Execution` — so the slot can never be filled (see [`NoOwner`]).
+    type OwnedBy = NoOwner;
 }
 
 /// The event-/domain-carried value of an execution.

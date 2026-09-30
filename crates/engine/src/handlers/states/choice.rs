@@ -11,7 +11,7 @@ use crate::types::command::{ActivateState, Command};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::meta::ObjectReference;
+use crate::types::meta::{ErasedOwner, ObjectReference};
 use crate::types::variables::Variables;
 
 pub struct ChoiceStateHandlerFactory;
@@ -125,12 +125,8 @@ impl StateHandler for ChoiceStateHandler<'_> {
         // Projection reuses the scan's `$states` — a Choice produces no raw result of its own, so the
         // pass-through fallback is the processed input.
         let mut local_scope = variables.clone();
-        let owner = activity_value
-            .meta
-            .owner
-            .clone()
-            .expect("an owned activity has an owner");
-        self.apply_assign(out, env, &owner, assign, &states, &mut local_scope)
+        let owner = activity_value.meta.owner.clone();
+        self.apply_assign(out, env, owner.erased(), assign, &states, &mut local_scope)
             .await?;
         let output_value = self
             .project_output(
@@ -153,11 +149,8 @@ impl StateHandler for ChoiceStateHandler<'_> {
         .await;
         out.append_command(Command::ActivateState(ActivateState {
             execution: activity_value.execution.clone(),
-            owner: activity_value
-                .meta
-                .owner
-                .clone()
-                .expect("an owned activity has an owner"),
+            // The flat form the command payload speaks (the same owner the local already holds).
+            owner: owner.into_erased(),
             state_path: next_path,
             input: output_value,
         }));

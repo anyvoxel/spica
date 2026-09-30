@@ -7,14 +7,14 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    Activity, ActivityStatus, ClaimTasks, Command, CompleteState, CompleteTask, CreateExecution,
-    CreateFlow, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
-    ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus, FlowVersion,
-    FlowVersionCreated, InMemoryLogStream, LogStream, ObjectReference, RejectionType, RequestId,
-    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Storage, StreamProcessor, Task,
-    TaskCompleted, TaskFailed, TaskStatus, TasksClaimed, TerminateExecution, TerminateState,
-    TerminationReason, Thread, ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp,
-    Variables, VariablesAssigned,
+    ActivateTask, Activity, ActivityStatus, ClaimTasks, Command, CompleteState, CompleteTask,
+    CreateExecution, CreateFlow, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
+    ExecutionError, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus,
+    FlowVersion, FlowVersionCreated, InMemoryLogStream, LogStream, ObjectReference, OwnerRef,
+    RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError, SpawnThread,
+    StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted, TaskFailed, TaskStatus,
+    TasksClaimed, TerminateExecution, TerminateState, TerminationReason, Thread, ThreadKind,
+    ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables, VariablesAssigned,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -76,6 +76,14 @@ fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectReference {
     )
 }
 
+/// The owner slot of a fixture activity the folds below only ever read as a *parent edge* — the run's
+/// derived root thread, which a top-level state hangs off. No thread row has to exist for such an
+/// edge to be projected (`add_child`/`remove_child` tolerate a missing parent), so a fixture whose
+/// subject is not the drain itself can name a stable stand-in instead of seeding a whole root thread.
+fn activity_root_thread_owner() -> OwnerRef<ThreadKind> {
+    common::thread_owner("child", 4)
+}
+
 /// Pre-seed `sm` as a created flow version in `storage`, returning its [`ObjectReference`].
 /// Definition resolution happens from storage at dispatch time (the `CreateExecution` command
 /// carries only the flow version reference), so raw-seam drivers seed the definition directly rather
@@ -89,9 +97,8 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
     let flow_version_uid = ulid::Ulid::new();
     let created_at = Timestamp::from_millis(0);
     // The owning Flow's reference, attached to the version below — same scope, uid nil (the flow's
-    // name is its sole identity).
-    let owner = spica_engine::OwnerReference::new(
-        spica_engine::ObjectKind::Flow,
+    // name is its sole identity). The slot's type names the kind, so only name and uid are passed.
+    let owner = spica_engine::OwnerRef::<spica_engine::FlowKind>::new(
         spica_engine::ObjectName::plain("test_flow").expect("static name is valid"),
         ulid::Ulid::nil(),
     );
@@ -103,7 +110,7 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
             )
             .name(spica_engine::ObjectName::plain("test_flow").expect("static name is valid"))
             .at(created_at)
-            .build(),
+            .with_owner(spica_engine::NoOwner::new()),
             status: FlowStatus::Active,
             // Newest-version counter — the version seeded below is the only one, so it is the latest.
             latest_version: version,
@@ -115,7 +122,6 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
             meta: spica_engine::ObjectMeta::builder(flow_version_uid)
                 .name(version_name.clone())
                 .at(created_at)
-                .build()
                 .with_owner(owner),
             version,
             definition: serde_json::to_string(&sm).expect("state machine serializes"),
@@ -371,7 +377,7 @@ async fn storage_projects_execution_and_activity_state() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             }),
         )
@@ -395,8 +401,7 @@ async fn storage_projects_execution_and_activity_state() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(activity_root_thread_owner()),
                 },
             },
         )
@@ -425,7 +430,7 @@ async fn storage_projects_execution_and_activity_state() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             },
         )
@@ -464,7 +469,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                             spica_engine::Timestamp::from_millis(100),
                             spica_engine::Timestamp::from_millis(100),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             }),
         )
@@ -498,7 +503,7 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                             spica_engine::Timestamp::from_millis(100),
                             spica_engine::Timestamp::from_millis(300),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             },
         )
@@ -543,8 +548,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         output: None,
         meta: spica_engine::ObjectMeta::builder(activity.uid)
             .timestamps(ts(at), ts(at))
-            .build()
-            .with_owner(exec.clone()),
+            .with_owner(activity_root_thread_owner()),
     };
     // Activity birth (created == updated), then a lifecycle transition advances `updated_at`.
     projector
@@ -562,7 +566,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                 activity: Activity {
                     meta: spica_engine::ObjectMeta::builder(activity.uid)
                         .timestamps(ts(100), ts(200))
-                        .build(),
+                        .with_owner(activity_root_thread_owner()),
                     ..act_birth(100)
                 },
             },
@@ -588,8 +592,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         deadline: ts(500),
         meta: spica_engine::ObjectMeta::builder(timer)
             .timestamps(ts(100), ts(100))
-            .build()
-            .with_owner(exec.clone()),
+            .with_owner(common::execution_timer_owner_of(exec.clone())),
     };
     projector
         .apply(
@@ -607,7 +610,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     status: TimerStatus::Completed,
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(ts(100), ts(150))
-                        .build(),
+                        .with_owner(common::execution_timer_owner_of(exec.clone())),
                     ..timer_birth
                 },
             },
@@ -638,8 +641,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         retry_state: RetryState::default(),
         meta: spica_engine::ObjectMeta::builder(task)
             .timestamps(ts(100), ts(100))
-            .build()
-            .with_owner(activity.clone()),
+            .with_owner(common::activity_owner_of(activity.clone())),
     };
     projector
         .apply(
@@ -660,7 +662,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     lease_expires_at: None,
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(ts(100), ts(180))
-                        .build(),
+                        .with_owner(common::activity_owner_of(activity.clone())),
                     ..task_birth
                 },
                 output: Value::Null,
@@ -710,7 +712,7 @@ async fn projection_records_create_and_update_timestamps() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             }),
             t(100),
@@ -753,8 +755,7 @@ async fn projection_records_create_and_update_timestamps() {
                     output: None,
                     meta: spica_engine::ObjectMeta::builder(activity.uid)
                         .timestamps(t(200), t(200))
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(activity_root_thread_owner()),
                 },
             },
             t(200),
@@ -776,8 +777,7 @@ async fn projection_records_create_and_update_timestamps() {
                     output: Some(json!(42)),
                     meta: spica_engine::ObjectMeta::builder(activity.uid)
                         .timestamps(t(200), t(300))
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(activity_root_thread_owner()),
                 },
             },
             t(300),
@@ -800,8 +800,7 @@ async fn projection_records_create_and_update_timestamps() {
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(t(400), t(400))
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(common::execution_timer_owner_of(exec.clone())),
                 },
             },
             t(400),
@@ -818,8 +817,7 @@ async fn projection_records_create_and_update_timestamps() {
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(t(400), t(450))
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(common::execution_timer_owner_of(exec.clone())),
                 },
             },
             t(450),
@@ -847,8 +845,7 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(t(600), t(600))
-                        .build()
-                        .with_owner(activity.clone()),
+                        .with_owner(common::activity_owner_of(activity.clone())),
                 },
             },
             t(600),
@@ -870,8 +867,7 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(t(600), t(650))
-                        .build()
-                        .with_owner(activity.clone()),
+                        .with_owner(common::activity_owner_of(activity.clone())),
                 },
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: "S".to_string(),
@@ -1013,6 +1009,24 @@ async fn pass_complete_events_populate_raw_output() {
 async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     let exec = exec_ref();
     let activity = act_ref();
+    // The run's derived root Thread: the scope a *top-level* state runs in, so where a top-level
+    // `Assign` lands — and the enclosing scope a fan-out Thread inherits its variables from.
+    let root_thread = Thread {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+        start_at: "P".to_string(),
+        index: 0,
+        status: ThreadStatus::Running,
+        input: json!({}),
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
+            .timestamps(
+                spica_engine::Timestamp::from_millis(0),
+                spica_engine::Timestamp::from_millis(0),
+            )
+            .with_owner(common::root_thread_owner_of(exec.clone())),
+    };
+    let root_thread_ref = root_thread.meta.reference();
     let thread = Thread {
         execution: exec.clone(),
         state_path: jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
@@ -1025,14 +1039,13 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
         output: None,
         meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
             .at(spica_engine::Timestamp::from_millis(0))
-            .build()
-            .with_owner(activity.clone()),
+            .with_owner(common::fanout_thread_owner_of(activity.clone())),
     };
     let thread_ref = thread.meta.reference();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
 
-    // A running Execution with `g` already assigned.
+    // A running Execution carrying the run's input.
     projector
         .apply(
             &mut storage,
@@ -1049,7 +1062,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build(),
+                        .with_owner(spica_engine::NoOwner::new()),
                 },
             }),
         )
@@ -1057,13 +1070,22 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     projector
         .apply(
             &mut storage,
+            &Event::ThreadCreated {
+                thread: root_thread.clone(),
+            },
+        )
+        .await;
+    // A top-level `Assign` targets the root Thread — the scope the top-level states run in.
+    projector
+        .apply(
+            &mut storage,
             &Event::VariablesAssigned(VariablesAssigned {
-                scope: exec.clone(),
+                scope: root_thread_ref.clone(),
                 variables: Variables::from([("g".to_string(), json!("hi"))]),
             }),
         )
         .await;
-    // The spawning container Activity owned by that Execution.
+    // The spawning container Activity, owned by that root Thread.
     projector
         .apply(
             &mut storage,
@@ -1083,15 +1105,14 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(common::thread_owner_of(root_thread_ref.clone())),
                 },
             },
         )
         .await;
 
-    // Spawn the thread: the `ThreadCreated` applier must seed its variables from the enclosing
-    // scope (the Execution, via the container Activity's owner) so the branch sees `$g`.
+    // Spawn the thread: the `ThreadCreated` applier must seed its variables from the enclosing scope
+    // (the root Thread, reached through the container Activity's owner) so the branch sees `$g`.
     projector
         .apply(
             &mut storage,
@@ -1150,6 +1171,24 @@ async fn terminate_execution_cancels_wait_and_drains() {
     let exec = exec_ref();
     let activity = act_ref();
     let timer = ulid::Ulid::new();
+    // The run's derived root Thread: every state hangs off it, so the execution drains *through* it
+    // — the two-level chain whose emission order the assertions below pin.
+    let root_thread = Thread {
+        execution: exec.clone(),
+        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+        start_at: "W".to_string(),
+        index: 0,
+        status: ThreadStatus::Running,
+        input: Value::Null,
+        output: None,
+        meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
+            .timestamps(
+                spica_engine::Timestamp::from_millis(0),
+                spica_engine::Timestamp::from_millis(0),
+            )
+            .with_owner(common::root_thread_owner_of(exec.clone())),
+    };
+    let root_thread_ref = root_thread.meta.reference();
 
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -1169,9 +1208,14 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
         }),
+        // After `ExecutionCreated`: the root thread is attached to the execution's `active_children`
+        // by this fold, which is what makes the execution wait on it below.
+        Event::ThreadCreated {
+            thread: root_thread.clone(),
+        },
         Event::StateActivating {
             activity: Activity {
                 execution: exec.clone(),
@@ -1188,8 +1232,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(exec.clone()),
+                    .with_owner(common::thread_owner_of(root_thread_ref.clone())),
             },
         },
         Event::StateActivated {
@@ -1208,8 +1251,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(exec.clone()),
+                    .with_owner(common::thread_owner_of(root_thread_ref.clone())),
             },
         },
         Event::TimerActivated {
@@ -1223,8 +1265,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(activity.clone()),
+                    .with_owner(common::activity_timer_owner_of(activity.clone())),
             },
         },
     ] {
@@ -1328,8 +1369,7 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(common::execution_timer_owner_of(exec.clone())),
                 },
             },
         )
@@ -1348,8 +1388,7 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(exec.clone()),
+                        .with_owner(common::execution_timer_owner_of(exec.clone())),
                 },
             },
         )
@@ -1400,8 +1439,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(exec.clone()),
+            .with_owner(common::root_thread_owner_of(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1431,8 +1469,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(thread_ref.clone()),
+            .with_owner(common::thread_owner_of(thread_ref.clone())),
     };
 
     let projector = Projector::new();
@@ -1453,7 +1490,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
         }),
         Event::StateActivating {
@@ -1473,8 +1510,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(activity.clone()),
+                    .with_owner(common::activity_timer_owner_of(activity.clone())),
             },
         },
     ] {
@@ -1609,7 +1645,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
         }),
         Event::StateActivating {
@@ -1628,8 +1664,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(exec.clone()),
+                    .with_owner(activity_root_thread_owner()),
             },
         },
         Event::TimerActivated {
@@ -1643,8 +1678,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(activity.clone()),
+                    .with_owner(common::activity_timer_owner_of(activity.clone())),
             },
         },
     ] {
@@ -1717,8 +1751,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(exec.clone()),
+            .with_owner(common::root_thread_owner_of(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1746,8 +1779,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(thread_ref.clone()),
+            .with_owner(common::thread_owner_of(thread_ref.clone())),
     };
 
     let projector = Projector::new();
@@ -1768,7 +1800,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
         }),
         Event::StateActivating {
@@ -1788,8 +1820,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(activity.clone()),
+                    .with_owner(common::activity_timer_owner_of(activity.clone())),
             },
         },
     ] {
@@ -1862,8 +1893,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(exec.clone()),
+            .with_owner(common::root_thread_owner_of(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1897,8 +1927,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .build()
-            .with_owner(thread_ref.clone()),
+            .with_owner(common::thread_owner_of(thread_ref.clone())),
     };
 
     let projector = Projector::new();
@@ -1919,7 +1948,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
         }),
         Event::StateActivating {
@@ -1939,8 +1968,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .build()
-                    .with_owner(activity.clone()),
+                    .with_owner(common::activity_timer_owner_of(activity.clone())),
             },
         },
     ] {
@@ -2205,7 +2233,7 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
                 meta: spica_engine::ObjectMeta::builder(uid)
                     .name(name.clone())
                     .at(Timestamp::from_millis(0))
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
             variables: Variables::new(),
             active_children: std::collections::HashSet::new(),
@@ -2278,7 +2306,7 @@ async fn seed_named_execution(
                 meta: spica_engine::ObjectMeta::builder(uid)
                     .name(name)
                     .at(Timestamp::from_millis(0))
-                    .build(),
+                    .with_owner(spica_engine::NoOwner::new()),
             },
             variables: Variables::new(),
             active_children: std::collections::HashSet::new(),
@@ -2465,6 +2493,75 @@ async fn create_flow_handler_rejects_malformed_definition_as_reject_record() {
             );
         }
         other => panic!("expected a Reject record, got {other:?}"),
+    }
+}
+
+/// A command payload carries its owner as a flat address, so the wrong kind can only be caught at the
+/// one boundary that fills the slot. Both fan-out commands must refuse a foreign-kind owner with a
+/// `Reject(InvalidArgument)` — a settled outcome for the caller — rather than write a row whose owner
+/// its own slot could never read back, or (worse) silently drop the command.
+#[tokio::test]
+async fn owner_slot_boundaries_refuse_a_foreign_owner_kind_as_reject_records() {
+    let storage = InMemoryStorage::new();
+    let mut processor = StreamProcessor::new();
+    let thread_owner = spica_engine::ObjectReference::new(
+        spica_engine::ObjectKind::Thread,
+        spica_engine::PlainName::new("branch")
+            .expect("static literal is a valid segment")
+            .generated_from_key(1),
+        ulid::Ulid::new(),
+    );
+
+    let cases = [
+        (
+            "activate_task",
+            Command::ActivateTask(ActivateTask {
+                execution: exec_ref(),
+                owner: thread_owner.clone(),
+                task: task_ref(ulid::Ulid::from(9u128)),
+                resource: "service-a".to_string(),
+                arguments: json!({}),
+                retry_plan: Vec::new(),
+                deadline: None,
+            }),
+        ),
+        (
+            "spawn_thread",
+            Command::SpawnThread(SpawnThread {
+                owner: thread_owner.clone(),
+                execution: exec_ref(),
+                state_path: None,
+                index: 0,
+                start_at: "B".to_string(),
+                input: json!({}),
+            }),
+        ),
+    ];
+
+    for (handler, command) in cases {
+        let entries = processor
+            .dispatch(&command, &storage, EntryId::new(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "{handler}: one response entry, got {entries:?}"
+        );
+        match &entries[0].payload {
+            EntryPayload::Reject(reject) => {
+                assert_eq!(
+                    reject.rejection_type,
+                    RejectionType::InvalidArgument,
+                    "{handler}: a foreign owner kind is the payload's fault: {reject:?}"
+                );
+                assert!(
+                    reject.rejection_reason.contains(handler),
+                    "{handler}: the refusal names the boundary: {reject:?}"
+                );
+            }
+            other => panic!("{handler}: expected Reject(InvalidArgument), got {other:?}"),
+        }
     }
 }
 
@@ -2717,8 +2814,7 @@ async fn seed_task(
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(task_id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(owner.clone()),
+                    .with_owner(common::activity_owner_of(owner.clone())),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2757,8 +2853,7 @@ async fn seed_owning_activity(
                 output: None,
                 meta: spica_engine::ObjectMeta::builder(activity.uid)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(owner),
+                    .with_owner(common::thread_owner_of(owner)),
             },
             active_children: std::collections::HashSet::new(),
             created_at: Timestamp::from_millis(0),
@@ -2826,8 +2921,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(other_resource)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(act_ref()),
+                    .with_owner(common::activity_owner_of(act_ref())),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2959,8 +3053,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(act_ref()),
+                        .with_owner(common::activity_owner_of(act_ref())),
                 }],
             }),
         )
@@ -3000,8 +3093,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .build()
-                        .with_owner(act_ref()),
+                        .with_owner(common::activity_owner_of(act_ref())),
                 }],
             }),
         )
@@ -3398,8 +3490,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(task)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(parent.clone()),
+                    .with_owner(common::activity_owner_of(parent.clone())),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -3478,8 +3569,7 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
                 },
                 meta: spica_engine::ObjectMeta::builder(task)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .build()
-                    .with_owner(act_ref()),
+                    .with_owner(common::activity_owner_of(act_ref())),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),

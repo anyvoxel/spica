@@ -3,7 +3,8 @@
 mod common;
 
 use common::{
-    TypedCase, flow_name, meta, name, path, pointer, ref_to, request, run_typed_case, uid, vars,
+    TypedCase, flow_name, flow_owner, meta, meta_root, name, path, pointer, ref_to, request,
+    root_thread_owner, run_typed_case, thread_owner, uid, vars,
 };
 use serde_json::json;
 use spica_engine::{
@@ -33,7 +34,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(uid(1), "lifecycle_flow"),
+                    meta: meta_root(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -42,7 +43,7 @@ async fn fail_with_explicit_error_and_cause() {
                 request_id: request(0),
                 flow_version: FlowVersion {
                     meta: meta(uid(2), "lifecycle_flow-1")
-                        .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
+                        .with_owner(flow_owner("lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
                     checksum: 2171183822638040358,
@@ -58,7 +59,7 @@ async fn fail_with_explicit_error_and_cause() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -68,7 +69,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -87,7 +88,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -102,7 +103,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -121,7 +122,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Completing,
@@ -136,7 +137,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
@@ -157,7 +158,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
@@ -188,7 +189,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -218,7 +219,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -237,7 +238,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -253,7 +254,7 @@ async fn fail_with_explicit_error_and_cause() {
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -298,7 +299,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(uid(1), "lifecycle_flow"),
+                    meta: meta_root(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -307,7 +308,7 @@ async fn fail_without_error_or_cause_defaults() {
                 request_id: request(0),
                 flow_version: FlowVersion {
                     meta: meta(uid(2), "lifecycle_flow-1")
-                        .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
+                        .with_owner(flow_owner("lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
                     checksum: 5539617061879590914,
@@ -323,7 +324,7 @@ async fn fail_without_error_or_cause_defaults() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -333,7 +334,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -352,7 +353,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -367,7 +368,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -386,7 +387,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Completing,
@@ -401,7 +402,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
@@ -422,7 +423,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
@@ -453,7 +454,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -483,7 +484,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "F".to_string(),
@@ -502,7 +503,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -518,7 +519,7 @@ async fn fail_without_error_or_cause_defaults() {
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -566,7 +567,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::FlowCreated(FlowCreated {
                 request_id: request(0),
                 flow: Flow {
-                    meta: meta(uid(1), "lifecycle_flow"),
+                    meta: meta_root(uid(1), "lifecycle_flow"),
                     status: FlowStatus::Active,
                     latest_version: 1,
                 },
@@ -575,7 +576,7 @@ async fn fail_error_and_cause_as_jsonata() {
                 request_id: request(0),
                 flow_version: FlowVersion {
                     meta: meta(uid(2), "lifecycle_flow-1")
-                        .with_owner(ref_to(ObjectKind::Flow, "lifecycle_flow", 1)),
+                        .with_owner(flow_owner("lifecycle_flow", 1)),
                     version: 1,
                     definition: definition.to_string(),
                     checksum: 8051900064570304716,
@@ -591,7 +592,7 @@ async fn fail_error_and_cause_as_jsonata() {
                 request_id: request(1),
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
@@ -601,7 +602,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::ThreadCreated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
@@ -620,7 +621,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Running,
@@ -635,7 +636,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Running,
@@ -654,7 +655,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Completing,
@@ -673,7 +674,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Completed,
@@ -698,7 +699,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -713,7 +714,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Running,
@@ -732,7 +733,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Completing,
@@ -747,7 +748,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
@@ -768,7 +769,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4)),
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States/F"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
@@ -799,7 +800,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
@@ -829,7 +830,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(ref_to(ObjectKind::Execution, "lifecycle_execution", 3)),
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
                     execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
@@ -848,7 +849,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -864,7 +865,7 @@ async fn fail_error_and_cause_as_jsonata() {
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
                     deadline: None,
-                    meta: meta(uid(3), "lifecycle_execution"),
+                    meta: meta_root(uid(3), "lifecycle_execution"),
                     flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {

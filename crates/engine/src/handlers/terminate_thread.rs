@@ -2,7 +2,7 @@ use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
-use crate::types::meta::ObjectKind;
+use crate::types::meta::{ErasedOwner, ObjectKind, ThreadOwner};
 
 /// Handles `TerminateThread`: begins the abnormal finish of a fan-out `Thread` with `reason`.
 /// Mirrors [`TerminateExecutionHandler`](super::terminate_execution::TerminateExecutionHandler) but
@@ -47,14 +47,13 @@ impl TerminateThreadHandler {
         // finish must also start the execution's, or an internal top-level failure would leave the
         // execution Running forever. Only relay while the execution is still Running — if it already
         // went Terminating (an external cancel that swept us here), that terminal already wins.
-        if let Some(owner) = thread_row.value.meta.owner.clone()
-            && owner.kind == ObjectKind::Execution
-            && let Ok(Some(exec)) = ctx.storage.get_execution(&owner).await
+        if let ThreadOwner::Execution(execution) = &thread_row.value.meta.owner
+            && let Ok(Some(exec)) = ctx.storage.get_execution(execution.erased()).await
             && exec.status.is_running()
         {
             out.append_command(Command::TerminateExecution(TerminateExecution {
-                name: owner.name.clone(),
-                uid: Some(owner.uid),
+                name: execution.name().clone(),
+                uid: Some(execution.uid()),
                 reason: reason.clone(),
             }));
         }
@@ -103,9 +102,13 @@ impl TerminateThreadHandler {
             .await;
             // Run the inline child-settled reaction so the owning container converges (mirrors the
             // `Execution` termination reaction).
-            if let Some(owner) = thread_row.value.meta.owner.clone() {
-                super::child_completed::child_settled(ctx, out, owner, thread_ref.clone()).await;
-            }
+            super::child_completed::child_settled(
+                ctx,
+                out,
+                thread_row.value.meta.owner.clone().into_erased(),
+                thread_ref.clone(),
+            )
+            .await;
         } else {
             tracing::debug!(
                 thread = %thread_ref,

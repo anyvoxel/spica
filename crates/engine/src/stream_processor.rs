@@ -560,7 +560,7 @@ pub(crate) fn log_event(event: &Event) {
         Event::FlowVersionCreated(FlowVersionCreated { flow_version, .. }) => {
             info!(
                 flow_version = %flow_version.meta.reference(),
-                name = ?flow_version.flow_name(),
+                name = %flow_version.flow_name(),
                 version = flow_version.version,
                 "flow version created"
             );
@@ -757,7 +757,7 @@ mod tests {
     use crate::types::flow_version::FlowVersion;
     use crate::types::id::{FlowName, RequestId};
     use crate::types::meta::{
-        ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerReference, PlainName,
+        ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef, PlainName,
     };
     use crate::types::reject::RejectionType;
 
@@ -843,9 +843,7 @@ mod tests {
                             1,
                         ))
                         .at(Timestamp::now())
-                        .build()
-                        .with_owner(OwnerReference::new(
-                            ObjectKind::Flow,
+                        .with_owner(OwnerRef::new(
                             ObjectName::plain("flow").expect("literal name is valid"),
                             ulid::Ulid::nil(),
                         )),

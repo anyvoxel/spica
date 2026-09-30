@@ -126,7 +126,7 @@ impl StateHandler for TaskStateHandler<'_> {
                 // The timer's `execution` anchor is the flat top-level run (`activity.execution`),
                 // not the immediate owner scope — see `emit_timer`.
                 activity_value.execution.clone(),
-                activity,
+                activity_value,
                 TimerPurpose::TaskTimeout,
                 deadline,
             )
@@ -271,8 +271,7 @@ mod tests {
             meta: ObjectMeta::builder(uid(3))
                 .name(obj_name("execution-2"))
                 .at(at())
-                .build()
-                .with_owner(minted_activity_ref()),
+                .with_owner(activity_timer_owner(minted_activity_ref())),
         }
     }
 

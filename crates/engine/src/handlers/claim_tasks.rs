@@ -3,7 +3,6 @@ use std::time::Duration;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ClaimTasks;
 use crate::types::event::{Event, TasksClaimed};
-use crate::types::meta::ObjectKind;
 
 /// Handles `ClaimTasks` — the durable claim behind `TaskApi::poll_tasks` (Zeebe `ActivateJobs`).
 ///
@@ -73,16 +72,6 @@ impl ClaimTasksHandler {
         };
         let mut claimed = Vec::new();
         for t in tasks {
-            // A task without an activity owner is an internal fault — the settle paths
-            // (`complete_task`/`fail_task`) expect one — so leave it unclaimed rather than hand a
-            // worker a task it could never settle.
-            if t.meta
-                .owner
-                .as_ref()
-                .is_none_or(|o| o.kind != ObjectKind::Activity)
-            {
-                continue;
-            }
             let mut value = t.value;
             // The claim moment is the very reading the lease window was computed from, so the row's
             // transition stamp and its `lease_expires_at` share one base.

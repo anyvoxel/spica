@@ -8,13 +8,11 @@ use crate::eval_env::EvalEnv;
 use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::log::{Entry, EntryPayload, Timestamp};
 use crate::storage::ReadonlyStorageTxn;
-use crate::types::command::{
-    Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
-};
+use crate::types::command::{Command, TerminateState, TerminationReason};
 use crate::types::error::{ExecutionError, RuntimeError, StorageError};
 use crate::types::event::Event;
 use crate::types::id::{EntryId, RequestId, StreamId};
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ObjectReference, OwnerScope};
 use crate::types::reject::{Reject, RejectionType};
 use crate::working::WorkingState;
 
@@ -157,50 +155,35 @@ impl<'a> Collector<'a> {
     /// that produced it), so `handle` always produces an outcome and returns `()`. The activity-level
     /// [`Command::TerminateState`] runs the state's terminate path (StateTerminating +
     /// StateTerminated, plus descendant cleanup) rather than marking the activity in place.
+    ///
+    /// `scope` is `None` when the site could not resolve one (the activity row that would name it
+    /// could not be read): the failure is then recorded at the activity level alone, and the log
+    /// names that activity rather than terminating into an address no object answers to.
     pub fn terminate(
         &mut self,
         activity: Option<ObjectReference>,
-        owner: ObjectReference,
+        scope: Option<OwnerScope>,
         error: ExecutionError,
     ) {
         let reason = TerminationReason::Failed { error };
-        if let Some(activity) = activity {
+        if let Some(activity) = activity.clone() {
             self.append_command(Command::TerminateState(TerminateState {
                 activity,
                 reason: reason.clone(),
             }));
         }
-        // Route the failure at the owning scope by its kind — the two scope kinds live in different
-        // stores, so they address differently (an Execution by name, a Thread by reference). Every
-        // state's owner is now a Thread, so a top-level failure names the root thread; it bridges up
-        // to its Execution in `TerminateThreadHandler`, keeping a single route that always lands on
-        // the executable root. An Execution owner (routed via `fail_execution`) stays name-addressed.
-        // Any other kind (nil/leaf owner) carries no scope to terminate — the `TerminateState` above
-        // has already unwound the activity.
-        match owner.kind {
-            ObjectKind::Execution => {
-                self.append_command(Command::TerminateExecution(TerminateExecution {
-                    name: owner.name.clone(),
-                    uid: Some(owner.uid),
-                    reason,
-                }));
-            }
-            ObjectKind::Thread => {
-                self.append_command(Command::TerminateThread(TerminateThread {
-                    thread: owner,
-                    reason,
-                }));
-            }
-            _ => tracing::error!(
-                owner = %owner,
-                "terminal fail on a non-scope owner; cannot terminate"
+        match scope {
+            Some(scope) => crate::handlers::emit_scope_termination(self, &scope, reason),
+            None => tracing::error!(
+                activity = ?activity,
+                "terminal fail with no resolvable scope; cannot terminate"
             ),
         }
     }
 
     /// Convenience for `terminate` at a site where the execution itself failed (no state context).
-    pub fn fail_execution(&mut self, execution: ObjectReference, error: ExecutionError) {
-        self.terminate(None, execution, error);
+    pub fn fail_execution(&mut self, execution: &ObjectReference, error: ExecutionError) {
+        self.terminate(None, OwnerScope::of_reference(execution), error);
     }
 
     /// Consume the collector, returning the collected [`Entry`]s. The

@@ -107,7 +107,8 @@ impl CreateFlowHandler {
                             .expect("a valid FlowName is a valid user object name"),
                     )
                     .at(created_at)
-                    .build(),
+                    // A flow is a root of its own tree: its owner slot is `NoOwner` by type.
+                    .with_owner(crate::types::meta::NoOwner::new()),
                 status: FlowStatus::Active,
                 // A flow is born with its first version (ordinal 1); the version applier advances
                 // this counter on later publishes.
@@ -121,13 +122,12 @@ impl CreateFlowHandler {
             request_id: *request_id,
             flow_version: FlowVersion {
                 // A flow version is owned by its flow: the meta carries an owner reference to the
-                // owning `Flow` (same scope, inherited) bundling the flow's own name and uid.
+                // owning `Flow` (same scope, inherited) bundling the flow's own name and uid. The
+                // slot's type names the kind, so only the name/uid parts are passed.
                 meta: crate::types::meta::ObjectMeta::builder(flow_version_uid)
                     .name(flow_version)
                     .at(created_at)
-                    .build()
-                    .with_owner(crate::types::meta::OwnerReference::new(
-                        crate::types::meta::ObjectKind::Flow,
+                    .with_owner(crate::types::meta::OwnerRef::new(
                         crate::types::meta::ObjectName::plain(name.as_str())
                             .expect("a valid FlowName is a valid user object name"),
                         flow_uid,

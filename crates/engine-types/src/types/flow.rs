@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta};
+use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta};
 
 /// The lifecycle status of a [`Flow`]. Deletion is a `TODO` (M1/M2): a flow is created `Active`
 /// and may become `Deleted` once a delete (cascade) operation lands — currently nothing transitions
@@ -26,6 +26,10 @@ pub struct FlowKind;
 
 impl ObjectKindMarker for FlowKind {
     const KIND: ObjectKind = ObjectKind::Flow;
+    /// A flow is a tenant-level root: it is addressed by name alone and hangs off nothing, so its
+    /// owner slot can never be filled (see [`NoOwner`]) — [`ObjectMeta::with_owner`] does not even
+    /// exist for it.
+    type OwnedBy = NoOwner;
 }
 
 /// One logical flow — a named aggregate that groups a monotone sequence of immutable

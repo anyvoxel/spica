@@ -22,12 +22,13 @@ use spica_client::worker::{
     TaskHandler, TaskService,
 };
 use spica_engine::{
-    ActivatedTask, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow, Engine,
-    EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
-    ExecutionError, ExecutionStatus, FailTask, FlowName, FlowVersionCreated, Hook, LogStream,
-    ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, ObjectReference, PlainName, Reject,
-    RequestId, RuntimeError, StatePath, StreamId, Task, TaskApi, TaskCompleted, TasksClaimed,
-    Timestamp, Variables,
+    ActivatedTask, ActivityKind, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow,
+    Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
+    ExecutionError, ExecutionStatus, FailTask, FlowKind, FlowName, FlowVersionCreated, Hook,
+    LogStream, NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectMetaBuilder, ObjectName,
+    ObjectReference, OwnerRef, PlainName, Reject, RequestId, RuntimeError, StatePath, StreamId,
+    Task, TaskApi, TaskCompleted, TasksClaimed, ThreadKind, ThreadOwner, TimerOwner, Timestamp,
+    Variables,
 };
 use spica_machinery::{
     Clock, CountingIdGenerator, IdGenerator, ManualClock, SystemClock, SystemIdGenerator,
@@ -551,13 +552,12 @@ pub fn flow_name(name: &str) -> FlowName {
 /// The metadata a timer-free run mints for the object `object_name`, identified by the `n`-th uid:
 /// every object's own name plus the injected identity, stamped at the clock's single instant
 /// ([`epoch`]). The kind is the caller's business — it comes from `K`, resolved at the record the
-/// meta is written into. A case whose clock has been advanced builds its `ObjectMeta` through
-/// [`ObjectMeta::builder`] instead, since these stamps would be wrong for it.
-pub fn meta<K: ObjectKindMarker>(uid: ulid::Ulid, object_name: &str) -> ObjectMeta<K> {
-    ObjectMeta::builder(uid)
-        .name(name(object_name))
-        .at(epoch())
-        .build()
+/// meta is written into, and so is the owner: a case with an owner finishes the builder with
+/// [`ObjectMetaBuilder::with_owner`], a root object uses [`meta_root`]. A case whose clock has been
+/// advanced builds its `ObjectMeta` through [`ObjectMeta::builder`] instead, since these stamps would
+/// be wrong for it.
+pub fn meta<K: ObjectKindMarker>(uid: ulid::Ulid, object_name: &str) -> ObjectMetaBuilder<K> {
+    ObjectMeta::builder(uid).name(name(object_name)).at(epoch())
 }
 
 /// [`meta`] with both stamps spelled out — for a case whose clock has been advanced (see
@@ -568,11 +568,30 @@ pub fn meta_span<K: ObjectKindMarker>(
     object_name: &str,
     created: Timestamp,
     updated: Timestamp,
-) -> ObjectMeta<K> {
+) -> ObjectMetaBuilder<K> {
     ObjectMeta::builder(uid)
         .name(name(object_name))
         .timestamps(created, updated)
-        .build()
+}
+
+/// The metadata of a **root** object — a `Flow` or a top-level `Execution`, whose owner slot is
+/// [`NoOwner`] by type. The bound is that fact spelled at the call: no generic helper can hand out an
+/// ownerless meta for an object the type says is owned.
+pub fn meta_root<K: ObjectKindMarker<OwnedBy = NoOwner>>(
+    uid: ulid::Ulid,
+    object_name: &str,
+) -> ObjectMeta<K> {
+    meta(uid, object_name).with_owner(NoOwner::new())
+}
+
+/// [`meta_root`] with both stamps spelled out — see [`meta_span`].
+pub fn meta_span_root<K: ObjectKindMarker<OwnedBy = NoOwner>>(
+    uid: ulid::Ulid,
+    object_name: &str,
+    created: Timestamp,
+    updated: Timestamp,
+) -> ObjectMeta<K> {
+    meta_span(uid, object_name, created, updated).with_owner(NoOwner::new())
 }
 
 /// A variable scope's delta as an `Assign` writes it — a map, so the literal lists its pairs and the
@@ -595,6 +614,101 @@ pub fn indexed_refs(pairs: &[(usize, ObjectReference)]) -> HashMap<usize, Object
 /// A reference to the object `name` of kind `kind`, whose identity is the `n`-th uid minted.
 pub fn ref_to(kind: ObjectKind, object: &str, n: u64) -> ObjectReference {
     ObjectReference::new(kind, name(object), uid(n))
+}
+
+/// The owner slot of a **task**: the activity named `object`/`n`, in the slot's own type. A fixture
+/// cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime check.
+pub fn activity_owner(object: &str, n: u64) -> OwnerRef<ActivityKind> {
+    OwnerRef::new(name(object), uid(n))
+}
+
+/// [`activity_owner`] for a fixture already holding the activity's *flat* reference (an
+/// `ObjectReference` is what a storage lookup takes, so a fixture may legitimately carry the untyped
+/// address too). The slot's own checked conversion runs here, so a fixture naming the wrong kind
+/// fails at its own construction rather than building a record the engine cannot represent.
+pub fn activity_owner_of(reference: ObjectReference) -> OwnerRef<ActivityKind> {
+    reference
+        .try_into()
+        .expect("fixture: a task's owner is an activity")
+}
+
+/// The owner slot of an **activity**: the thread named `object`/`n`, in the slot's own type — a
+/// top-level run's derived root thread, or a fan-out branch's thread (see `ActivityKind::OwnedBy`).
+/// A fixture cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime
+/// check.
+pub fn thread_owner(object: &str, n: u64) -> OwnerRef<ThreadKind> {
+    OwnerRef::new(name(object), uid(n))
+}
+
+/// [`thread_owner`] for a fixture already holding the thread's *flat* reference — the form a storage
+/// lookup takes, so a fixture seeding a thread row carries the untyped address too.
+pub fn thread_owner_of(reference: ObjectReference) -> OwnerRef<ThreadKind> {
+    reference
+        .try_into()
+        .expect("fixture: an activity's owner is a thread")
+}
+
+/// The owner slot of a **flow version**: the flow named `object`/`n`, in the slot's own type (see
+/// `FlowVersionKind::OwnedBy`). A fixture cannot ask for a kind the slot does not admit — the type
+/// carries the kind, not a runtime check.
+pub fn flow_owner(object: &str, n: u64) -> OwnerRef<FlowKind> {
+    OwnerRef::new(name(object), uid(n))
+}
+
+/// The owner slot of a **thread** whose scope is the top-level run — a root thread, owned by the
+/// `Execution` it stands in for (see `ThreadOwner`).
+pub fn root_thread_owner(object: &str, n: u64) -> ThreadOwner {
+    ThreadOwner::Execution(OwnerRef::new(name(object), uid(n)))
+}
+
+/// [`root_thread_owner`] for a fixture already holding the execution's *flat* reference (the form a
+/// storage lookup takes, so a fixture may legitimately carry the untyped address too).
+pub fn root_thread_owner_of(execution: ObjectReference) -> ThreadOwner {
+    ThreadOwner::Execution(
+        execution
+            .try_into()
+            .expect("fixture: a root thread is owned by its execution"),
+    )
+}
+
+/// The owner slot of a **thread** fanned out by a container: `object`/`n` is the owning `Parallel`/
+/// `Map` activity (see `ThreadOwner`).
+pub fn fanout_thread_owner(object: &str, n: u64) -> ThreadOwner {
+    ThreadOwner::Activity(OwnerRef::new(name(object), uid(n)))
+}
+
+/// [`fanout_thread_owner`] for a fixture already holding the container activity's *flat* reference.
+pub fn fanout_thread_owner_of(activity: ObjectReference) -> ThreadOwner {
+    ThreadOwner::Activity(
+        activity
+            .try_into()
+            .expect("fixture: a fan-out thread is owned by its container activity"),
+    )
+}
+
+/// The owner slot of a **timer** armed by the run itself (an `ExecutionTimeout`), in the union's own
+/// type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
+pub fn execution_timer_owner_of(execution: ObjectReference) -> TimerOwner {
+    TimerOwner::Execution(
+        execution
+            .try_into()
+            .expect("fixture: an execution-timeout timer is owned by its run"),
+    )
+}
+
+/// The owner slot of a **timer** armed by the waiting activity (a `WaitResume`, a task retry or a
+/// task timeout): `object`/`n` is the owning activity.
+pub fn activity_timer_owner(object: &str, n: u64) -> TimerOwner {
+    TimerOwner::Activity(OwnerRef::new(name(object), uid(n)))
+}
+
+/// [`activity_timer_owner`] for a fixture already holding the waiting activity's *flat* reference.
+pub fn activity_timer_owner_of(activity: ObjectReference) -> TimerOwner {
+    TimerOwner::Activity(
+        activity
+            .try_into()
+            .expect("fixture: a state timer is owned by its waiting activity"),
+    )
 }
 
 /// The JSON Pointer `/segments` (`""` being the document root) — the form a `StatePath` wraps.
