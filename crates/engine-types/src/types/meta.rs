@@ -359,141 +359,105 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for ObjectRef<K> {
     }
 }
 
-/// The owner slot of a **Thread**: the one scope a thread runs in, of the two that exist.
+/// Declare the owner slot of an object kind that a fixed set of scopes may own: an enum whose
+/// variants are that slot's own, each holding one scope's typed reference.
 ///
-/// A fan-out thread is owned by the container `Parallel`/`Map` activity that spawned it; a **root**
-/// thread is the scope a whole top-level run executes in, so it is owned by the `Execution` itself.
-/// The two are different *kinds*, and the drain cascade sends each to a different parent, so the slot
-/// is a sum rather than a widened reference: dispatch is an exhaustive `match` and no reader compares
-/// a runtime kind to learn which parent it holds. The wire's `kind` decides a variant exactly once,
-/// on the way in ([`Self::deserialize`]) — parse, don't validate.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ThreadOwner {
-    Execution(ObjectRef<ExecutionKind>),
-    Activity(ObjectRef<ActivityKind>),
-}
-
-impl Serialize for ThreadOwner {
-    /// The variant's own reference — the union adds no field of its own, so the wire keeps the
-    /// `{kind, name, uid}` object the slot held before it was typed.
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            ThreadOwner::Execution(r) => r.serialize(s),
-            ThreadOwner::Activity(r) => r.serialize(s),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ThreadOwner {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let seen = RawObjectRef::deserialize(d)?;
-        Ok(match seen.kind {
-            ObjectKind::Execution => {
-                ThreadOwner::Execution(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
-            }
-            ObjectKind::Activity => {
-                ThreadOwner::Activity(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
-            }
-            // A kind outside the union is a payload no thread could have carried: refused here rather
-            // than repaired into a slot with no variant for it.
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "reference kind mismatch: the payload carries kind {other:?}, but this slot admits \
-                     only Execution or Activity owners ({})",
-                    std::any::type_name::<ThreadOwner>(),
-                )));
-            }
-        })
-    }
-}
-
-impl OwnerKindMarker for ThreadOwner {
-    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
-        Some(self.as_raw_object_ref())
-    }
-}
-
-impl sealed::Sealed for ThreadOwner {}
-
-impl HasRawObjectRef for ThreadOwner {
-    fn as_raw_object_ref(&self) -> &RawObjectRef {
-        match self {
-            ThreadOwner::Execution(r) => r.as_raw_object_ref(),
-            ThreadOwner::Activity(r) => r.as_raw_object_ref(),
-        }
-    }
-
-    fn into_raw_object_ref(self) -> RawObjectRef {
-        match self {
-            ThreadOwner::Execution(r) => r.into_raw_object_ref(),
-            ThreadOwner::Activity(r) => r.into_raw_object_ref(),
-        }
-    }
-}
-
-/// The owner slot of a **Timer**: the scope whose deadline it is, of the two scopes that arm one.
+/// One macro instead of a union per slot, because these parts must agree and drift silently when
+/// handwritten: the kind an incoming wire `kind` decodes to, the refusal of every *other* kind, and
+/// the erasure reads. The variants stay the caller's (`Execution => ExecutionKind`), so the slot
+/// keeps its own vocabulary and a refusal still names the union that admitted what it did.
 ///
-/// An `ExecutionTimeout` is armed by the top-level run itself, while a `WaitResume`, a task retry or a
-/// task timeout is armed by the activity that is waiting — so the slot is the same `Execution`-or-
-/// `Activity` sum as a thread's, kept as its own type because *which* two scopes may own a timer is a
-/// fact about timers: widening a timer's owner later must not widen a thread's by accident.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TimerOwner {
-    Execution(ObjectRef<ExecutionKind>),
-    Activity(ObjectRef<ActivityKind>),
-}
-
-impl Serialize for TimerOwner {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            TimerOwner::Execution(r) => r.serialize(s),
-            TimerOwner::Activity(r) => r.serialize(s),
+/// The union adds no field of its own, so the wire keeps the `{kind, name, uid}` object the slot
+/// held before it was typed.
+macro_rules! declare_owner {
+    ($(#[$doc:meta])* $name:ident { $($variant:ident => $kind:ty),+ $(,)? }) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum $name {
+            $($variant(ObjectRef<$kind>),)+
         }
-    }
-}
 
-impl<'de> Deserialize<'de> for TimerOwner {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let seen = RawObjectRef::deserialize(d)?;
-        Ok(match seen.kind {
-            ObjectKind::Execution => {
-                TimerOwner::Execution(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                match self {
+                    $($name::$variant(r) => r.serialize(s),)+
+                }
             }
-            ObjectKind::Activity => {
-                TimerOwner::Activity(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
-            }
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "reference kind mismatch: the payload carries kind {other:?}, but this slot admits \
-                     only Execution or Activity owners ({})",
-                    std::any::type_name::<TimerOwner>(),
-                )));
-            }
-        })
-    }
-}
-
-impl OwnerKindMarker for TimerOwner {
-    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
-        Some(self.as_raw_object_ref())
-    }
-}
-
-impl sealed::Sealed for TimerOwner {}
-
-impl HasRawObjectRef for TimerOwner {
-    fn as_raw_object_ref(&self) -> &RawObjectRef {
-        match self {
-            TimerOwner::Execution(r) => r.as_raw_object_ref(),
-            TimerOwner::Activity(r) => r.as_raw_object_ref(),
         }
-    }
 
-    fn into_raw_object_ref(self) -> RawObjectRef {
-        match self {
-            TimerOwner::Execution(r) => r.into_raw_object_ref(),
-            TimerOwner::Activity(r) => r.into_raw_object_ref(),
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let seen = RawObjectRef::deserialize(d)?;
+                match seen.kind {
+                    $(<$kind as ObjectKindMarker>::KIND => {
+                        ObjectRef::<$kind>::try_from(seen)
+                            .map($name::$variant)
+                            .map_err(serde::de::Error::custom)
+                    })+
+                    // A kind outside the union is a payload no object of this kind could have
+                    // carried: refused here rather than repaired into a slot with no variant for it.
+                    other => {
+                        let admitted =
+                            [$(format!("{:?}", <$kind as ObjectKindMarker>::KIND)),+].join(" or ");
+                        Err(serde::de::Error::custom(format!(
+                            "reference kind mismatch: the payload carries kind {other:?}, but this \
+                             slot admits only {admitted} owners ({})",
+                            std::any::type_name::<Self>(),
+                        )))
+                    }
+                }
+            }
         }
+
+        impl OwnerKindMarker for $name {
+            fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
+                Some(self.as_raw_object_ref())
+            }
+        }
+
+        impl sealed::Sealed for $name {}
+
+        impl HasRawObjectRef for $name {
+            fn as_raw_object_ref(&self) -> &RawObjectRef {
+                match self {
+                    $($name::$variant(r) => r.as_raw_object_ref(),)+
+                }
+            }
+
+            fn into_raw_object_ref(self) -> RawObjectRef {
+                match self {
+                    $($name::$variant(r) => r.into_raw_object_ref(),)+
+                }
+            }
+        }
+    };
+}
+
+declare_owner! {
+    /// The owner slot of a **Thread**: the one scope a thread runs in, of the two that exist.
+    ///
+    /// A fan-out thread is owned by the container `Parallel`/`Map` activity that spawned it; a **root**
+    /// thread is the scope a whole top-level run executes in, so it is owned by the `Execution` itself.
+    /// The two are different *kinds*, and the drain cascade sends each to a different parent, so the slot
+    /// is a sum rather than a widened reference: dispatch is an exhaustive `match` and no reader compares
+    /// a runtime kind to learn which parent it holds. The wire's `kind` decides a variant exactly once,
+    /// on the way in ([`Self::deserialize`]) — parse, don't validate.
+    ThreadOwner {
+        Execution => ExecutionKind,
+        Activity => ActivityKind,
+    }
+}
+
+declare_owner! {
+    /// The owner slot of a **Timer**: the scope whose deadline it is, of the two scopes that arm one.
+    ///
+    /// An `ExecutionTimeout` is armed by the top-level run itself, while a `WaitResume`, a task retry or a
+    /// task timeout is armed by the activity that is waiting — so the slot is the same `Execution`-or-
+    /// `Activity` sum as a thread's, but its own type: a timer's owner is a fact about timers, so
+    /// widening it later must not widen a thread's by accident.
+    TimerOwner {
+        Execution => ExecutionKind,
+        Activity => ActivityKind,
     }
 }
 
@@ -609,6 +573,11 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for KindTag<K> {
 ///   a generated name for transient ones.
 /// - [`Self::uid`] is the **sameness** key — a name can be re-used across delete+recreate, so `uid`
 ///   is what tells two references to the same *object* apart. It is opaque and never reused.
+///
+/// Identity (`kind`/`name`/`uid`) is fixed at birth: only the builder and the wire decode write it,
+/// and the `with_*` methods move `updated_at`/`owner` alone. Unlike `kind`, `name`/`uid` are `pub`,
+/// so this is convention rather than the compiler's holding — the rule to keep when a handler holds
+/// a record mutably is that a rename is a *new* object (`uid` is never reused), never a field write.
 ///
 /// [`Self::owner`] links each object to its single owning parent in the object tree. `owner` is the
 /// **single parent edge** for every entity — the former ad-hoc `Execution.parent`/`Activity.parent`/
@@ -831,6 +800,11 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
 /// scope that may be any object) speak — so every site holding one is a place typing deliberately
 /// stops, and reaching for it on a field that names a single kind is the mistake the name makes
 /// visible.
+///
+/// An address is not an identity record: it is a by-value handle handed to whoever must name the
+/// object, so the fields stay `pub` and editing one is meaningless rather than dangerous — the
+/// object is addressed by the row's own `(kind, name, uid)`, and a copy that disagrees with them
+/// simply fails the uid check on read. Renaming an object is a new object, never an edit here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RawObjectRef {
     /// The referenced object's kind.
