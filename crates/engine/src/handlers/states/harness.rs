@@ -28,10 +28,10 @@ use crate::handler::{Collector, HandlerContext, OverlaySink};
 use crate::handlers::dispatch::build_state_handlers;
 use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
+use crate::types::execution::ExecutionKind;
 use crate::types::id::EntryId;
 use crate::types::meta::{
-    ErasedOwner, ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef, ThreadOwner,
-    TimerOwner,
+    ObjectMeta, ObjectName, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner,
 };
 use crate::types::thread::ThreadKind;
 use crate::working::WorkingState;
@@ -79,59 +79,39 @@ pub fn seeded_input() -> Value {
 
 // ── seeded references ───────────────────────────────────────────────────────
 
-pub fn execution_ref() -> ObjectReference {
-    ObjectReference::new(ObjectKind::Execution, obj_name("execution"), uid(90))
+pub fn execution_ref() -> ObjectRef<ExecutionKind> {
+    ObjectRef::new(obj_name("execution"), uid(90))
 }
 
 /// The scope every activity under test is owned by: a fan-out thread (the derived root thread for a
 /// top-level run, per the engine's unified-owner model) at `/States`.
-pub fn thread_ref() -> ObjectReference {
-    ObjectReference::new(ObjectKind::Thread, obj_name("execution-0"), uid(91))
-}
-
-/// [`thread_ref`] in the type an activity's owner slot holds — the same address through the slot's own
-/// checked conversion.
-pub fn thread_owner() -> OwnerRef<ThreadKind> {
-    thread_ref()
-        .try_into()
-        .expect("the scope fixture is a thread")
+pub fn thread_ref() -> ObjectRef<ThreadKind> {
+    ObjectRef::new(obj_name("execution-0"), uid(91))
 }
 
 /// The reference `activate` mints on a clean store: the injected generator's first id, named from the
 /// partition counter's first free suffix over the execution's plain base name.
-pub fn minted_activity_ref() -> ObjectReference {
-    ObjectReference::new(ObjectKind::Activity, obj_name("execution-0"), uid(1))
+pub fn minted_activity_ref() -> ObjectRef<ActivityKind> {
+    ObjectRef::new(obj_name("execution-0"), uid(1))
 }
 
 /// The owner slot of a **thread** whose scope is the top-level run: a root thread is owned by its
 /// `Execution` (see `ThreadOwner`), and the slot's own checked conversion runs here — a fixture naming
 /// a kind the slot does not admit fails at its own construction.
-pub fn root_thread_owner(execution: ObjectReference) -> ThreadOwner {
-    ThreadOwner::Execution(
-        execution
-            .try_into()
-            .expect("the run fixture is an execution"),
-    )
+pub fn root_thread_owner(execution: ObjectRef<ExecutionKind>) -> ThreadOwner {
+    ThreadOwner::Execution(execution)
 }
 
 /// The owner slot of a **thread** fanned out by a container activity — the `Activity` variant of
 /// [`ThreadOwner`], the parent a fan-out branch or item hangs off.
-pub fn fanout_thread_owner(activity: ObjectReference) -> ThreadOwner {
-    ThreadOwner::Activity(
-        activity
-            .try_into()
-            .expect("the container fixture is an activity"),
-    )
+pub fn fanout_thread_owner(activity: ObjectRef<ActivityKind>) -> ThreadOwner {
+    ThreadOwner::Activity(activity)
 }
 
 /// The owner slot of a **timer** armed by the waiting activity (a `WaitResume` or task timeout): the
 /// `Activity` variant of [`TimerOwner`].
-pub fn activity_timer_owner(activity: ObjectReference) -> TimerOwner {
-    TimerOwner::Activity(
-        activity
-            .try_into()
-            .expect("the waiting fixture is an activity"),
-    )
+pub fn activity_timer_owner(activity: ObjectRef<ActivityKind>) -> TimerOwner {
+    TimerOwner::Activity(activity)
 }
 
 /// The meta `activate` mints for that activity: `created_at == updated_at == at()` (the birth
@@ -140,7 +120,7 @@ pub fn minted_activity_meta() -> ObjectMeta<ActivityKind> {
     ObjectMeta::builder(uid(1))
         .name(obj_name("execution-0"))
         .at(at())
-        .with_owner(thread_owner())
+        .with_owner(thread_ref())
 }
 
 /// The activity value `activate` mints on a clean store: [`minted_activity_ref`] with the given
@@ -186,8 +166,8 @@ pub fn complete_cmd(output: Value) -> CompleteState {
 /// liveness before it does anything else, and the owner `complete` loads the scope variables from.
 pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
     let thread = Thread {
-        meta: ObjectMeta::builder(thread_ref().uid)
-            .name(thread_ref().name)
+        meta: ObjectMeta::builder(thread_ref().uid())
+            .name(thread_ref().name().clone())
             .at(at())
             .with_owner(root_thread_owner(execution_ref())),
         execution: execution_ref(),
@@ -209,7 +189,7 @@ pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
 /// disposes of them.
 pub fn seeded_activity(
     input: Value,
-    children: impl IntoIterator<Item = ObjectReference>,
+    children: impl IntoIterator<Item = RawObjectRef>,
 ) -> ActivityRecord {
     let mut activity = minted_activity(path("/States/P"), input.clone());
     activity.input = Some(input);
@@ -228,7 +208,7 @@ pub fn seeded_activity_with(
     input: Value,
     activity_state: ActivityState,
     status: ActivityStatus,
-    children: impl IntoIterator<Item = ObjectReference>,
+    children: impl IntoIterator<Item = RawObjectRef>,
 ) -> ActivityRecord {
     let mut activity = minted_activity(state_path, input.clone());
     activity.input = Some(input);
@@ -242,12 +222,8 @@ pub fn seeded_activity_with(
 
 /// The reference of the `index`-th fan-out child (a `Parallel` branch / `Map` item). The ids sit far
 /// above the injected generator's range, so a freshly minted object never collides with a seeded one.
-pub fn child_ref(index: usize) -> ObjectReference {
-    ObjectReference::new(
-        ObjectKind::Thread,
-        obj_name(&format!("child-{index}")),
-        uid(80 + index as u64),
-    )
+pub fn child_ref(index: usize) -> ObjectRef<ThreadKind> {
+    ObjectRef::new(obj_name(&format!("child-{index}")), uid(80 + index as u64))
 }
 
 /// A settled fan-out child row (a `Parallel` branch / `Map` item) — the per-child outcome the
@@ -261,8 +237,8 @@ pub fn seeded_child_thread(
 ) -> ThreadRecord {
     let reference = child_ref(index);
     let thread = Thread {
-        meta: ObjectMeta::builder(reference.uid)
-            .name(reference.name)
+        meta: ObjectMeta::builder(reference.uid())
+            .name(reference.name().clone())
             .at(at())
             .with_owner(fanout_thread_owner(minted_activity_ref())),
         execution: execution_ref(),
@@ -282,7 +258,7 @@ pub fn seeded_child_thread(
 /// a `complete` test starts when it is not continuing a preceding `activate`.
 pub async fn complete_store(
     input: Value,
-    children: impl IntoIterator<Item = ObjectReference>,
+    children: impl IntoIterator<Item = RawObjectRef>,
 ) -> InMemoryStorage {
     let mut store = InMemoryStorage::new();
     store
@@ -338,7 +314,7 @@ impl Dispatch {
     }
 
     /// The committed activity row at `reference`, or `None` where nothing was folded.
-    pub async fn activity(&self, reference: &ObjectReference) -> Option<ActivityRecord> {
+    pub async fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Option<ActivityRecord> {
         self.store
             .get_activity(reference)
             .await
@@ -346,7 +322,7 @@ impl Dispatch {
     }
 
     /// The committed refs still attached to `reference` as its children.
-    pub async fn children(&self, reference: &ObjectReference) -> HashSet<ObjectReference> {
+    pub async fn children(&self, reference: &RawObjectRef) -> HashSet<RawObjectRef> {
         self.store
             .get_children(reference.clone())
             .await
@@ -391,10 +367,9 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: Option<ThreadRe
             definitions: &mut definitions,
             state_handlers: &state_handlers,
         };
-        // The leader's dispatcher owns this conversion; here the fixture's command is trusted, so
-        // the driver performs the same checked conversion its dispatch would.
-        let owner = OwnerRef::<ThreadKind>::try_from(cmd.owner.clone())
-            .expect("the fixture's scope is a thread");
+        // The scope's own type is the command's, so a fixture cannot name a kind the slot does not
+        // admit — the dispatch has nothing left to check.
+        let owner = cmd.owner.clone();
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")
@@ -456,8 +431,8 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
 pub async fn child_completed(
     state: &State,
     store: InMemoryStorage,
-    activity: ObjectReference,
-    child: ObjectReference,
+    activity: ObjectRef<ActivityKind>,
+    child: RawObjectRef,
 ) -> Dispatch {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
     let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
@@ -491,7 +466,7 @@ pub async fn child_completed(
         // driver needs only the scope variables it evaluates against.
         let thread = ctx
             .storage
-            .get_thread(scope_ref.erased())
+            .get_thread(&scope_ref)
             .await
             .expect("the in-memory store reads")
             .expect("the owning thread is seeded");

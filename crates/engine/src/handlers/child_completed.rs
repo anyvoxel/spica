@@ -15,9 +15,11 @@
 //! round (never a silent no-op that would need a marker event).
 
 use crate::handler::{Collector, HandlerContext};
+use crate::types::activity::ActivityKind;
 use crate::types::command::Command;
-use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference};
-use crate::types::thread::ThreadStatus;
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
+use crate::types::thread::{ThreadKind, ThreadStatus};
 use crate::{ActivityStatus, ExecutionStatus};
 
 /// A direct child `child` has settled under `parent`. Single hop: react at the `parent` node itself,
@@ -27,13 +29,35 @@ use crate::{ActivityStatus, ExecutionStatus};
 pub async fn child_settled(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    parent: ObjectReference,
-    child: ObjectReference,
+    parent: RawObjectRef,
+    child: RawObjectRef,
 ) {
     match parent.kind {
-        ObjectKind::Activity => Box::pin(activity_child_settled(ctx, out, parent, child)).await,
-        ObjectKind::Execution => Box::pin(execution_child_settled(ctx, out, parent)).await,
-        ObjectKind::Thread => Box::pin(thread_child_settled(ctx, out, parent)).await,
+        ObjectKind::Activity => {
+            Box::pin(activity_child_settled(
+                ctx,
+                out,
+                parent.clone().typed::<ActivityKind>(),
+                child,
+            ))
+            .await
+        }
+        ObjectKind::Execution => {
+            Box::pin(execution_child_settled(
+                ctx,
+                out,
+                parent.clone().typed::<ExecutionKind>(),
+            ))
+            .await
+        }
+        ObjectKind::Thread => {
+            Box::pin(thread_child_settled(
+                ctx,
+                out,
+                parent.clone().typed::<ThreadKind>(),
+            ))
+            .await
+        }
         // A Flow / FlowVersion / Timer / Task parent owns no children in this path.
         _ => {}
     }
@@ -45,7 +69,7 @@ pub async fn child_settled(
 async fn execution_child_settled(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    parent: ObjectReference,
+    parent: ObjectRef<ExecutionKind>,
 ) {
     let Some(exec) = ctx.storage.get_execution(&parent).await.ok().flatten() else {
         return; // gone already; nothing to drain.
@@ -53,13 +77,12 @@ async fn execution_child_settled(
     if !exec.active_children.is_empty() {
         return; // not drained yet — some other child owns the finish.
     }
+    // The Continue commands address their owner as a flat reference, so the erasure happens at this
+    // seam — one value, both arms.
+    let owner = parent.into_raw_object_ref();
     match &exec.status {
-        ExecutionStatus::Completing => {
-            out.append_command(Command::ContinueComplete { owner: parent })
-        }
-        ExecutionStatus::Terminating(_) => {
-            out.append_command(Command::ContinueTerminate { owner: parent })
-        }
+        ExecutionStatus::Completing => out.append_command(Command::ContinueComplete { owner }),
+        ExecutionStatus::Terminating(_) => out.append_command(Command::ContinueTerminate { owner }),
         // Running + children: no state-specific replenish hook for an Execution yet.
         // TODO(Map/Parallel): dispatch replenish via the state table for Executions too.
         _ => {}
@@ -72,7 +95,7 @@ async fn execution_child_settled(
 async fn thread_child_settled(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    parent: ObjectReference,
+    parent: ObjectRef<ThreadKind>,
 ) {
     let Some(thread) = ctx.storage.get_thread(&parent).await.ok().flatten() else {
         return; // gone already; nothing to drain.
@@ -80,11 +103,11 @@ async fn thread_child_settled(
     if !thread.active_children.is_empty() {
         return; // not drained yet — some other child owns the thread's finish.
     }
+    // See `execution_child_settled`: the Continue command's owner is flat, so the erasure is here.
+    let owner = parent.into_raw_object_ref();
     match &thread.status {
-        ThreadStatus::Completing => out.append_command(Command::ContinueComplete { owner: parent }),
-        ThreadStatus::Terminating(_) => {
-            out.append_command(Command::ContinueTerminate { owner: parent })
-        }
+        ThreadStatus::Completing => out.append_command(Command::ContinueComplete { owner }),
+        ThreadStatus::Terminating(_) => out.append_command(Command::ContinueTerminate { owner }),
         _ => {}
     }
 }
@@ -97,18 +120,20 @@ async fn thread_child_settled(
 async fn activity_child_settled(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    parent: ObjectReference,
-    child: ObjectReference,
+    parent: ObjectRef<ActivityKind>,
+    child: RawObjectRef,
 ) {
     let Some(act) = ctx.storage.get_activity(&parent).await.ok().flatten() else {
         return;
     };
+    // See `execution_child_settled`: the Continue command's owner is flat, so the erasure is here.
+    let owner = parent.clone().into_raw_object_ref();
     match act.value.status {
         ActivityStatus::Completing if act.active_children.is_empty() => {
-            out.append_command(Command::ContinueComplete { owner: parent });
+            out.append_command(Command::ContinueComplete { owner });
         }
         ActivityStatus::Terminating(_) if act.active_children.is_empty() => {
-            out.append_command(Command::ContinueTerminate { owner: parent });
+            out.append_command(Command::ContinueTerminate { owner });
         }
         // Running + children: the **replenish** half (state-specific). Dispatched on *every*
         // settled child (not just when `active_children` is empty), so a `Map` refills a
@@ -128,19 +153,13 @@ async fn activity_child_settled(
 async fn dispatch_child_completed(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    activity: ObjectReference,
+    activity: ObjectRef<ActivityKind>,
     act: &crate::storage::ActivityRecord,
-    child: ObjectReference,
+    child: RawObjectRef,
 ) {
     // An activity's owner is always a `Thread` (see `emit_transition`), so the row is read directly.
     let scope_ref = act.value.meta.owner.clone();
-    let Some(thread) = ctx
-        .storage
-        .get_thread(scope_ref.erased())
-        .await
-        .ok()
-        .flatten()
-    else {
+    let Some(thread) = ctx.storage.get_thread(&scope_ref).await.ok().flatten() else {
         return; // owning scope gone — nothing to replenish into.
     };
     let sm = match ctx.machine_for_thread(&thread).await {

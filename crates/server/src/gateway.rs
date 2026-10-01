@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_engine::{
-    ActivatedTask, Command, Engine, Event, ExecutionCreated, ExecutionError, FlowName,
-    FlowVersionCreated, Hook, ObjectName, ObjectReference, Reject, RequestId, RuntimeError, Task,
-    TaskCompleted, TasksClaimed, Timestamp,
+    ActivatedTask, Command, Engine, Event, ExecutionCreated, ExecutionError, ExecutionKind,
+    FlowName, FlowVersionCreated, FlowVersionKind, Hook, ObjectName, ObjectRef, Reject, RequestId,
+    RuntimeError, Task, TaskCompleted, TasksClaimed, TimerKind, Timestamp,
 };
 use spica_scheduler::{Scheduler, TimerSink};
 use tokio::sync::{Mutex, oneshot};
@@ -196,9 +196,9 @@ impl Hook for CompositeHook {
             Event::TimerActivated { timer } => {
                 // The durable event carries the timer's absolute deadline; re-arm from that moment.
                 self.scheduler
-                    .schedule(&timer.meta.reference(), timer.deadline);
+                    .schedule(&timer.meta.typed_reference(), timer.deadline);
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.reference()),
+            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.typed_reference()),
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -218,7 +218,7 @@ struct EngineTimerSink {
 
 #[tonic::async_trait]
 impl TimerSink for EngineTimerSink {
-    async fn trigger(&self, timer: &ObjectReference) {
+    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
         let Some(engine) = self
             .engine
             .lock()
@@ -282,7 +282,7 @@ impl Gateway {
         }
     }
 
-    /// Create a new flow version from `definition` and return its created version's [`ObjectReference`].
+    /// Create a new flow version from `definition` and return its created version's [`RawObjectRef`].
     /// Validation, duplicate pre-check and command assembly live in
     /// [`Engine::create_flow`](spica_engine::Engine::create_flow); this side owns only the
     /// request/response correlation (register before append, await the ack).
@@ -290,7 +290,7 @@ impl Gateway {
         &self,
         name: FlowName,
         definition: &str,
-    ) -> Result<ObjectReference, ExecutionError> {
+    ) -> Result<ObjectRef<FlowVersionKind>, ExecutionError> {
         let request_id = RequestId::new();
         let rx = self
             .ack
@@ -311,7 +311,7 @@ impl Gateway {
             );
         };
         tracing::info!(name = %name_log, flow_version = %flow_version.meta.reference(), version = flow_version.version, "flow created, acked");
-        Ok(flow_version.meta.reference())
+        Ok(flow_version.meta.typed_reference())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id **at birth** (settling
@@ -321,9 +321,9 @@ impl Gateway {
     pub(crate) async fn start_for_revision(
         &self,
         name: ObjectName,
-        flow_version: ObjectReference,
+        flow_version: ObjectRef<FlowVersionKind>,
         input: serde_json::Value,
-    ) -> Result<ObjectReference, ExecutionError> {
+    ) -> Result<ObjectRef<ExecutionKind>, ExecutionError> {
         let request_id = RequestId::new();
         let rx = self
             .ack
@@ -338,7 +338,7 @@ impl Gateway {
         };
         match event {
             Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
-                Ok(execution.meta.reference())
+                Ok(execution.meta.typed_reference())
             }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }

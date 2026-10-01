@@ -1,5 +1,5 @@
 //! `Workflow` service handlers — definition versioning: `CreateFlow` persists a definition and
-//! returns its created version's `ObjectReference`; `ResolveFlowVersion` resolves a name (+ ordinal
+//! returns its created version's `RawObjectRef`; `ResolveFlowVersion` resolves a name (+ ordinal
 //! version) to its concrete version reference without starting anything.
 
 use spica_engine::FlowName;
@@ -13,7 +13,7 @@ use crate::common::{Svc, proto_ref, to_status};
 
 #[tonic::async_trait]
 impl WorkflowServiceTrait for Svc {
-    /// Persist a new flow version and return its created version's `ObjectReference`.
+    /// Persist a new flow version and return its created version's `RawObjectRef`.
     async fn create_flow(
         &self,
         request: Request<CreateFlowRequest>,
@@ -35,7 +35,7 @@ impl WorkflowServiceTrait for Svc {
         }))
     }
 
-    /// Resolve a flow name (+ optional ordinal version) to its concrete version `ObjectReference` — a
+    /// Resolve a flow name (+ optional ordinal version) to its concrete version `RawObjectRef` — a
     /// non-blocking read of the persisted projection, so a client can capture the reference (for
     /// scripting, or to bind `StartExecution` by explicit revision later) without starting anything.
     async fn resolve_flow_version(

@@ -1,8 +1,11 @@
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectKind, ThreadOwner};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ThreadOwner};
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 
 /// Handles `TerminateThread`: begins the abnormal finish of a fan-out `Thread` with `reason`.
 /// Mirrors [`TerminateExecutionHandler`](super::terminate_execution::TerminateExecutionHandler) but
@@ -48,7 +51,7 @@ impl TerminateThreadHandler {
         // execution Running forever. Only relay while the execution is still Running — if it already
         // went Terminating (an external cancel that swept us here), that terminal already wins.
         if let ThreadOwner::Execution(execution) = &thread_row.value.meta.owner
-            && let Ok(Some(exec)) = ctx.storage.get_execution(execution.erased()).await
+            && let Ok(Some(exec)) = ctx.storage.get_execution(execution).await
             && exec.status.is_running()
         {
             out.append_command(Command::TerminateExecution(TerminateExecution {
@@ -63,12 +66,14 @@ impl TerminateThreadHandler {
         for child in children {
             match child.kind {
                 ObjectKind::Timer => {
-                    out.append_command(Command::CancelTimer { timer: child });
+                    out.append_command(Command::CancelTimer {
+                        timer: child.typed::<TimerKind>(),
+                    });
                     pending += 1;
                 }
                 ObjectKind::Activity => {
                     out.append_command(Command::TerminateState(TerminateState {
-                        activity: child,
+                        activity: child.typed::<ActivityKind>(),
                         reason: reason.clone(),
                     }));
                     pending += 1;
@@ -77,7 +82,7 @@ impl TerminateThreadHandler {
                 // fans out) owns child threads which must themselves be torn down recursively.
                 ObjectKind::Thread => {
                     out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child,
+                        thread: child.typed::<ThreadKind>(),
                         reason: reason.clone(),
                     }));
                     pending += 1;
@@ -105,7 +110,7 @@ impl TerminateThreadHandler {
             super::child_completed::child_settled(
                 ctx,
                 out,
-                thread_row.value.meta.owner.clone().into_erased(),
+                thread_row.value.meta.owner.clone().into_raw_object_ref(),
                 thread_ref.clone(),
             )
             .await;

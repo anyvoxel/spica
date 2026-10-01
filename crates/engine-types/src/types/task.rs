@@ -3,7 +3,8 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::activity::ActivityKind;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, OwnerRef};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef};
 use spica_machinery::Timestamp;
 
 /// Per-retrier retry bookkeeping for a single `Retry` entry, carried **on the task** (Zeebe-style
@@ -145,8 +146,8 @@ pub struct TaskKind;
 impl ObjectKindMarker for TaskKind {
     const KIND: ObjectKind = ObjectKind::Task;
     /// A task is always invoked by the `Task` state's activity — exactly one kind, so the slot is an
-    /// [`OwnerRef`] rather than a union: a task whose owner is not an activity is unrepresentable.
-    type OwnedBy = OwnerRef<ActivityKind>;
+    /// [`ObjectRef`] rather than a union: a task whose owner is not an activity is unrepresentable.
+    type OwnedBy = ObjectRef<ActivityKind>;
 }
 
 /// The event-/domain-carried value of a Task.
@@ -165,7 +166,7 @@ pub struct Task {
     /// lives in a branch) is traceable to, and nameable from, its root run — the same ownership
     /// channel an `Activity`/`Timer` carries. `meta.owner` is the immediate invoking activity; this
     /// is the run itself.
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     /// The `Resource` URI the task calls (a downstream service / activity identifier).
     pub resource: String,
     /// The projected `arguments` passed to the resource as its input payload.
@@ -266,11 +267,14 @@ mod tests {
         Task {
             meta: ObjectMeta::builder(ulid::Ulid::new())
                 .timestamps(ts(0), ts(0))
-                .with_owner(OwnerRef::new(
+                .with_owner(ObjectRef::new(
                     ObjectName::plain("invoke").unwrap(),
                     ulid::Ulid::new(),
                 )),
-            execution: ObjectReference::nil(),
+            execution: ObjectRef::new(
+                ObjectName::from_parsed("execution-0").expect("a generated form is a valid name"),
+                ulid::Ulid::nil(),
+            ),
             resource: "service-a".to_string(),
             arguments: Value::Null,
             status,
@@ -412,7 +416,7 @@ mod tests {
     #[test]
     fn a_task_slot_admits_only_an_activity_owner() {
         let owner =
-            OwnerRef::<ActivityKind>::new(ObjectName::plain("invoke").unwrap(), ulid::Ulid::new());
+            ObjectRef::<ActivityKind>::new(ObjectName::plain("invoke").unwrap(), ulid::Ulid::new());
         let mut task = at_status(TaskStatus::Pending);
         task.meta = task.meta.with_owner(owner.clone());
         let mut json = serde_json::to_value(&task).expect("task serializes");
@@ -423,6 +427,6 @@ mod tests {
         json["meta"]["owner"]["kind"] = serde_json::json!("Thread");
         let err =
             serde_json::from_value::<Task>(json).expect_err("a task is never owned by a thread");
-        assert!(err.to_string().contains("owner kind mismatch"), "{err}");
+        assert!(err.to_string().contains("reference kind mismatch"), "{err}");
     }
 }

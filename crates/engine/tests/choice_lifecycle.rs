@@ -11,11 +11,12 @@ use common::{
 };
 use serde_json::json;
 use spica_engine::{
-    ActivateState, Activity, ActivityStatus, Command, CompleteExecution, CompleteState,
-    CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution, ExecutionCreated,
-    ExecutionError, ExecutionStatus, Flow, FlowCreated, FlowStatus, FlowVersion,
-    FlowVersionCreated, ObjectKind, RuntimeError, StateTransitioned, TerminateExecution,
-    TerminateState, TerminateThread, TerminationReason, Thread, ThreadStatus, VariablesAssigned,
+    ActivateState, Activity, ActivityKind, ActivityStatus, Command, CompleteExecution,
+    CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution,
+    ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow, FlowCreated,
+    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, RuntimeError, StateTransitioned,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
+    ThreadStatus, VariablesAssigned,
 };
 
 #[rustfmt::skip]
@@ -69,7 +70,7 @@ async fn choice_first_matching_rule_wins() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 10}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -77,7 +78,7 @@ async fn choice_first_matching_rule_wins() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 10}),
                     output: None,
@@ -87,7 +88,7 @@ async fn choice_first_matching_rule_wins() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -97,8 +98,8 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Picker"),
                 input: json!({"n": 10}),
             })),
@@ -106,7 +107,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 10}),
@@ -121,7 +122,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 10}),
@@ -133,14 +134,14 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"n": 10}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 10}),
@@ -155,7 +156,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 10}),
@@ -167,12 +168,12 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/Big"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Big"),
                 input: json!({"n": 10}),
             })),
@@ -180,7 +181,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Big"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 10}),
@@ -195,7 +196,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Big"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 10}),
@@ -207,14 +208,14 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
                 output: json!({"n": 10}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Big"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 10}),
@@ -229,7 +230,7 @@ async fn choice_first_matching_rule_wins() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Big"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 10}),
@@ -241,14 +242,14 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"branch": "big"}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -261,7 +262,7 @@ async fn choice_first_matching_rule_wins() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -271,14 +272,14 @@ async fn choice_first_matching_rule_wins() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"branch": "big"}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 10}),
                     output: Some(json!({"branch": "big"})),
@@ -288,7 +289,7 @@ async fn choice_first_matching_rule_wins() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 10}),
                     output: Some(json!({"branch": "big"})),
@@ -354,7 +355,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"v": 25}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -362,7 +363,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"v": 25}),
                     output: None,
@@ -372,7 +373,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -382,8 +383,8 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Picker"),
                 input: json!({"v": 25}),
             })),
@@ -391,7 +392,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 25}),
@@ -406,7 +407,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 25}),
@@ -418,14 +419,14 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"v": 25}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"v": 25}),
@@ -437,14 +438,14 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Event(Event::VariablesAssigned(VariablesAssigned {
-                scope: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                scope: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 variables: vars(&[("range", json!("rule"))]),
             })),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"v": 25}),
@@ -456,12 +457,12 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/Done"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Done"),
                 input: json!({"chosen": "rule", "range": "rule"}),
             })),
@@ -469,7 +470,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Done"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"chosen": "rule", "range": "rule"}),
@@ -484,7 +485,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Done"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"chosen": "rule", "range": "rule"}),
@@ -496,14 +497,14 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
                 output: json!({"chosen": "rule", "range": "rule"}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Done"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"chosen": "rule", "range": "rule"}),
@@ -518,7 +519,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Done"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"chosen": "rule", "range": "rule"}),
@@ -530,14 +531,14 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"chosen": "rule", "range": "rule"}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -550,7 +551,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -560,14 +561,14 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"chosen": "rule", "range": "rule"}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"v": 25}),
                     output: Some(json!({"chosen": "rule", "range": "rule"})),
@@ -577,7 +578,7 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"v": 25}),
                     output: Some(json!({"chosen": "rule", "range": "rule"})),
@@ -637,7 +638,7 @@ async fn choice_without_a_match_takes_the_default() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -645,7 +646,7 @@ async fn choice_without_a_match_takes_the_default() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"v": 1}),
                     output: None,
@@ -655,7 +656,7 @@ async fn choice_without_a_match_takes_the_default() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -665,8 +666,8 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Picker"),
                 input: json!({"v": 1}),
             })),
@@ -674,7 +675,7 @@ async fn choice_without_a_match_takes_the_default() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -689,7 +690,7 @@ async fn choice_without_a_match_takes_the_default() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -701,14 +702,14 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"v": 1}),
@@ -720,14 +721,14 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Event(Event::VariablesAssigned(VariablesAssigned {
-                scope: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                scope: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 variables: vars(&[("range", json!("state"))]),
             })),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"v": 1}),
@@ -739,12 +740,12 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/Fallback"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Fallback"),
                 input: json!({"chosen": "default", "range": "state"}),
             })),
@@ -752,7 +753,7 @@ async fn choice_without_a_match_takes_the_default() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Fallback"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"chosen": "default", "range": "state"}),
@@ -767,7 +768,7 @@ async fn choice_without_a_match_takes_the_default() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Fallback"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"chosen": "default", "range": "state"}),
@@ -779,14 +780,14 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
                 output: json!({"chosen": "default", "range": "state"}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Fallback"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"chosen": "default", "range": "state"}),
@@ -801,7 +802,7 @@ async fn choice_without_a_match_takes_the_default() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Fallback"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"chosen": "default", "range": "state"}),
@@ -813,14 +814,14 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"chosen": "default", "range": "state"}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -833,7 +834,7 @@ async fn choice_without_a_match_takes_the_default() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -843,14 +844,14 @@ async fn choice_without_a_match_takes_the_default() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"chosen": "default", "range": "state"}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"v": 1}),
                     output: Some(json!({"chosen": "default", "range": "state"})),
@@ -860,7 +861,7 @@ async fn choice_without_a_match_takes_the_default() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"v": 1}),
                     output: Some(json!({"chosen": "default", "range": "state"})),
@@ -916,7 +917,7 @@ async fn choice_without_a_match_or_default_fails() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -924,7 +925,7 @@ async fn choice_without_a_match_or_default_fails() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"v": 1}),
                     output: None,
@@ -934,7 +935,7 @@ async fn choice_without_a_match_or_default_fails() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -944,8 +945,8 @@ async fn choice_without_a_match_or_default_fails() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Picker"),
                 input: json!({"v": 1}),
             })),
@@ -953,7 +954,7 @@ async fn choice_without_a_match_or_default_fails() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -968,7 +969,7 @@ async fn choice_without_a_match_or_default_fails() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -980,14 +981,14 @@ async fn choice_without_a_match_or_default_fails() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"v": 1}),
@@ -999,7 +1000,7 @@ async fn choice_without_a_match_or_default_fails() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
                         state: "Picker".to_string(),
@@ -1007,7 +1008,7 @@ async fn choice_without_a_match_or_default_fails() {
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
                         state: "Picker".to_string(),
@@ -1018,7 +1019,7 @@ async fn choice_without_a_match_or_default_fails() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
@@ -1037,7 +1038,7 @@ async fn choice_without_a_match_or_default_fails() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
@@ -1056,7 +1057,7 @@ async fn choice_without_a_match_or_default_fails() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -1082,7 +1083,7 @@ async fn choice_without_a_match_or_default_fails() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -1099,7 +1100,7 @@ async fn choice_without_a_match_or_default_fails() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
                             state: "Picker".to_string(),
@@ -1113,7 +1114,7 @@ async fn choice_without_a_match_or_default_fails() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
                             state: "Picker".to_string(),
@@ -1179,7 +1180,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1187,7 +1188,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"v": 1}),
                     output: None,
@@ -1197,7 +1198,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -1207,8 +1208,8 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Picker"),
                 input: json!({"v": 1}),
             })),
@@ -1216,7 +1217,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -1231,7 +1232,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"v": 1}),
@@ -1243,14 +1244,14 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"v": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"v": 1}),
@@ -1262,7 +1263,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::Jsonata {
                         field: "{% $states.input.v + 1 %}".to_string(),
@@ -1271,7 +1272,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::Jsonata {
                         field: "{% $states.input.v + 1 %}".to_string(),
@@ -1283,7 +1284,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::Jsonata {
@@ -1303,7 +1304,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Picker"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::Jsonata {
@@ -1323,7 +1324,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -1351,7 +1352,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Picker".to_string(),
                     index: 0,
@@ -1369,7 +1370,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::Jsonata {
                             field: "{% $states.input.v + 1 %}".to_string(),
@@ -1384,7 +1385,7 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::Jsonata {
                             field: "{% $states.input.v + 1 %}".to_string(),

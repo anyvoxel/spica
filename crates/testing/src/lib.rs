@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use mockall::mock;
 use spica_engine_types::storage::ReadonlyStorageTxn;
 use spica_engine_types::{
-    ActivityRecord, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectReference, StorageError,
-    TaskRecord, ThreadRecord, TimerRecord, Timestamp,
+    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
+    FlowVersionKind, ObjectRef, RawObjectRef, StorageError, TaskKind, TaskRecord, ThreadKind,
+    ThreadRecord, TimerKind, TimerRecord, Timestamp,
 };
 
 mock! {
@@ -34,28 +35,28 @@ mock! {
     impl ReadonlyStorageTxn for ReadonlyStorageTxn {
         async fn get_execution(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ExecutionKind>,
         ) -> Result<Option<ExecutionRecord>, StorageError>;
         async fn get_thread(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ThreadKind>,
         ) -> Result<Option<ThreadRecord>, StorageError>;
         async fn get_activity(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ActivityKind>,
         ) -> Result<Option<ActivityRecord>, StorageError>;
         async fn get_timer(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TimerKind>,
         ) -> Result<Option<TimerRecord>, StorageError>;
         async fn get_task(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TaskKind>,
         ) -> Result<Option<TaskRecord>, StorageError>;
         async fn get_children(
             &self,
-            id: ObjectReference,
-        ) -> Result<HashSet<ObjectReference>, StorageError>;
+            id: RawObjectRef,
+        ) -> Result<HashSet<RawObjectRef>, StorageError>;
         async fn activatable_tasks(
             &self,
             resource: &str,
@@ -68,7 +69,7 @@ mock! {
         ) -> Result<Option<Flow>, StorageError>;
         async fn get_flow_version(
             &self,
-            version: &ObjectReference,
+            version: &ObjectRef<FlowVersionKind>,
         ) -> Result<Option<FlowVersion>, StorageError>;
         async fn flow_version_of(
             &self,

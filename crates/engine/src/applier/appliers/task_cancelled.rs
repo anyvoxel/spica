@@ -2,7 +2,7 @@
 
 use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 use crate::{Task, TaskStatus};
 
@@ -17,13 +17,13 @@ impl TaskCancelledApplier {
         // Mark the task Cancelled and drain it from its owning activity. The physical call is left
         // running; a later `CompleteTask` for this task is swallowed by the `CompleteTaskHandler`'s
         // non-`Running` guard.
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
             let parent = t
                 .meta
                 .owner
                 .clone()
-                // The slot is an `OwnerRef<ActivityKind>` and `active_children` speaks flat addresses.
-                .into_erased();
+                // The slot is an `ObjectRef<ActivityKind>` and `active_children` speaks flat addresses.
+                .into_raw_object_ref();
             t.status = TaskStatus::Cancelled;
             // Sync the domain value's transition stamp from the event (see task_completed.rs).
             t.value.meta.with_update_at(task.meta.updated_at);

@@ -3,7 +3,7 @@
 use crate::ApplierContext;
 use crate::Timer;
 use crate::types::error::ExecutionError;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 use crate::TimerStatus;
 
@@ -15,7 +15,7 @@ impl TimerTriggeredApplier {
         ctx: &mut ApplierContext<'_>,
         timer: &Timer,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut t) = ctx.storage.get_timer(&timer.meta.reference()).await? {
+        if let Some(mut t) = ctx.storage.get_timer(&timer.meta.typed_reference()).await? {
             let parent = t.value.meta.owner.clone();
             t.value.status = TimerStatus::Completed;
             // Sync the domain value's transition stamp from the event (the row's own `updated_at` is
@@ -24,7 +24,7 @@ impl TimerTriggeredApplier {
             t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
             ctx.storage
-                .remove_child(parent.into_erased(), timer.meta.reference())
+                .remove_child(parent.into_raw_object_ref(), timer.meta.reference())
                 .await?;
         }
         Ok(())

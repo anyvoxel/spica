@@ -3,7 +3,10 @@ use crate::types::command::{
     Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectKind};
+use crate::types::meta::{HasRawObjectRef, ObjectKind};
+use crate::types::task::TaskKind;
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 
 /// Handles `Command::TerminateState`: the abnormal finish of the activity bound to it, with
 /// `reason`. Emits `StateTerminating`, sweeps the activity's owned children (M1: only timers —
@@ -54,8 +57,8 @@ impl TerminateStateHandler {
                 super::child_completed::child_settled(
                     ctx,
                     out,
-                    act.value.meta.owner.clone().into_erased(),
-                    activity.clone(),
+                    act.value.meta.owner.clone().into_raw_object_ref(),
+                    activity.as_raw_object_ref().clone(),
                 )
                 .await;
                 return Ok(());
@@ -97,7 +100,9 @@ impl TerminateStateHandler {
         for child in children {
             match child.kind {
                 ObjectKind::Timer => {
-                    out.append_command(Command::CancelTimer { timer: child });
+                    out.append_command(Command::CancelTimer {
+                        timer: child.typed::<TimerKind>(),
+                    });
                     pending += 1;
                 }
                 // A `Parallel` state's in-flight branches are child *executions* rooted under this
@@ -119,7 +124,7 @@ impl TerminateStateHandler {
                 // the name-addressed `TerminateExecution` above.
                 ObjectKind::Thread => {
                     out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.clone(),
+                        thread: child.clone().typed::<ThreadKind>(),
                         reason: reason.clone(),
                     }));
                     pending += 1;
@@ -132,7 +137,9 @@ impl TerminateStateHandler {
                 // it. The physical call is left running; a later `CompleteTask` is swallowed by the
                 // `CompleteTaskHandler`'s non-Running guard.
                 ObjectKind::Task => {
-                    out.append_command(Command::CancelTask { task: child });
+                    out.append_command(Command::CancelTask {
+                        task: child.typed::<TaskKind>(),
+                    });
                     pending += 1;
                 }
                 // A node container never owns a Flow/FlowVersion child (no such reachable tree edge).
@@ -150,8 +157,8 @@ impl TerminateStateHandler {
             super::child_completed::child_settled(
                 ctx,
                 out,
-                act.value.meta.owner.clone().into_erased(),
-                activity.clone(),
+                act.value.meta.owner.clone().into_raw_object_ref(),
+                activity.as_raw_object_ref().clone(),
             )
             .await;
         } else {

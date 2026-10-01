@@ -28,7 +28,7 @@ struct PassStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for PassStateHandler<'_> {
-    // Pass's projection — `Assign` (a delta on the execution scope, emitted as `VariablesAssigned`)
+    // Pass's projection — `Assign` (a delta on the owning scope, emitted as `VariablesAssigned`)
     // then `Output` (defaults to the input) — is the canonical ASL success projection and is exactly
     // the base's default `finish`: Pass supplies only its own `Assign`/`Output` sources and routing.
     fn assign(&self) -> Option<&AssignObject> {
@@ -62,6 +62,7 @@ mod tests {
     };
     use crate::types::error::{ExecutionError, RuntimeError};
     use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
+    use crate::types::meta::HasRawObjectRef;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Variables};
 
     // These exercise the base-owned `StateHandler::activate` — the Template Method a `Pass` inherits
@@ -123,7 +124,10 @@ mod tests {
         assert_eq!(row.value.status, ActivityStatus::Running);
         assert_eq!(row.created_at, at());
         assert!(
-            activated.children(&thread_ref()).await.contains(&activity),
+            activated
+                .children(thread_ref().as_raw_object_ref())
+                .await
+                .contains(activity.as_raw_object_ref()),
             "StateActivating folds the owner's child edge"
         );
         assert_eq!(
@@ -165,8 +169,8 @@ mod tests {
                     reason: reason.clone(),
                 })),
                 EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                    name: execution_ref().name,
-                    uid: Some(execution_ref().uid),
+                    name: execution_ref().name().clone(),
+                    uid: Some(execution_ref().uid()),
                     reason,
                 })),
             ]

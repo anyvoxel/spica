@@ -32,7 +32,7 @@ impl TasksClaimedApplier {
         // what a poll grants is exactly what the fold accepts — including a steal, which lands as an
         // ordinary claim: the expired lease is simply claimable again.
         for task in tasks {
-            if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await?
+            if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await?
                 && t.is_claimable_at(ctx.timestamp)
             {
                 t.status = TaskStatus::Running;

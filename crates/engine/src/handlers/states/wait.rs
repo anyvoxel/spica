@@ -218,7 +218,7 @@ mod tests {
         ActivateState, Command, TerminateState, TerminateThread, TerminationReason,
     };
     use crate::types::event::{Event, StateTransitioned};
-    use crate::types::meta::ObjectMeta;
+    use crate::types::meta::{HasRawObjectRef, ObjectMeta};
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
 
     // A `Wait`'s activation product: the deadline is resolved in `process_input` (so it is a property
@@ -299,7 +299,7 @@ mod tests {
         let timer = resume_timer(resume_at).meta.reference();
         assert!(
             activated
-                .children(&minted_activity_ref())
+                .children(minted_activity_ref().as_raw_object_ref())
                 .await
                 .contains(&timer),
             "TimerActivated folds the owner's child edge"

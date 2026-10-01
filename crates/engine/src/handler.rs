@@ -8,11 +8,14 @@ use crate::eval_env::EvalEnv;
 use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::log::{Entry, EntryPayload, Timestamp};
 use crate::storage::ReadonlyStorageTxn;
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, TerminateState, TerminationReason};
 use crate::types::error::{ExecutionError, RuntimeError, StorageError};
 use crate::types::event::Event;
+use crate::types::execution::ExecutionKind;
+use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{EntryId, RequestId, StreamId};
-use crate::types::meta::{ObjectReference, OwnerScope};
+use crate::types::meta::{ObjectRef, OwnerScope};
 use crate::types::reject::{Reject, RejectionType};
 use crate::working::WorkingState;
 
@@ -159,9 +162,12 @@ impl<'a> Collector<'a> {
     /// `scope` is `None` when the site could not resolve one (the activity row that would name it
     /// could not be read): the failure is then recorded at the activity level alone, and the log
     /// names that activity rather than terminating into an address no object answers to.
+    ///
+    /// `activity` is the state that failed — `None` at a site with no state context (see
+    /// [`fail_execution`](Self::fail_execution)).
     pub fn terminate(
         &mut self,
-        activity: Option<ObjectReference>,
+        activity: Option<ObjectRef<ActivityKind>>,
         scope: Option<OwnerScope>,
         error: ExecutionError,
     ) {
@@ -182,8 +188,8 @@ impl<'a> Collector<'a> {
     }
 
     /// Convenience for `terminate` at a site where the execution itself failed (no state context).
-    pub fn fail_execution(&mut self, execution: &ObjectReference, error: ExecutionError) {
-        self.terminate(None, OwnerScope::of_reference(execution), error);
+    pub fn fail_execution(&mut self, execution: &ObjectRef<ExecutionKind>, error: ExecutionError) {
+        self.terminate(None, Some(OwnerScope::Execution(execution.clone())), error);
     }
 
     /// Consume the collector, returning the collected [`Entry`]s. The
@@ -258,7 +264,7 @@ pub struct HandlerContext<'a> {
     /// The StreamProcessor's per-version machine cache. Handlers resolve the machine an execution is
     /// bound to through [`Self::machine`], never from a single in-memory `sm` — so a recovered
     /// Engine re-resolves definitions by id from storage instead of re-supplying them.
-    pub definitions: &'a mut HashMap<ObjectReference, Arc<StateMachine>>,
+    pub definitions: &'a mut HashMap<ObjectRef<FlowVersionKind>, Arc<StateMachine>>,
 
     // TODO：这个变量的名称不应该叫做 definitions
     /// The shared `State` → [`StateHandlerFactory`] dispatch table, threaded through so the inline
@@ -291,7 +297,7 @@ impl HandlerContext<'_> {
     /// (e.g. its definition was GC'd).
     pub async fn machine(
         &mut self,
-        flow_version: &ObjectReference,
+        flow_version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Arc<StateMachine>, ExecutionError> {
         if let Some(m) = self.definitions.get(flow_version) {
             return Ok(m.clone());

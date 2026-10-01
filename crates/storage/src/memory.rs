@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use spica_engine_types::{
-    ActivityRecord, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind, ObjectName,
-    ObjectReference, Storage, StorageError, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-    Timestamp,
+    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
+    FlowVersionKind, ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError,
+    StorageTxn, TaskKind, TaskRecord, ThreadKind, ThreadRecord, TimerKind, TimerRecord, Timestamp,
 };
 
 /// The in-memory projection state, kept behind a shared interior (see [`InMemoryStorage`]). The
@@ -44,7 +44,7 @@ struct InMemoryDb {
 ///
 /// Mirrors the persisted KV layout at the Rust-map level: a flow is addressed by its immutable
 /// `name` (`flow_id` is audit-only, never an addressing key — executions bind a version's
-/// [`ObjectReference`]), and each version row is keyed by its own `{flow}-{version}` name.
+/// [`RawObjectRef`]), and each version row is keyed by its own `{flow}-{version}` name.
 ///
 /// The maps live behind an `Arc<Mutex<InMemoryDb>>` so [`Storage::begin_txn`] can hand a fold an
 /// **owned** [`InMemoryTxn`] (an `Arc` clone) without borrowing `&mut self` — matching the owned
@@ -74,7 +74,7 @@ impl InMemoryStorage {
 }
 
 impl InMemoryDb {
-    fn children(&self, id: &ObjectReference) -> HashSet<ObjectReference> {
+    fn children(&self, id: &RawObjectRef) -> HashSet<RawObjectRef> {
         match id.kind {
             ObjectKind::Execution => self
                 .executions
@@ -99,7 +99,7 @@ impl InMemoryDb {
         }
     }
 
-    fn remove_child(&mut self, parent: &ObjectReference, child: &ObjectReference) {
+    fn remove_child(&mut self, parent: &RawObjectRef, child: &RawObjectRef) {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(exec) = self.executions.get_mut(&parent.name) {
@@ -121,7 +121,7 @@ impl InMemoryDb {
         }
     }
 
-    fn add_child(&mut self, parent: &ObjectReference, child: ObjectReference) {
+    fn add_child(&mut self, parent: &RawObjectRef, child: RawObjectRef) {
         match parent.kind {
             ObjectKind::Execution => {
                 if let Some(exec) = self.executions.get_mut(&parent.name) {
@@ -148,37 +148,37 @@ impl InMemoryDb {
 impl Storage for InMemoryStorage {
     async fn get_execution(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
-        Ok(self.db().executions.get(&reference.name).cloned())
+        Ok(self.db().executions.get(reference.name()).cloned())
     }
 
     async fn get_thread(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError> {
-        Ok(self.db().threads.get(&reference.name).cloned())
+        Ok(self.db().threads.get(reference.name()).cloned())
     }
 
     async fn get_activity(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError> {
-        Ok(self.db().activities.get(&reference.name).cloned())
+        Ok(self.db().activities.get(reference.name()).cloned())
     }
 
     async fn get_timer(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError> {
-        Ok(self.db().timers.get(&reference.name).cloned())
+        Ok(self.db().timers.get(reference.name()).cloned())
     }
 
     async fn get_task(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError> {
-        Ok(self.db().tasks.get(&reference.name).cloned())
+        Ok(self.db().tasks.get(reference.name()).cloned())
     }
 
     async fn activatable_tasks(
@@ -198,10 +198,7 @@ impl Storage for InMemoryStorage {
             .collect())
     }
 
-    async fn get_children(
-        &self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError> {
+    async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError> {
         Ok(self.db().children(&id))
     }
 
@@ -276,8 +273,8 @@ impl Storage for InMemoryStorage {
 
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         self.db().remove_child(&parent, &child);
         Ok(())
@@ -285,8 +282,8 @@ impl Storage for InMemoryStorage {
 
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         self.db().add_child(&parent, child);
         Ok(())
@@ -310,9 +307,9 @@ impl Storage for InMemoryStorage {
 
     async fn get_flow_version(
         &self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError> {
-        Ok(self.db().flow_versions.get(&version.name).cloned())
+        Ok(self.db().flow_versions.get(version.name()).cloned())
     }
 
     async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
@@ -393,10 +390,10 @@ struct InMemoryTxn {
 impl StorageTxn for InMemoryTxn {
     async fn get_execution(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
-        if let Some(exec) = self.batch.executions.get(&reference.name) {
+        if let Some(exec) = self.batch.executions.get(reference.name()) {
             return Ok(Some(exec.clone()));
         }
         Ok(self
@@ -404,16 +401,16 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .executions
-            .get(&reference.name)
+            .get(reference.name())
             .cloned())
     }
 
     async fn get_thread(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
-        if let Some(thread) = self.batch.threads.get(&reference.name) {
+        if let Some(thread) = self.batch.threads.get(reference.name()) {
             return Ok(Some(thread.clone()));
         }
         Ok(self
@@ -421,15 +418,15 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .threads
-            .get(&reference.name)
+            .get(reference.name())
             .cloned())
     }
 
     async fn get_activity(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError> {
-        if let Some(act) = self.batch.activities.get(&reference.name) {
+        if let Some(act) = self.batch.activities.get(reference.name()) {
             return Ok(Some(act.clone()));
         }
         Ok(self
@@ -437,15 +434,15 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .activities
-            .get(&reference.name)
+            .get(reference.name())
             .cloned())
     }
 
     async fn get_timer(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError> {
-        if let Some(timer) = self.batch.timers.get(&reference.name) {
+        if let Some(timer) = self.batch.timers.get(reference.name()) {
             return Ok(Some(timer.clone()));
         }
         Ok(self
@@ -453,15 +450,15 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .timers
-            .get(&reference.name)
+            .get(reference.name())
             .cloned())
     }
 
     async fn get_task(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError> {
-        if let Some(task) = self.batch.tasks.get(&reference.name) {
+        if let Some(task) = self.batch.tasks.get(reference.name()) {
             return Ok(Some(task.clone()));
         }
         Ok(self
@@ -469,7 +466,7 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .tasks
-            .get(&reference.name)
+            .get(reference.name())
             .cloned())
     }
 
@@ -500,21 +497,21 @@ impl StorageTxn for InMemoryTxn {
 
     async fn get_children(
         &mut self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError> {
+        id: RawObjectRef,
+    ) -> Result<HashSet<RawObjectRef>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
-                .get_execution(&id)
+                .get_execution(&id.clone().typed::<ExecutionKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Thread => self
-                .get_thread(&id)
+                .get_thread(&id.clone().typed::<ThreadKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Activity => self
-                .get_activity(&id)
+                .get_activity(&id.clone().typed::<ActivityKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
@@ -554,8 +551,8 @@ impl StorageTxn for InMemoryTxn {
     /// and buffer the result into this fold's batch (atomicity at commit).
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         self.buffer_child_mutation(&parent, &child, false);
         Ok(())
@@ -565,8 +562,8 @@ impl StorageTxn for InMemoryTxn {
     /// buffer the result into this fold's batch (atomicity at commit).
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         self.buffer_child_mutation(&parent, &child, true);
         Ok(())
@@ -599,9 +596,9 @@ impl StorageTxn for InMemoryTxn {
 
     async fn get_flow_version(
         &mut self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError> {
-        if let Some(ver) = self.batch.flow_versions.get(&version.name) {
+        if let Some(ver) = self.batch.flow_versions.get(version.name()) {
             return Ok(Some(ver.clone()));
         }
         Ok(self
@@ -609,7 +606,7 @@ impl StorageTxn for InMemoryTxn {
             .lock()
             .expect("in-memory storage lock poisoned")
             .flow_versions
-            .get(&version.name)
+            .get(version.name())
             .cloned())
     }
 
@@ -681,12 +678,7 @@ impl InMemoryTxn {
     /// mutated row into this fold's batch. Reading the batch first (read-your-writes) is what lets a
     /// read-modify-write compose with an earlier `put_execution`/`add_child` of the same row in the
     /// same fold without clobbering it.
-    fn buffer_child_mutation(
-        &mut self,
-        parent: &ObjectReference,
-        child: &ObjectReference,
-        insert: bool,
-    ) {
+    fn buffer_child_mutation(&mut self, parent: &RawObjectRef, child: &RawObjectRef, insert: bool) {
         match parent.kind {
             ObjectKind::Execution => {
                 let base = self
@@ -781,15 +773,13 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine_types::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, OwnerRef, PlainName, RetryState,
-        Task, TaskStatus, Timestamp, Variables,
+        Execution, ExecutionStatus, ObjectRef, PlainName, RetryState, Task, TaskStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
-    fn test_exec_ref() -> ObjectReference {
+    fn test_exec_ref() -> ObjectRef<ExecutionKind> {
         let uid = ulid::Ulid::new();
-        ObjectReference::new(
-            ObjectKind::Execution,
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -798,23 +788,21 @@ mod tests {
     }
 
     /// A minimal running execution row for exercising the in-memory store.
-    fn sample_execution(id: ObjectReference) -> ExecutionRecord {
+    fn sample_execution(id: ObjectRef<ExecutionKind>) -> ExecutionRecord {
         ExecutionRecord {
             value: Execution {
                 deadline: None,
-                flow_version: ObjectReference::new(
-                    ObjectKind::FlowVersion,
+                flow_version: ObjectRef::new(
                     PlainName::new("flow").unwrap().generated_from_key(1),
                     ulid::Ulid::nil(),
                 ),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine_types::ObjectMeta::builder(id.uid)
+                meta: spica_engine_types::ObjectMeta::builder(id.uid())
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .with_owner(spica_engine_types::NoOwner::new()),
             },
-            variables: Variables::new(),
             active_children: HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -845,7 +833,7 @@ mod tests {
     ) -> TaskRecord {
         TaskRecord {
             value: Task {
-                execution: ObjectReference::nil(),
+                execution: ObjectRef::nil(),
                 resource: resource.to_string(),
                 arguments: Value::Null,
                 status,
@@ -860,7 +848,7 @@ mod tests {
                 },
                 meta: spica_engine_types::ObjectMeta::builder(id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(OwnerRef::new(
+                    .with_owner(ObjectRef::new(
                         PlainName::new("invoke").unwrap().generated_from_key(1),
                         ulid::Ulid::nil(),
                     )),

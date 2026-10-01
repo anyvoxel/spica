@@ -11,7 +11,11 @@ impl ThreadTerminatingApplier {
         ctx: &mut ApplierContext<'_>,
         thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut row) = ctx.storage.get_thread(&thread.meta.reference()).await? {
+        if let Some(mut row) = ctx
+            .storage
+            .get_thread(&thread.meta.typed_reference())
+            .await?
+        {
             row.status = thread.status.clone();
             row.value.meta.updated_at = thread.meta.updated_at;
             row.with_update_at(ctx.timestamp);

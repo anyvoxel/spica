@@ -7,11 +7,12 @@ use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::eval_env::{EvalEnv, extract_jsonata};
 use crate::handler::Collector;
+use crate::types::activity::ActivityKind;
 use crate::types::command::{ActivateState, Command};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::meta::{ErasedOwner, ObjectReference};
+use crate::types::meta::ObjectRef;
 use crate::types::variables::Variables;
 
 pub struct ChoiceStateHandlerFactory;
@@ -99,7 +100,7 @@ impl StateHandler for ChoiceStateHandler<'_> {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -126,7 +127,7 @@ impl StateHandler for ChoiceStateHandler<'_> {
         // pass-through fallback is the processed input.
         let mut local_scope = variables.clone();
         let owner = activity_value.meta.owner.clone();
-        self.apply_assign(out, env, owner.erased(), assign, &states, &mut local_scope)
+        self.apply_assign(out, env, &owner, assign, &states, &mut local_scope)
             .await?;
         let output_value = self
             .project_output(
@@ -149,8 +150,7 @@ impl StateHandler for ChoiceStateHandler<'_> {
         .await;
         out.append_command(Command::ActivateState(ActivateState {
             execution: activity_value.execution.clone(),
-            // The flat form the command payload speaks (the same owner the local already holds).
-            owner: owner.into_erased(),
+            owner,
             state_path: next_path,
             input: output_value,
         }));

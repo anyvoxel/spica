@@ -4,14 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, OwnerRef};
-use spica_machinery::Timestamp;
-// `RetryState` is the shared retry run-state defined alongside the task types it references
-// (`task::RetrierAttemptState`); an activity embeds the same struct a task does.
 use crate::types::command::TerminationReason;
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef};
 use crate::types::task::RetryState;
 use crate::types::thread::ThreadKind;
 use spica_asl::StatePath;
+use spica_machinery::Timestamp;
 
 /// Lifecycle status of an Activity — the execution of a single state within an Execution.
 ///
@@ -82,9 +81,9 @@ pub enum ActivityState {
 /// `Parallel`-specific state that exists because this activity is executing a `Parallel`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ParallelActivityState {
-    /// Branch index → child execution, populated by `Event::ThreadCreated` (from each thread's own
+    /// Branch index → child thread, populated by `Event::ThreadCreated` (from each thread's own
     /// `index`) as branches fan out, so convergence can aggregate outputs in declaration order.
-    pub branches: HashMap<usize, ObjectReference>,
+    pub branches: HashMap<usize, ObjectRef<ThreadKind>>,
 }
 
 /// A `Wait` state's activity-level runtime repository — the absolute instant the wait resumes.
@@ -122,8 +121,8 @@ pub struct MapActivityState {
     pub items: Vec<Value>,
     pub total: usize,
     pub max_concurrency: usize,
-    /// Item index → child execution, populated by `ThreadCreated` as items fan out.
-    pub children: HashMap<usize, ObjectReference>,
+    /// Item index → child thread, populated by `ThreadCreated` as items fan out.
+    pub children: HashMap<usize, ObjectRef<ThreadKind>>,
 }
 
 /// The [`ObjectKindMarker`] tying an [`Activity`]'s meta to [`ObjectKind::Activity`].
@@ -134,8 +133,8 @@ impl ObjectKindMarker for ActivityKind {
     const KIND: ObjectKind = ObjectKind::Activity;
     /// A state runs inside exactly one scope, and that scope is always a [`Thread`](crate::Thread) —
     /// the derived root thread for a top-level run, or a fan-out branch's thread. So the slot is an
-    /// [`OwnerRef`] rather than a union: an activity owned by an `Execution` directly is unrepresentable.
-    type OwnedBy = OwnerRef<ThreadKind>;
+    /// [`ObjectRef`] rather than a union: an activity owned by an `Execution` directly is unrepresentable.
+    type OwnedBy = ObjectRef<ThreadKind>;
 }
 
 /// The event-carried domain value of an Activity.
@@ -148,7 +147,8 @@ impl ObjectKindMarker for ActivityKind {
 pub struct Activity {
     /// Shared identity + timing metadata. `meta.uid` is the activity's identity (durable object uid);
     /// the domain `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside
-    /// `meta`. Use [`Activity::reference`] to obtain the canonical [`ObjectReference`].
+    /// `meta`. Use [`Self::reference`](crate::types::meta::ObjectMeta::reference) to obtain the
+    /// canonical [`RawObjectRef`].
     pub meta: ObjectMeta<ActivityKind>,
     /// The execution this activity belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s reference
     /// (the flat query anchor shared by the whole tree), regardless of how deep the activity sits in
@@ -157,7 +157,7 @@ pub struct Activity {
     /// (see [`ActivityKind::OwnedBy`]): a top-level run's states are owned by the run's derived root
     /// thread, a fan-out branch's by that branch's thread. So `execution` names a real `Execution` by
     /// construction, while the scope edge carries its own type.
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     /// The complete JSON Pointer (RFC 6901) to this state's definition within the shared machine
     /// document, e.g. `/States/P2` (top-level) or `/States/P1/Branches/0/States/P2` (inside a
     /// Parallel branch). The leaf state name (the activity's identity — the state's key in the
@@ -226,8 +226,10 @@ mod tests {
     /// is always owned by the scope whose machine it runs in, never by a run or a timer.
     #[test]
     fn an_activity_slot_admits_only_a_thread_owner() {
-        let owner =
-            OwnerRef::<ThreadKind>::new(ObjectName::plain("execution").unwrap(), ulid::Ulid::new());
+        let owner = ObjectRef::<ThreadKind>::new(
+            ObjectName::plain("execution").unwrap(),
+            ulid::Ulid::new(),
+        );
         let mut json = serde_json::to_value(
             ObjectMeta::<ActivityKind>::builder(ulid::Ulid::new())
                 .at(Timestamp::from_millis(0))
@@ -243,7 +245,7 @@ mod tests {
         let err = serde_json::from_value::<ObjectMeta<ActivityKind>>(json)
             .expect_err("an activity is never owned by a run");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
-        assert!(msg.contains("admits only Thread owners"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Thread"), "{msg}");
     }
 }

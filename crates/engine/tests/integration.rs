@@ -1334,11 +1334,11 @@ async fn parallel_routes_next_after_convergence() {
 
 #[tokio::test]
 async fn parallel_branch_assign_reads_parent_and_owns_scope() {
-    // A branch reads a parent-scope variable (`$g`, assigned at the execution scope) and assigns its
-    // own thread-scoped variable, then reads both back within the branch. Exercises finding #6
-    // end-to-end: the branch `Assign` must land on the branch `Thread` (not be silently dropped by
-    // the old execution-only applier) and the thread must inherit the enclosing execution's
-    // variables. A correct result proves both — either failure would error/terminate instead.
+    // A branch reads a parent-scope variable (`$g`, assigned by a top-level state into the root
+    // Thread) and assigns its own thread-scoped variable, then reads both back within the branch.
+    // Exercises finding #6 end-to-end: a branch `Assign` must land on the branch `Thread`, and the
+    // thread must inherit the enclosing scope's variables. A correct result proves both — either
+    // failure would error/terminate instead.
     let sm = parse_sm(
         r#"{
           "StartAt": "SetG",

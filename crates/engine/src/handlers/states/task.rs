@@ -7,9 +7,11 @@ use super::super::{cancel_activity_timers, emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
+use crate::types::activity::ActivityKind;
 use crate::types::command::{ActivateTask, Command, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::ObjectRef;
+use crate::types::task::TaskKind;
 use crate::{Activity, Variables};
 
 pub struct TaskStateHandlerFactory;
@@ -90,7 +92,7 @@ impl StateHandler for TaskStateHandler<'_> {
             Err(e) => (None, Some(e)),
         };
 
-        let activity = activity_value.meta.reference();
+        let activity = activity_value.meta.typed_reference();
         let task_uid = out.mint();
         // The task's reference is minted with a name derived from the owning execution's plain base
         // (finding #13), exactly like the activity (#3) and timer (#11) names — not the opaque
@@ -98,10 +100,10 @@ impl StateHandler for TaskStateHandler<'_> {
         // root run.
         let task_name = activity_value
             .execution
-            .name
+            .name()
             .base()
             .generated_from_key(out.next_generated_seq().await);
-        let task_ref = ObjectReference::new(ObjectKind::Task, task_name, task_uid);
+        let task_ref = ObjectRef::<TaskKind>::new(task_name, task_uid);
         out.append_command(Command::ActivateTask(ActivateTask {
             execution: activity_value.execution.clone(),
             owner: activity.clone(),
@@ -149,7 +151,7 @@ impl StateHandler for TaskStateHandler<'_> {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity: &ObjectReference,
+        activity: &ObjectRef<ActivityKind>,
         _activity_value: &Activity,
     ) -> FinishReadiness {
         cancel_activity_timers(ctx, out, activity.clone()).await;
@@ -256,8 +258,8 @@ mod tests {
     /// The invoked entity's reference: named from the execution's plain base (the same convention the
     /// activity and timer names follow) off the partition counter's second free suffix, and minted
     /// from the injected generator's second id.
-    fn invoked_task_ref() -> ObjectReference {
-        ObjectReference::new(ObjectKind::Task, obj_name("execution-1"), uid(2))
+    fn invoked_task_ref() -> ObjectRef<TaskKind> {
+        ObjectRef::new(obj_name("execution-1"), uid(2))
     }
 
     /// The `TaskTimeout` timer `after_activated` arms: parented on the invoking activity — which is

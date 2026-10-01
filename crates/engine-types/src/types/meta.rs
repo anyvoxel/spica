@@ -8,7 +8,7 @@
 //!   it belongs in the bottom crate shared by every layer. It is re-exported here so engine users
 //!   keep a single import path.
 //! - This module adds the **kind** ([`ObjectKind`]), the **meta** envelope ([`ObjectMeta`]), and the
-//!   reference form ([`ObjectReference`]) built on top — the pieces that couple naming to the
+//!   reference form ([`RawObjectRef`]) built on top — the pieces that couple naming to the
 //!   engine's object model.
 //!
 //! See `docs/identity-and-partitioning-design.md` for the full design.
@@ -28,7 +28,7 @@ use spica_machinery::Timestamp;
 pub use spica_machinery::name::{ObjectName, PlainName, ScopeName};
 
 /// The type of a spica object — the k8s "Kind" of its [`ObjectMeta`]. The reference on an
-/// [`ObjectReference`] carries this kind, so a single value both names an object *and* discriminates
+/// [`RawObjectRef`] carries this kind, so a single value both names an object *and* discriminates
 /// its role (the former node-only `NodeId`/`NodeKind` enums re-encoded the same information by hand);
 /// among the node kinds it covers `Flow`/`FlowVersion` too, which are not nodes in the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ impl std::fmt::Display for ObjectKind {
 pub trait ObjectKindMarker {
     const KIND: ObjectKind;
 
-    /// What stands in this object's owner slot: exactly one kind ([`OwnerRef`]), one of a fixed set
+    /// What stands in this object's owner slot: exactly one kind ([`ObjectRef`]), one of a fixed set
     /// (an entity's own sum type), or nothing at all ([`NoOwner`] — a root object).
     type OwnedBy: OwnerKindMarker;
 }
@@ -102,14 +102,14 @@ pub trait ObjectKindMarker {
 /// What may stand in an owner slot, and how it crosses the wire — the bound on
 /// [`ObjectKindMarker::OwnedBy`].
 ///
-/// A slot's whole optionality lives here: [`Self::as_reference`] is the only owner read that may
+/// A slot's whole optionality lives here: [`Self::to_raw_object_ref`] is the only owner read that may
 /// answer "no address" (a root's [`NoOwner`]), and [`Self::from_wire`] is the only place an absent
-/// `owner` is admitted. Erasure to the flat reference is one level up, in [`ErasedOwner`], which an
-/// empty slot deliberately does not implement — so the engine's owner reads are total on owned
-/// objects and unrepresentable on roots.
+/// `owner` is admitted. The total (non-optional) form of the same read is one level up, in
+/// [`HasRawObjectRef`], which an empty slot deliberately does not implement — so the engine's owner reads
+/// are total on owned objects and unrepresentable on roots.
 pub trait OwnerKindMarker: Clone + std::fmt::Debug + PartialEq {
-    /// The flat owner address, or `None` for a slot that holds no address at all.
-    fn as_reference(&self) -> Option<&ObjectReference>;
+    /// The owner's [`RawObjectRef`], or `None` for a slot that holds no address at all.
+    fn to_raw_object_ref(&self) -> Option<&RawObjectRef>;
 
     /// Fold the wire's optional `owner` into the slot. The absent form is admitted only where the
     /// slot's own type says so, so "an owned object always names its owner" is refused at the read
@@ -126,31 +126,33 @@ pub trait OwnerKindMarker: Clone + std::fmt::Debug + PartialEq {
 }
 
 mod sealed {
-    /// Restricts [`super::ErasedOwner`] to the slots this module defines: a foreign impl could claim
+    /// Restricts [`super::HasRawObjectRef`] to the slots this module defines: a foreign impl could claim
     /// an erasure its own type does not have.
     pub trait Sealed {}
 }
 
-/// An owner slot that carries an **address** — the engine's face of an owner, where
+/// A reference slot that carries an **address** — the engine's face of any typed reference, where
 /// [`OwnerKindMarker`] is the wire's.
 ///
-/// This is the single **erasure seam**: [`Self::erased`] is the one way a typed owner becomes the flat
-/// reference the storage contract, `active_children` and command payloads speak. A `Deref` to
-/// [`ObjectReference`] would hide that seam and re-open `.kind` — the read a slot exists to forbid —
-/// so the trait deliberately exposes no `kind()`: an owner's kind is either matched at compile time
-/// through the slot's own type, or dropped at this one greppable call.
+/// This is the single **erasure seam**: [`Self::as_raw_object_ref`] is the one way a typed
+/// reference — an owner slot or a plain typed field — becomes the flat reference the storage
+/// contract, `active_children` and command payloads speak. A `Deref` to [`RawObjectRef`] would
+/// hide that seam and re-open `.kind` — the read a typed field exists to forbid — so the trait
+/// deliberately exposes no `kind()`: a reference's kind is either matched at compile time through
+/// the field's own type, or dropped at this one greppable call.
 ///
-/// [`NoOwner`] is not one, and the omission is load-bearing: `meta.owner.into_erased()` compiles on an
-/// owned object and does not compile on a root's meta, so "a root has no owner" needs no `expect`, no
-/// `Option`, and no runtime kind check anywhere.
-pub trait ErasedOwner: OwnerKindMarker + sealed::Sealed {
+/// [`NoOwner`] is not one, and the omission is load-bearing:
+/// `meta.owner.into_raw_object_ref()` compiles on an owned object and does not compile on a
+/// root's meta, so "a root has no owner" needs no `expect`, no `Option`, and no runtime kind check
+/// anywhere.
+pub trait HasRawObjectRef: OwnerKindMarker + sealed::Sealed {
     /// Erase to the flat reference form — where the type stops being carried.
-    fn erased(&self) -> &ObjectReference;
+    fn as_raw_object_ref(&self) -> &RawObjectRef;
 
     /// The same erasure for an owner the caller owns: the seam sites (storage's `add_child`/
     /// `remove_child`, command payloads) take the flat reference by value, and cloning it out of a
     /// borrow only to move it again is the borrow checker's business leaking into every caller.
-    fn into_erased(self) -> ObjectReference;
+    fn into_raw_object_ref(self) -> RawObjectRef;
 }
 
 /// A flat reference whose kind is not the one the slot it was read into admits.
@@ -160,32 +162,32 @@ pub trait ErasedOwner: OwnerKindMarker + sealed::Sealed {
 /// with a bare `?` lands in the engine's internal-fault arm, which the leader **retries**. Not being
 /// convertible means the wrong classification cannot be written by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerKindMismatch {
+pub struct KindMismatch {
     /// The kind the flat reference carried.
     seen: ObjectKind,
     /// The one kind the slot admits.
     expected: ObjectKind,
-    /// The marker type naming the slot (`OwnerRef<ActivityKind>` …), so the fault names the *type*
+    /// The marker type naming the slot (`ObjectRef<ActivityKind>` …), so the fault names the *type*
     /// that was expected, not merely a kind constant it admits.
     slot: &'static str,
 }
 
-impl std::fmt::Display for OwnerKindMismatch {
+impl std::fmt::Display for KindMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "owner kind mismatch: the payload carries kind {:?}, but this slot admits only {:?} \
-             owners ({})",
+            "reference kind mismatch: the payload carries kind {:?}, but this field admits only {:?} \
+             ({})",
             self.seen, self.expected, self.slot,
         )
     }
 }
 
-impl std::error::Error for OwnerKindMismatch {}
+impl std::error::Error for KindMismatch {}
 
 /// A payload that carries no `owner`, read into a slot that only ever holds one.
 ///
-/// Its own type, like [`OwnerKindMismatch`]: the fault is the *payload's* — an object whose slot names
+/// Its own type, like [`KindMismatch`]: the fault is the *payload's* — an object whose slot names
 /// an owner is minted together with it and never loses it, so a row without one cannot be read. Not an
 /// [`ExecutionError`](crate::ExecutionError) for the same reason a mismatch is not: propagating it
 /// with `?` would land it in the internal-fault arm, which the leader retries.
@@ -193,7 +195,7 @@ impl std::error::Error for OwnerKindMismatch {}
 pub struct MissingOwner {
     /// The kind of the object whose slot was left empty.
     kind: ObjectKind,
-    /// The slot type that requires an owner (`OwnerRef<ActivityKind>` …), so the fault names the type
+    /// The slot type that requires an owner (`ObjectRef<ActivityKind>` …), so the fault names the type
     /// that was expected rather than only the object that came up short.
     slot: &'static str,
 }
@@ -214,7 +216,7 @@ impl std::error::Error for MissingOwner {}
 /// The owner slot of a **root** object: no owner at all.
 ///
 /// "A top-level `Execution` has no parent" is the *type* of its slot rather than an empty `Option`, so
-/// no reader unwraps to learn it: the slot is [`Self`], and [`Self`] is not an [`ErasedOwner`] — there
+/// no reader unwraps to learn it: the slot is [`Self`], and [`Self`] is not an [`HasRawObjectRef`] — there
 /// is no address to read and none to set. It is constructible because a root's meta must be built;
 /// it cannot stand in an owned slot, which admits only references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -227,24 +229,26 @@ impl NoOwner {
     }
 }
 
-/// A typed owner reference — the single-kind slot, holding a reference **of kind `K::KIND`**.
+/// A typed reference to an object **of kind `K::KIND`** — the one reference form a field may hold
+/// when its kind is fixed by the field's meaning rather than by the value (an owner slot, a
+/// `Task`'s flat `execution` anchor, a `FlowVersion` a run binds to).
 ///
-/// The kind is still a value in memory (the wire carries it, and rows written before the slot was
+/// The kind is still a value in memory (the wire carries it, and rows written before the field was
 /// typed stay readable), but it is private and written through exactly two gates: the checked
-/// conversion from an [`ObjectReference`] and `Deserialize`. Every other path — including reading it
-/// back — goes through [`OwnerKindMarker::erased`].
-pub struct OwnerRef<K: ObjectKindMarker>(ObjectReference, PhantomData<fn() -> K>);
+/// conversion from an [`RawObjectRef`] and `Deserialize`. Every other path — including reading it
+/// back — goes through [`HasRawObjectRef::as_raw_object_ref`].
+pub struct ObjectRef<K: ObjectKindMarker>(RawObjectRef, PhantomData<fn() -> K>);
 
 // Hand-written so `K` needs no `Clone`/`Debug`/`PartialEq` of its own: the marker is a
 // `PhantomData<fn() -> K>`, present only to name `K::KIND`, and every value lives in the inner
-// `ObjectReference`. A derive would demand those bounds from every marker for nothing.
-impl<K: ObjectKindMarker> Clone for OwnerRef<K> {
+// `RawObjectRef`. A derive would demand those bounds from every marker for nothing.
+impl<K: ObjectKindMarker> Clone for ObjectRef<K> {
     fn clone(&self) -> Self {
         Self(self.0.clone(), PhantomData)
     }
 }
 
-impl<K: ObjectKindMarker> std::fmt::Debug for OwnerRef<K> {
+impl<K: ObjectKindMarker> std::fmt::Debug for ObjectRef<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple(std::any::type_name::<K>())
             .field(&self.0)
@@ -252,18 +256,35 @@ impl<K: ObjectKindMarker> std::fmt::Debug for OwnerRef<K> {
     }
 }
 
-impl<K: ObjectKindMarker> PartialEq for OwnerRef<K> {
+impl<K: ObjectKindMarker> PartialEq for ObjectRef<K> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<K: ObjectKindMarker> Eq for OwnerRef<K> {}
+impl<K: ObjectKindMarker> Eq for ObjectRef<K> {}
 
-impl<K: ObjectKindMarker> OwnerRef<K> {
+// Delegates to the inner reference so a typed reference can key a map — the machine cache
+// (`HandlerContext::definitions`) is keyed by version. The kind is carried by `K` and adds nothing a
+// hash could hold, and `K` must not be required to implement `Hash` itself.
+impl<K: ObjectKindMarker> std::hash::Hash for ObjectRef<K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<K: ObjectKindMarker> std::fmt::Display for ObjectRef<K> {
+    /// The same scope-relative `{kind}/{name}` form an [`RawObjectRef`] prints, so log sites read
+    /// identically whether the field they hold is typed or flat.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<K: ObjectKindMarker> ObjectRef<K> {
     /// Build from already-known parts. The kind comes from `K`, so it cannot be passed wrong.
     pub fn new(name: ObjectName, uid: ulid::Ulid) -> Self {
-        Self(ObjectReference::new(K::KIND, name, uid), PhantomData)
+        Self(RawObjectRef::new(K::KIND, name, uid), PhantomData)
     }
 
     /// The referenced object's name.
@@ -275,16 +296,26 @@ impl<K: ObjectKindMarker> OwnerRef<K> {
     pub fn uid(&self) -> ulid::Ulid {
         self.0.uid
     }
+
+    /// A placeholder of this kind with a nil uid. [`RawObjectRef::nil`] is the same placeholder
+    /// before a slot has picked a kind; this one keeps the *kind* honest where only the kind carries
+    /// meaning — a value matched by variant and a single echoed key, never by full equality.
+    pub fn nil() -> Self {
+        Self::new(
+            ObjectName::from_parsed("unset").expect("a static literal is a valid object name"),
+            ulid::Ulid::nil(),
+        )
+    }
 }
 
-impl<K: ObjectKindMarker> TryFrom<ObjectReference> for OwnerRef<K> {
-    type Error = OwnerKindMismatch;
+impl<K: ObjectKindMarker> TryFrom<RawObjectRef> for ObjectRef<K> {
+    type Error = KindMismatch;
 
     /// Checked entry from the flat form: the one place a foreign kind is rejected instead of being
     /// carried along until some later reader guesses wrong.
-    fn try_from(reference: ObjectReference) -> Result<Self, Self::Error> {
+    fn try_from(reference: RawObjectRef) -> Result<Self, Self::Error> {
         if reference.kind != K::KIND {
-            return Err(OwnerKindMismatch {
+            return Err(KindMismatch {
                 seen: reference.kind,
                 expected: K::KIND,
                 slot: std::any::type_name::<K>(),
@@ -294,37 +325,37 @@ impl<K: ObjectKindMarker> TryFrom<ObjectReference> for OwnerRef<K> {
     }
 }
 
-impl<K: ObjectKindMarker> OwnerKindMarker for OwnerRef<K> {
-    fn as_reference(&self) -> Option<&ObjectReference> {
+impl<K: ObjectKindMarker> OwnerKindMarker for ObjectRef<K> {
+    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
         Some(&self.0)
     }
 }
 
-impl<K: ObjectKindMarker> sealed::Sealed for OwnerRef<K> {}
+impl<K: ObjectKindMarker> sealed::Sealed for ObjectRef<K> {}
 
-impl<K: ObjectKindMarker> ErasedOwner for OwnerRef<K> {
-    fn erased(&self) -> &ObjectReference {
+impl<K: ObjectKindMarker> HasRawObjectRef for ObjectRef<K> {
+    fn as_raw_object_ref(&self) -> &RawObjectRef {
         &self.0
     }
 
-    fn into_erased(self) -> ObjectReference {
+    fn into_raw_object_ref(self) -> RawObjectRef {
         self.0
     }
 }
 
-impl<K: ObjectKindMarker> Serialize for OwnerRef<K> {
+impl<K: ObjectKindMarker> Serialize for ObjectRef<K> {
     /// Writes exactly the `{kind, name, uid}` object the slot held before it was typed.
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(s)
     }
 }
 
-impl<'de, K: ObjectKindMarker> Deserialize<'de> for OwnerRef<K> {
+impl<'de, K: ObjectKindMarker> Deserialize<'de> for ObjectRef<K> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let seen = ObjectReference::deserialize(d)?;
+        let seen = RawObjectRef::deserialize(d)?;
         // Rejected here, on the way in, rather than repaired into a slot that cannot hold it: a row
         // naming a foreign owner is a row this type cannot read, and a log entry is no different.
-        OwnerRef::try_from(seen).map_err(serde::de::Error::custom)
+        ObjectRef::try_from(seen).map_err(serde::de::Error::custom)
     }
 }
 
@@ -338,8 +369,8 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for OwnerRef<K> {
 /// on the way in ([`Self::deserialize`]) — parse, don't validate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadOwner {
-    Execution(OwnerRef<ExecutionKind>),
-    Activity(OwnerRef<ActivityKind>),
+    Execution(ObjectRef<ExecutionKind>),
+    Activity(ObjectRef<ActivityKind>),
 }
 
 impl Serialize for ThreadOwner {
@@ -355,19 +386,19 @@ impl Serialize for ThreadOwner {
 
 impl<'de> Deserialize<'de> for ThreadOwner {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let seen = ObjectReference::deserialize(d)?;
+        let seen = RawObjectRef::deserialize(d)?;
         Ok(match seen.kind {
             ObjectKind::Execution => {
-                ThreadOwner::Execution(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+                ThreadOwner::Execution(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
             }
             ObjectKind::Activity => {
-                ThreadOwner::Activity(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+                ThreadOwner::Activity(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
             }
             // A kind outside the union is a payload no thread could have carried: refused here rather
             // than repaired into a slot with no variant for it.
             other => {
                 return Err(serde::de::Error::custom(format!(
-                    "owner kind mismatch: the payload carries kind {other:?}, but this slot admits \
+                    "reference kind mismatch: the payload carries kind {other:?}, but this slot admits \
                      only Execution or Activity owners ({})",
                     std::any::type_name::<ThreadOwner>(),
                 )));
@@ -377,25 +408,25 @@ impl<'de> Deserialize<'de> for ThreadOwner {
 }
 
 impl OwnerKindMarker for ThreadOwner {
-    fn as_reference(&self) -> Option<&ObjectReference> {
-        Some(self.erased())
+    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
+        Some(self.as_raw_object_ref())
     }
 }
 
 impl sealed::Sealed for ThreadOwner {}
 
-impl ErasedOwner for ThreadOwner {
-    fn erased(&self) -> &ObjectReference {
+impl HasRawObjectRef for ThreadOwner {
+    fn as_raw_object_ref(&self) -> &RawObjectRef {
         match self {
-            ThreadOwner::Execution(r) => r.erased(),
-            ThreadOwner::Activity(r) => r.erased(),
+            ThreadOwner::Execution(r) => r.as_raw_object_ref(),
+            ThreadOwner::Activity(r) => r.as_raw_object_ref(),
         }
     }
 
-    fn into_erased(self) -> ObjectReference {
+    fn into_raw_object_ref(self) -> RawObjectRef {
         match self {
-            ThreadOwner::Execution(r) => r.into_erased(),
-            ThreadOwner::Activity(r) => r.into_erased(),
+            ThreadOwner::Execution(r) => r.into_raw_object_ref(),
+            ThreadOwner::Activity(r) => r.into_raw_object_ref(),
         }
     }
 }
@@ -408,8 +439,8 @@ impl ErasedOwner for ThreadOwner {
 /// fact about timers: widening a timer's owner later must not widen a thread's by accident.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimerOwner {
-    Execution(OwnerRef<ExecutionKind>),
-    Activity(OwnerRef<ActivityKind>),
+    Execution(ObjectRef<ExecutionKind>),
+    Activity(ObjectRef<ActivityKind>),
 }
 
 impl Serialize for TimerOwner {
@@ -423,17 +454,17 @@ impl Serialize for TimerOwner {
 
 impl<'de> Deserialize<'de> for TimerOwner {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let seen = ObjectReference::deserialize(d)?;
+        let seen = RawObjectRef::deserialize(d)?;
         Ok(match seen.kind {
             ObjectKind::Execution => {
-                TimerOwner::Execution(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+                TimerOwner::Execution(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
             }
             ObjectKind::Activity => {
-                TimerOwner::Activity(OwnerRef::try_from(seen).map_err(serde::de::Error::custom)?)
+                TimerOwner::Activity(ObjectRef::try_from(seen).map_err(serde::de::Error::custom)?)
             }
             other => {
                 return Err(serde::de::Error::custom(format!(
-                    "owner kind mismatch: the payload carries kind {other:?}, but this slot admits \
+                    "reference kind mismatch: the payload carries kind {other:?}, but this slot admits \
                      only Execution or Activity owners ({})",
                     std::any::type_name::<TimerOwner>(),
                 )));
@@ -443,25 +474,25 @@ impl<'de> Deserialize<'de> for TimerOwner {
 }
 
 impl OwnerKindMarker for TimerOwner {
-    fn as_reference(&self) -> Option<&ObjectReference> {
-        Some(self.erased())
+    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
+        Some(self.as_raw_object_ref())
     }
 }
 
 impl sealed::Sealed for TimerOwner {}
 
-impl ErasedOwner for TimerOwner {
-    fn erased(&self) -> &ObjectReference {
+impl HasRawObjectRef for TimerOwner {
+    fn as_raw_object_ref(&self) -> &RawObjectRef {
         match self {
-            TimerOwner::Execution(r) => r.erased(),
-            TimerOwner::Activity(r) => r.erased(),
+            TimerOwner::Execution(r) => r.as_raw_object_ref(),
+            TimerOwner::Activity(r) => r.as_raw_object_ref(),
         }
     }
 
-    fn into_erased(self) -> ObjectReference {
+    fn into_raw_object_ref(self) -> RawObjectRef {
         match self {
-            TimerOwner::Execution(r) => r.into_erased(),
-            TimerOwner::Activity(r) => r.into_erased(),
+            TimerOwner::Execution(r) => r.into_raw_object_ref(),
+            TimerOwner::Activity(r) => r.into_raw_object_ref(),
         }
     }
 }
@@ -475,22 +506,22 @@ impl ErasedOwner for TimerOwner {
 /// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerScope {
-    Execution(OwnerRef<ExecutionKind>),
-    Thread(OwnerRef<ThreadKind>),
+    Execution(ObjectRef<ExecutionKind>),
+    Thread(ObjectRef<ThreadKind>),
 }
 
 impl OwnerScope {
     /// Recover the scope a flat reference names: the one seam where an address the engine carries
-    /// *erased* (a command's `execution`, an activity's `execution` anchor or owner) becomes a scope
+    /// *flat* (a command's `execution`, an activity's `execution` anchor or owner) becomes a scope
     /// type again. Those anchors are minted by the engine itself, so a reference that names no scope
     /// is an anomaly, not a decision: it yields `None` — the caller records the failure without a
     /// scope and the log names the address — rather than panicking the processor on a corrupt payload.
-    pub fn of_reference(reference: &ObjectReference) -> Option<Self> {
+    pub fn of_reference(reference: &RawObjectRef) -> Option<Self> {
         match reference.kind {
-            ObjectKind::Execution => OwnerRef::<ExecutionKind>::try_from(reference.clone())
+            ObjectKind::Execution => ObjectRef::<ExecutionKind>::try_from(reference.clone())
                 .ok()
                 .map(OwnerScope::Execution),
-            ObjectKind::Thread => OwnerRef::<ThreadKind>::try_from(reference.clone())
+            ObjectKind::Thread => ObjectRef::<ThreadKind>::try_from(reference.clone())
                 .ok()
                 .map(OwnerScope::Thread),
             _ => None,
@@ -499,7 +530,7 @@ impl OwnerScope {
 }
 
 impl OwnerKindMarker for NoOwner {
-    fn as_reference(&self) -> Option<&ObjectReference> {
+    fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
         None
     }
 
@@ -620,7 +651,7 @@ pub struct ObjectMeta<K: ObjectKindMarker> {
 
 /// Whether an owner slot holds no address at all — the one case the wire omits `owner` for.
 fn owner_is_absent<T: OwnerKindMarker>(owner: &T) -> bool {
-    owner.as_reference().is_none()
+    owner.to_raw_object_ref().is_none()
 }
 
 /// The **wire form** of an [`ObjectMeta`]: `owner` is optional *there* (a root's row carries none),
@@ -667,8 +698,15 @@ impl<K: ObjectKindMarker> ObjectMeta<K> {
 
     /// The canonical reference to this object — the one implementation for every kind, replacing the
     /// per-object `reference()` helpers that each hard-coded their own kind.
-    pub fn reference(&self) -> ObjectReference {
-        ObjectReference::new(K::KIND, self.name.clone(), self.uid)
+    pub fn reference(&self) -> RawObjectRef {
+        RawObjectRef::new(K::KIND, self.name.clone(), self.uid)
+    }
+
+    /// The same address as [`Self::reference`], in the type `K` already is — for a site that must
+    /// hand it to a typed slot (a command payload's activity/thread id) and would otherwise rebuild
+    /// it from `name`/`uid` by hand.
+    pub fn typed_reference(&self) -> ObjectRef<K> {
+        ObjectRef::new(self.name.clone(), self.uid)
     }
 
     /// Record a mutation at `at`: advances `updated_at`, leaves `created_at`.
@@ -788,10 +826,13 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
 ///   `(name, uid)` pair, where `name` is the referenced
 ///   object's own `ObjectName` and `uid` its `meta.uid`.
 ///
-/// [`OwnerReference`] is a type alias of this struct — a reference *is* just an owner-style
-/// reference, so the two names address the same type.
+/// A **raw** reference: its kind is a stored value, not the type parameter [`ObjectRef`] carries.
+/// It is what the wire, a storage key and the genuinely heterogeneous seams (`active_children`, a
+/// scope that may be any object) speak — so every site holding one is a place typing deliberately
+/// stops, and reaching for it on a field that names a single kind is the mistake the name makes
+/// visible.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ObjectReference {
+pub struct RawObjectRef {
     /// The referenced object's kind.
     pub kind: ObjectKind,
     /// The referenced object's name (user or generated).
@@ -801,10 +842,7 @@ pub struct ObjectReference {
     pub uid: ulid::Ulid,
 }
 
-/// The owning-object reference of an [`ObjectMeta`]. See [`ObjectReference`].
-pub type OwnerReference = ObjectReference;
-
-impl ObjectReference {
+impl RawObjectRef {
     /// Build a reference from already-validated parts.
     pub fn new(kind: ObjectKind, name: ObjectName, uid: ulid::Ulid) -> Self {
         Self { kind, name, uid }
@@ -821,9 +859,20 @@ impl ObjectReference {
             ulid::Ulid::nil(),
         )
     }
+
+    /// Re-establish a flat reference's type after the caller has already dispatched on its `kind`.
+    ///
+    /// A mixed-kind collection — `active_children` above all — holds addresses on purpose, and every
+    /// sweep arm matches the kind it acts on before building a typed command payload. A conversion
+    /// that fails there contradicts a check the caller just made, so it is an engine bug loud enough
+    /// to panic on rather than a payload to refuse with a rejection.
+    pub fn typed<K: ObjectKindMarker>(self) -> ObjectRef<K> {
+        ObjectRef::try_from(self)
+            .expect("the caller matched the kind before re-typing the reference")
+    }
 }
 
-impl std::fmt::Display for ObjectReference {
+impl std::fmt::Display for RawObjectRef {
     /// Same-scope form `{kind}/{name}`. The address is scope-relative by construction (the
     /// referenced object shares the holder's tenant/namespace); `uid` is carried as a separate
     /// field, not here.
@@ -832,7 +881,7 @@ impl std::fmt::Display for ObjectReference {
     }
 }
 
-impl std::str::FromStr for ObjectReference {
+impl std::str::FromStr for RawObjectRef {
     type Err = ExecutionError;
 
     /// Parse the `{kind}/{name}` same-scope form back into a reference. The `uid` cannot be encoded
@@ -890,7 +939,7 @@ mod tests {
     struct OwnedTestKind;
     impl ObjectKindMarker for OwnedTestKind {
         const KIND: ObjectKind = ObjectKind::Execution;
-        type OwnedBy = OwnerRef<OtherTestKind>;
+        type OwnedBy = ObjectRef<OtherTestKind>;
     }
 
     #[test]
@@ -998,8 +1047,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_reference_roundtrips() {
-        let owner = OwnerReference::new(
+    fn raw_object_ref_roundtrips() {
+        let owner = RawObjectRef::new(
             ObjectKind::Activity,
             PlainName::new("checkout")
                 .unwrap()
@@ -1010,19 +1059,19 @@ mod tests {
         );
         // Same-scope Display form `{kind}/{name}` roundtrips (uid is not printable; parse yields nil).
         assert_eq!(owner.to_string(), "activity/checkout-424242");
-        let reparsed: OwnerReference = owner.to_string().parse().unwrap();
+        let reparsed: RawObjectRef = owner.to_string().parse().unwrap();
         assert_eq!(reparsed, owner);
         assert_eq!(reparsed.uid, ulid::Ulid::nil());
 
         // Malformed references are rejected.
-        assert!("activity".parse::<OwnerReference>().is_err()); // missing name
-        assert!("wat/checkout".parse::<OwnerReference>().is_err()); // bad kind
-        assert!("activity/a/b".parse::<OwnerReference>().is_err()); // too many parts
+        assert!("activity".parse::<RawObjectRef>().is_err()); // missing name
+        assert!("wat/checkout".parse::<RawObjectRef>().is_err()); // bad kind
+        assert!("activity/a/b".parse::<RawObjectRef>().is_err()); // too many parts
     }
 
     #[test]
     fn object_reference_roundtrips_through_display_and_fromstr() {
-        let r = ObjectReference::new(
+        let r = RawObjectRef::new(
             ObjectKind::FlowVersion,
             PlainName::new("order").unwrap().generated_from_key(1),
             ulid::Ulid::new(),
@@ -1032,7 +1081,7 @@ mod tests {
         let s = r.to_string();
         assert_eq!(s, format!("flowversion/{}", r.name));
         let parsed = s
-            .parse::<ObjectReference>()
+            .parse::<RawObjectRef>()
             .expect("reference Display reparses");
         assert_eq!(parsed.kind, r.kind);
         assert_eq!(parsed.name, r.name);
@@ -1040,14 +1089,14 @@ mod tests {
 
     #[test]
     fn object_reference_nil_is_a_stable_placeholder() {
-        // `ObjectReference::nil` is a recognizable placeholder (never matches a real reference with a
+        // `RawObjectRef::nil` is a recognizable placeholder (never matches a real reference with a
         // fresh uid), and its Display is stable.
-        let nil = ObjectReference::nil();
+        let nil = RawObjectRef::nil();
         assert!(nil.uid.is_nil());
-        assert_eq!(ObjectReference::nil().to_string(), "flowversion/flow-0");
+        assert_eq!(RawObjectRef::nil().to_string(), "flowversion/flow-0");
         assert_ne!(
             nil,
-            ObjectReference::new(
+            RawObjectRef::new(
                 ObjectKind::FlowVersion,
                 PlainName::new("flow").unwrap().generated_from_key(0),
                 ulid::Ulid::new(),
@@ -1055,60 +1104,76 @@ mod tests {
         );
     }
 
+    /// The typed placeholder carries what the flat one cannot: a *kind*. A fixture whose anchor no
+    /// assertion ever compares still cannot be built for the wrong kind.
+    #[test]
+    fn a_typed_nil_keeps_its_kind() {
+        let unset = ObjectRef::<OtherTestKind>::nil();
+        assert!(unset.uid().is_nil());
+        assert_eq!(unset.as_raw_object_ref().kind, ObjectKind::Task);
+        assert_eq!(
+            serde_json::to_value(&unset).unwrap(),
+            serde_json::to_value(unset.as_raw_object_ref()).unwrap()
+        );
+    }
+
     #[test]
     fn owner_ref_pins_the_kind_on_the_wire() {
-        let owner = OwnerRef::<OtherTestKind>::new(
+        let owner = ObjectRef::<OtherTestKind>::new(
             PlainName::new("checkout").unwrap().generated_from_key(7),
             ulid::Ulid::new(),
         );
         let json = serde_json::to_value(&owner).expect("owner serializes");
         // The wire is the same flat reference the slot held before it was typed — no wrapper, no
-        // extra key: an `OwnerRef` is an `ObjectReference` plus a type.
-        assert_eq!(json, serde_json::to_value(owner.erased()).unwrap());
+        // extra key: an `ObjectRef` is an `RawObjectRef` plus a type.
+        assert_eq!(
+            json,
+            serde_json::to_value(owner.as_raw_object_ref()).unwrap()
+        );
 
-        let back: OwnerRef<OtherTestKind> =
+        let back: ObjectRef<OtherTestKind> =
             serde_json::from_value(json).expect("a matching owner deserializes");
         assert_eq!(back, owner);
         assert_eq!(back.name(), owner.name());
         assert_eq!(back.uid(), owner.uid());
-        assert_eq!(back.erased().kind, ObjectKind::Task);
+        assert_eq!(back.as_raw_object_ref().kind, ObjectKind::Task);
     }
 
     #[test]
     fn owner_ref_rejects_a_foreign_kind_on_the_wire() {
         let owner =
-            OwnerRef::<TestKind>::new(ObjectName::plain("checkout").unwrap(), ulid::Ulid::new());
+            ObjectRef::<TestKind>::new(ObjectName::plain("checkout").unwrap(), ulid::Ulid::new());
         let json = serde_json::to_value(&owner).expect("owner serializes");
-        let err = serde_json::from_value::<OwnerRef<OtherTestKind>>(json)
+        let err = serde_json::from_value::<ObjectRef<OtherTestKind>>(json)
             .expect_err("a Task-typed slot must not read an Execution owner");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("carries kind Execution"), "{msg}");
-        assert!(msg.contains("admits only Task owners"), "{msg}");
+        assert!(msg.contains("admits only Task"), "{msg}");
         // The fault names the slot *type*, so the reader learns which marker admitted the wrong kind.
         assert!(msg.contains("OtherTestKind"), "{msg}");
     }
 
     #[test]
     fn owner_ref_conversion_checks_the_kind() {
-        let foreign = ObjectReference::new(
+        let foreign = RawObjectRef::new(
             ObjectKind::Task,
             ObjectName::plain("checkout").unwrap(),
             ulid::Ulid::new(),
         );
-        let err = OwnerRef::<TestKind>::try_from(foreign)
+        let err = ObjectRef::<TestKind>::try_from(foreign)
             .expect_err("a Task cannot stand in an Execution-typed slot");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
-        assert!(msg.contains("admits only Execution owners"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Execution"), "{msg}");
 
-        let matching = ObjectReference::new(
+        let matching = RawObjectRef::new(
             ObjectKind::Execution,
             ObjectName::plain("checkout").unwrap(),
             ulid::Ulid::new(),
         );
-        let owner = OwnerRef::<TestKind>::try_from(matching).expect("the kind matches");
-        assert_eq!(owner.erased().kind, ObjectKind::Execution);
+        let owner = ObjectRef::<TestKind>::try_from(matching).expect("the kind matches");
+        assert_eq!(owner.as_raw_object_ref().kind, ObjectKind::Execution);
     }
 
     /// Every flat anchor a failure site holds (a command's `execution`, an activity's owner) reads
@@ -1117,34 +1182,34 @@ mod tests {
     /// allowed to wedge the processor into a retry loop.
     #[test]
     fn a_flat_reference_is_read_back_as_the_scope_it_names() {
-        let run = ObjectReference::new(
+        let run = RawObjectRef::new(
             ObjectKind::Execution,
             ObjectName::plain("execution").unwrap(),
             ulid::Ulid::new(),
         );
         assert_eq!(
             OwnerScope::of_reference(&run),
-            Some(OwnerScope::Execution(OwnerRef::new(
+            Some(OwnerScope::Execution(ObjectRef::new(
                 run.name.clone(),
                 run.uid
             )))
         );
 
-        let thread = ObjectReference::new(
+        let thread = RawObjectRef::new(
             ObjectKind::Thread,
             ObjectName::plain("parallel").unwrap(),
             ulid::Ulid::new(),
         );
         assert_eq!(
             OwnerScope::of_reference(&thread),
-            Some(OwnerScope::Thread(OwnerRef::new(
+            Some(OwnerScope::Thread(ObjectRef::new(
                 thread.name.clone(),
                 thread.uid
             )))
         );
 
         // A nil reference is a `FlowVersion` placeholder: no scope, so no scope termination.
-        assert_eq!(OwnerScope::of_reference(&ObjectReference::nil()), None);
+        assert_eq!(OwnerScope::of_reference(&RawObjectRef::nil()), None);
     }
 
     /// A thread's owner slot admits exactly the two scopes a thread can hang off, and the union adds
@@ -1153,18 +1218,21 @@ mod tests {
     #[test]
     fn thread_owner_roundtrips_both_of_its_scopes() {
         let cases = [
-            ThreadOwner::Execution(OwnerRef::new(
+            ThreadOwner::Execution(ObjectRef::new(
                 ObjectName::plain("execution").unwrap(),
                 ulid::Ulid::new(),
             )),
-            ThreadOwner::Activity(OwnerRef::new(
+            ThreadOwner::Activity(ObjectRef::new(
                 ObjectName::plain("parallel").unwrap(),
                 ulid::Ulid::new(),
             )),
         ];
         for owner in cases {
             let json = serde_json::to_value(&owner).expect("the union serializes");
-            assert_eq!(json, serde_json::to_value(owner.erased()).unwrap());
+            assert_eq!(
+                json,
+                serde_json::to_value(owner.as_raw_object_ref()).unwrap()
+            );
             let back: ThreadOwner = serde_json::from_value(json).expect("the union deserializes");
             assert_eq!(back, owner);
         }
@@ -1174,7 +1242,7 @@ mod tests {
     /// reader learns which union admitted the kinds it did, not merely that the payload was odd.
     #[test]
     fn thread_owner_refuses_a_foreign_kind() {
-        let owner = OwnerRef::<OtherTestKind>::new(
+        let owner = ObjectRef::<OtherTestKind>::new(
             ObjectName::plain("checkout").unwrap(),
             ulid::Ulid::new(),
         );
@@ -1183,7 +1251,7 @@ mod tests {
         )
         .expect_err("a thread is never owned by a task");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("carries kind Task"), "{msg}");
         assert!(msg.contains("admits only Execution or Activity"), "{msg}");
         assert!(msg.contains("ThreadOwner"), "{msg}");
@@ -1194,7 +1262,7 @@ mod tests {
     /// other silently.
     #[test]
     fn timer_owner_refuses_a_kind_it_does_not_admit() {
-        let thread = ObjectReference::new(
+        let thread = RawObjectRef::new(
             ObjectKind::Thread,
             ObjectName::plain("branch").unwrap(),
             ulid::Ulid::new(),
@@ -1217,7 +1285,7 @@ mod tests {
     fn a_typed_slot_is_enforced_through_the_meta() {
         let meta = ObjectMeta::<OwnedTestKind>::builder(ulid::Ulid::new())
             .at(ts(1000))
-            .with_owner(OwnerRef::<OtherTestKind>::new(
+            .with_owner(ObjectRef::<OtherTestKind>::new(
                 PlainName::new("checkout").unwrap().generated_from_key(7),
                 ulid::Ulid::new(),
             ));
@@ -1233,7 +1301,7 @@ mod tests {
         foreign["owner"]["kind"] = serde_json::json!("Activity");
         let err = serde_json::from_value::<ObjectMeta<OwnedTestKind>>(foreign)
             .expect_err("the slot accepts only a Task owner");
-        assert!(err.to_string().contains("owner kind mismatch"), "{err}");
+        assert!(err.to_string().contains("reference kind mismatch"), "{err}");
     }
 
     /// The other half of the slot's wire contract: a row that *omits* an owner read into a slot that
@@ -1241,7 +1309,7 @@ mod tests {
     /// a row without one is a payload no event ever wrote.
     #[test]
     fn an_owned_slot_refuses_an_absent_owner_on_the_wire() {
-        let owner = OwnerRef::<OtherTestKind>::new(
+        let owner = ObjectRef::<OtherTestKind>::new(
             PlainName::new("checkout").unwrap().generated_from_key(7),
             ulid::Ulid::new(),
         );
@@ -1281,7 +1349,7 @@ mod tests {
     fn a_root_meta_refuses_a_payload_that_carries_an_owner() {
         let owned = ObjectMeta::<OwnedTestKind>::builder(ulid::Ulid::new())
             .at(ts(1000))
-            .with_owner(OwnerRef::<OtherTestKind>::new(
+            .with_owner(ObjectRef::<OtherTestKind>::new(
                 PlainName::new("checkout").unwrap().generated_from_key(7),
                 ulid::Ulid::new(),
             ));

@@ -5,7 +5,7 @@ use serde_with::skip_serializing_none;
 
 use crate::types::flow::FlowKind;
 use crate::types::id::FlowName;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, OwnerRef};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef};
 
 /// The [`ObjectKindMarker`] tying a [`FlowVersion`]'s meta to [`ObjectKind::FlowVersion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +16,7 @@ impl ObjectKindMarker for FlowVersionKind {
     /// A version is published by exactly one flow — it *is* that flow's snapshot, and a version is
     /// never re-parented — so the slot names that one kind rather than a union: a version owned by
     /// anything but a [`Flow`](crate::Flow) is unrepresentable.
-    type OwnedBy = OwnerRef<FlowKind>;
+    type OwnedBy = ObjectRef<FlowKind>;
 }
 
 /// One immutable, published version of a logical flow — the durable object `Storage` persists and
@@ -39,7 +39,7 @@ impl ObjectKindMarker for FlowVersionKind {
 ///
 /// Its identity is a k8s-style `meta.name` (`{flow_name}-{version}`, the **storage key**) plus a
 /// `meta.uid` (the version's never-reused ulid) — [`Self::reference`] bundles them into an
-/// [`ObjectReference`] that any consumer can address it by.
+/// [`RawObjectRef`] that any consumer can address it by.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlowVersion {
@@ -76,7 +76,7 @@ impl FlowVersion {
     /// The owning flow, read from this version's `meta.owner` — the one owner read. A version is
     /// minted together with its owner (`create_flow`) and the slot is never cleared, so the slot's own
     /// type already guarantees a flow is there.
-    pub fn flow_owner(&self) -> &OwnerRef<FlowKind> {
+    pub fn flow_owner(&self) -> &ObjectRef<FlowKind> {
         &self.meta.owner
     }
 
@@ -105,7 +105,7 @@ impl FlowVersion {
 mod tests {
     use super::*;
     use crate::types::flow::Flow;
-    use crate::types::meta::{ObjectName, OwnerRef};
+    use crate::types::meta::{ObjectName, ObjectRef};
     use spica_machinery::Timestamp;
 
     #[test]
@@ -131,7 +131,10 @@ mod tests {
             meta: ObjectMeta::builder(uid)
                 .name(FlowVersion::version_name(&flow, 1))
                 .at(Timestamp::from_millis(0))
-                .with_owner(OwnerRef::new(ObjectName::plain("order").unwrap(), flow_uid)),
+                .with_owner(ObjectRef::new(
+                    ObjectName::plain("order").unwrap(),
+                    flow_uid,
+                )),
             version: 1,
             definition: String::new(),
             checksum: FlowVersion::definition_checksum(""),
@@ -152,7 +155,7 @@ mod tests {
     #[test]
     fn a_version_slot_admits_only_its_flow() {
         let flow = FlowName::new("order").unwrap();
-        let owner = OwnerRef::new(ObjectName::plain("order").unwrap(), ulid::Ulid::new());
+        let owner = ObjectRef::new(ObjectName::plain("order").unwrap(), ulid::Ulid::new());
         let version = FlowVersion {
             meta: ObjectMeta::builder(ulid::Ulid::new())
                 .name(FlowVersion::version_name(&flow, 1))
@@ -172,8 +175,8 @@ mod tests {
         let err = serde_json::from_value::<FlowVersion>(json)
             .expect_err("a version is never owned by an execution");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
-        assert!(msg.contains("admits only Flow owners"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
+        assert!(msg.contains("admits only Flow"), "{msg}");
     }
 
     #[test]
@@ -183,7 +186,7 @@ mod tests {
             meta: ObjectMeta::builder(ulid::Ulid::new())
                 .name(FlowVersion::version_name(&flow, 1))
                 .at(Timestamp::from_millis(0))
-                .with_owner(OwnerRef::new(
+                .with_owner(ObjectRef::new(
                     ObjectName::plain("order").unwrap(),
                     ulid::Ulid::new(),
                 )),

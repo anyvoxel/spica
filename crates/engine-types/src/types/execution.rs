@@ -3,7 +3,8 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference};
+use crate::types::flow_version::FlowVersionKind;
+use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of an [`Execution`].
@@ -86,13 +87,13 @@ pub struct Execution {
     /// tree's root is owned by nothing.
     pub meta: ObjectMeta<ExecutionKind>,
     /// The flow version this execution is bound to (its state machine definition), addressed as a
-    /// full [`ObjectReference`] (`{kind: FlowVersion, name: <flow>-<version>, uid}`). This is the
+    /// typed [`ObjectRef`] (`{kind: FlowVersion, name: <flow>-<version>, uid}`). This is the
     /// CCES analogue of Zeebe's `processDefinitionKey`: the execution references a **never-reused,
     /// immutable** version (never the mutable flow name), so it always resolves its machine against
     /// exactly the definition it was created on — even after the flow is updated or its name is
     /// deleted and re-created. Every entity in a tree (a `Thread` inherited from its container)
     /// shares the same version.
-    pub flow_version: ObjectReference,
+    pub flow_version: ObjectRef<FlowVersionKind>,
     pub status: ExecutionStatus,
     /// The absolute moment the state machine's `TimeoutSeconds` expires, `Some` iff the definition
     /// sets one. Nothing decides from it — the run is terminated by the `ExecutionTimeout` timer whose

@@ -4,8 +4,8 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{FailTask, TerminationReason};
 use crate::types::error::ExecutionError;
 use crate::types::event::{Event, TaskFailed};
-use crate::types::meta::{ErasedOwner, OwnerScope};
-use crate::{ActivityStatus, RetrierAttemptState, TaskStatus};
+use crate::types::meta::{ObjectRef, OwnerScope};
+use crate::{ActivityKind, ActivityStatus, RetrierAttemptState, TaskStatus};
 
 /// Handles `FailTask`: a claimed task was reported **failed** (Zeebe `FailJob`), or the engine's own
 /// deadline backstop (`TaskTimeout`) marked it failed.
@@ -63,10 +63,9 @@ impl FailTaskHandler {
             }
         }
 
-        // The slot is an `OwnerRef<ActivityKind>`, so "the owner is an activity" is a type fact, not a
-        // runtime check. Both consumers below (the timer sweep and the failure route) take a flat
-        // address, so the owner crosses the erasure seam here, once.
-        let activity_id = act.meta.owner.clone().into_erased();
+        // The slot is an `ObjectRef<ActivityKind>`, so "the owner is an activity" is a type fact, not a
+        // runtime check — the task's own owner needs no erasure to name the activity it fails.
+        let activity_id = act.meta.owner.clone();
 
         // Build the failing task entity with the lease cleared; the retry decision below mutates it.
         let mut task_value = act.value();
@@ -165,7 +164,7 @@ impl FailTaskHandler {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity_id: crate::types::meta::ObjectReference,
+        activity_id: ObjectRef<ActivityKind>,
         error: &ExecutionError,
     ) {
         let activity = match ctx.storage.get_activity(&activity_id).await {
@@ -176,7 +175,7 @@ impl FailTaskHandler {
         // fan-out branch. Reading it is what binds the machine revision the task's state (and so its
         // retry/catch plan) is consulted against.
         let owner = activity.value.meta.owner.clone();
-        let Some(thread) = ctx.storage.get_thread(owner.erased()).await.ok().flatten() else {
+        let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
             return; // owning thread gone — nothing to consult.
         };
         // The owning thread binds to a machine revision; resolve it (cached by the Processor)
@@ -250,7 +249,7 @@ impl FailTaskHandler {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity_id: crate::types::meta::ObjectReference,
+        activity_id: ObjectRef<ActivityKind>,
         error: &ExecutionError,
     ) {
         let reason = TerminationReason::Failed {

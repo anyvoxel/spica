@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TimerPurpose;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, TimerOwner};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef, TimerOwner};
 use spica_machinery::Timestamp;
 
 /// Lifecycle status of a Timer. Kept separate from `ExecutionStatus` / `ActivityStatus` because a
@@ -49,9 +50,11 @@ pub struct Timer {
     /// Shared identity + timing metadata. `meta.uid` is the timer's stable identity; the domain
     /// `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside `meta`.
     pub meta: ObjectMeta<TimerKind>,
-    /// The execution this timer belongs to — the scope (and, at `StartExecution`'s
-    /// `ExecutionTimeout`, the name-prefix) of the timer.
-    pub execution: ObjectReference,
+    /// The execution this timer belongs to — the flat top-level anchor, **always** a run (a
+    /// `WaitResume` armed inside a `Parallel` branch still names the tree's root run, so the timer's
+    /// `{execution.name}-{suffix}` generated name points at it; the *immediate* scope that armed the
+    /// timer is `meta.owner`, see [`TimerOwner`]).
+    pub execution: ObjectRef<ExecutionKind>,
     pub purpose: TimerPurpose,
     pub status: TimerStatus,
     /// Absolute wall-clock moment the timer fires. Persisting the absolute deadline (not a relative
@@ -77,7 +80,7 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::meta::{ObjectName, OwnerRef, TimerOwner};
+    use crate::types::meta::{ObjectName, ObjectRef, TimerOwner};
 
     fn ts(ms: u64) -> Timestamp {
         Timestamp::from_millis(ms)
@@ -90,11 +93,14 @@ mod tests {
             meta: ObjectMeta::builder(ulid::Ulid::from(7u128))
                 .name(ObjectName::from_parsed("execution-0").expect("a valid object name"))
                 .timestamps(ts(0), ts(0))
-                .with_owner(TimerOwner::Activity(OwnerRef::new(
+                .with_owner(TimerOwner::Activity(ObjectRef::new(
                     ObjectName::from_parsed("execution-0").expect("a valid object name"),
                     ulid::Ulid::from(7u128),
                 ))),
-            execution: ObjectReference::nil(),
+            execution: ObjectRef::new(
+                ObjectName::from_parsed("execution-0").expect("a valid object name"),
+                ulid::Ulid::nil(),
+            ),
             purpose: TimerPurpose::WaitResume,
             status: TimerStatus::Active,
             deadline: ts(5_000),
@@ -116,7 +122,7 @@ mod tests {
         assert!(t.status.is_terminal(), "a cancelled timer is terminal");
         assert_eq!(t.deadline, ts(5_000));
         assert_eq!(t.purpose, TimerPurpose::WaitResume);
-        assert_eq!(t.execution, ObjectReference::nil());
+        assert_eq!(t.execution.uid(), ulid::Ulid::nil());
     }
 
     /// A timer's slot admits the two scopes that arm one and nothing else: a `WaitResume` round-trips
@@ -139,7 +145,7 @@ mod tests {
         let mut run_owned = timer.clone();
         run_owned.meta = run_owned
             .meta
-            .with_owner(TimerOwner::Execution(OwnerRef::new(
+            .with_owner(TimerOwner::Execution(ObjectRef::new(
                 ObjectName::from_parsed("execution-0").expect("a valid object name"),
                 ulid::Ulid::from(7u128),
             )));
@@ -151,7 +157,7 @@ mod tests {
         json["meta"]["owner"]["kind"] = serde_json::json!("Thread");
         let err = serde_json::from_value::<Timer>(json).expect_err("a thread never arms a timer");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("admits only Execution or Activity"), "{msg}");
     }
 

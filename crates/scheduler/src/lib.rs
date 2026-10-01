@@ -9,7 +9,7 @@
 //! pending — the earlier deadlock where an inline `sleep` blocked the whole stream can't recur.
 //!
 //! This crate depends on `spica-engine` for the value types the contract carries
-//! ([`ObjectReference`](spica_engine::ObjectReference), [`Timestamp`](spica_engine::Timestamp)) and
+//! ([`ObjectRef<TimerKind>`](spica_engine::ObjectRef), [`Timestamp`](spica_engine::Timestamp)) and
 //! on `spica-machinery` for the [`Clock`](spica_machinery::Clock) its expiry decisions read; the
 //! graph stays acyclic (`scheduler → engine`/`machinery`, never the reverse), and the assembly binary
 //! (`spica-server`) selects a concrete implementation and injects it as `Arc<dyn Scheduler>`.

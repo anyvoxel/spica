@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use spica_engine::{
-    Engine, ExecutionError, ObjectKind, ObjectName, ObjectReference, RejectionType, RuntimeError,
+    Engine, ExecutionError, HasRawObjectRef, ObjectKind, ObjectKindMarker, ObjectName, ObjectRef,
+    RawObjectRef, RejectionType, RuntimeError,
 };
 use tonic::Status;
 
@@ -48,9 +49,12 @@ where
         .map_err(|_| Status::invalid_argument(format!("invalid {what} ULID: {s:?}")))
 }
 
-/// Map an engine [`ObjectReference`] onto the wire [`spica_proto::v1::ObjectReference`] — the one
-/// place a version reference crosses into the gRPC boundary (structured kind/name/uid on the wire).
-pub(crate) fn proto_ref(r: &ObjectReference) -> spica_proto::v1::ObjectReference {
+/// Map an engine object reference onto the wire [`spica_proto::v1::ObjectReference`] — the one place
+/// a reference crosses into the gRPC boundary (structured kind/name/uid on the wire), shared by every
+/// service. The flat address is what the wire carries, so a typed reference erases here and the
+/// argument is the engine's own reference vocabulary rather than its erased form.
+pub(crate) fn proto_ref(r: &impl HasRawObjectRef) -> spica_proto::v1::ObjectReference {
+    let r = r.as_raw_object_ref();
     spica_proto::v1::ObjectReference {
         kind: r.kind.as_str().to_string(),
         name: r.name.as_str(),
@@ -58,10 +62,14 @@ pub(crate) fn proto_ref(r: &ObjectReference) -> spica_proto::v1::ObjectReference
     }
 }
 
-/// Parse a wire [`spica_proto::v1::ObjectReference`] back into an engine [`ObjectReference`],
-/// failing the RPC as `INVALID_ARGUMENT` on an unknown kind or a malformed name/uid.
+/// Parse a wire [`spica_proto::v1::ObjectReference`] into the *typed* reference the target slot
+/// demands, failing the RPC as `INVALID_ARGUMENT` on an unknown kind, a malformed name/uid, or a
+/// kind the slot does not admit — the wire is the one place a foreign kind can still be carried in,
+/// so it is refused here rather than repaired into a value the engine could not hold.
 #[allow(clippy::result_large_err)]
-pub(crate) fn parse_ref(r: spica_proto::v1::ObjectReference) -> Result<ObjectReference, Status> {
+pub(crate) fn parse_ref<K: ObjectKindMarker>(
+    r: spica_proto::v1::ObjectReference,
+) -> Result<ObjectRef<K>, Status> {
     let kind = ObjectKind::parse(&r.kind)
         .ok_or_else(|| Status::invalid_argument(format!("unknown object kind: {:?}", r.kind)))?;
     let name = ObjectName::from_parsed(&r.name)
@@ -70,7 +78,8 @@ pub(crate) fn parse_ref(r: spica_proto::v1::ObjectReference) -> Result<ObjectRef
         .uid
         .parse::<ulid::Ulid>()
         .map_err(|_| Status::invalid_argument(format!("invalid uid ULID: {:?}", r.uid)))?;
-    Ok(ObjectReference::new(kind, name, uid))
+    ObjectRef::try_from(RawObjectRef::new(kind, name, uid))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 /// Map a spica engine error onto a gRPC status — the one place engine errors cross into a

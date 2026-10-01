@@ -5,7 +5,7 @@ use crate::types::error::ExecutionError;
 use crate::types::event::TaskCompleted;
 
 use crate::TaskStatus;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 #[derive(Default)]
 pub(crate) struct TaskCompletedApplier;
@@ -24,14 +24,10 @@ impl TaskCompletedApplier {
         // is folded into the activity's `raw_output`: it is the state's raw result before the
         // complete step's `Output` projection, distinct from the immutable processed input recorded
         // during `StateActivated`.
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await? {
-            let parent = t
-                .meta
-                .owner
-                .clone()
-                // An activity is the only thing that can own a task (the slot's own type), so the
-                // fold needs no `kind` guard here — and storage speaks flat addresses.
-                .into_erased();
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
+            // An activity is the only thing that can own a task (the slot's own type), so the fold
+            // needs no `kind` guard here.
+            let parent = t.meta.owner.clone();
             t.status = TaskStatus::Completed;
             // Sync the domain value's transition stamp from the event (the row's own `updated_at`
             // is the entry timestamp via `with_update_at`, a separate concept).
@@ -44,7 +40,7 @@ impl TaskCompletedApplier {
                 ctx.storage.put_activity(act).await?;
             }
             ctx.storage
-                .remove_child(parent, task.meta.reference())
+                .remove_child(parent.into_raw_object_ref(), task.meta.reference())
                 .await?;
         }
         Ok(())

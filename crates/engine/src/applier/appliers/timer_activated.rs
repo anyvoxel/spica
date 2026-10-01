@@ -6,7 +6,7 @@
 use crate::ApplierContext;
 use crate::Timer;
 use crate::types::error::ExecutionError;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 /// `TimerActivated` folds the timer row into Storage **and** declares the physical deadline arm as an
 /// [`Effect`] for the caller to execute. The applier performs no external side effect itself — the
@@ -26,7 +26,7 @@ impl TimerActivatedApplier {
         super::bump_generated_seq(ctx.storage, &timer.meta.reference().name).await?;
         ctx.storage
             .add_child(
-                timer.meta.owner.clone().into_erased(),
+                timer.meta.owner.clone().into_raw_object_ref(),
                 timer.meta.reference(),
             )
             .await?;

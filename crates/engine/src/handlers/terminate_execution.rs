@@ -1,8 +1,12 @@
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectRef};
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 
 /// Handles `TerminateExecution`: begins the abnormal finish of a running execution with `reason`.
 /// Emits `ExecutionTerminating`, sweeps owned children (`CancelTimer` for timers,
@@ -21,8 +25,7 @@ impl TerminateExecutionHandler {
         let TerminateExecution { name, uid, reason } = p;
         // Storage keys executions by name, so a name-only probe (the uid, when present, doubles as the
         // incarnation guard below) resolves the row regardless of incarnation.
-        let probe =
-            ObjectReference::new(ObjectKind::Execution, name.clone(), uid.unwrap_or_default());
+        let probe = ObjectRef::<ExecutionKind>::new(name.clone(), uid.unwrap_or_default());
         let exec = match ctx.storage.get_execution(&probe).await? {
             Some(e) => e,
             None => {
@@ -82,12 +85,14 @@ impl TerminateExecutionHandler {
         for child in children {
             match child.kind {
                 ObjectKind::Timer => {
-                    out.append_command(Command::CancelTimer { timer: child });
+                    out.append_command(Command::CancelTimer {
+                        timer: child.typed::<TimerKind>(),
+                    });
                     pending += 1;
                 }
                 ObjectKind::Activity => {
                     out.append_command(Command::TerminateState(TerminateState {
-                        activity: child,
+                        activity: child.typed::<ActivityKind>(),
                         reason: reason.clone(),
                     }));
                     pending += 1;
@@ -98,7 +103,7 @@ impl TerminateExecutionHandler {
                 // emit its own terminal.
                 ObjectKind::Thread => {
                     out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child,
+                        thread: child.typed::<ThreadKind>(),
                         reason: reason.clone(),
                     }));
                     pending += 1;

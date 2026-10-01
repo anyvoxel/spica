@@ -132,9 +132,9 @@ mod tests {
     use crate::Storage;
     use crate::engine::NoopHook;
     use crate::types::event::FlowVersionCreated;
-    use crate::types::flow_version::FlowVersion;
+    use crate::types::flow_version::{FlowVersion, FlowVersionKind};
     use crate::types::id::{FlowName, RequestId};
-    use crate::types::meta::{ObjectMeta, ObjectName, ObjectReference, OwnerRef};
+    use crate::types::meta::{ObjectMeta, ObjectName, ObjectRef};
 
     use super::*;
 
@@ -162,7 +162,7 @@ mod tests {
                             version,
                         ))
                         .at(Timestamp::now())
-                        .with_owner(OwnerRef::new(
+                        .with_owner(ObjectRef::new(
                             ObjectName::plain("flow").expect("literal name is valid"),
                             ulid::Ulid::nil(),
                         )),
@@ -175,18 +175,18 @@ mod tests {
     }
 
     /// The reference the event's applier files its row under — the key a read addresses.
-    fn version_ref(event: &Event) -> ObjectReference {
+    fn version_ref(event: &Event) -> ObjectRef<FlowVersionKind> {
         let Event::FlowVersionCreated(created) = event else {
             panic!("the fixture emits a flow-version create; got {event:?}");
         };
-        created.flow_version.meta.reference()
+        created.flow_version.meta.typed_reference()
     }
 
     /// Read a row through the store's **committed** face — the only face the Noop commit writes, so a
     /// `None` here is what "this entry has not been folded yet" means to a reader.
     async fn committed_version(
         storage: &Mutex<Box<dyn Storage>>,
-        reference: &ObjectReference,
+        reference: &ObjectRef<FlowVersionKind>,
     ) -> Option<FlowVersion> {
         storage
             .lock()

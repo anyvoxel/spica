@@ -6,17 +6,18 @@ use std::time::Duration;
 
 use common::{
     Act, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, activity_timer_owner_of,
-    epoch, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name, path, pointer,
-    ref_to, request, root_thread_owner, root_thread_owner_of, run_typed_case, stamp, thread_owner,
-    uid, vars,
+    epoch, flat_ref_to, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name,
+    path, pointer, ref_to, request, root_thread_owner, root_thread_owner_of, run_typed_case, stamp,
+    thread_owner, uid, vars,
 };
 use serde_json::json;
 use spica_engine::{
-    ActivateState, Activity, ActivityState, ActivityStatus, Command, CompleteExecution,
-    CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution,
-    ExecutionCreated, ExecutionStatus, Flow, FlowCreated, FlowStatus, FlowVersion,
-    FlowVersionCreated, ObjectKind, StateTransitioned, Thread, ThreadStatus, Timer, TimerPurpose,
-    TimerStatus, VariablesAssigned, WaitActivityState,
+    ActivateState, Activity, ActivityKind, ActivityState, ActivityStatus, Command,
+    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
+    Event, Execution, ExecutionCreated, ExecutionKind, ExecutionStatus, Flow, FlowCreated,
+    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind, StateTransitioned,
+    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus,
+    VariablesAssigned, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -59,7 +60,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -67,7 +68,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -77,7 +78,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -87,8 +88,8 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/W"),
                 input: json!({"n": 1}),
             })),
@@ -96,7 +97,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -111,7 +112,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -126,14 +127,14 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 timer: Timer {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                 },
             }),
             EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-2", 6),
+                timer: ref_to::<TimerKind>("lifecycle_execution-2", 6),
             }),
             EntryPayload::Event(Event::TimerTriggered {
                 timer: Timer {
@@ -142,19 +143,19 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         epoch(),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
-                    .with_owner(activity_timer_owner_of(ref_to(
+                    .with_owner(activity_timer_owner_of(flat_ref_to(
                         ObjectKind::Activity,
                         "lifecycle_execution-1",
                         5,
                     ))),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
@@ -165,7 +166,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -184,7 +185,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -196,12 +197,12 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/P"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/P"),
                 input: json!({"n": 1}),
             })),
@@ -213,7 +214,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -232,7 +233,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -244,7 +245,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
@@ -255,7 +256,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -274,7 +275,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
                     .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -286,7 +287,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
@@ -296,12 +297,12 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         epoch(),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
-                    .with_owner(root_thread_owner_of(ref_to(
+                    .with_owner(root_thread_owner_of(flat_ref_to(
                         ObjectKind::Execution,
                         "lifecycle_execution",
                         3,
                     ))),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -317,12 +318,12 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         epoch(),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
-                    .with_owner(root_thread_owner_of(ref_to(
+                    .with_owner(root_thread_owner_of(flat_ref_to(
                         ObjectKind::Execution,
                         "lifecycle_execution",
                         3,
                     ))),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -332,7 +333,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
@@ -343,7 +344,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         epoch(),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     ),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -357,7 +358,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         epoch(),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     ),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -409,7 +410,7 @@ async fn wait_until_a_literal_timestamp() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -417,7 +418,7 @@ async fn wait_until_a_literal_timestamp() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -427,7 +428,7 @@ async fn wait_until_a_literal_timestamp() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -437,8 +438,8 @@ async fn wait_until_a_literal_timestamp() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/W"),
                 input: json!({"n": 1}),
             })),
@@ -446,7 +447,7 @@ async fn wait_until_a_literal_timestamp() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -461,7 +462,7 @@ async fn wait_until_a_literal_timestamp() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -476,34 +477,34 @@ async fn wait_until_a_literal_timestamp() {
                 timer: Timer {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
                 },
             }),
             EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-2", 6),
+                timer: ref_to::<TimerKind>("lifecycle_execution-2", 6),
             }),
             EntryPayload::Event(Event::TimerTriggered {
                 timer: Timer {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -518,7 +519,7 @@ async fn wait_until_a_literal_timestamp() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -530,14 +531,14 @@ async fn wait_until_a_literal_timestamp() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -550,7 +551,7 @@ async fn wait_until_a_literal_timestamp() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "W".to_string(),
                     index: 0,
@@ -560,14 +561,14 @@ async fn wait_until_a_literal_timestamp() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -577,7 +578,7 @@ async fn wait_until_a_literal_timestamp() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -636,7 +637,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -644,7 +645,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -654,7 +655,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
                     index: 0,
@@ -664,8 +665,8 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Seed"),
                 input: json!({"n": 1}),
             })),
@@ -673,7 +674,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -688,7 +689,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -700,14 +701,14 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -719,14 +720,14 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Event(Event::VariablesAssigned(VariablesAssigned {
-                scope: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                scope: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 variables: vars(&[("delay", json!(45))]),
             })),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Seed"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -738,12 +739,12 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/W"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/W"),
                 input: json!({"n": 1}),
             })),
@@ -751,7 +752,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -766,7 +767,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 activity: Activity {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -781,34 +782,34 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 timer: Timer {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
                 },
             }),
             EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-3", 7),
+                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::TimerTriggered {
                 timer: Timer {
                     meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -820,14 +821,14 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Event(Event::VariablesAssigned(VariablesAssigned {
-                scope: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                scope: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 variables: vars(&[("delay", json!(45)), ("waited", json!(true))]),
             })),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/W"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -839,14 +840,14 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"echo": 1.0, "waited": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
                     index: 0,
@@ -859,7 +860,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "Seed".to_string(),
                     index: 0,
@@ -869,14 +870,14 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"echo": 1.0, "waited": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"echo": 1.0, "waited": true})),
@@ -886,7 +887,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"echo": 1.0, "waited": true})),

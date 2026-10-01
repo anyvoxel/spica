@@ -6,18 +6,20 @@ use std::time::Duration;
 
 use common::{
     Act, Call, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_owner, activity_timer_owner,
-    epoch, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name, path, pointer,
-    ref_to, request, root_thread_owner, run_typed_case, stamp, thread_owner, uid,
+    epoch, flat_ref_to, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name,
+    path, pointer, ref_to, request, root_thread_owner, run_typed_case, stamp, thread_owner, uid,
 };
 use serde_json::json;
 use spica_engine::{
-    ActivateState, ActivateTask, Activity, ActivityStatus, ClaimTasks, Command, CompleteExecution,
-    CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event,
-    Execution, ExecutionCreated, ExecutionError, ExecutionStatus, FailTask, Flow, FlowCreated,
-    FlowStatus, FlowVersion, FlowVersionCreated, ObjectKind, Reject, RejectionType,
-    RetrierAttemptState, RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task,
-    TaskCompleted, TaskFailed, TaskStatus, TasksClaimed, TerminateExecution, TerminateState,
-    TerminateThread, TerminationReason, Thread, ThreadStatus, Timer, TimerPurpose, TimerStatus,
+    ActivateState, ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command,
+    CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
+    EntryPayload, Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind,
+    ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated,
+    FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState, RetryPolicy,
+    RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed, TaskKind,
+    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
+    TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose,
+    TimerStatus,
 };
 
 #[rustfmt::skip]
@@ -60,7 +62,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -68,7 +70,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -78,7 +80,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -88,8 +90,8 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -97,7 +99,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -112,7 +114,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -124,9 +126,9 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -136,7 +138,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -163,7 +165,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 tasks: vec![Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Running,
@@ -180,7 +182,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
             })),
             EntryPayload::Command(Command::CompleteTask(CompleteTask {
                 request_id: request(3),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 output: json!({"ok": true}),
             })),
@@ -189,7 +191,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Completed,
@@ -206,14 +208,14 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 output: json!({"ok": true}),
             })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -228,7 +230,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -240,12 +242,12 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/P"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/P"),
                 input: json!({"ok": true}),
             })),
@@ -253,7 +255,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -268,7 +270,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -280,14 +282,14 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"ok": true}),
@@ -302,7 +304,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"ok": true}),
@@ -314,14 +316,14 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -334,7 +336,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -344,14 +346,14 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
@@ -361,7 +363,7 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
@@ -434,7 +436,7 @@ async fn task_settled_before_a_claim_is_refused() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -442,7 +444,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -452,7 +454,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -462,8 +464,8 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -471,7 +473,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -486,7 +488,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -498,9 +500,9 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -510,7 +512,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -527,7 +529,7 @@ async fn task_settled_before_a_claim_is_refused() {
             }),
             EntryPayload::Command(Command::CompleteTask(CompleteTask {
                 request_id: request(3),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 output: json!({"early": true}),
             })),
@@ -549,7 +551,7 @@ async fn task_settled_before_a_claim_is_refused() {
                     Task {
                         meta: meta(uid(6), "lifecycle_execution-2")
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -567,7 +569,7 @@ async fn task_settled_before_a_claim_is_refused() {
             })),
             EntryPayload::Command(Command::CompleteTask(CompleteTask {
                 request_id: request(4),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 output: json!({"late": true}),
             })),
@@ -576,7 +578,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Completed,
@@ -593,14 +595,14 @@ async fn task_settled_before_a_claim_is_refused() {
                 output: json!({"late": true}),
             })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"late": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -615,7 +617,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -627,12 +629,12 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/P"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/P"),
                 input: json!({"late": true}),
             })),
@@ -640,7 +642,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"late": true}),
@@ -655,7 +657,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"late": true}),
@@ -667,14 +669,14 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"late": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"late": true}),
@@ -689,7 +691,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"late": true}),
@@ -701,14 +703,14 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"late": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -721,7 +723,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -731,14 +733,14 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"late": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"late": true})),
@@ -748,7 +750,7 @@ async fn task_settled_before_a_claim_is_refused() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"late": true})),
@@ -830,7 +832,7 @@ async fn task_timeout_seconds_fails_the_run() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -838,7 +840,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -848,7 +850,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -858,8 +860,8 @@ async fn task_timeout_seconds_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -867,7 +869,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -882,7 +884,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -894,9 +896,9 @@ async fn task_timeout_seconds_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -906,7 +908,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 timer: Timer {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::TaskTimeout,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
@@ -916,7 +918,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -932,20 +934,20 @@ async fn task_timeout_seconds_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-3", 7),
+                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::TimerTriggered {
                 timer: Timer {
                     meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::TaskTimeout,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
                 },
             }),
             EntryPayload::Command(Command::FailTask(FailTask {
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 worker_id: "".to_string(),
                 error: ExecutionError::Runtime(RuntimeError::TimedOut {
                     message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
@@ -955,7 +957,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 task: Task {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Failed,
@@ -977,7 +979,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::TimedOut {
@@ -996,7 +998,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::TimedOut {
@@ -1012,7 +1014,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::TimedOut {
                         message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
@@ -1023,7 +1025,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1049,7 +1051,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1066,7 +1068,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::TimedOut {
                             message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
@@ -1080,7 +1082,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::TimedOut {
                             message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
@@ -1158,7 +1160,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1166,7 +1168,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -1176,7 +1178,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1186,8 +1188,8 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -1195,7 +1197,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1210,7 +1212,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1222,9 +1224,9 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "late".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -1234,7 +1236,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 timer: Timer {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::TaskTimeout,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
@@ -1244,7 +1246,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "late".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -1260,20 +1262,20 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-3", 7),
+                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::TimerTriggered {
                 timer: Timer {
                     meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::TaskTimeout,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
                 },
             }),
             EntryPayload::Command(Command::FailTask(FailTask {
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 worker_id: "".to_string(),
                 error: ExecutionError::Runtime(RuntimeError::TimedOut {
                     message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
@@ -1283,7 +1285,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 task: Task {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "late".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Failed,
@@ -1308,7 +1310,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -1320,12 +1322,12 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/Ok"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Ok"),
                 input: json!({"n": 1}),
             })),
@@ -1333,7 +1335,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1348,7 +1350,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1360,14 +1362,14 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-4", 8),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-4", 8),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -1384,7 +1386,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: Activity {
                     meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -1396,14 +1398,14 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"caught": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1416,7 +1418,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1426,14 +1428,14 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"caught": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"caught": true})),
@@ -1443,7 +1445,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"caught": true})),
@@ -1509,7 +1511,7 @@ async fn task_retry_re_arms_across_the_backoff() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1517,7 +1519,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -1527,7 +1529,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1537,8 +1539,8 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -1546,7 +1548,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1561,7 +1563,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1573,9 +1575,9 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![
@@ -1593,7 +1595,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -1629,7 +1631,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                     Task {
                         meta: meta(uid(6), "lifecycle_execution-2")
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -1654,7 +1656,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 ],
             })),
             EntryPayload::Command(Command::FailTask(FailTask {
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: "T".to_string(),
@@ -1666,7 +1668,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -1712,7 +1714,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                     Task {
                         meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -1743,7 +1745,7 @@ async fn task_retry_re_arms_across_the_backoff() {
             })),
             EntryPayload::Command(Command::CompleteTask(CompleteTask {
                 request_id: request(5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 output: json!({"ok": true}),
             })),
@@ -1752,7 +1754,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 task: Task {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Completed,
@@ -1782,14 +1784,14 @@ async fn task_retry_re_arms_across_the_backoff() {
                 output: json!({"ok": true}),
             })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -1808,7 +1810,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -1824,12 +1826,12 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/P"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/P"),
                 input: json!({"ok": true}),
             })),
@@ -1837,7 +1839,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -1852,7 +1854,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -1864,14 +1866,14 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"ok": true}),
@@ -1886,7 +1888,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"ok": true}),
@@ -1898,14 +1900,14 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1918,7 +1920,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -1928,14 +1930,14 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
@@ -1945,7 +1947,7 @@ async fn task_retry_re_arms_across_the_backoff() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
@@ -2057,7 +2059,7 @@ async fn task_catch_routes_on_a_failed_task() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -2065,7 +2067,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -2075,7 +2077,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2085,8 +2087,8 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -2094,7 +2096,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2109,7 +2111,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2121,9 +2123,9 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -2133,7 +2135,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -2161,7 +2163,7 @@ async fn task_catch_routes_on_a_failed_task() {
                     Task {
                         meta: meta(uid(6), "lifecycle_execution-2")
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -2178,7 +2180,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 ],
             })),
             EntryPayload::Command(Command::FailTask(FailTask {
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w1".to_string(),
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: "T".to_string(),
@@ -2190,7 +2192,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Failed,
@@ -2214,7 +2216,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -2226,12 +2228,12 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/Recover"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/Recover"),
                 input: json!({"n": 1}),
             })),
@@ -2239,7 +2241,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Recover"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2254,7 +2256,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Recover"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2266,14 +2268,14 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Recover"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -2288,7 +2290,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Recover"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -2300,14 +2302,14 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2320,7 +2322,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2330,14 +2332,14 @@ async fn task_catch_routes_on_a_failed_task() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -2347,7 +2349,7 @@ async fn task_catch_routes_on_a_failed_task() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
@@ -2423,7 +2425,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -2431,7 +2433,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -2441,7 +2443,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2451,8 +2453,8 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -2460,7 +2462,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2475,7 +2477,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2487,22 +2489,22 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
                 deadline: None,
             })),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                 },
@@ -2511,7 +2513,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -2530,7 +2532,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
@@ -2544,13 +2546,13 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::CancelTask {
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
             }),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2569,7 +2571,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             })),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                 },
@@ -2578,7 +2580,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Cancelled,
@@ -2594,13 +2596,13 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                     }),
@@ -2609,7 +2611,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                 },
@@ -2618,7 +2620,7 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
@@ -2632,13 +2634,13 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2650,13 +2652,13 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
             }),
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                     }),
@@ -2720,7 +2722,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -2728,7 +2730,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -2738,7 +2740,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -2748,8 +2750,8 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/T"),
                 input: json!({"n": 1}),
             })),
@@ -2757,7 +2759,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2772,7 +2774,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2784,9 +2786,9 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Command(Command::ActivateTask(ActivateTask {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
                 resource: "r".to_string(),
                 arguments: json!({"n": 1}),
                 retry_plan: vec![],
@@ -2796,7 +2798,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Pending,
@@ -2824,7 +2826,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                     Task {
                         meta: meta(uid(6), "lifecycle_execution-2")
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -2856,7 +2858,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                     Task {
                         meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                             .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                        execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                        execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                         resource: "r".to_string(),
                         arguments: json!({"n": 1}),
                         status: TaskStatus::Running,
@@ -2876,7 +2878,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
             // a lapsed lease hands the entity over rather than minting a retry.
             EntryPayload::Command(Command::CompleteTask(CompleteTask {
                 request_id: request(4),
-                task: ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+                task: ref_to::<TaskKind>("lifecycle_execution-2", 0),
                 worker_id: "w2".to_string(),
                 output: json!({"ok": true}),
             })),
@@ -2885,7 +2887,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 task: Task {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(activity_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     resource: "r".to_string(),
                     arguments: json!({"n": 1}),
                     status: TaskStatus::Completed,
@@ -2902,14 +2904,14 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 output: json!({"ok": true}),
             })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -2924,7 +2926,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/T"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -2936,12 +2938,12 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 next: pointer("/States/P"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/P"),
                 input: json!({"ok": true}),
             })),
@@ -2949,7 +2951,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -2964,7 +2966,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"ok": true}),
@@ -2976,14 +2978,14 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"ok": true}),
@@ -2998,7 +3000,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"ok": true}),
@@ -3010,14 +3012,14 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -3030,7 +3032,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 thread: Thread {
                     meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "T".to_string(),
                     index: 0,
@@ -3040,14 +3042,14 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!({"ok": true}),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
@@ -3057,7 +3059,7 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_span_root(uid(3), "lifecycle_execution", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),

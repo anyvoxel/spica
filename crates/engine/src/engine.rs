@@ -16,10 +16,12 @@ use crate::types::command::{
     TerminationReason,
 };
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::execution::Execution;
+use crate::types::execution::{Execution, ExecutionKind};
+use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{EntryId, FlowName, RequestId, StreamId};
-use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectName, ObjectRef};
 use crate::types::task::Task;
+use crate::types::task::TaskKind;
 
 /// Executes ASL state machines via the CCES architecture (Causal Command Event Sourcing).
 ///
@@ -307,7 +309,8 @@ impl Engine {
 }
 
 impl EngineInner {
-    /// Resolve the latest created version's [`ObjectReference`] under `name` from the **persisted**
+    /// Resolve the latest created version's [`ObjectRef<FlowVersionKind>`] under `name` from the
+    /// **persisted**
     /// Storage projection. Used by [`resolve_version_id`](Self::resolve_version_id) (version `0` =
     /// latest); a past-state lookup, so it does not go through the future-awaiting
     /// [`await_ack`](Self::await_ack).
@@ -315,7 +318,10 @@ impl EngineInner {
     /// This read is safe while the long-lived StreamProcessor runs: it acquires the Storage lock **per**
     /// entry, releasing it between entries (see the `storage` field doc), so this read never issues a
     /// blocking write-hold on the StreamProcessor's applies.
-    async fn latest_version(&self, name: &FlowName) -> Result<ObjectReference, ExecutionError> {
+    async fn latest_version(
+        &self,
+        name: &FlowName,
+    ) -> Result<ObjectRef<FlowVersionKind>, ExecutionError> {
         let storage = self.storage.lock().await;
         // The owning `Flow` keeps an O(1) counter of its newest ordinal; resolve that ordinal to the
         // concrete version row (keyed by `{flow_name}-{version}`), then to its reference.
@@ -330,7 +336,7 @@ impl EngineInner {
         storage
             .flow_version_of(name.clone(), flow.latest_version)
             .await?
-            .map(|ver| ver.meta.reference())
+            .map(|ver| ver.meta.typed_reference())
             .ok_or_else(|| {
                 ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                     "flow {name} has no version {}",
@@ -366,7 +372,7 @@ impl EngineInner {
         .await
     }
 
-    /// Wait for the execution started by [`start_for_revision`](Self::start_for_revision) to reach a
+    /// Wait for the execution started by [`create_execution`](Self::create_execution) to reach a
     /// terminal state, returning its **terminal [`Execution`] snapshot** — for both success
     /// (`Completed`) and failure (`Terminated(reason)`) alike. Settling is left to the caller:
     /// inspect `status`/`output` on the returned value rather than treating failure as an error.
@@ -379,7 +385,7 @@ impl EngineInner {
     /// or its projection was GC'd), or a storage failure — never for a failed execution.
     pub async fn wait_for_execution(
         &self,
-        execution: &ObjectReference,
+        execution: &ObjectRef<ExecutionKind>,
     ) -> Result<Execution, ExecutionError> {
         // Poll the durable projection. The interval keeps contention on the shared Storage lock low
         // (the StreamProcessor releases it between entries — see the `storage` field doc — so this read
@@ -404,19 +410,20 @@ impl EngineInner {
         }
     }
 
-    /// Resolve the persisted [`ObjectReference`] for `(name, version)` **without blocking on settlement**
+    /// Resolve the persisted [`ObjectRef<FlowVersionKind>`] for `(name, version)` **without blocking
+    /// on settlement**
     /// or awaiting any live ack: `version == 0` selects the latest created version (the "latest"
     /// convention), any other `version` resolves through the flow's `(name, version)` index.
     ///
     /// This is the non-awaiting *resolution* step a caller performs before
-    /// [`start_for_revision`](Self::start_for_revision), exposed so the Server's `StartExecution` can
+    /// [`create_execution`](Self::create_execution), exposed so the Server's `StartExecution` can
     /// bind a revision by name+version and still return the execution id at birth — settling is left
     /// to the client's Query read rather than blocked here.
     pub async fn resolve_version_id(
         &self,
         name: FlowName,
         version: u32,
-    ) -> Result<ObjectReference, ExecutionError> {
+    ) -> Result<ObjectRef<FlowVersionKind>, ExecutionError> {
         // Version 0 is the server's "latest" convention.
         if version == 0 {
             return self.latest_version(&name).await;
@@ -432,7 +439,7 @@ impl EngineInner {
                     "flow {name} has no version {version}"
                 )))
             })?;
-        Ok(ver.meta.reference())
+        Ok(ver.meta.typed_reference())
     }
 
     /// Read one persisted object of any kind from the current projection by `(kind, name)` — the
@@ -458,27 +465,27 @@ impl EngineInner {
                     .map(QueryObject::Flow))
             }
             ObjectKind::FlowVersion => Ok(storage
-                .get_flow_version(&ref_for(kind, name))
+                .get_flow_version(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::FlowVersion)),
             ObjectKind::Execution => Ok(storage
-                .get_execution(&ref_for(kind, name))
+                .get_execution(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Execution)),
             ObjectKind::Thread => Ok(storage
-                .get_thread(&ref_for(kind, name))
+                .get_thread(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Thread)),
             ObjectKind::Activity => Ok(storage
-                .get_activity(&ref_for(kind, name))
+                .get_activity(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Activity)),
             ObjectKind::Timer => Ok(storage
-                .get_timer(&ref_for(kind, name))
+                .get_timer(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Timer)),
             ObjectKind::Task => Ok(storage
-                .get_task(&ref_for(kind, name))
+                .get_task(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Task)),
         }
@@ -560,7 +567,7 @@ impl EngineInner {
         task: ObjectName,
         error: ExecutionError,
     ) -> Result<(), ExecutionError> {
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        let task_ref = ObjectRef::<TaskKind>::new(task, ulid::Ulid::nil());
         self.append_command(Command::FailTask(FailTask {
             task: task_ref,
             worker_id: worker_id.to_string(),
@@ -579,7 +586,7 @@ impl EngineInner {
         request_id: RequestId,
         output: serde_json::Value,
     ) -> Result<(), ExecutionError> {
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        let task_ref = ObjectRef::<TaskKind>::new(task, ulid::Ulid::nil());
         self.append_command(Command::CompleteTask(CompleteTask {
             request_id,
             task: task_ref,
@@ -597,7 +604,7 @@ impl EngineInner {
         &self,
         request_id: RequestId,
         name: ObjectName,
-        flow_version: ObjectReference,
+        flow_version: ObjectRef<FlowVersionKind>,
         input: serde_json::Value,
     ) -> Result<(), ExecutionError> {
         if self

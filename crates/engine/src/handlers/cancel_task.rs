@@ -1,8 +1,9 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectReference};
+use crate::types::meta::{HasRawObjectRef, ObjectRef};
 use crate::types::reject::RejectionType;
+use crate::types::task::TaskKind;
 
 /// Handles `CancelTask`: an in-flight `Task` is cancelled because its owning activity/execution is
 /// being torn down. Emits `TaskCancelled`, which marks the task `Cancelled` in storage and drains it
@@ -26,7 +27,7 @@ pub struct CancelTaskHandler;
 impl CancelTaskHandler {
     pub(crate) async fn handle(
         &self,
-        task: &ObjectReference,
+        task: &ObjectRef<TaskKind>,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
@@ -37,9 +38,7 @@ impl CancelTaskHandler {
                 format!("task {task} not found; cancel dropped"),
             ));
         };
-        // The slot is an `OwnerRef<ActivityKind>`; the container lookup and the log line below both
-        // take flat addresses, so the owner crosses the erasure seam here, once.
-        let owner = task_value.meta.owner.clone().into_erased();
+        let owner = task_value.meta.owner.clone();
         let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await else {
             tracing::warn!(
                 task = %task,
@@ -51,7 +50,9 @@ impl CancelTaskHandler {
         task_value.cancel(ctx.now());
         out.append_event(Event::TaskCancelled { task: task_value })
             .await;
-        container.after_child_terminated(ctx, out, task).await;
+        container
+            .after_child_terminated(ctx, out, task.as_raw_object_ref())
+            .await;
 
         Ok(())
     }
@@ -72,9 +73,12 @@ mod tests {
     use crate::handlers::dispatch::build_state_handlers;
     use crate::storage::{ActivityRecord, TaskRecord};
     use crate::types::event::Event;
+    use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
-    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef};
+    use crate::types::meta::HasRawObjectRef;
+    use crate::types::meta::{ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef, RawObjectRef};
     use crate::types::reject::RejectionType;
+    use crate::types::task::TaskKind;
     use crate::{
         Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Task, TaskStatus,
         ThreadKind, Timestamp,
@@ -86,48 +90,39 @@ mod tests {
         Timestamp::from_millis(1_000)
     }
 
-    fn reference(kind: ObjectKind, name: &str, uid: u64) -> ObjectReference {
-        ObjectReference::new(
-            kind,
+    /// A seeded address of the kind the caller names in the type — so a fixture reaches a typed slot
+    /// without a conversion, and cannot name a kind that slot does not admit.
+    fn reference<K: ObjectKindMarker>(name: &str, uid: u64) -> ObjectRef<K> {
+        ObjectRef::new(
             ObjectName::from_parsed(name).expect("a static literal is a valid object name"),
             ulid::Ulid::from(u128::from(uid)),
         )
     }
 
-    fn activity_ref() -> ObjectReference {
-        reference(ObjectKind::Activity, "execution-0", 90)
+    /// The task's owner slot: an activity, the only kind it admits.
+    fn activity_ref() -> ObjectRef<ActivityKind> {
+        reference("execution-0", 90)
     }
 
-    /// [`activity_ref`] in the type a task's owner slot holds — the same address, through the slot's
-    /// own checked conversion, so the fixture cannot seed a task whose owner is not an activity.
-    fn activity_owner() -> OwnerRef<ActivityKind> {
-        activity_ref()
-            .try_into()
-            .expect("a task's owner is an activity")
-    }
-
-    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits, so the
-    /// fixture cannot seed a row the engine could not represent.
-    fn thread_owner() -> OwnerRef<ThreadKind> {
-        reference(ObjectKind::Thread, "execution-1", 80)
-            .try_into()
-            .expect("an activity's owner is a thread")
+    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits.
+    fn thread_owner() -> ObjectRef<ThreadKind> {
+        reference("execution-1", 80)
     }
 
     /// The cancel target. Its name is load-bearing: the cancelled task keeps its own meta, and a
     /// renamed task is one its owner can no longer match against the child it owns.
-    fn task_ref() -> ObjectReference {
-        reference(ObjectKind::Task, "execution-0", 91)
+    fn task_ref() -> ObjectRef<TaskKind> {
+        reference("execution-0", 91)
     }
 
     /// The live task the sweep cancels, owned by [`activity_ref`] and leased to `w1`.
     fn seeded_task() -> TaskRecord {
         let value = Task {
-            meta: ObjectMeta::builder(task_ref().uid)
-                .name(task_ref().name)
+            meta: ObjectMeta::builder(task_ref().uid())
+                .name(task_ref().name().clone())
                 .at(at())
-                .with_owner(activity_owner()),
-            execution: reference(ObjectKind::Execution, "execution", 70),
+                .with_owner(activity_ref()),
+            execution: reference::<ExecutionKind>("execution", 70),
             resource: "service-a".to_string(),
             arguments: json!({ "in": 1 }),
             status: TaskStatus::Running,
@@ -144,19 +139,16 @@ mod tests {
 
     /// The owning activity, with the task as its one live child so the drain the cancel triggers is
     /// observable: the container may only converge an owner that has nothing left in flight.
-    fn seeded_activity(
-        status: ActivityStatus,
-        children: HashSet<ObjectReference>,
-    ) -> ActivityRecord {
+    fn seeded_activity(status: ActivityStatus, children: HashSet<RawObjectRef>) -> ActivityRecord {
         let mut path = jsonptr::PointerBuf::new();
         path.push_back("States");
         path.push_back("P");
         let activity = Activity {
-            meta: ObjectMeta::builder(activity_ref().uid)
-                .name(activity_ref().name)
+            meta: ObjectMeta::builder(activity_ref().uid())
+                .name(activity_ref().name().clone())
                 .at(at())
                 .with_owner(thread_owner()),
-            execution: reference(ObjectKind::Execution, "execution", 70),
+            execution: reference::<ExecutionKind>("execution", 70),
             state_path: StatePath::from(path),
             status,
             raw_input: json!({ "in": 1 }),
@@ -247,7 +239,10 @@ mod tests {
         fn live_world() -> (TaskRecord, ActivityRecord) {
             (
                 seeded_task(),
-                seeded_activity(ActivityStatus::Running, HashSet::from([task_ref()])),
+                seeded_activity(
+                    ActivityStatus::Running,
+                    HashSet::from([task_ref().into_raw_object_ref()]),
+                ),
             )
         }
 
@@ -268,8 +263,8 @@ mod tests {
                 panic!("a cancelled task emits TaskCancelled: {chain:?}");
             };
             assert_eq!(task.status, TaskStatus::Cancelled);
-            assert_eq!(task.meta.name, task_ref().name);
-            assert_eq!(task.meta.owner, activity_owner());
+            assert_eq!(task.meta.name, *task_ref().name());
+            assert_eq!(task.meta.owner, activity_ref());
             assert_eq!(task.meta.updated_at, at());
         }
 

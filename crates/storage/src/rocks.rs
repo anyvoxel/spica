@@ -43,9 +43,9 @@ use async_trait::async_trait;
 use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
 use spica_engine_types::{
-    ActivityRecord, ExecutionRecord, Flow, FlowName, FlowVersion, ObjectKind, ObjectName,
-    ObjectReference, Storage, StorageError, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-    Timestamp,
+    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
+    FlowVersionKind, ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError,
+    StorageTxn, TaskKind, TaskRecord, ThreadKind, ThreadRecord, TimerKind, TimerRecord, Timestamp,
 };
 
 use crate::{KeyBuilder, Kind, Scope};
@@ -118,35 +118,35 @@ impl RocksStorage {
 impl Storage for RocksStorage {
     async fn get_execution(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
         self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError> {
         self.get_row(self.keys.thread(reference))
     }
 
     async fn get_activity(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError> {
         self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError> {
         self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError> {
         self.get_row(self.keys.task(reference))
     }
@@ -215,23 +215,20 @@ impl Storage for RocksStorage {
 
     /// `active_children` is stored on the parent row, so this reads it back like
     /// [`InMemoryStorage`](crate::InMemoryStorage) does (a leaf — TimerRecord/TaskRecord — owns nothing).
-    async fn get_children(
-        &self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError> {
+    async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
-                .get_execution(&id)
+                .get_execution(&id.clone().typed::<ExecutionKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Thread => self
-                .get_thread(&id)
+                .get_thread(&id.clone().typed::<ThreadKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Activity => self
-                .get_activity(&id)
+                .get_activity(&id.clone().typed::<ActivityKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
@@ -243,47 +240,56 @@ impl Storage for RocksStorage {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.meta.reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.typed_reference()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.meta.reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.typed_reference()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.meta.reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.typed_reference()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.typed_reference()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.meta.reference()), &task)
+        self.put_row(self.keys.task(&task.meta.typed_reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`, exactly like
     /// [`InMemoryStorage`](crate::InMemoryStorage), persisted back through the DB.
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
-                if let Some(mut exec) = self.get_execution(&parent).await? {
+                if let Some(mut exec) = self
+                    .get_execution(&parent.clone().typed::<ExecutionKind>())
+                    .await?
+                {
                     exec.active_children.remove(&child);
                     self.put_execution(exec).await?;
                 }
             }
             ObjectKind::Thread => {
-                if let Some(mut thread) = self.get_thread(&parent).await? {
+                if let Some(mut thread) = self
+                    .get_thread(&parent.clone().typed::<ThreadKind>())
+                    .await?
+                {
                     thread.active_children.remove(&child);
                     self.put_thread(thread).await?;
                 }
             }
             ObjectKind::Activity => {
-                if let Some(mut act) = self.get_activity(&parent).await? {
+                if let Some(mut act) = self
+                    .get_activity(&parent.clone().typed::<ActivityKind>())
+                    .await?
+                {
                     act.active_children.remove(&child);
                     self.put_activity(act).await?;
                 }
@@ -297,24 +303,33 @@ impl Storage for RocksStorage {
     /// Read-modify-write `parent`'s `active_children` plus `child`, persisted back through the DB.
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
-                if let Some(mut exec) = self.get_execution(&parent).await? {
+                if let Some(mut exec) = self
+                    .get_execution(&parent.clone().typed::<ExecutionKind>())
+                    .await?
+                {
                     exec.active_children.insert(child);
                     self.put_execution(exec).await?;
                 }
             }
             ObjectKind::Thread => {
-                if let Some(mut thread) = self.get_thread(&parent).await? {
+                if let Some(mut thread) = self
+                    .get_thread(&parent.clone().typed::<ThreadKind>())
+                    .await?
+                {
                     thread.active_children.insert(child);
                     self.put_thread(thread).await?;
                 }
             }
             ObjectKind::Activity => {
-                if let Some(mut act) = self.get_activity(&parent).await? {
+                if let Some(mut act) = self
+                    .get_activity(&parent.clone().typed::<ActivityKind>())
+                    .await?
+                {
                     act.active_children.insert(child);
                     self.put_activity(act).await?;
                 }
@@ -343,9 +358,9 @@ impl Storage for RocksStorage {
 
     async fn get_flow_version(
         &self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError> {
-        self.get_row(self.keys.flow_version(&version.name))
+        self.get_row(self.keys.flow_version(version.name()))
     }
 
     async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
@@ -460,35 +475,35 @@ impl RocksTxn {
 impl StorageTxn for RocksTxn {
     async fn get_execution(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
         self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError> {
         self.get_row(self.keys.thread(reference))
     }
 
     async fn get_activity(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError> {
         self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError> {
         self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError> {
         self.get_row(self.keys.task(reference))
     }
@@ -528,21 +543,21 @@ impl StorageTxn for RocksTxn {
 
     async fn get_children(
         &mut self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError> {
+        id: RawObjectRef,
+    ) -> Result<HashSet<RawObjectRef>, StorageError> {
         Ok(match id.kind {
             ObjectKind::Execution => self
-                .get_execution(&id)
+                .get_execution(&id.clone().typed::<ExecutionKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Thread => self
-                .get_thread(&id)
+                .get_thread(&id.clone().typed::<ThreadKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
             ObjectKind::Activity => self
-                .get_activity(&id)
+                .get_activity(&id.clone().typed::<ActivityKind>())
                 .await?
                 .map(|x| x.active_children)
                 .unwrap_or_default(),
@@ -554,47 +569,56 @@ impl StorageTxn for RocksTxn {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.meta.reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.typed_reference()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.meta.reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.typed_reference()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.meta.reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.typed_reference()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.typed_reference()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.meta.reference()), &task)
+        self.put_row(self.keys.task(&task.meta.typed_reference()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`: read the (read-your-writes)
     /// row, remove `child`, and buffer the result back into the transaction (atomicity at commit).
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
-                if let Some(mut exec) = self.get_execution(&parent).await? {
+                if let Some(mut exec) = self
+                    .get_execution(&parent.clone().typed::<ExecutionKind>())
+                    .await?
+                {
                     exec.active_children.remove(&child);
                     self.put_execution(exec).await?;
                 }
             }
             ObjectKind::Thread => {
-                if let Some(mut thread) = self.get_thread(&parent).await? {
+                if let Some(mut thread) = self
+                    .get_thread(&parent.clone().typed::<ThreadKind>())
+                    .await?
+                {
                     thread.active_children.remove(&child);
                     self.put_thread(thread).await?;
                 }
             }
             ObjectKind::Activity => {
-                if let Some(mut act) = self.get_activity(&parent).await? {
+                if let Some(mut act) = self
+                    .get_activity(&parent.clone().typed::<ActivityKind>())
+                    .await?
+                {
                     act.active_children.remove(&child);
                     self.put_activity(act).await?;
                 }
@@ -609,24 +633,33 @@ impl StorageTxn for RocksTxn {
     /// insert `child`, and buffer the result back into the transaction (atomicity at commit).
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError> {
         match parent.kind {
             ObjectKind::Execution => {
-                if let Some(mut exec) = self.get_execution(&parent).await? {
+                if let Some(mut exec) = self
+                    .get_execution(&parent.clone().typed::<ExecutionKind>())
+                    .await?
+                {
                     exec.active_children.insert(child);
                     self.put_execution(exec).await?;
                 }
             }
             ObjectKind::Thread => {
-                if let Some(mut thread) = self.get_thread(&parent).await? {
+                if let Some(mut thread) = self
+                    .get_thread(&parent.clone().typed::<ThreadKind>())
+                    .await?
+                {
                     thread.active_children.insert(child);
                     self.put_thread(thread).await?;
                 }
             }
             ObjectKind::Activity => {
-                if let Some(mut act) = self.get_activity(&parent).await? {
+                if let Some(mut act) = self
+                    .get_activity(&parent.clone().typed::<ActivityKind>())
+                    .await?
+                {
                     act.active_children.insert(child);
                     self.put_activity(act).await?;
                 }
@@ -654,9 +687,9 @@ impl StorageTxn for RocksTxn {
 
     async fn get_flow_version(
         &mut self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError> {
-        self.get_row(self.keys.flow_version(&version.name))
+        self.get_row(self.keys.flow_version(version.name()))
     }
 
     async fn put_flow_version(&mut self, ver: FlowVersion) -> Result<(), StorageError> {
@@ -711,15 +744,14 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use spica_engine_types::{
-        Execution, ExecutionStatus, ObjectKind, ObjectReference, OwnerRef, PlainName, RetryState,
-        Task, TaskStatus, Timer, TimerOwner, TimerPurpose, TimerStatus, Timestamp, Variables,
+        Execution, ExecutionKind, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName,
+        RetryState, Task, TaskStatus, Timer, TimerOwner, TimerPurpose, TimerStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
-    fn test_exec_ref() -> ObjectReference {
+    fn test_exec_ref() -> ObjectRef<ExecutionKind> {
         let uid = ulid::Ulid::new();
-        ObjectReference::new(
-            ObjectKind::Execution,
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -728,10 +760,9 @@ mod tests {
     }
 
     /// A distinct timer reference (`child-<uid>`), matching a `Timer::reference()`.
-    fn timer_ref() -> ObjectReference {
+    fn timer_ref() -> ObjectRef<TimerKind> {
         let uid = ulid::Ulid::new();
-        ObjectReference::new(
-            ObjectKind::Timer,
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -745,23 +776,21 @@ mod tests {
     }
 
     /// A minimal running execution row for exercising the store.
-    fn sample_execution(id: ObjectReference) -> ExecutionRecord {
+    fn sample_execution(id: ObjectRef<ExecutionKind>) -> ExecutionRecord {
         ExecutionRecord {
             value: Execution {
                 deadline: None,
-                flow_version: ObjectReference::new(
-                    ObjectKind::FlowVersion,
+                flow_version: ObjectRef::new(
                     PlainName::new("flow").unwrap().generated_from_key(1),
                     ulid::Ulid::nil(),
                 ),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine_types::ObjectMeta::builder(id.uid)
+                meta: spica_engine_types::ObjectMeta::builder(id.uid())
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .with_owner(spica_engine_types::NoOwner::new()),
             },
-            variables: Variables::new(),
             active_children: HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -780,7 +809,7 @@ mod tests {
                 .await
                 .unwrap();
             let got = store.get_execution(&id).await.unwrap().unwrap();
-            assert_eq!(got.meta.reference(), id);
+            assert_eq!(got.meta.typed_reference(), id);
         }
         // Reopened store must still see the row (durability via RocksDB WAL across a drop/reopen).
         {
@@ -792,7 +821,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .reference(),
+                    .typed_reference(),
                 id
             );
         }
@@ -811,26 +840,55 @@ mod tests {
                 .await
                 .unwrap();
 
+            // `add_child`/`remove_child` speak the flat address the parent's own set holds, so the
+            // typed parent/child cross the erasure seam here.
             let parent = id.clone();
             // no children initially
-            assert!(store.get_children(parent.clone()).await.unwrap().is_empty());
+            assert!(
+                store
+                    .get_children(parent.clone().into_raw_object_ref())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             // add, then reflect in the persisted row
             store
-                .add_child(parent.clone(), child.clone())
+                .add_child(
+                    parent.clone().into_raw_object_ref(),
+                    child.clone().into_raw_object_ref(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
-                store.get_children(parent.clone()).await.unwrap(),
-                HashSet::from([child.clone()])
+                store
+                    .get_children(parent.clone().into_raw_object_ref())
+                    .await
+                    .unwrap(),
+                HashSet::from([child.clone().into_raw_object_ref()])
             );
             // a leaf parent (TimerRecord) owns nothing and never grows
-            assert!(store.get_children(timer_ref()).await.unwrap().is_empty());
+            assert!(
+                store
+                    .get_children(timer_ref().into_raw_object_ref())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             // remove, then reflect
             store
-                .remove_child(parent.clone(), child.clone())
+                .remove_child(
+                    parent.clone().into_raw_object_ref(),
+                    child.clone().into_raw_object_ref(),
+                )
                 .await
                 .unwrap();
-            assert!(store.get_children(parent).await.unwrap().is_empty());
+            assert!(
+                store
+                    .get_children(parent.into_raw_object_ref())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -847,8 +905,7 @@ mod tests {
                 .unwrap();
             // A timer under the same numeric-ish space is a distinct key namespace.
             let uid: ulid::Ulid = ulid::Ulid::new();
-            let timer_ref = ObjectReference::new(
-                ObjectKind::Timer,
+            let timer_ref = ObjectRef::<TimerKind>::new(
                 PlainName::new("child")
                     .unwrap()
                     .generated_from_key(uid.0 as u64),
@@ -861,10 +918,7 @@ mod tests {
                 deadline: Timestamp::from_millis(0),
                 meta: spica_engine_types::ObjectMeta::builder(uid)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(TimerOwner::Execution(OwnerRef::new(
-                        id.name.clone(),
-                        id.uid,
-                    ))),
+                    .with_owner(TimerOwner::Execution(id.clone())),
             });
             store.put_timer(t.clone()).await.unwrap();
             assert_eq!(
@@ -874,7 +928,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .reference(),
+                    .typed_reference(),
                 timer_ref
             );
             // the execution row is untouched by writing a timer
@@ -885,7 +939,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .reference(),
+                    .typed_reference(),
                 id
             );
         }
@@ -904,7 +958,7 @@ mod tests {
     ) -> TaskRecord {
         TaskRecord {
             value: Task {
-                execution: ObjectReference::nil(),
+                execution: ObjectRef::nil(),
                 resource: resource.to_string(),
                 arguments: Value::Null,
                 status,
@@ -919,7 +973,7 @@ mod tests {
                 },
                 meta: spica_engine_types::ObjectMeta::builder(id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(OwnerRef::new(
+                    .with_owner(ObjectRef::new(
                         PlainName::new("invoke").unwrap().generated_from_key(1),
                         ulid::Ulid::nil(),
                     )),

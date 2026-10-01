@@ -13,9 +13,12 @@
 //! [`finish_activity_via_state`]).
 
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::activity::ActivityKind;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::thread::{ThreadKind, ThreadStatus};
 
 /// Emit a drained-and-finishing `node`'s terminal (by kind and status), then deliver the settled
 /// node up to its owner as one hop ([`child_completed::child_settled`]) — which issues the next
@@ -27,12 +30,28 @@ use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope};
 pub(crate) async fn finish_node(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectReference,
+    node: &RawObjectRef,
 ) -> Result<(), ProcessingError> {
     match node.kind {
-        ObjectKind::Activity => Box::pin(finish_activity(ctx, out, node)).await,
-        ObjectKind::Thread => Box::pin(finish_thread(ctx, out, node)).await,
-        ObjectKind::Execution => Box::pin(finish_execution(ctx, out, node)).await,
+        ObjectKind::Activity => {
+            Box::pin(finish_activity(
+                ctx,
+                out,
+                &node.clone().typed::<ActivityKind>(),
+            ))
+            .await
+        }
+        ObjectKind::Thread => {
+            Box::pin(finish_thread(ctx, out, &node.clone().typed::<ThreadKind>())).await
+        }
+        ObjectKind::Execution => {
+            Box::pin(finish_execution(
+                ctx,
+                out,
+                &node.clone().typed::<ExecutionKind>(),
+            ))
+            .await
+        }
         _ => Ok(()),
     }
 }
@@ -58,7 +77,7 @@ enum DeferredFinish {
 async fn finish_activity_via_state(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectReference,
+    node: &ObjectRef<ActivityKind>,
     act: &crate::storage::ActivityRecord,
 ) -> Result<DeferredFinish, ProcessingError> {
     let activity_value = act.value();
@@ -68,7 +87,7 @@ async fn finish_activity_via_state(
     // hop — while a missing row, definition, or handler is a real unresolvable (closed generically by
     // the caller). Only the read separates the two; `machine_for_thread` mixes a missing definition
     // (domain) with the storage fault underneath it, so its `Infra` is split out explicitly.
-    let Some(thread) = ctx.storage.get_thread(owner.erased()).await? else {
+    let Some(thread) = ctx.storage.get_thread(&owner).await? else {
         return Ok(DeferredFinish::Unresolvable);
     };
     let sm = match ctx.machine_for_thread(&thread).await {
@@ -96,7 +115,7 @@ async fn finish_activity_via_state(
         );
         out.terminate(
             Some(node.clone()),
-            OwnerScope::of_reference(&activity_value.execution),
+            Some(OwnerScope::Execution(activity_value.execution.clone())),
             e,
         );
         return Ok(DeferredFinish::Terminated);
@@ -107,7 +126,7 @@ async fn finish_activity_via_state(
 async fn finish_activity(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectReference,
+    node: &ObjectRef<ActivityKind>,
 ) -> Result<(), ProcessingError> {
     use crate::ActivityStatus;
     // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
@@ -155,8 +174,8 @@ async fn finish_activity(
     Box::pin(super::child_completed::child_settled(
         ctx,
         out,
-        act.value.meta.owner.clone().into_erased(),
-        node.clone(),
+        act.value.meta.owner.clone().into_raw_object_ref(),
+        node.as_raw_object_ref().clone(),
     ))
     .await;
     Ok(())
@@ -165,9 +184,8 @@ async fn finish_activity(
 async fn finish_thread(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectReference,
+    node: &ObjectRef<ThreadKind>,
 ) -> Result<(), ProcessingError> {
-    use crate::types::thread::ThreadStatus;
     // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
     // "already closed", which this hop answers with nothing.
     let Some(thread) = ctx.storage.get_thread(node).await? else {
@@ -202,8 +220,8 @@ async fn finish_thread(
     Box::pin(super::child_completed::child_settled(
         ctx,
         out,
-        thread.value.meta.owner.clone().into_erased(),
-        node.clone(),
+        thread.value.meta.owner.clone().into_raw_object_ref(),
+        node.clone().into_raw_object_ref(),
     ))
     .await;
     Ok(())
@@ -212,7 +230,7 @@ async fn finish_thread(
 async fn finish_execution(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectReference,
+    node: &ObjectRef<ExecutionKind>,
 ) -> Result<(), ProcessingError> {
     use crate::ExecutionStatus;
     // A read fault is the dispatch's — returned, so the leader owns retry/refusal; a missing row is
@@ -258,7 +276,7 @@ pub struct ContinueCompleteHandler;
 impl ContinueCompleteHandler {
     pub(crate) async fn handle(
         &self,
-        owner: &ObjectReference,
+        owner: &RawObjectRef,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
@@ -273,7 +291,7 @@ pub struct ContinueTerminateHandler;
 impl ContinueTerminateHandler {
     pub(crate) async fn handle(
         &self,
-        owner: &ObjectReference,
+        owner: &RawObjectRef,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {

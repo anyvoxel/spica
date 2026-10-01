@@ -1,10 +1,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::types::activity::ActivityKind;
 use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::execution::ExecutionKind;
+use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{FlowName, RequestId};
-use crate::types::meta::{ObjectName, ObjectReference};
+use crate::types::meta::{ObjectName, ObjectRef, RawObjectRef};
 use crate::types::task::RetryPolicy;
+use crate::types::task::TaskKind;
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 use spica_asl::StatePath;
 use spica_machinery::Timestamp;
 
@@ -71,9 +77,9 @@ impl TerminationReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivateState {
     /// The top-level run this state lives in — carried verbatim through nesting.
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     /// The immediate scope the new activity enters (an `Execution` or fan-out `Thread`).
-    pub owner: ObjectReference,
+    pub owner: ObjectRef<ThreadKind>,
     /// The exact JSON Pointer to the state being entered (self-locating definition lookup).
     pub state_path: StatePath,
     /// The state's raw input, projected from the transition (`StateTransitioned` output).
@@ -107,7 +113,7 @@ pub struct CreateExecution {
     /// `ExecutionCreated` lands in the same atomic batch (a committed command has a causal event
     /// and is never re-dispatched; an uncommitted one is re-dispatched fresh).
     pub name: ObjectName,
-    pub flow_version: ObjectReference,
+    pub flow_version: ObjectRef<FlowVersionKind>,
     pub input: Value,
 }
 
@@ -116,10 +122,10 @@ pub struct CreateExecution {
 pub struct SpawnThread {
     /// The owning node — the `Parallel`/`Map` activity's reference (kind `Activity`) whose
     /// `active_children` must drain before the container can finish.
-    pub owner: ObjectReference,
+    pub owner: ObjectRef<ActivityKind>,
     /// The reference of the top-level run this branch belongs to (the child inherits it as
     /// its `execution` anchor, carried verbatim through every nesting level).
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     /// Resolved JSON Pointer to this branch's `States` table within the shared machine.
     pub state_path: Option<StatePath>,
     /// This child's ordinal within its container's fan-out source — the `Branches` array index
@@ -141,14 +147,14 @@ pub struct SpawnThread {
 /// Payload of [`Command::CompleteExecution`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteExecution {
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     pub output: Value,
 }
 
 /// Payload of [`Command::CompleteThread`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteThread {
-    pub thread: ObjectReference,
+    pub thread: ObjectRef<ThreadKind>,
     pub output: Value,
 }
 
@@ -163,14 +169,14 @@ pub struct TerminateExecution {
 /// Payload of [`Command::TerminateThread`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminateThread {
-    pub thread: ObjectReference,
+    pub thread: ObjectRef<ThreadKind>,
     pub reason: TerminationReason,
 }
 
 /// Payload of [`Command::CompleteState`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteState {
-    pub activity: ObjectReference,
+    pub activity: ObjectRef<ActivityKind>,
     /// The state's raw result (see the variant's doc: carried makes the command
     /// self-describing and the complete step record it without re-reading storage).
     pub output: Value,
@@ -179,16 +185,16 @@ pub struct CompleteState {
 /// Payload of [`Command::TerminateState`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminateState {
-    pub activity: ObjectReference,
+    pub activity: ObjectRef<ActivityKind>,
     pub reason: TerminationReason,
 }
 
 /// Payload of [`Command::ActivateTask`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivateTask {
-    pub execution: ObjectReference,
-    pub owner: ObjectReference,
-    pub task: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
+    pub owner: ObjectRef<ActivityKind>,
+    pub task: ObjectRef<TaskKind>,
     pub resource: String,
     pub arguments: Value,
     pub retry_plan: Vec<RetryPolicy>,
@@ -213,7 +219,7 @@ pub struct ClaimTasks {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteTask {
     pub request_id: RequestId,
-    pub task: ObjectReference,
+    pub task: ObjectRef<TaskKind>,
     pub worker_id: String,
     pub output: Value,
 }
@@ -221,7 +227,7 @@ pub struct CompleteTask {
 /// Payload of [`Command::FailTask`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailTask {
-    pub task: ObjectReference,
+    pub task: ObjectRef<TaskKind>,
     pub worker_id: String,
     pub error: ExecutionError,
 }
@@ -241,7 +247,7 @@ pub struct FailTask {
 ///
 /// The state machine definition is **created in Storage** (by id) rather than threaded through
 /// commands: [`Command::CreateFlow`] is the single transport for a definition, and every execution
-/// command after that references a version's `ObjectReference`. This keeps execution commands small and lets
+/// command after that references a version's `RawObjectRef`. This keeps execution commands small and lets
 /// a recovered/restarted Engine resolve machines by id from storage without re-supplying them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -252,14 +258,14 @@ pub enum Command {
     /// boundary, parsed on demand at execution). The handler (running in the StreamProcessor) is what
     /// assigns identity: it get-or-creates the [`Flow`](crate::Flow) by `name` (the name *is* the
     /// flow's identity — no generation id), computes the next `version` ordinal (1 for a new name,
-    /// `max+1` for an existing one), mints the version's `ObjectReference` the new version is bound to, and
+    /// `max+1` for an existing one), mints the version's `RawObjectRef` the new version is bound to, and
     /// emits [`Event::FlowCreated`](crate::Event), which folds the definition into Storage. Every
-    /// other command carries only ids — an execution references a version's `ObjectReference`, never the
+    /// other command carries only ids — an execution references a version's `RawObjectRef`, never the
     /// machine — keeping execution commands small and fully serializable.
     CreateFlow(CreateFlow),
 
     // ── Execution (lifecycle: spawn → complete → terminate) ─────────────────
-    /// Begin executing a state machine. `flow_version` is the [`ObjectReference`] of the immutable
+    /// Begin executing a state machine. `flow_version` is the [`RawObjectRef`] of the immutable
     /// flow version the execution binds to (its definition); the machine is resolved from Storage at
     /// dispatch time, never carried in the command. Produces `ExecutionCreated` +
     /// `ActivateState`(start state) + (if `TimeoutSeconds` is set) a `TimerActivated`
@@ -297,7 +303,7 @@ pub enum Command {
     /// `Succeed`/`End` reached). Distinct from [`CompleteExecution`](Command::CompleteExecution):
     /// that verb is reserved for the **top-level** run, while a `Thread`'s terminal hop — the end of
     /// a `Parallel` branch or a `Map` item — completes only the branch, converged by the owning
-    /// container Activity. Address by the thread's `ObjectReference` (its generated single-use uid),
+    /// container Activity. Address by the thread's `RawObjectRef` (its generated single-use uid),
     /// never a user name.
     ///
     /// Produces `ThreadCompleting`, cancels the branch's sm-timers, and `ThreadCompleted` once
@@ -318,7 +324,7 @@ pub enum Command {
     /// external root-termination path, keyed in execution storage), while a `Thread` is only ever
     /// terminated **internally** by its owning container Activity — a `Parallel`/`Map` sweep issues
     /// this when a branch/item must be torn down (e.g. an ancestor cancellation draining the tree).
-    /// Address by the thread's `ObjectReference` (its generated single-use uid), not a user name.
+    /// Address by the thread's `RawObjectRef` (its generated single-use uid), not a user name.
     ///
     /// Produces `ThreadTerminating`, sweeps owned children, and `ThreadTerminated{reason}` once
     /// drained — mirroring `TerminateExecution`'s cascade, but resolved against thread storage and
@@ -373,11 +379,11 @@ pub enum Command {
     /// Signal that an armed timer has fired (its deadline passed). Dispatched by a `WaitResume`
     /// fires the owning state's resume; by an `ExecutionTimeout` triggers `TerminateExecution` with
     /// `TimedOut`. Idempotent if the owner already moved past.
-    TriggerTimer { timer: ObjectReference },
+    TriggerTimer { timer: ObjectRef<TimerKind> },
 
     /// Cancel a pending timer (e.g. the execution's `TimeoutSeconds` once it finishes). Idempotent —
     /// a no-op if the timer already completed/cancelled.
-    CancelTimer { timer: ObjectReference },
+    CancelTimer { timer: ObjectRef<TimerKind> },
 
     // ── Task (external-resource call, Zeebe-style lease lifecycle) ─────────────
     /// Invoke an external `Task` — the Task-state analogue of inline timer arming. The
@@ -427,7 +433,7 @@ pub enum Command {
 
     /// Cancel a pending `Task` (e.g. the owning activity/execution is terminated while the call is
     /// in flight). Idempotent — a no-op if the task already settled.
-    CancelTask { task: ObjectReference },
+    CancelTask { task: ObjectRef<TaskKind> },
 
     /// Continue a drained-and-finishing `owner`'s **success** drain on a later round. Issued by the
     /// one-hop child-settled reactor (see `handlers::child_completed`) the moment it observes the
@@ -435,13 +441,13 @@ pub enum Command {
     /// owner's terminal next round and issues a follow-up Continue for *its* owner. Replaces the old
     /// inline recursive cascade with one hop per round (Zeebe's `COMPLETE_ELEMENT` decoupling), so
     /// convergence no longer recurses up the owner chain on the call stack.
-    ContinueComplete { owner: ObjectReference },
+    ContinueComplete { owner: RawObjectRef },
 
     /// Continue a drained-and-finishing `owner`'s **failure** drain on a later round — the
     /// `Terminating` analogue of [`ContinueComplete`](Command::ContinueComplete). The `reason` is
     /// recovered from the `owner`'s `Terminating(reason)` status at drain time (single source of
     /// truth), so it is deliberately not carried.
-    ContinueTerminate { owner: ObjectReference },
+    ContinueTerminate { owner: RawObjectRef },
 }
 
 impl Command {

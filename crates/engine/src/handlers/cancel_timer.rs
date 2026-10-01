@@ -1,7 +1,8 @@
 use crate::TimerStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectReference};
+use crate::types::meta::{HasRawObjectRef, ObjectRef};
+use crate::types::timer::TimerKind;
 
 /// Handles `CancelTimer`: marks an armed timer cancelled. Idempotent — a no-op for a timer that
 /// already fired or was already cancelled. After recording the timer's terminal state, runs the
@@ -13,7 +14,7 @@ pub struct CancelTimerHandler;
 impl CancelTimerHandler {
     pub(crate) async fn handle(
         &self,
-        timer: &ObjectReference,
+        timer: &ObjectRef<TimerKind>,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
@@ -32,8 +33,8 @@ impl CancelTimerHandler {
         super::child_completed::child_settled(
             ctx,
             out,
-            act.value.meta.owner.clone().into_erased(),
-            timer.clone(),
+            act.value.meta.owner.clone().into_raw_object_ref(),
+            timer.as_raw_object_ref().clone(),
         )
         .await;
 

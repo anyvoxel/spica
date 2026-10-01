@@ -3,7 +3,9 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteState, FailTask, TerminationReason, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope, TimerOwner};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, OwnerScope, TimerOwner};
+use crate::types::task::TaskKind;
+use crate::types::timer::TimerKind;
 
 /// Handles `TriggerTimer`: a timer's deadline elapsed. Idempotent (a no-op if the timer is gone or
 /// already terminal). Dispatches by `purpose`: `WaitResume` fires the owning state;
@@ -14,7 +16,7 @@ pub struct TriggerTimerHandler;
 impl TriggerTimerHandler {
     pub(crate) async fn handle(
         &self,
-        timer: &ObjectReference,
+        timer: &ObjectRef<TimerKind>,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
@@ -62,18 +64,18 @@ impl TriggerTimerHandler {
                 super::child_completed::child_settled(
                     ctx,
                     out,
-                    activity.erased().clone(),
-                    timer.clone(),
+                    activity.as_raw_object_ref().clone(),
+                    timer.as_raw_object_ref().clone(),
                 )
                 .await;
                 // A Wait's raw result is its processed input (no distinct raw output). Load it so the
                 // `CompleteState` command carries the raw result, keeping the command self-describing.
-                let raw_result = match ctx.storage.get_activity(activity.erased()).await {
+                let raw_result = match ctx.storage.get_activity(&activity).await {
                     Ok(Some(act)) => act.value().input.clone().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null, // owner gone — the handler will no-op.
                 };
                 out.append_command(Command::CompleteState(CompleteState {
-                    activity: activity.into_erased(),
+                    activity,
                     output: raw_result,
                 }));
             }
@@ -94,19 +96,20 @@ impl TriggerTimerHandler {
                 super::child_completed::child_settled(
                     ctx,
                     out,
-                    activity.erased().clone(),
-                    timer.clone(),
+                    activity.as_raw_object_ref().clone(),
+                    timer.as_raw_object_ref().clone(),
                 )
                 .await;
                 let in_flight = ctx
                     .storage
-                    .get_children(activity.erased().clone())
+                    .get_children(activity.as_raw_object_ref().clone())
                     .await
                     .ok()
                     .and_then(|cs| cs.into_iter().find(|c| c.kind == ObjectKind::Task));
                 let Some(task) = in_flight else {
                     return Ok(()); // no in-flight task — the timeout no longer applies.
                 };
+                let task = task.typed::<TaskKind>();
                 // Fail the task with the engine-authoritative timeout: `worker_id` is empty (this is
                 // not a worker report, so no lease-match check applies — the deadline is the engine's
                 // own backstop). `FailTaskHandler` routes it through Retry/Catch/terminate.
