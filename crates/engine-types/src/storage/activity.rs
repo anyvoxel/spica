@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
 use crate::types::activity::Activity;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::RawObjectRef;
 use spica_machinery::Timestamp;
 
 /// The storage projection row of an ActivityRecord.
@@ -20,7 +20,7 @@ pub struct ActivityRecord {
     /// The canonical ActivityRecord domain value reconstructed from the event stream.
     pub value: Activity,
     /// Owned nodes still in flight (e.g. this Wait's resume timer). Terminating waits on them.
-    pub active_children: HashSet<ObjectReference>,
+    pub active_children: HashSet<RawObjectRef>,
     /// When this row's birth event (`StateActivating`) landed in the log. Projection-derived from the
     /// applied entry's `timestamp` — never a local `Timestamp::now()` — so every replica replaying the
     /// same entries computes the identical value. A reconstruction applier carries it over from the
@@ -41,7 +41,7 @@ impl ActivityRecord {
     /// Rebuild a storage projection row from the event-carried entity value and the independently
     /// maintained `active_children` set. Stamps zero timestamps; the caller (a creation or
     /// reconstruction applier) sets the real ones explicitly.
-    pub fn from_value(value: Activity, active_children: HashSet<ObjectReference>) -> Self {
+    pub fn from_value(value: Activity, active_children: HashSet<RawObjectRef>) -> Self {
         Self {
             value,
             active_children,

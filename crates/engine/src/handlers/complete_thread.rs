@@ -2,7 +2,7 @@ use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ThreadOwner};
+use crate::types::meta::{HasRawObjectRef, ThreadOwner};
 
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
@@ -66,7 +66,7 @@ impl CompleteThreadHandler {
                 // `active_children`, so `CompleteExecution` now closes the run.
                 ThreadOwner::Execution(execution) => {
                     out.append_command(Command::CompleteExecution(CompleteExecution {
-                        execution: execution.into_erased(),
+                        execution,
                         output: output.clone(),
                     }));
                 }
@@ -76,7 +76,7 @@ impl CompleteThreadHandler {
                     super::child_completed::child_settled(
                         ctx,
                         out,
-                        activity.into_erased(),
+                        activity.into_raw_object_ref(),
                         thread_ref.clone(),
                     )
                     .await;

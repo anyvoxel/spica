@@ -312,7 +312,7 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 
 ### 候选方案:Task 持有自己的 timeout timer 引用(倾向这条)
 
-保留 Timer 挂 Activity,让 **Task 记住自己的 timer**(`Task.timeout_timer: Option<ObjectReference>`,随 `ActivateTask` 一起带去):
+保留 Timer 挂 Activity,让 **Task 记住自己的 timer**(`Task.timeout_timer: Option<ObjectRef<TimerKind>>`,随 `ActivateTask` 一起带去):
 
 - `trigger_timer` 的 `TaskTimeout` 臂 O(1) 拿到 task,搜索与 no-in-flight 分支都删掉;
 - 终结路径按引用**精确**扫那一颗 timer,而非「扫 activity 的所有 timer」;

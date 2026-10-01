@@ -8,11 +8,13 @@ use super::super::{emit_transition, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, SpawnThread, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectReference, OwnerScope};
+use crate::types::meta::{HasRawObjectRef, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, ActivityStatus, MapActivityState, Variables};
 
 /// The `Map` state: iterates an `Items` array, running the `ItemProcessor` sub-state-machine once
@@ -117,7 +119,7 @@ impl StateHandler for MapStateHandler<'_> {
         } else {
             progress.max_concurrency.min(progress.total)
         };
-        let activity = activity_value.meta.reference();
+        let activity = activity_value.meta.typed_reference();
         let owner = activity.clone();
         let pointer = activity_value.state_path.item_processor();
         let start_at = self
@@ -183,7 +185,7 @@ impl StateHandler for MapStateHandler<'_> {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -191,7 +193,7 @@ impl StateHandler for MapStateHandler<'_> {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            activity_value.meta.owner.clone().into_erased(),
+            activity_value.meta.owner.clone(),
             activity,
             &activity_value.state_path,
             &activity_value.raw_input,
@@ -217,10 +219,10 @@ impl StateHandler for MapStateHandler<'_> {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
-        child: ObjectReference,
+        child: RawObjectRef,
     ) {
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
@@ -236,7 +238,11 @@ impl StateHandler for MapStateHandler<'_> {
         // `active_children`, and the `children` map (index -> child) records who that was — so
         // membership in it is the whole test, and a node outside it is not ours to react to. Every
         // entry was folded from a `ThreadCreated`, so an item is always a `Thread`.
-        let Some(child_exec) = progress.children.values().find(|e| **e == child) else {
+        let Some(child_exec) = progress
+            .children
+            .values()
+            .find(|e| e.as_raw_object_ref() == &child)
+        else {
             return;
         };
         // A child that vanished without settling counts as a failure (mirrors `parallel.rs`).
@@ -296,7 +302,7 @@ impl StateHandler for MapStateHandler<'_> {
         if completed_now == progress.total {
             // Aggregate the per-item outputs in item-index order (mirroring a `Parallel`'s
             // branch-order aggregation). Every child is `Completed` by now.
-            let mut entries: Vec<(usize, crate::types::meta::ObjectReference)> = progress
+            let mut entries: Vec<(usize, ObjectRef<ThreadKind>)> = progress
                 .children
                 .iter()
                 .map(|(i, e)| (*i, e.clone()))
@@ -457,7 +463,7 @@ impl MapStateHandler<'_> {
         reason: TerminationReason,
     ) {
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.meta.reference(),
+            activity: activity.meta.typed_reference(),
             reason: reason.clone(),
         }));
         super::super::emit_scope_termination(
@@ -483,14 +489,8 @@ impl MapStateHandler<'_> {
         variables: &Variables,
         aggregated: Value,
     ) {
-        let activity_ref = activity.meta.reference();
-        let owner = activity
-            .meta
-            .owner
-            .clone()
-            // A thread is the only thing that can own an activity (the slot's own type), and every
-            // consumer below takes the flat address storage and commands speak — erased once here.
-            .into_erased();
+        let activity_ref = activity.meta.typed_reference();
+        let owner = activity.meta.owner.clone();
         // `$states.result` / the default state result is the aggregated per-item output array;
         // `Output`, when present, projects over it (so a Map can reshape that array).
         let states = States::new(
@@ -505,14 +505,14 @@ impl MapStateHandler<'_> {
         fail_or!(
             out,
             Some(activity_ref.clone()),
-            OwnerScope::of_reference(&owner),
+            Some(OwnerScope::Thread(owner.clone())),
             self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
                 .await
         );
         let output_value = fail_or!(
             out,
-            Some(activity_ref),
-            OwnerScope::of_reference(&owner),
+            Some(activity_ref.clone()),
+            Some(OwnerScope::Thread(owner.clone())),
             self.project_output(env, self.output(), &states, &local_scope, aggregated)
                 .await
         );
@@ -533,7 +533,7 @@ impl MapStateHandler<'_> {
         emit_transition(
             out,
             activity.execution.clone(),
-            activity.meta.owner.clone().into_erased(),
+            activity.meta.owner.clone(),
             activity_ref,
             &activity.state_path,
             &output_value,
@@ -809,7 +809,7 @@ mod tests {
     /// The item index → child thread map a fanned-out `Map` activity carries. Written by the
     /// `ThreadCreated` fold in production; a test writes it down directly, and writes it *out of
     /// order* so the aggregation's index sort is what the assertion actually pins.
-    fn item_children(indices: &[usize]) -> HashMap<usize, ObjectReference> {
+    fn item_children(indices: &[usize]) -> HashMap<usize, ObjectRef<ThreadKind>> {
         indices.iter().rev().map(|i| (*i, child_ref(*i))).collect()
     }
 
@@ -826,8 +826,8 @@ mod tests {
     fn planned_container(
         items: Vec<Value>,
         max_concurrency: usize,
-        children: HashMap<usize, ObjectReference>,
-        active_children: impl IntoIterator<Item = ObjectReference>,
+        children: HashMap<usize, ObjectRef<ThreadKind>>,
+        active_children: impl IntoIterator<Item = RawObjectRef>,
     ) -> ActivityRecord {
         let total = items.len();
         seeded_activity_with(
@@ -865,7 +865,7 @@ mod tests {
             &map_state(Some(MapItems::Array(items)), None, Some(true)),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
@@ -917,7 +917,7 @@ mod tests {
             &map_state(Some(MapItems::Array(items)), Some(1), Some(true)),
             store,
             minted_activity_ref(),
-            child_ref(0),
+            child_ref(0).into_raw_object_ref(),
         )
         .await;
 
@@ -944,7 +944,12 @@ mod tests {
         // settle being driven.
         seed_container(
             &mut store,
-            planned_container(items.clone(), 1, item_children(&[0, 1]), [child_ref(0)]),
+            planned_container(
+                items.clone(),
+                1,
+                item_children(&[0, 1]),
+                [child_ref(0).into_raw_object_ref()],
+            ),
             [
                 item_child(0, json!(null), ThreadStatus::Running),
                 item_child(1, json!(null), ThreadStatus::Completed),
@@ -956,7 +961,7 @@ mod tests {
             &map_state(Some(MapItems::Array(items)), Some(1), Some(true)),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
@@ -982,7 +987,12 @@ mod tests {
         let mut store = InMemoryStorage::new();
         seed_container(
             &mut store,
-            planned_container(items.clone(), 0, item_children(&[0, 1]), [child_ref(0)]),
+            planned_container(
+                items.clone(),
+                0,
+                item_children(&[0, 1]),
+                [child_ref(0).into_raw_object_ref()],
+            ),
             [
                 item_child(0, json!(null), ThreadStatus::Running),
                 item_child(1, json!(null), ThreadStatus::Terminated(failure)),
@@ -994,7 +1004,7 @@ mod tests {
             &map_state(Some(MapItems::Array(items)), None, None),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
@@ -1040,7 +1050,7 @@ mod tests {
             store,
             minted_activity_ref(),
             // Not one of the plan's children.
-            child_ref(9),
+            child_ref(9).into_raw_object_ref(),
         )
         .await;
 

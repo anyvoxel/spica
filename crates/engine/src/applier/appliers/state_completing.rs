@@ -11,7 +11,11 @@ impl StateCompletingApplier {
         ctx: &mut ApplierContext<'_>,
         activity: &Activity,
     ) -> Result<(), ExecutionError> {
-        if let Some(act) = ctx.storage.get_activity(&activity.meta.reference()).await? {
+        if let Some(act) = ctx
+            .storage
+            .get_activity(&activity.meta.typed_reference())
+            .await?
+        {
             // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
             let mut row =
                 crate::storage::ActivityRecord::from_value(activity.clone(), act.active_children);

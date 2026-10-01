@@ -127,7 +127,7 @@ impl CreateFlowHandler {
                 meta: crate::types::meta::ObjectMeta::builder(flow_version_uid)
                     .name(flow_version)
                     .at(created_at)
-                    .with_owner(crate::types::meta::OwnerRef::new(
+                    .with_owner(crate::types::meta::ObjectRef::new(
                         crate::types::meta::ObjectName::plain(name.as_str())
                             .expect("a valid FlowName is a valid user object name"),
                         flow_uid,

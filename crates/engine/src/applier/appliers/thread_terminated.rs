@@ -1,7 +1,7 @@
 //! `ThreadTerminated` event projection: folds the `Event::ThreadTerminated` into Storage.
 
 use crate::types::error::ExecutionError;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 use crate::{ApplierContext, Thread};
 
 #[derive(Default)]
@@ -12,14 +12,18 @@ impl ThreadTerminatedApplier {
         ctx: &mut ApplierContext<'_>,
         thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut row) = ctx.storage.get_thread(&thread.meta.reference()).await? {
+        if let Some(mut row) = ctx
+            .storage
+            .get_thread(&thread.meta.typed_reference())
+            .await?
+        {
             row.status = thread.status.clone();
             row.value.meta.updated_at = thread.meta.updated_at;
             let parent = row.value.meta.owner.clone();
             row.with_update_at(ctx.timestamp);
             ctx.storage.put_thread(row).await?;
             ctx.storage
-                .remove_child(parent.into_erased(), thread.meta.reference())
+                .remove_child(parent.into_raw_object_ref(), thread.meta.reference())
                 .await?;
         }
         Ok(())

@@ -17,11 +17,16 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
+use crate::types::activity::ActivityKind;
 use crate::types::error::StorageError;
+use crate::types::execution::ExecutionKind;
 use crate::types::flow::Flow;
-use crate::types::flow_version::FlowVersion;
+use crate::types::flow_version::{FlowVersion, FlowVersionKind};
 use crate::types::id::FlowName;
-use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectName, ObjectRef, RawObjectRef};
+use crate::types::task::TaskKind;
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 use spica_machinery::Timestamp;
 
 pub use activity::ActivityRecord;
@@ -48,28 +53,25 @@ pub use timer::TimerRecord;
 pub trait Storage: Send + Sync {
     async fn get_execution(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError>;
     async fn get_thread(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError>;
     async fn get_activity(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError>;
     async fn get_timer(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError>;
     async fn get_task(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError>;
-    async fn get_children(
-        &self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError>;
+    async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError>;
 
     /// Scan up to `limit` tasks of `resource` that a worker may claim **at** `now` — the discovery
     /// query behind a worker pull (`TaskApi::poll_tasks`). A
@@ -124,14 +126,14 @@ pub trait Storage: Send + Sync {
     /// Remove `child` from `parent`'s `active_children` (a terminal child draining its owner).
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError>;
     /// Add `child` to `parent`'s `active_children` (a child appears when its `ing` event lands).
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError>;
 
     /// Fetch a flow by its addressing key (`name`, the immutable primary key).
@@ -139,12 +141,12 @@ pub trait Storage: Send + Sync {
     /// Upsert a flow row (written by the `FlowCreated` applier; advances `latest_version`).
     async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError>;
 
-    /// Fetch a persisted flow version by its [`ObjectReference`]. This is how handlers resolve the
+    /// Fetch a persisted flow version by its [`ObjectRef`]. This is how handlers resolve the
     /// machine an execution is bound to, lazily loading it into the StreamProcessor's definition
     /// cache. Returns `None` if the version no longer exists (deleted/GC'd).
     async fn get_flow_version(
         &self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError>;
     /// Persist a flow version (written by the `FlowCreated` applier). The canonical row is keyed by
     /// the version's own `ObjectName` (`{flow_name}-{version}`), so it is addressable by that name.
@@ -223,28 +225,28 @@ pub trait Storage: Send + Sync {
 pub trait StorageTxn: Send {
     async fn get_execution(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError>;
     async fn get_thread(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError>;
     async fn get_activity(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError>;
     async fn get_timer(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError>;
     async fn get_task(
         &mut self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError>;
     async fn get_children(
         &mut self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError>;
+        id: RawObjectRef,
+    ) -> Result<HashSet<RawObjectRef>, StorageError>;
 
     /// Scan up to `limit` claimable-at-`now` tasks of `resource`, read-your-writes: the pending
     /// batch is consulted first, then committed rows — the overlay equivalent of
@@ -260,7 +262,7 @@ pub trait StorageTxn: Send {
     async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError>;
     async fn get_flow_version(
         &mut self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError>;
     async fn flow_version_of(
         &mut self,
@@ -281,14 +283,14 @@ pub trait StorageTxn: Send {
     /// Remove `child` from `parent`'s `active_children` (a terminal child draining its owner).
     async fn remove_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError>;
     /// Add `child` to `parent`'s `active_children` (a child appears when its `ing` event lands).
     async fn add_child(
         &mut self,
-        parent: ObjectReference,
-        child: ObjectReference,
+        parent: RawObjectRef,
+        child: RawObjectRef,
     ) -> Result<(), StorageError>;
     /// Upsert a flow row into this transaction's pending batch.
     async fn put_flow(&mut self, flow: Flow) -> Result<(), StorageError>;
@@ -325,28 +327,25 @@ pub trait StorageTxn: Send {
 pub trait ReadonlyStorageTxn: Send + Sync {
     async fn get_execution(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError>;
     async fn get_thread(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError>;
     async fn get_activity(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError>;
     async fn get_timer(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError>;
     async fn get_task(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError>;
-    async fn get_children(
-        &self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError>;
+    async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError>;
     async fn activatable_tasks(
         &self,
         resource: &str,
@@ -356,7 +355,7 @@ pub trait ReadonlyStorageTxn: Send + Sync {
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError>;
     async fn get_flow_version(
         &self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError>;
     async fn flow_version_of(
         &self,
@@ -373,38 +372,35 @@ pub trait ReadonlyStorageTxn: Send + Sync {
 impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
     async fn get_execution(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ExecutionKind>,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
         <T as Storage>::get_execution(self, reference).await
     }
     async fn get_thread(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ThreadKind>,
     ) -> Result<Option<ThreadRecord>, StorageError> {
         <T as Storage>::get_thread(self, reference).await
     }
     async fn get_activity(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<ActivityRecord>, StorageError> {
         <T as Storage>::get_activity(self, reference).await
     }
     async fn get_timer(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TimerKind>,
     ) -> Result<Option<TimerRecord>, StorageError> {
         <T as Storage>::get_timer(self, reference).await
     }
     async fn get_task(
         &self,
-        reference: &ObjectReference,
+        reference: &ObjectRef<TaskKind>,
     ) -> Result<Option<TaskRecord>, StorageError> {
         <T as Storage>::get_task(self, reference).await
     }
-    async fn get_children(
-        &self,
-        id: ObjectReference,
-    ) -> Result<HashSet<ObjectReference>, StorageError> {
+    async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError> {
         <T as Storage>::get_children(self, id).await
     }
     async fn activatable_tasks(
@@ -420,7 +416,7 @@ impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
     }
     async fn get_flow_version(
         &self,
-        version: &ObjectReference,
+        version: &ObjectRef<FlowVersionKind>,
     ) -> Result<Option<FlowVersion>, StorageError> {
         <T as Storage>::get_flow_version(self, version).await
     }

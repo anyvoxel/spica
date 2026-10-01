@@ -8,11 +8,13 @@ use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, SpawnThread, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ErasedOwner, ObjectReference, OwnerScope};
+use crate::types::meta::{ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, ActivityStatus, Variables};
 
 /// The `Parallel` state: runs several branch sub-state-machines concurrently, waits for all of them
@@ -95,7 +97,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         variables: &Variables,
         _states: &Value,
     ) -> Result<(), ExecutionError> {
-        let activity = activity_value.meta.reference();
+        let activity = activity_value.meta.typed_reference();
         let owner = activity.clone();
         for (index, branch) in self.state.branches.iter().enumerate() {
             let pointer = activity_value.state_path.branch(index);
@@ -156,7 +158,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -164,7 +166,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            activity_value.meta.owner.clone().into_erased(),
+            activity_value.meta.owner.clone(),
             activity,
             &activity_value.state_path,
             &activity_value.raw_input,
@@ -188,10 +190,10 @@ impl StateHandler for ParallelStateHandler<'_> {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
-        _child: ObjectReference,
+        _child: RawObjectRef,
     ) {
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
             return; // activity gone — nothing to converge.
@@ -205,7 +207,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         let Some(ActivityState::Parallel(progress)) = act.value.activity_state.as_ref() else {
             return;
         };
-        let mut entries: Vec<(usize, crate::types::meta::ObjectReference)> = progress
+        let mut entries: Vec<(usize, ObjectRef<ThreadKind>)> = progress
             .branches
             .iter()
             .map(|(i, e)| (*i, e.clone()))
@@ -302,7 +304,7 @@ impl ParallelStateHandler<'_> {
         // duplicate — so the surviving branch threads, and the timers they armed, are never stopped
         // and outlive a run that has already ended. The state's own terminate handler sweeps them.
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.meta.reference(),
+            activity: activity.meta.typed_reference(),
             reason: reason.clone(),
         }));
         super::super::emit_scope_termination(
@@ -324,18 +326,12 @@ impl ParallelStateHandler<'_> {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
         aggregated: Value,
     ) {
-        let owner = activity_value
-            .meta
-            .owner
-            .clone()
-            // A thread is the only thing that can own an activity (the slot's own type), and every
-            // consumer below takes the flat address storage and commands speak — erased once here.
-            .into_erased();
+        let owner = activity_value.meta.owner.clone();
         // `$states.result` / the default state result is the aggregated branch-output array; `Output`,
         // when present, projects over it (so a Parallel can reshape that array).
         let states = States::new(
@@ -350,14 +346,14 @@ impl ParallelStateHandler<'_> {
         fail_or!(
             out,
             Some(activity.clone()),
-            OwnerScope::of_reference(&owner),
+            Some(OwnerScope::Thread(owner.clone())),
             self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
                 .await
         );
         let output_value = fail_or!(
             out,
-            Some(activity),
-            OwnerScope::of_reference(&owner),
+            Some(activity.clone()),
+            Some(OwnerScope::Thread(owner.clone())),
             self.project_output(env, self.output(), &states, &local_scope, aggregated)
                 .await
         );
@@ -378,7 +374,7 @@ impl ParallelStateHandler<'_> {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            activity_value.meta.owner.clone().into_erased(),
+            activity_value.meta.owner.clone(),
             activity,
             &activity_value.state_path,
             &output_value,
@@ -401,6 +397,7 @@ mod tests {
     use crate::storage::{ActivityRecord, ThreadRecord};
     use crate::types::command::{ActivateState, CompleteThread, TerminateThread};
     use crate::types::event::StateTransitioned;
+    use crate::types::meta::HasRawObjectRef;
     use crate::{EntryPayload, ParallelActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
@@ -580,7 +577,7 @@ mod tests {
     /// The convergence map a fanned-out `Parallel` activity carries: branch index → child thread.
     /// Written by the `ThreadCreated` fold in production; a test writes it down directly, and writes
     /// it *out of order* so the aggregation's index sort is what the assertion actually pins.
-    fn fan_out(latest_first: bool) -> HashMap<usize, ObjectReference> {
+    fn fan_out(latest_first: bool) -> HashMap<usize, ObjectRef<ThreadKind>> {
         let mut branches = HashMap::new();
         if latest_first {
             branches.insert(1, child_ref(1));
@@ -636,7 +633,7 @@ mod tests {
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
@@ -697,7 +694,7 @@ mod tests {
                     branches: fan_out(false),
                 }),
                 ActivityStatus::Running,
-                [child_ref(0)],
+                [child_ref(0).into_raw_object_ref()],
             ),
             [
                 branch_child(0, json!(null), ThreadStatus::Running),
@@ -710,7 +707,7 @@ mod tests {
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
@@ -744,7 +741,7 @@ mod tests {
                 }),
                 ActivityStatus::Running,
                 // Branch 1 is still attached, so the drain is incomplete.
-                [child_ref(1)],
+                [child_ref(1).into_raw_object_ref()],
             ),
             [
                 branch_child(0, json!({ "i": 0 }), ThreadStatus::Completed),
@@ -757,7 +754,7 @@ mod tests {
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             store,
             minted_activity_ref(),
-            child_ref(0),
+            child_ref(0).into_raw_object_ref(),
         )
         .await;
 
@@ -785,14 +782,14 @@ mod tests {
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             store,
             minted_activity_ref(),
-            child_ref(1),
+            child_ref(1).into_raw_object_ref(),
         )
         .await;
 
         let reason = TerminationReason::Failed {
             error: ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                 "branch {}",
-                child_ref(1)
+                child_ref(1).into_raw_object_ref()
             ))),
         };
         assert_eq!(

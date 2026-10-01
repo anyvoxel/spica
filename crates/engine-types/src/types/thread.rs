@@ -3,7 +3,8 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectReference, ThreadOwner};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef, ThreadOwner};
 use spica_asl::StatePath;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
@@ -84,7 +85,7 @@ pub struct Thread {
     /// `active_children` rely on that owning edge.
     pub meta: ObjectMeta<ThreadKind>,
     /// The execution this thread belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s
-    /// `ObjectReference`, regardless of nesting depth (a tree holds exactly one `Execution`, and it
+    /// typed reference, regardless of nesting depth (a tree holds exactly one `Execution`, and it
     /// is always the root). This is the flat grouping key for "all events of one top-level run" (the
     /// CCES analogue of Zeebe's `processInstanceKey`), so a query can filter the whole tree by
     /// `execution == R` without recursing the parent chain. It is a query denormalization, **not** a
@@ -95,7 +96,7 @@ pub struct Thread {
     /// The thread's machine version is **not** duplicated here: every thread shares the owning tree's
     /// top-level run, so its `flow_version` is always that execution's — resolved via
     /// [`crate::storage::resolve_thread_flow_version`] from `execution`, never stored twice.
-    pub execution: ObjectReference,
+    pub execution: ObjectRef<ExecutionKind>,
     /// A JSON Pointer (RFC 6901) into the single shared `StateMachine` document locating this
     /// thread's sub-`States` table, e.g. `/States/P1/Branches/0/States/P2/ItemProcessor/States`.
     /// **Always present** — a thread's defining property is that it runs a portion of the shared
@@ -132,7 +133,7 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// This thread's canonical [`ObjectReference`] — the `(kind, name, uid)` triple a consumer uses
+    /// This thread's canonical [`RawObjectRef`] — the `(kind, name, uid)` triple a consumer uses
     /// to address it (`kind = Thread`, `name = meta.name`, `uid = meta.uid`). Mirrors
     /// [`Execution::reference`](crate::types::execution::Execution::reference); Storage keys the row
     /// by this reference and reads it back by reference.
@@ -144,7 +145,7 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::meta::{ObjectName, OwnerRef};
+    use crate::types::meta::{ObjectName, ObjectRef};
     use crate::types::thread::ThreadKind;
     use spica_machinery::Timestamp;
 
@@ -155,11 +156,11 @@ mod tests {
     #[test]
     fn a_thread_slot_admits_only_the_two_scopes_a_thread_hangs_off() {
         let owners = [
-            ThreadOwner::Execution(OwnerRef::new(
+            ThreadOwner::Execution(ObjectRef::new(
                 ObjectName::plain("execution").unwrap(),
                 ulid::Ulid::new(),
             )),
-            ThreadOwner::Activity(OwnerRef::new(
+            ThreadOwner::Activity(ObjectRef::new(
                 ObjectName::plain("parallel").unwrap(),
                 ulid::Ulid::new(),
             )),
@@ -177,7 +178,7 @@ mod tests {
         let mut json = serde_json::to_value(
             ObjectMeta::<ThreadKind>::builder(ulid::Ulid::new())
                 .at(Timestamp::from_millis(0))
-                .with_owner(ThreadOwner::Activity(OwnerRef::new(
+                .with_owner(ThreadOwner::Activity(ObjectRef::new(
                     ObjectName::plain("parallel").unwrap(),
                     ulid::Ulid::new(),
                 ))),
@@ -187,7 +188,7 @@ mod tests {
         let err = serde_json::from_value::<ObjectMeta<ThreadKind>>(json)
             .expect_err("a thread is never owned by a task");
         let msg = err.to_string();
-        assert!(msg.contains("owner kind mismatch"), "{msg}");
+        assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("ThreadOwner"), "{msg}");
     }
 }

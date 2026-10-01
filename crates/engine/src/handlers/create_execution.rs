@@ -4,7 +4,9 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
-use crate::types::meta::{NoOwner, ObjectKind, ObjectMeta, ObjectReference, OwnerRef, OwnerScope};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef, OwnerScope};
+use crate::types::thread::ThreadKind;
 
 /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
 /// arms the state-machine `TimeoutSeconds` timer if configured. Immediately enters the start state
@@ -38,7 +40,7 @@ impl CreateExecutionHandler {
         // loser surfaces `ALREADY_EXISTS` to its awaiter (and the log) via a `Reject`, not a silent
         // drop. A name-only probe (nil uid) suffices — storage keys executions by name, so the uid is
         // irrelevant to the read.
-        let probe = ObjectReference::new(ObjectKind::Execution, name.clone(), ulid::Ulid::nil());
+        let probe = ObjectRef::<ExecutionKind>::new(name.clone(), ulid::Ulid::nil());
         if let Ok(Some(_)) = ctx.storage.get_execution(&probe).await {
             tracing::warn!(
                 name = %name.as_str(),
@@ -57,7 +59,7 @@ impl CreateExecutionHandler {
         // `ExecutionCreated` lands in the same atomic batch as this command (committed ⇒ conclusive,
         // never re-dispatched), so a re-dispatch mints a fresh consistent uid.
         let uid: ulid::Ulid = ctx.mint();
-        let id = ObjectReference::new(ObjectKind::Execution, name.clone(), uid);
+        let id = ObjectRef::<ExecutionKind>::new(name.clone(), uid);
         // Resolve the machine this execution binds to. This is the first use of the version in a
         // fresh StreamProcessor — it loads the definition (keyed by the version's object reference)
         // from Storage into the cache. If the version is missing (definition GC'd), the execution
@@ -66,7 +68,7 @@ impl CreateExecutionHandler {
             result,
             out,
             None,
-            OwnerScope::of_reference(&id),
+            Some(OwnerScope::Execution(id.clone())),
             ctx.machine(flow_version).await
         );
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
@@ -129,7 +131,7 @@ impl CreateExecutionHandler {
             // by construction; unwrap it to derive the timer's `{name}-{8-char}` handle. The
             // `Generated` arm is unreachable for a CreateExecution name but kept explicit so a future
             // misuse fails loudly instead of silently mis-naming the timer.
-            let base = match id.name.as_plain() {
+            let base = match id.name().as_plain() {
                 Some(p) => p,
                 None => {
                     out.fail_execution(
@@ -152,9 +154,7 @@ impl CreateExecutionHandler {
                     .at(ctx.now())
                     // An execution timeout is armed by the run itself — the `Execution` variant of the
                     // timer slot, never an activity's.
-                    .with_owner(crate::types::meta::TimerOwner::Execution(
-                        crate::types::meta::OwnerRef::new(id.name.clone(), id.uid),
-                    )),
+                    .with_owner(crate::types::meta::TimerOwner::Execution(id.clone())),
                 execution: id.clone(),
                 purpose: TimerPurpose::ExecutionTimeout,
                 status: crate::TimerStatus::Active,
@@ -172,10 +172,10 @@ impl CreateExecutionHandler {
         // still settles through `wait_for_execution`.
         let root_uid: ulid::Ulid = ctx.mint();
         let root_name = id
-            .name
+            .name()
             .base()
             .generated_from_key(out.next_generated_seq().await);
-        let root_thread = ObjectReference::new(ObjectKind::Thread, root_name.clone(), root_uid);
+        let root_thread = ObjectRef::<ThreadKind>::new(root_name.clone(), root_uid);
         // The root thread runs the machine's top-level `States` table and enters the machine's own
         // `StartAt` — the pointer and the entry point are the same pair every fan-out thread carries.
         let root_states = StatePath::root();
@@ -187,10 +187,7 @@ impl CreateExecutionHandler {
                     .at(ctx.now())
                     // A root thread's owner is the run it stands in for — the `Execution` variant, the
                     // one a fan-out thread (owned by its container activity) never carries.
-                    .with_owner(crate::types::meta::ThreadOwner::Execution(OwnerRef::new(
-                        id.name.clone(),
-                        id.uid,
-                    ))),
+                    .with_owner(crate::types::meta::ThreadOwner::Execution(id.clone())),
                 execution: id.clone(),
                 state_path: root_states.clone(),
                 start_at: start_at.clone(),

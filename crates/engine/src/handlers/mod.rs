@@ -80,13 +80,17 @@ use crate::StatePath;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
+use crate::types::activity::ActivityKind;
 use crate::types::command::{
     ActivateState, Command, CompleteThread, TerminateExecution, TerminateThread, TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
-use crate::types::meta::{ErasedOwner, ObjectKind, ObjectReference, OwnerScope};
+use crate::types::execution::ExecutionKind;
+use crate::types::meta::{ObjectKind, ObjectRef, OwnerScope};
+use crate::types::thread::ThreadKind;
+use crate::types::timer::TimerKind;
 use crate::{Activity, ActivityStatus};
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -113,7 +117,7 @@ pub(super) fn emit_scope_termination(
         }
         OwnerScope::Thread(thread) => {
             out.append_command(Command::TerminateThread(TerminateThread {
-                thread: thread.erased().clone(),
+                thread: thread.clone(),
                 reason,
             }))
         }
@@ -137,7 +141,7 @@ pub(super) fn emit_scope_termination(
 pub(super) async fn cancel_activity_timers(
     ctx: &HandlerContext<'_>,
     out: &mut Collector<'_>,
-    activity: ObjectReference,
+    activity: ObjectRef<ActivityKind>,
 ) {
     let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
         return; // activity already gone — nothing to sweep.
@@ -146,7 +150,13 @@ pub(super) async fn cancel_activity_timers(
         if child.kind != ObjectKind::Timer {
             continue; // only timer children matter here (M1 task activities own none other).
         }
-        let Some(t) = ctx.storage.get_timer(&child).await.ok().flatten() else {
+        let Some(t) = ctx
+            .storage
+            .get_timer(&child.clone().typed::<TimerKind>())
+            .await
+            .ok()
+            .flatten()
+        else {
             continue;
         };
         if t.value.status != crate::TimerStatus::Active {
@@ -183,9 +193,9 @@ pub(super) fn eval_string_or_expr(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn emit_transition(
     out: &mut Collector<'_>,
-    execution: ObjectReference,
-    owner: ObjectReference,
-    activity: ObjectReference,
+    execution: ObjectRef<ExecutionKind>,
+    owner: ObjectRef<ThreadKind>,
+    activity: ObjectRef<ActivityKind>,
     activity_state_path: &StatePath,
     output: &Value,
     next: Option<&str>,
@@ -223,8 +233,8 @@ pub(super) async fn emit_transition(
         }));
     } else {
         out.terminate(
-            Some(activity),
-            OwnerScope::of_reference(&execution),
+            Some(activity.clone()),
+            Some(OwnerScope::Execution(execution)),
             ExecutionError::Runtime(RuntimeError::NoTerminal),
         );
     }
@@ -259,14 +269,14 @@ pub(super) async fn emit_state_completed(
 /// re-deriving it).
 pub(super) async fn emit_timer(
     out: &mut Collector<'_>,
-    execution: ObjectReference,
+    execution: ObjectRef<ExecutionKind>,
     owner: &Activity,
     purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
     let timer_uid: ulid::Ulid = out.mint();
     let timer_name = execution
-        .name
+        .name()
         .base()
         .generated_from_key(out.next_generated_seq().await);
     out.append_event(Event::TimerActivated {
@@ -282,7 +292,7 @@ pub(super) async fn emit_timer(
                 // `Activity` variant is built here from the activity's own identity — no flat
                 // reference is passed in, and a wrong kind cannot reach the slot.
                 .with_owner(crate::types::meta::TimerOwner::Activity(
-                    crate::types::meta::OwnerRef::new(owner.meta.name.clone(), owner.meta.uid),
+                    crate::types::meta::ObjectRef::new(owner.meta.name.clone(), owner.meta.uid),
                 )),
         },
     })
@@ -304,7 +314,7 @@ pub(super) async fn emit_timer(
 pub(super) async fn complete_activity(
     env: &mut EvalEnv,
     out: &mut Collector<'_>,
-    activity: ObjectReference,
+    activity: ObjectRef<ActivityKind>,
     activity_value: &Activity,
     variables: &Variables,
     assign: Option<&AssignObject>,
@@ -335,16 +345,14 @@ pub(super) async fn complete_activity(
     .build();
     let mut local_scope = variables.clone();
     // A thread is the only thing that can own an activity (the slot's own type), so the owners below
-    // need no `kind` guard; the emitters take the flat address storage and commands speak, so the
-    // erasure happens once here instead of at each of them.
-    let owner = activity_value.meta.owner.clone().into_erased();
-
+    // need no `kind` guard.
+    let owner = activity_value.meta.owner.clone();
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
         let evaluated = fail_or!(
             out,
-            Some(activity),
-            OwnerScope::of_reference(&owner),
+            Some(activity.clone()),
+            Some(OwnerScope::Thread(owner.clone())),
             env.eval_json(&assign_value, &states, &local_scope)
         );
         match evaluated {
@@ -362,8 +370,8 @@ pub(super) async fn complete_activity(
             }
             _ => {
                 out.terminate(
-                    Some(activity),
-                    OwnerScope::of_reference(&owner),
+                    Some(activity.clone()),
+                    Some(OwnerScope::Thread(owner.clone())),
                     ExecutionError::Runtime(RuntimeError::InvalidDefinition(
                         "Assign must evaluate to a JSON object".to_string(),
                     )),
@@ -376,8 +384,8 @@ pub(super) async fn complete_activity(
     let output_value = match output {
         Some(o) => fail_or!(
             out,
-            Some(activity),
-            OwnerScope::of_reference(&owner),
+            Some(activity.clone()),
+            Some(OwnerScope::Thread(owner.clone())),
             env.eval_json(o, &states, &local_scope)
         ),
         None => raw_result.clone(),

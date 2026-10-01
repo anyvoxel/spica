@@ -15,7 +15,7 @@ impl ExecutionTerminatingApplier {
     ) -> Result<(), ExecutionError> {
         if let Some(mut exec) = ctx
             .storage
-            .get_execution(&execution.meta.reference())
+            .get_execution(&execution.meta.typed_reference())
             .await?
         {
             exec.status = execution.status.clone();

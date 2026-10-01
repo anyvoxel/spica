@@ -46,7 +46,10 @@
 //! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
 //! by the `version` field, never by key order.
 
-use spica_engine_types::{FlowName, ObjectKind, ObjectName, ObjectReference, ScopeName};
+use spica_engine_types::{
+    ActivityKind, ExecutionKind, FlowName, ObjectKind, ObjectName, ObjectRef, ScopeName, TaskKind,
+    ThreadKind, TimerKind,
+};
 
 /// The two fixed scope segments of every key (tenant + namespace).
 ///
@@ -168,33 +171,33 @@ impl KeyBuilder {
     /// (a user name, or a system `obj-<uid>` for children), which is now the execution's unique
     /// primary key; the `uid` is a secondary attribute, not the storage key. A name is a safe single
     /// segment (both the user and generated charsets ban `/`).
-    pub fn execution(&self, reference: &ObjectReference) -> Vec<u8> {
-        self.row(Kind::Execution, &reference.name.as_str())
+    pub fn execution(&self, reference: &ObjectRef<ExecutionKind>) -> Vec<u8> {
+        self.row(Kind::Execution, &reference.name().as_str())
     }
 
     /// Thread row: `/<t>/<ns>/thread/<name>` — keyed by the reference's addressing `name` (a generated
     /// `obj-<uid>` for fan-out sub-runs), exactly like the execution row, so every node kind shares one
     /// uniform, human-debuggable key scheme.
-    pub fn thread(&self, reference: &ObjectReference) -> Vec<u8> {
-        self.row(Kind::Thread, &reference.name.as_str())
+    pub fn thread(&self, reference: &ObjectRef<ThreadKind>) -> Vec<u8> {
+        self.row(Kind::Thread, &reference.name().as_str())
     }
 
     /// Activity row: `/<t>/<ns>/activity/<name>`. The activity's generated `obj-<uid>` name is its
     /// primary key (aligned with executions/flows/timers).
-    pub fn activity(&self, reference: &ObjectReference) -> Vec<u8> {
-        self.row(Kind::Activity, &reference.name.as_str())
+    pub fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Vec<u8> {
+        self.row(Kind::Activity, &reference.name().as_str())
     }
 
     /// Timer row: `/<t>/<ns>/timer/<name>`. The timer's generated `obj-<uid>` name is its primary key
     /// (aligned with executions/flows), even though the uid happens to be a bijective source for it.
-    pub fn timer(&self, reference: &ObjectReference) -> Vec<u8> {
-        self.row(Kind::Timer, &reference.name.as_str())
+    pub fn timer(&self, reference: &ObjectRef<TimerKind>) -> Vec<u8> {
+        self.row(Kind::Timer, &reference.name().as_str())
     }
 
     /// Task row: `/<t>/<ns>/task/<name>`. The task's generated `obj-<uid>` name is its primary key
     /// (aligned with executions/flows/timers).
-    pub fn task(&self, reference: &ObjectReference) -> Vec<u8> {
-        self.row(Kind::Task, &reference.name.as_str())
+    pub fn task(&self, reference: &ObjectRef<TaskKind>) -> Vec<u8> {
+        self.row(Kind::Task, &reference.name().as_str())
     }
 
     /// The task-row keys prefix `/<t>/<ns>/task/` — the range start for a forward scan over **all**
@@ -291,7 +294,9 @@ fn join(segments: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine_types::{ExecutionKind, NoOwner, ObjectKind, ObjectMeta, PlainName};
+    use spica_engine_types::{
+        ActivityKind, ExecutionKind, NoOwner, ObjectMeta, PlainName, TaskKind,
+    };
     use ulid::Ulid;
 
     fn scope(tenant: &str, ns: &str) -> Scope {
@@ -300,9 +305,8 @@ mod tests {
 
     /// An execution reference for the given uid (`obj-<uid>` generated name), matching
     /// `Execution::reference()` so the uid/key round-trips.
-    fn exec_ref(uid: Ulid) -> ObjectReference {
-        ObjectReference::new(
-            ObjectKind::Execution,
+    fn exec_ref(uid: Ulid) -> ObjectRef<ExecutionKind> {
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -312,9 +316,8 @@ mod tests {
 
     /// An activity reference for the given uid (`obj-<uid>` generated name), matching
     /// `Activity::reference()` so the uid/key round-trips.
-    fn act_ref(uid: Ulid) -> ObjectReference {
-        ObjectReference::new(
-            ObjectKind::Activity,
+    fn act_ref(uid: Ulid) -> ObjectRef<ActivityKind> {
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -324,9 +327,8 @@ mod tests {
 
     /// A task reference for the given uid (`obj-<uid>` generated name), matching
     /// `Task::reference()` so the uid/key round-trips.
-    fn task_ref(uid: Ulid) -> ObjectReference {
-        ObjectReference::new(
-            ObjectKind::Task,
+    fn task_ref(uid: Ulid) -> ObjectRef<TaskKind> {
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -336,9 +338,8 @@ mod tests {
 
     /// A timer reference for the given uid (`obj-<uid>` generated name), matching
     /// `Timer::reference()` so the uid/key round-trips.
-    fn timer_ref(uid: Ulid) -> ObjectReference {
-        ObjectReference::new(
-            ObjectKind::Timer,
+    fn timer_ref(uid: Ulid) -> ObjectRef<TimerKind> {
+        ObjectRef::new(
             PlainName::new("child")
                 .unwrap()
                 .generated_from_key(uid.0 as u64),
@@ -359,7 +360,7 @@ mod tests {
         let exec_key = String::from_utf8(kb.execution(&exec)).unwrap();
         assert!(exec_key.starts_with("/acme/prod/execution/"));
         // Keyed by the addressing name (`obj-<uid>` here), not the bare uid.
-        assert!(exec_key.ends_with(exec.name.as_str().as_str()));
+        assert!(exec_key.ends_with(exec.name().as_str().as_str()));
         assert!(
             String::from_utf8(kb.activity(&act))
                 .unwrap()

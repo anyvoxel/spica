@@ -2,11 +2,8 @@ use crate::RetryState;
 use crate::Task;
 use crate::TaskStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::types::activity::ActivityKind;
 use crate::types::command::ActivateTask;
 use crate::types::event::Event;
-use crate::types::meta::OwnerRef;
-use crate::types::reject::RejectionType;
 
 /// The side-effect handler that invokes a `Task` state's `Resource`: emits only `TaskActivated`,
 /// recording the logical invocation (owning `parent` activity, `resource` URI, and projected
@@ -39,15 +36,6 @@ impl ActivateTaskHandler {
             retry_plan,
             deadline,
         } = p;
-        // A command payload carries the owner as a flat address, so the one place the task's slot can
-        // be handed the wrong kind is here. A foreign kind is the *command's* fault, and a command
-        // fault is refused — never propagated as an engine fault, which the leader would retry.
-        let owner = OwnerRef::<ActivityKind>::try_from(owner.clone()).map_err(|e| {
-            ProcessingError::Rejected(
-                RejectionType::InvalidArgument,
-                format!("activate_task: {e}"),
-            )
-        })?;
         out.append_event(Event::TaskActivated {
             task: Task {
                 // The execution anchor is carried from the command (finding #13), so the task is
@@ -65,12 +53,12 @@ impl ActivateTaskHandler {
                 retry_state: RetryState::default(),
                 // Birth: `created_at == updated_at == now` (invocation moment). The `meta.name` is
                 // carried from the command's task reference (already execution-based per finding
-                // #13), not re-derived as `child-<uid>`; the owner is the invoking activity checked
-                // above.
-                meta: crate::types::meta::ObjectMeta::builder(task.uid)
-                    .name(task.name.clone())
+                // #13), not re-derived as `child-<uid>`; the owner is the invoking activity the
+                // command's own slot names — a foreign kind cannot be built, let alone dispatched.
+                meta: crate::types::meta::ObjectMeta::builder(task.uid())
+                    .name(task.name().clone())
                     .at(out.now())
-                    .with_owner(owner),
+                    .with_owner(owner.clone()),
             },
         })
         .await;

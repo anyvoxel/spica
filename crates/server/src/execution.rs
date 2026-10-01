@@ -27,7 +27,9 @@ impl ExecutionServiceTrait for Svc {
         // Resolve the revision to a concrete version reference: either the explicit reference
         // CreateFlow returned, or a (name, version) lookup resolved non-blocking against the projection.
         let flow_version = match req.target {
-            Some(spica_proto::v1::start_execution_request::Target::FlowVersion(r)) => parse_ref(r)?,
+            Some(spica_proto::v1::start_execution_request::Target::FlowVersion(r)) => {
+                parse_ref::<spica_engine::FlowVersionKind>(r)?
+            }
             Some(spica_proto::v1::start_execution_request::Target::FlowName(name)) => {
                 let name = spica_engine::FlowName::new(&name)
                     .map_err(|e| Status::invalid_argument(format!("invalid flow name: {e}")))?;
@@ -55,7 +57,7 @@ impl ExecutionServiceTrait for Svc {
             .await
             .map_err(to_status)?;
         Ok(Response::new(StartExecutionResponse {
-            execution_id: execution_id.uid.to_string(),
+            execution_id: execution_id.uid().to_string(),
             // Echo the validated name back as the primary handle — the key later Query reads /
             // StopExecution calls resolve by.
             name: req.name,

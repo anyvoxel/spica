@@ -7,12 +7,13 @@ use std::mem::Discriminant;
 use super::{emit_state_completed, emit_transition};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
+use crate::types::activity::ActivityKind;
 use crate::types::command::{ActivateState, Command, CompleteState};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
 use crate::types::id::RequestId;
-use crate::types::meta::{ErasedOwner, ObjectMeta, ObjectReference, OwnerRef, OwnerScope};
+use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, OwnerScope, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
@@ -176,10 +177,10 @@ pub trait StateHandler: Send + Sync {
         &self,
         _ctx: &mut HandlerContext<'_>,
         _out: &mut Collector<'_>,
-        _activity: ObjectReference,
+        _activity: ObjectRef<ActivityKind>,
         _activity_value: &Activity,
         _variables: &Variables,
-        _child: ObjectReference,
+        _child: RawObjectRef,
     ) {
     }
 
@@ -196,7 +197,7 @@ pub trait StateHandler: Send + Sync {
         &self,
         ctx: &mut HandlerContext<'_>,
         _out: &mut Collector<'_>,
-        activity: &ObjectReference,
+        activity: &ObjectRef<ActivityKind>,
         _activity_value: &Activity,
     ) -> FinishReadiness {
         match self.live_children(ctx, activity).await {
@@ -213,7 +214,7 @@ pub trait StateHandler: Send + Sync {
     async fn live_children(
         &self,
         ctx: &HandlerContext<'_>,
-        activity: &ObjectReference,
+        activity: &ObjectRef<ActivityKind>,
     ) -> Option<usize> {
         match ctx.storage.get_activity(activity).await {
             Ok(Some(a)) => Some(a.active_children.len()),
@@ -259,7 +260,7 @@ pub trait StateHandler: Send + Sync {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectReference,
+        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -280,15 +281,8 @@ pub trait StateHandler: Send + Sync {
         .build();
         let mut local_scope = variables.clone();
         let owner = activity_value.meta.owner.clone();
-        self.apply_assign(
-            out,
-            env,
-            owner.erased(),
-            self.assign(),
-            &states,
-            &mut local_scope,
-        )
-        .await?;
+        self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
+            .await?;
         let output_value = self
             .project_output(env, self.output(), &states, &local_scope, result)
             .await?;
@@ -297,7 +291,7 @@ pub trait StateHandler: Send + Sync {
         emit_transition(
             out,
             activity_value.execution.clone(),
-            owner.into_erased(),
+            owner.clone(),
             activity,
             &activity_value.state_path,
             &output_value,
@@ -318,7 +312,7 @@ pub trait StateHandler: Send + Sync {
         &self,
         out: &mut Collector<'_>,
         env: &mut EvalEnv,
-        owner: &ObjectReference,
+        owner: &ObjectRef<ThreadKind>,
         assign: Option<&AssignObject>,
         states: &Value,
         scope: &mut Variables,
@@ -378,7 +372,7 @@ pub trait StateHandler: Send + Sync {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &ActivateState,
-        owner: OwnerRef<ThreadKind>,
+        owner: ObjectRef<ThreadKind>,
     ) {
         let ActivateState {
             execution,
@@ -390,7 +384,7 @@ pub trait StateHandler: Send + Sync {
         // (2.1) Construct the activity value in one place: mint its incarnation uid, name it as a
         // child of the owning execution (finding #3), and build the full meta with the command's
         // owner as its scope (`created_at == updated_at` is the entry moment). The canonical
-        // ObjectReference is derived from the value, so the uid/name live in exactly one spot.
+        // RawObjectRef is derived from the value, so the uid/name live in exactly one spot.
         let mut activity_value = Activity {
             execution: execution.clone(),
             state_path: state_path.clone(),
@@ -404,28 +398,31 @@ pub trait StateHandler: Send + Sync {
             meta: ObjectMeta::builder(ctx.mint())
                 .name(
                     execution
-                        .name
+                        .name()
                         .base()
                         .generated_from_key(out.next_generated_seq().await),
                 )
                 .at(ctx.now())
                 .with_owner(owner.clone()),
         };
-        let activity = activity_value.meta.reference();
+        let activity = ObjectRef::<ActivityKind>::new(
+            activity_value.meta.name.clone(),
+            activity_value.meta.uid,
+        );
 
         // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
         // fan-out thread for a branch/item — which the slot's own type guarantees, so this read needs
         // no `kind` guard. Reading the concrete row is exactly what yields the variables the hooks
         // evaluate against and confirms the thread still accepts transitions.
-        let scope = match ctx.storage.get_thread(owner.erased()).await {
+        let scope = match ctx.storage.get_thread(&owner).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 out.terminate(
                     Some(activity.clone()),
-                    OwnerScope::of_reference(execution),
+                    Some(OwnerScope::Execution(execution.clone())),
                     ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
                         "thread {}",
-                        owner.erased()
+                        owner.as_raw_object_ref()
                     ))),
                 );
                 return;
@@ -433,7 +430,7 @@ pub trait StateHandler: Send + Sync {
             Err(e) => {
                 out.terminate(
                     Some(activity.clone()),
-                    OwnerScope::of_reference(execution),
+                    Some(OwnerScope::Execution(execution.clone())),
                     e.into(),
                 );
                 return;
@@ -471,7 +468,11 @@ pub trait StateHandler: Send + Sync {
         {
             Ok(input) => input,
             Err(e) => {
-                out.terminate(Some(activity), Some(OwnerScope::Thread(owner.clone())), e);
+                out.terminate(
+                    Some(activity.clone()),
+                    Some(OwnerScope::Thread(owner.clone())),
+                    e,
+                );
                 return;
             }
         };
@@ -491,7 +492,11 @@ pub trait StateHandler: Send + Sync {
             .after_activated(ctx.env, out, &activity_value, &variables, &states)
             .await
         {
-            out.terminate(Some(activity), Some(OwnerScope::Thread(owner.clone())), e);
+            out.terminate(
+                Some(activity.clone()),
+                Some(OwnerScope::Thread(owner.clone())),
+                e,
+            );
             return;
         }
 
@@ -601,7 +606,7 @@ pub trait StateHandler: Send + Sync {
         // is read directly. The owner is taken from the *persisted row* rather than from the command,
         // so this read is also what supplies the variables `finish` evaluates against.
         let owner = act.value.meta.owner.clone();
-        let scope = match ctx.storage.get_thread(owner.erased()).await {
+        let scope = match ctx.storage.get_thread(&owner).await {
             Ok(Some(t)) => t,
             Ok(None) => return, // owning thread already gone — nothing to complete into.
             Err(_) => return,
@@ -632,21 +637,20 @@ mod tests {
 
     use super::super::dispatch::build_state_handlers;
     use crate::StatePath;
-    use crate::types::meta::ObjectReference;
-    use crate::{Activity, ActivityStatus};
+    use crate::{Activity, ActivityStatus, ExecutionKind};
 
     /// A minimal empty `Activity` sufficient to dispatch an object-safe lifecycle hook — the create
     /// contract only cares that the hook *dispatches*, not what it does.
     fn empty_activity() -> Activity {
         Activity {
             meta: crate::types::meta::ObjectMeta::builder(ulid::Ulid::new()).with_owner(
-                crate::types::meta::OwnerRef::new(
+                crate::types::meta::ObjectRef::new(
                     crate::types::meta::ObjectName::plain("execution")
                         .expect("a valid object name"),
                     ulid::Ulid::new(),
                 ),
             ),
-            execution: ObjectReference::nil(),
+            execution: crate::types::meta::ObjectRef::<ExecutionKind>::nil(),
             state_path: StatePath::from(jsonptr::PointerBuf::new()),
             status: ActivityStatus::Running,
             raw_input: Value::Null,

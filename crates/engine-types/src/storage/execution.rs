@@ -4,16 +4,16 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 
 use crate::types::execution::Execution;
-use crate::types::meta::ObjectReference;
-use crate::types::variables::Variables;
+use crate::types::meta::RawObjectRef;
 use spica_machinery::Timestamp;
 
 /// The storage projection row of an execution.
 ///
 /// `Execution` is the canonical execution domain entity reconstructed from the stream. Storage
-/// wraps it so projection-only bookkeeping — currently `variables`, `active_children`, and the
-/// `created_at`/`updated_at` timing facts — stays separated from the entity value that lifecycle
-/// events carry.
+/// wraps it so projection-only bookkeeping — `active_children` and the `created_at`/`updated_at`
+/// timing facts — stays separated from the entity value that lifecycle events carry. The run's
+/// variable scope lives on its derived root `Thread` row (see
+/// [`VariablesAssigned`](crate::types::event::VariablesAssigned)), not here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionRecord {
     /// The canonical execution domain value reconstructed from the event stream.
@@ -25,13 +25,9 @@ pub struct ExecutionRecord {
     /// separate namespaces. (`Activity`/`Timer`/`Task` now carry the same two fields, so their rows
     /// nest under `value` too.)
     pub value: Execution,
-    /// The execution's current variable scope. `Assign` mutates this projection state through
-    /// `VariablesAssigned`; it stays off the event-carried `Execution` so execution lifecycle
-    /// events do not repeatedly serialize a mutable scope snapshot.
-    pub variables: Variables,
     /// Owned nodes still in flight (active activities / timers / child executions). Completing or
     /// terminating waits for this projection-only set to drain before the terminal `ed` is emitted.
-    pub active_children: HashSet<ObjectReference>,
+    pub active_children: HashSet<RawObjectRef>,
     /// When this row's birth event (the `ExecutionCreated`) landed in the log. Projection-derived
     /// from the applied entry's `timestamp` — never a local `Timestamp::now()` at apply time — so
     /// every replica replaying the same entries computes the identical value (the timestamp is a
@@ -47,10 +43,9 @@ impl ExecutionRecord {
         self.value.clone()
     }
 
-    pub fn from_value(value: Execution, active_children: HashSet<ObjectReference>) -> Self {
+    pub fn from_value(value: Execution, active_children: HashSet<RawObjectRef>) -> Self {
         Self {
             value,
-            variables: Variables::new(),
             active_children,
             // Zero-stamped here; a creation applier stamps the real entry timestamp (see
             // `ApplierContext::timestamp`).

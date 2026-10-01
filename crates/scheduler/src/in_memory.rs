@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use spica_engine::{ObjectReference, Timestamp};
+use spica_engine::{ObjectRef, TimerKind, Timestamp};
 use spica_machinery::{Clock, SystemClock};
 use tokio::sync::mpsc;
 
@@ -25,11 +25,11 @@ use crate::{Scheduler, TimerSink};
 enum SchedulerInput {
     /// Arm a timer to fire `TriggerTimer` at the absolute `deadline`.
     Schedule {
-        timer: ObjectReference,
+        timer: ObjectRef<TimerKind>,
         deadline: Timestamp,
     },
     /// Cancel a previously-armed timer (a `TimerCancelled` event was applied).
-    Cancel { timer: ObjectReference },
+    Cancel { timer: ObjectRef<TimerKind> },
     /// The clock was moved; re-evaluate what is due (see [`Scheduler::tick`]). Carried on the inbox
     /// rather than a bare wake primitive so it cannot be lost to a select race — a lost wake would
     /// hang a manually-advanced test.
@@ -38,7 +38,7 @@ enum SchedulerInput {
 
 /// Apply one inbox message to the armed set. A re-arm for the same reference replaces the prior
 /// deadline (defensive; arms are unique).
-fn apply(input: SchedulerInput, armed: &mut HashMap<ObjectReference, Timestamp>) {
+fn apply(input: SchedulerInput, armed: &mut HashMap<ObjectRef<TimerKind>, Timestamp>) {
     match input {
         SchedulerInput::Schedule { timer, deadline } => {
             armed.insert(timer, deadline);
@@ -95,7 +95,7 @@ impl InMemoryScheduler {
             // Armed timers as reference -> deadline. A flat map rather than a delay queue: the queue
             // would key its waiting on real elapsed time, which is precisely what an injected clock
             // must be able to disagree with. The scan below is over a handful of live timers.
-            let mut armed: HashMap<ObjectReference, Timestamp> = HashMap::new();
+            let mut armed: HashMap<ObjectRef<TimerKind>, Timestamp> = HashMap::new();
             loop {
                 // Drain the inbox first, so a cancel that raced its own deadline is honoured before
                 // the fire below rather than after it.
@@ -118,7 +118,7 @@ impl InMemoryScheduler {
                 // Fire everything the clock says is due. Cloning the references out first keeps the
                 // map unborrowed while each trigger is awaited.
                 let now = loop_clock.now();
-                let due: Vec<ObjectReference> = armed
+                let due: Vec<ObjectRef<TimerKind>> = armed
                     .iter()
                     .filter(|(_, deadline)| **deadline <= now)
                     .map(|(timer, _)| timer.clone())
@@ -183,14 +183,14 @@ impl Scheduler for InMemoryScheduler {
             .expect("scheduler sink lock is not poisoned") = Some(sink);
     }
 
-    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp) {
+    fn schedule(&self, timer: &ObjectRef<TimerKind>, deadline: Timestamp) {
         let _ = self.tx.send(SchedulerInput::Schedule {
             timer: timer.clone(),
             deadline,
         });
     }
 
-    fn cancel(&self, timer: &ObjectReference) {
+    fn cancel(&self, timer: &ObjectRef<TimerKind>) {
         let _ = self.tx.send(SchedulerInput::Cancel {
             timer: timer.clone(),
         });
@@ -204,7 +204,7 @@ impl Scheduler for InMemoryScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine::{ObjectKind, PlainName};
+    use spica_engine::PlainName;
     use spica_machinery::ManualClock;
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -212,10 +212,9 @@ mod tests {
     use tokio::time::sleep;
     use ulid::Ulid;
 
-    fn timer() -> ObjectReference {
+    fn timer() -> ObjectRef<TimerKind> {
         let uid = Ulid::new();
-        ObjectReference::new(
-            ObjectKind::Timer,
+        ObjectRef::new(
             PlainName::new("child")
                 .expect("static literal is a valid segment")
                 .generated_from_key(uid.0 as u64),
@@ -236,7 +235,7 @@ mod tests {
     /// observe the expiry callback without a real log. Mirrors how the engine connects its sink.
     #[derive(Clone, Default)]
     struct RecordingSink {
-        triggered: Arc<Mutex<Vec<ObjectReference>>>,
+        triggered: Arc<Mutex<Vec<ObjectRef<TimerKind>>>>,
     }
 
     impl RecordingSink {
@@ -244,13 +243,13 @@ mod tests {
             Self::default()
         }
         /// Snapshot of every timer this sink has been asked to trigger.
-        fn snaps(&self) -> Vec<ObjectReference> {
+        fn snaps(&self) -> Vec<ObjectRef<TimerKind>> {
             self.triggered.lock().unwrap().clone()
         }
 
         /// Wait (bounded) for `count` triggers to land — the loop runs on a background task, so a
         /// manual-clock test still has to let that task run before it can assert.
-        async fn wait_for(&self, count: usize) -> Vec<ObjectReference> {
+        async fn wait_for(&self, count: usize) -> Vec<ObjectRef<TimerKind>> {
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
                     let fired = self.snaps();
@@ -267,7 +266,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TimerSink for RecordingSink {
-        async fn trigger(&self, timer: &ObjectReference) {
+        async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
             self.triggered.lock().unwrap().push(timer.clone());
         }
     }
@@ -362,7 +361,7 @@ mod tests {
         // Jump past two of the three: both fire, and the third stays armed.
         clock.advance(Duration::from_secs(30));
         s.tick();
-        let fired: HashSet<ObjectReference> = sink.wait_for(2).await.into_iter().collect();
+        let fired: HashSet<ObjectRef<TimerKind>> = sink.wait_for(2).await.into_iter().collect();
         assert_eq!(
             fired,
             HashSet::from([first, second]),

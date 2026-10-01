@@ -3,18 +3,19 @@
 mod common;
 
 use common::{
-    TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, fanout_thread_owner, flow_name,
-    flow_owner, indexed_refs, meta, meta_root, name, path, pointer, ref_to, request,
+    TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, fanout_thread_owner, flat_ref_to,
+    flow_name, flow_owner, indexed_refs, meta, meta_root, name, path, pointer, ref_to, request,
     root_thread_owner, run_typed_case, stamp, thread_owner, uid,
 };
 use serde_json::json;
 use spica_engine::{
-    ActivateState, Activity, ActivityState, ActivityStatus, Command, CompleteExecution,
-    CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution,
-    ExecutionCreated, ExecutionError, ExecutionStatus, Flow, FlowCreated, FlowStatus, FlowVersion,
-    FlowVersionCreated, MapActivityState, ObjectKind, RuntimeError, SpawnThread, StateTransitioned,
-    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadStatus,
-    Timer, TimerPurpose, TimerStatus, WaitActivityState,
+    ActivateState, Activity, ActivityKind, ActivityState, ActivityStatus, Command,
+    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
+    Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
+    FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, MapActivityState,
+    ObjectKind, RuntimeError, SpawnThread, StateTransitioned, TerminateExecution, TerminateState,
+    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind,
+    TimerPurpose, TimerStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -64,7 +65,7 @@ async fn map_over_items_aggregates_in_item_order() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -72,7 +73,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -82,7 +83,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -92,8 +93,8 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -101,7 +102,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -121,7 +122,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -138,24 +139,24 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 0,
                 start_at: "Emit".to_string(),
                 input: json!(3),
             })),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 1,
                 start_at: "Emit".to_string(),
                 input: json!(1),
             })),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 2,
                 start_at: "Emit".to_string(),
@@ -165,7 +166,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -175,8 +176,8 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(3),
             })),
@@ -184,7 +185,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -194,8 +195,8 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(1),
             })),
@@ -203,7 +204,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 2,
@@ -213,8 +214,8 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(2),
             })),
@@ -222,7 +223,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(3),
@@ -237,7 +238,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(3),
@@ -249,14 +250,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 output: json!(3),
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -271,7 +272,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -283,14 +284,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-6", 10),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-6", 10),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -305,7 +306,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -317,14 +318,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-7", 11),
                 output: json!(2),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(3),
@@ -339,7 +340,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(3),
@@ -351,14 +352,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 output: json!(3),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(1),
@@ -373,7 +374,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(1),
@@ -385,14 +386,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(2),
@@ -407,7 +408,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(2),
@@ -419,14 +420,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 output: json!(2),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -439,7 +440,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -452,7 +453,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -465,7 +466,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -478,7 +479,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 2,
@@ -491,7 +492,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 2,
@@ -504,7 +505,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -515,9 +516,9 @@ async fn map_over_items_aggregates_in_item_order() {
                         total: 3,
                         max_concurrency: 0,
                         children: indexed_refs(&[
-                            (0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)),
-                            (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7)),
-                            (2, ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)),
+                            (0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)),
+                            (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7)),
+                            (2, ref_to::<ThreadKind>("lifecycle_execution-4", 8)),
                         ]),
                     })),
                     retry_state: None,
@@ -528,7 +529,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -539,9 +540,9 @@ async fn map_over_items_aggregates_in_item_order() {
                         total: 3,
                         max_concurrency: 0,
                         children: indexed_refs(&[
-                            (0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)),
-                            (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7)),
-                            (2, ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)),
+                            (0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)),
+                            (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7)),
+                            (2, ref_to::<ThreadKind>("lifecycle_execution-4", 8)),
                         ]),
                     })),
                     retry_state: None,
@@ -549,14 +550,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!([3, 1, 2]),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -569,7 +570,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -579,14 +580,14 @@ async fn map_over_items_aggregates_in_item_order() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!([3, 1, 2]),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1, 2])),
@@ -596,7 +597,7 @@ async fn map_over_items_aggregates_in_item_order() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1, 2])),
@@ -657,7 +658,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -665,7 +666,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -675,7 +676,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -685,8 +686,8 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -694,7 +695,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -714,7 +715,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -731,8 +732,8 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 0,
                 start_at: "Emit".to_string(),
@@ -742,7 +743,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -752,8 +753,8 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(3),
             })),
@@ -761,7 +762,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(3),
@@ -776,7 +777,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(3),
@@ -788,14 +789,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!(3),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(3),
@@ -810,7 +811,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(3),
@@ -822,14 +823,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 output: json!(3),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -842,7 +843,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -852,8 +853,8 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 1,
                 start_at: "Emit".to_string(),
@@ -863,7 +864,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -873,8 +874,8 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(1),
             })),
@@ -882,7 +883,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -897,7 +898,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -909,14 +910,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(1),
@@ -931,7 +932,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-4", 8)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(1),
@@ -943,14 +944,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -963,7 +964,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -976,7 +977,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -986,7 +987,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         items: vec![json!(3), json!(1)],
                         total: 2,
                         max_concurrency: 1,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-4", 8))]),
                     })),
                     retry_state: None,
                     output: None,
@@ -996,7 +997,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -1006,21 +1007,21 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         items: vec![json!(3), json!(1)],
                         total: 2,
                         max_concurrency: 1,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-4", 8))]),
                     })),
                     retry_state: None,
                     output: Some(json!([3, 1])),
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!([3, 1]),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1033,7 +1034,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1043,14 +1044,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!([3, 1]),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1])),
@@ -1060,7 +1061,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1])),
@@ -1120,7 +1121,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1128,7 +1129,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -1138,7 +1139,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1148,8 +1149,8 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -1157,7 +1158,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1177,7 +1178,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1197,7 +1198,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
@@ -1217,7 +1218,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
@@ -1234,14 +1235,14 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!([]),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1254,7 +1255,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1264,14 +1265,14 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!([]),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!({"n": 1}),
                     output: Some(json!([])),
@@ -1281,7 +1282,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!({"n": 1}),
                     output: Some(json!([])),
@@ -1340,7 +1341,7 @@ async fn map_defaults_its_items_to_its_array_input() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!([10, 20]),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1348,7 +1349,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!([10, 20]),
                     output: None,
@@ -1358,7 +1359,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1368,8 +1369,8 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!([10, 20]),
             })),
@@ -1377,7 +1378,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!([10, 20]),
@@ -1397,7 +1398,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!([10, 20]),
@@ -1414,16 +1415,16 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 0,
                 start_at: "Emit".to_string(),
                 input: json!(10),
             })),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 1,
                 start_at: "Emit".to_string(),
@@ -1433,7 +1434,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -1443,8 +1444,8 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(10),
             })),
@@ -1452,7 +1453,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -1462,8 +1463,8 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 state_path: path("/States/M/ItemProcessor/States/Emit"),
                 input: json!(20),
             })),
@@ -1471,7 +1472,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(10),
@@ -1486,7 +1487,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(10),
@@ -1498,14 +1499,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-4", 8),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-4", 8),
                 output: json!(10),
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(20),
@@ -1520,7 +1521,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Running,
                     raw_input: json!(20),
@@ -1532,14 +1533,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 output: json!(20),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(10),
@@ -1554,7 +1555,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(10),
@@ -1566,14 +1567,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 output: json!(10),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(20),
@@ -1588,7 +1589,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Emit"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(20),
@@ -1600,14 +1601,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 output: json!(20),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -1620,7 +1621,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 0,
@@ -1633,7 +1634,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -1646,7 +1647,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Emit".to_string(),
                     index: 1,
@@ -1659,7 +1660,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completing,
                     raw_input: json!([10, 20]),
@@ -1669,7 +1670,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                         items: vec![json!(10), json!(20)],
                         total: 2,
                         max_concurrency: 0,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
                     retry_state: None,
                     output: None,
@@ -1679,7 +1680,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Completed,
                     raw_input: json!([10, 20]),
@@ -1689,21 +1690,21 @@ async fn map_defaults_its_items_to_its_array_input() {
                         items: vec![json!(10), json!(20)],
                         total: 2,
                         max_concurrency: 0,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
                     retry_state: None,
                     output: Some(json!([10, 20])),
                 },
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!([10, 20]),
             })),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1716,7 +1717,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1726,14 +1727,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                 },
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 output: json!([10, 20]),
             })),
             EntryPayload::Event(Event::ExecutionCompleting {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completing,
                     input: json!([10, 20]),
                     output: Some(json!([10, 20])),
@@ -1743,7 +1744,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Completed,
                     input: json!([10, 20]),
                     output: Some(json!([10, 20])),
@@ -1807,7 +1808,7 @@ async fn map_item_failure_fails_the_run() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -1815,7 +1816,7 @@ async fn map_item_failure_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -1825,7 +1826,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -1835,8 +1836,8 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -1844,7 +1845,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1864,7 +1865,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -1881,8 +1882,8 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 0,
                 start_at: "Boom".to_string(),
@@ -1892,7 +1893,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Boom".to_string(),
                     index: 0,
@@ -1902,8 +1903,8 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Boom"),
                 input: json!(1),
             })),
@@ -1911,7 +1912,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -1926,7 +1927,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -1938,14 +1939,14 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(1),
@@ -1960,7 +1961,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -1981,7 +1982,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -1999,7 +2000,7 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "Boom".to_string(),
@@ -2012,7 +2013,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Boom".to_string(),
                     index: 0,
@@ -2031,7 +2032,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Boom".to_string(),
                     index: 0,
@@ -2047,7 +2048,7 @@ async fn map_item_failure_fails_the_run() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2057,7 +2058,7 @@ async fn map_item_failure_fails_the_run() {
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2070,7 +2071,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2086,7 +2087,7 @@ async fn map_item_failure_fails_the_run() {
                         items: vec![json!(1), json!(2)],
                         total: 2,
                         max_concurrency: 1,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6))]),
                     })),
                     retry_state: None,
                     output: None,
@@ -2096,7 +2097,7 @@ async fn map_item_failure_fails_the_run() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2112,7 +2113,7 @@ async fn map_item_failure_fails_the_run() {
                         items: vec![json!(1), json!(2)],
                         total: 2,
                         max_concurrency: 1,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6))]),
                     })),
                     retry_state: None,
                     output: None,
@@ -2122,7 +2123,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -2152,7 +2153,7 @@ async fn map_item_failure_fails_the_run() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -2171,7 +2172,7 @@ async fn map_item_failure_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
                             state: "M".to_string(),
@@ -2187,7 +2188,7 @@ async fn map_item_failure_fails_the_run() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
                             state: "M".to_string(),
@@ -2267,7 +2268,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -2275,7 +2276,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -2285,7 +2286,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -2295,8 +2296,8 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -2304,7 +2305,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2324,7 +2325,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -2341,16 +2342,16 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 0,
                 start_at: "Pick".to_string(),
                 input: json!(1),
             })),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                 state_path: Some(path("/States/M/ItemProcessor/States")),
                 index: 1,
                 start_at: "Pick".to_string(),
@@ -2360,7 +2361,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {   // Map.Thread-1
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 0,
@@ -2370,8 +2371,8 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Pick"),
                 input: json!(1),
             })),
@@ -2379,7 +2380,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {  // Map.Thread-2
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 1,
@@ -2389,8 +2390,8 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 state_path: path("/States/M/ItemProcessor/States/Pick"),
                 input: json!(2),
             })),
@@ -2398,7 +2399,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {   // Map.Thread-1
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -2413,7 +2414,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -2425,14 +2426,14 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-4", 8),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-4", 8),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {   // Map.Thread-2
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -2447,7 +2448,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -2459,14 +2460,14 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 output: json!(2),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {   // Map.Thread-1
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(1),
@@ -2481,7 +2482,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(1),
@@ -2493,12 +2494,12 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-4", 8),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-4", 8),
                 next: pointer("/States/M/ItemProcessor/States/Boom"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 state_path: path("/States/M/ItemProcessor/States/Boom"),
                 input: json!(1),
             })),
@@ -2506,7 +2507,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity { // Map.Thread-2
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(2),
@@ -2521,7 +2522,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Pick"),
                     status: ActivityStatus::Completed,
                     raw_input: json!(2),
@@ -2533,12 +2534,12 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 next: pointer("/States/M/ItemProcessor/States/Slow"),
             })),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 state_path: path("/States/M/ItemProcessor/States/Slow"),
                 input: json!(2),
             })),
@@ -2546,7 +2547,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity { // Map.Thread-1
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -2561,7 +2562,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Running,
                     raw_input: json!(1),
@@ -2573,14 +2574,14 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-6", 10),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-6", 10),
                 output: json!(1),
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity { // Map.Thread-2
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -2595,7 +2596,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
                     status: ActivityStatus::Running,
                     raw_input: json!(2),
@@ -2610,7 +2611,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 timer: Timer {
                     meta: meta(uid(12), "lifecycle_execution-8")
                         .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
@@ -2620,7 +2621,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity { // Map.Thread-1
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Completing,
                     raw_input: json!(1),
@@ -2635,7 +2636,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2656,7 +2657,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(thread_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Boom"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2674,7 +2675,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "Boom".to_string(),
@@ -2687,7 +2688,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {  // Map.Thread-1
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 0,
@@ -2706,7 +2707,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 0,
@@ -2722,7 +2723,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2732,7 +2733,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {   // Root Thread
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2745,7 +2746,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2761,14 +2762,14 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         items: vec![json!(1), json!(2)],
                         total: 2,
                         max_concurrency: 0,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
                     retry_state: None,
                     output: None,
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {// Map.Thread-2
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2781,7 +2782,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -2808,7 +2809,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             })),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),   // 重复对 /States/M 进行终止
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),   // 重复对 /States/M 进行终止
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2821,7 +2822,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 thread: Thread {  // Map.Thread-2
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 1,
@@ -2837,7 +2838,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-7", 11),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2850,7 +2851,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
                             state: "M".to_string(),
@@ -2863,7 +2864,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::StateFailed {
                         state: "M".to_string(),
@@ -2876,7 +2877,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2894,26 +2895,26 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::CancelTimer {
-                timer: ref_to(ObjectKind::Timer, "lifecycle_execution-8", 12),
+                timer: ref_to::<TimerKind>("lifecycle_execution-8", 12),
             }),
             EntryPayload::Event(Event::TimerCancelled {
                 timer: Timer {
                     meta: meta(uid(12), "lifecycle_execution-8")
                         .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Cancelled,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2931,13 +2932,13 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 1,
@@ -2953,13 +2954,13 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -2975,20 +2976,20 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         items: vec![json!(1), json!(2)],
                         total: 2,
                         max_concurrency: 0,
-                        children: indexed_refs(&[(0, ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6)), (1, ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7))]),
+                        children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
                     retry_state: None,
                     output: None,
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -3004,13 +3005,13 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                 },
             }),
             EntryPayload::Command(Command::ContinueTerminate {
-                owner: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
             }),
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
                             state: "M".to_string(),
@@ -3083,7 +3084,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
             EntryPayload::Command(Command::CreateExecution(CreateExecution {
                 request_id: request(1),
                 name: name("lifecycle_execution"),
-                flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                 input: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::ExecutionCreated(ExecutionCreated {
@@ -3091,7 +3092,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Running,
                     input: json!({"n": 1}),
                     output: None,
@@ -3101,7 +3102,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -3111,8 +3112,8 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::ActivateState(ActivateState {
-                execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
-                owner: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 state_path: path("/States/M"),
                 input: json!({"n": 1}),
             })),
@@ -3120,7 +3121,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Running,
                     raw_input: json!({"n": 1}),
@@ -3137,13 +3138,13 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
                 },
             })),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
                 },
@@ -3152,7 +3153,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
@@ -3174,7 +3175,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M"),
                     status: ActivityStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
@@ -3196,7 +3197,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -3218,7 +3219,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
                         .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States"),
                     start_at: "M".to_string(),
                     index: 0,
@@ -3233,7 +3234,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminating(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
                     }),
@@ -3245,7 +3246,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                 execution: Execution {
                     deadline: None,
                     meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to(ObjectKind::FlowVersion, "lifecycle_flow-1", 2),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
                     status: ExecutionStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
                     }),

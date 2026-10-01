@@ -5,7 +5,7 @@ use crate::types::error::ExecutionError;
 use crate::types::event::TaskFailed;
 
 use crate::TaskStatus;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 /// Applies `TaskFailed`, whose **task entity's `status` is the outcome**:
 ///
@@ -29,14 +29,9 @@ impl TaskFailedApplier {
     ) -> Result<(), ExecutionError> {
         let TaskFailed { task, .. } = event;
         let retryable = task.status == TaskStatus::Pending;
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.reference()).await? {
-            let parent = t
-                .meta
-                .owner
-                .clone()
-                // See `task_completed`: the slot's type admits only an activity owner, and storage
-                // speaks flat addresses.
-                .into_erased();
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
+            // See `task_completed`: the slot's type admits only an activity owner.
+            let parent = t.meta.owner.clone();
             // Fold the entity verbatim (status, cleared worker/lease, + the retry bookkeeping the
             // handler stamped: `attempts`, `retrier_attempts`, `next_available_at`).
             t.value = task.clone();
@@ -55,7 +50,7 @@ impl TaskFailedApplier {
                 // Terminal failure: drain the task from its owning activity (the sweep + duplicate
                 // guard). `error` is not folded — it drives the state's `Catch`/`TerminateState`.
                 ctx.storage
-                    .remove_child(parent, task.meta.reference())
+                    .remove_child(parent.into_raw_object_ref(), task.meta.reference())
                     .await?;
             }
         }

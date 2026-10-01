@@ -754,12 +754,11 @@ mod tests {
     use crate::types::command::{CompleteTask, CreateFlow, TerminateExecution};
     use crate::types::error::StorageError;
     use crate::types::flow::Flow;
-    use crate::types::flow_version::FlowVersion;
+    use crate::types::flow_version::{FlowVersion, FlowVersionKind};
     use crate::types::id::{FlowName, RequestId};
-    use crate::types::meta::{
-        ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef, PlainName,
-    };
+    use crate::types::meta::{ObjectMeta, ObjectName, ObjectRef, PlainName, RawObjectRef};
     use crate::types::reject::RejectionType;
+    use crate::{ActivityKind, ExecutionKind, TaskKind, ThreadKind, TimerKind};
 
     use super::*;
 
@@ -843,7 +842,7 @@ mod tests {
                             1,
                         ))
                         .at(Timestamp::now())
-                        .with_owner(OwnerRef::new(
+                        .with_owner(ObjectRef::new(
                             ObjectName::plain("flow").expect("literal name is valid"),
                             ulid::Ulid::nil(),
                         )),
@@ -856,18 +855,18 @@ mod tests {
     }
 
     /// The reference the event's applier files its row under — the key a read addresses.
-    fn version_ref(event: &Event) -> ObjectReference {
+    fn version_ref(event: &Event) -> ObjectRef<FlowVersionKind> {
         let Event::FlowVersionCreated(created) = event else {
             panic!("the fixture emits a flow-version create; got {event:?}");
         };
-        created.flow_version.meta.reference()
+        created.flow_version.meta.typed_reference()
     }
 
     /// Read a row through the store's **committed** face — a `None` here is what "this entry has not
     /// been folded yet" means to a reader.
     async fn committed_version(
         storage: &Mutex<Box<dyn Storage>>,
-        reference: &ObjectReference,
+        reference: &ObjectRef<FlowVersionKind>,
     ) -> Option<FlowVersion> {
         storage
             .lock()
@@ -881,7 +880,7 @@ mod tests {
     /// the residue would overwrite the mark back — the observable form of "folded exactly once".
     async fn mark_committed(
         storage: &Mutex<Box<dyn Storage>>,
-        reference: &ObjectReference,
+        reference: &ObjectRef<FlowVersionKind>,
         marker: &str,
     ) {
         let mut row = committed_version(storage, reference)
@@ -910,8 +909,7 @@ mod tests {
         let (ts, ev) = flow_version_event();
         let residue_ref = version_ref(&ev);
         let residual_uid: ulid::Ulid = ulid::Ulid::new();
-        let residual_timer = ObjectReference::new(
-            ObjectKind::Timer,
+        let residual_timer = ObjectRef::new(
             PlainName::new("child")
                 .expect("static literal is a valid segment")
                 .generated_from_key(residual_uid.0 as u64),
@@ -1038,38 +1036,38 @@ mod tests {
     impl Storage for FaultingStorage {
         async fn get_execution(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ExecutionKind>,
         ) -> Result<Option<ExecutionRecord>, StorageError> {
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ThreadKind>,
         ) -> Result<Option<ThreadRecord>, StorageError> {
             self.inner.get_thread(reference).await
         }
         async fn get_activity(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ActivityKind>,
         ) -> Result<Option<ActivityRecord>, StorageError> {
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TimerKind>,
         ) -> Result<Option<TimerRecord>, StorageError> {
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TaskKind>,
         ) -> Result<Option<TaskRecord>, StorageError> {
             self.inner.get_task(reference).await
         }
         async fn get_children(
             &self,
-            id: ObjectReference,
-        ) -> Result<std::collections::HashSet<ObjectReference>, StorageError> {
+            id: RawObjectRef,
+        ) -> Result<std::collections::HashSet<RawObjectRef>, StorageError> {
             self.inner.get_children(id).await
         }
         async fn activatable_tasks(
@@ -1097,15 +1095,15 @@ mod tests {
         }
         async fn remove_child(
             &mut self,
-            parent: ObjectReference,
-            child: ObjectReference,
+            parent: RawObjectRef,
+            child: RawObjectRef,
         ) -> Result<(), StorageError> {
             self.inner.remove_child(parent, child).await
         }
         async fn add_child(
             &mut self,
-            parent: ObjectReference,
-            child: ObjectReference,
+            parent: RawObjectRef,
+            child: RawObjectRef,
         ) -> Result<(), StorageError> {
             self.inner.add_child(parent, child).await
         }
@@ -1117,7 +1115,7 @@ mod tests {
         }
         async fn get_flow_version(
             &self,
-            version: &ObjectReference,
+            version: &ObjectRef<FlowVersionKind>,
         ) -> Result<Option<FlowVersion>, StorageError> {
             self.inner.get_flow_version(version).await
         }
@@ -1175,43 +1173,43 @@ mod tests {
     impl StorageTxn for FaultingTxn {
         async fn get_execution(
             &mut self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ExecutionKind>,
         ) -> Result<Option<ExecutionRecord>, StorageError> {
             self.read()?;
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &mut self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ThreadKind>,
         ) -> Result<Option<ThreadRecord>, StorageError> {
             self.read()?;
             self.inner.get_thread(reference).await
         }
         async fn get_activity(
             &mut self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<ActivityKind>,
         ) -> Result<Option<ActivityRecord>, StorageError> {
             self.read()?;
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &mut self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TimerKind>,
         ) -> Result<Option<TimerRecord>, StorageError> {
             self.read()?;
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &mut self,
-            reference: &ObjectReference,
+            reference: &ObjectRef<TaskKind>,
         ) -> Result<Option<TaskRecord>, StorageError> {
             self.read()?;
             self.inner.get_task(reference).await
         }
         async fn get_children(
             &mut self,
-            id: ObjectReference,
-        ) -> Result<std::collections::HashSet<ObjectReference>, StorageError> {
+            id: RawObjectRef,
+        ) -> Result<std::collections::HashSet<RawObjectRef>, StorageError> {
             self.read()?;
             self.inner.get_children(id).await
         }
@@ -1230,7 +1228,7 @@ mod tests {
         }
         async fn get_flow_version(
             &mut self,
-            version: &ObjectReference,
+            version: &ObjectRef<FlowVersionKind>,
         ) -> Result<Option<FlowVersion>, StorageError> {
             self.read()?;
             self.inner.get_flow_version(version).await
@@ -1260,15 +1258,15 @@ mod tests {
         }
         async fn remove_child(
             &mut self,
-            parent: ObjectReference,
-            child: ObjectReference,
+            parent: RawObjectRef,
+            child: RawObjectRef,
         ) -> Result<(), StorageError> {
             self.inner.remove_child(parent, child).await
         }
         async fn add_child(
             &mut self,
-            parent: ObjectReference,
-            child: ObjectReference,
+            parent: RawObjectRef,
+            child: RawObjectRef,
         ) -> Result<(), StorageError> {
             self.inner.add_child(parent, child).await
         }
@@ -1294,8 +1292,7 @@ mod tests {
     fn complete_task_cmd(request_id: RequestId) -> Command {
         Command::CompleteTask(CompleteTask {
             request_id,
-            task: ObjectReference::new(
-                ObjectKind::Task,
+            task: ObjectRef::new(
                 ObjectName::plain("task_0").expect("a static literal is a valid object name"),
                 ulid::Ulid::nil(),
             ),

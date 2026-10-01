@@ -42,7 +42,7 @@ async fn get_object_reads_flow_version_and_execution_by_name() {
         .expect("flow row should exist");
     assert!(matches!(flow, QueryObject::Flow(f) if f.meta.name.as_str() == "lookup_flow"));
     let version = engine
-        .get_object(ObjectKind::FlowVersion, &flow_version.name)
+        .get_object(ObjectKind::FlowVersion, flow_version.name())
         .await
         .unwrap()
         .expect("first flow version row should exist");

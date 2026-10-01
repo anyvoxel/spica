@@ -12,8 +12,9 @@
 use crate::ActivityStatus;
 use crate::handler::{Collector, HandlerContext};
 use crate::storage::{ActivityRecord, ReadonlyStorageTxn};
+use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, CompleteState};
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
 
 /// A node that owns children: the reaction point for one of them settling. The implementor is chosen
 /// from the owner's *kind* at the call site (a task's owner is always an `Activity`, a root thread's
@@ -26,13 +27,13 @@ pub(crate) trait Container {
     /// discovered as a silent no-op after the terminal event is already on the log.
     ///
     /// `None` answers a *missing row* only. Which impl runs is decided by the owner's kind at the call
-    /// site, so an owner of another kind is a broken invariant rather than an ownerless settle, and an
-    /// impl meets it by panicking instead of folding it into the `None` the caller reports.
+    /// site, so the parameter's own type is the kind this container owns — an owner of another kind is
+    /// unrepresentable rather than a case to fold into the `None` the caller reports.
     ///
     /// This read is the *existence* check only. The hooks re-read the row: the settle's own batch
     /// rewrites it (draining the child, folding the payload), so the row read here is stale by the
     /// time a hook decides on it.
-    async fn open(storage: &dyn ReadonlyStorageTxn, owner: ObjectReference) -> Option<Self>
+    async fn open(storage: &dyn ReadonlyStorageTxn, owner: ObjectRef<ActivityKind>) -> Option<Self>
     where
         Self: Sized;
 
@@ -43,7 +44,7 @@ pub(crate) trait Container {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        child: &ObjectReference,
+        child: &RawObjectRef,
     );
 
     /// An owned `child` reached an **abnormal** terminal (cancelled, terminated, timed out). The
@@ -53,13 +54,13 @@ pub(crate) trait Container {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        child: &ObjectReference,
+        child: &RawObjectRef,
     );
 }
 
 /// The container for an `Activity`'s children.
 pub(crate) struct ActivityContainer {
-    activity: ObjectReference,
+    activity: ObjectRef<ActivityKind>,
 }
 
 impl ActivityContainer {
@@ -73,13 +74,13 @@ impl ActivityContainer {
         match &act.value.status {
             ActivityStatus::Completing => {
                 out.append_command(Command::ContinueComplete {
-                    owner: self.activity.clone(),
+                    owner: self.activity.as_raw_object_ref().clone(),
                 });
                 true
             }
             ActivityStatus::Terminating(_) => {
                 out.append_command(Command::ContinueTerminate {
-                    owner: self.activity.clone(),
+                    owner: self.activity.as_raw_object_ref().clone(),
                 });
                 true
             }
@@ -89,17 +90,12 @@ impl ActivityContainer {
 }
 
 impl Container for ActivityContainer {
-    async fn open(storage: &dyn ReadonlyStorageTxn, owner: ObjectReference) -> Option<Self> {
-        // The call site picks this impl from the owner's kind, so an owner of another kind means the
-        // tree itself is corrupt: a programming error with no answer to give, unlike a missing row,
-        // which is a real state the caller reports.
-        if owner.kind != ObjectKind::Activity {
-            // TODO：这里是应该使用 unreachable 还是应该返回一个错误然后走 Reject，还没想清楚
-            unreachable!(
-                "a {:?} owner {owner} cannot own activity children",
-                owner.kind
-            );
-        }
+    async fn open(
+        storage: &dyn ReadonlyStorageTxn,
+        owner: ObjectRef<ActivityKind>,
+    ) -> Option<Self> {
+        // The call site picks this impl from the owner's kind, and the parameter's own type is that
+        // kind — an owner of another kind is unrepresentable rather than a case to check.
         // TODO：如果 owner 不存在，是不是也应该是一个 Reject？
         storage.get_activity(&owner).await.ok().flatten()?;
         Some(Self { activity: owner })
@@ -109,7 +105,7 @@ impl Container for ActivityContainer {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        child: &ObjectReference,
+        child: &RawObjectRef,
     ) {
         let Some(act) = ctx
             .storage
@@ -156,7 +152,7 @@ impl Container for ActivityContainer {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        child: &ObjectReference,
+        child: &RawObjectRef,
     ) {
         let Some(act) = ctx
             .storage
@@ -198,10 +194,16 @@ mod tests {
     use crate::handler::{Collector, HandlerContext, OverlaySink};
     use crate::handlers::dispatch::build_state_handlers;
     use crate::storage::{ActivityRecord, Storage};
+    use crate::types::activity::ActivityKind;
     use crate::types::command::{Command, CompleteState, TerminationReason};
+    use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
-    use crate::types::meta::{ObjectKind, ObjectMeta, ObjectName, ObjectReference, OwnerRef};
+    use crate::types::meta::{
+        HasRawObjectRef, ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef,
+    };
+    use crate::types::task::TaskKind;
     use crate::types::thread::ThreadKind;
+    use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
     use crate::{Activity, ActivityStatus, EntryPayload, Timestamp};
 
@@ -211,29 +213,27 @@ mod tests {
         Timestamp::from_millis(1_000)
     }
 
-    fn reference(kind: ObjectKind, name: &str, uid: u64) -> ObjectReference {
-        ObjectReference::new(
-            kind,
+    /// A seeded address of the kind the caller names in the type — so a fixture reaches a typed slot
+    /// without a conversion, and cannot name a kind that slot does not admit.
+    fn reference<K: ObjectKindMarker>(name: &str, uid: u64) -> ObjectRef<K> {
+        ObjectRef::new(
             ObjectName::from_parsed(name).expect("a static literal is a valid object name"),
             ulid::Ulid::from(u128::from(uid)),
         )
     }
 
-    fn activity_ref() -> ObjectReference {
-        reference(ObjectKind::Activity, "execution-0", 90)
+    fn activity_ref() -> ObjectRef<ActivityKind> {
+        reference("execution-0", 90)
     }
 
-    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits, so the
-    /// fixture cannot seed a row the engine could not represent.
-    fn thread_owner() -> OwnerRef<ThreadKind> {
-        reference(ObjectKind::Thread, "execution-1", 80)
-            .try_into()
-            .expect("an activity's owner is a thread")
+    /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits.
+    fn thread_owner() -> ObjectRef<ThreadKind> {
+        reference("execution-1", 80)
     }
 
     /// The child handed to the container — a settled `Task`, the only kind that routes here so far.
-    fn task_ref() -> ObjectReference {
-        reference(ObjectKind::Task, "execution-0", 91)
+    fn task_ref() -> ObjectRef<TaskKind> {
+        reference("execution-0", 91)
     }
 
     /// A seeded activity row with `children` live children still attached. `raw_output` stands in for
@@ -247,11 +247,11 @@ mod tests {
         path.push_back("States");
         path.push_back("P");
         let activity = Activity {
-            meta: ObjectMeta::builder(activity_ref().uid)
-                .name(activity_ref().name)
+            meta: ObjectMeta::builder(activity_ref().uid())
+                .name(activity_ref().name().clone())
                 .at(at())
                 .with_owner(thread_owner()),
-            execution: reference(ObjectKind::Execution, "execution", 70),
+            execution: reference::<ExecutionKind>("execution", 70),
             state_path: StatePath::from(path),
             status,
             raw_input: json!({ "in": 1 }),
@@ -262,7 +262,7 @@ mod tests {
             output: None,
         };
         let live = (0..children)
-            .map(|n| reference(ObjectKind::Timer, "deadline", 200 + n as u64))
+            .map(|n| reference::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
             .collect::<HashSet<_>>();
         let mut row = ActivityRecord::from_value(activity, live);
         row.born(at());
@@ -304,11 +304,11 @@ mod tests {
             };
             if terminated {
                 container
-                    .after_child_terminated(&mut ctx, &mut out, &task_ref())
+                    .after_child_terminated(&mut ctx, &mut out, task_ref().as_raw_object_ref())
                     .await;
             } else {
                 container
-                    .after_child_completed(&mut ctx, &mut out, &task_ref())
+                    .after_child_completed(&mut ctx, &mut out, task_ref().as_raw_object_ref())
                     .await;
             }
         }
@@ -330,17 +330,6 @@ mod tests {
                 .is_none(),
             "a missing activity row must not yield a container"
         );
-    }
-
-    /// A row of the wrong kind is a broken invariant, not an ownerless settle: the kind is what picks
-    /// this impl, so folding it into the same `None` a missing row answers with would hide a corrupt
-    /// tree behind a case the caller is expected to survive.
-    #[tokio::test]
-    #[should_panic(expected = "cannot own activity children")]
-    async fn a_non_activity_owner_panics() {
-        let store = InMemoryStorage::new();
-        let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
-        ActivityContainer::open(&work, task_ref()).await;
     }
 
     /// A settled `Task` under a `Running` activity completes that activity, carrying the payload the
@@ -389,7 +378,7 @@ mod tests {
         assert_eq!(
             chain,
             vec![EntryPayload::Command(Command::ContinueComplete {
-                owner: activity_ref(),
+                owner: activity_ref().into_raw_object_ref(),
             })]
         );
     }
@@ -421,7 +410,7 @@ mod tests {
         assert_eq!(
             chain,
             vec![EntryPayload::Command(Command::ContinueTerminate {
-                owner: activity_ref(),
+                owner: activity_ref().into_raw_object_ref(),
             })]
         );
     }

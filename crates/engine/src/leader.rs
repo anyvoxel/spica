@@ -34,8 +34,9 @@ use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
+use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{EntryId, RequestId};
-use crate::types::meta::ObjectReference;
+use crate::types::meta::ObjectRef;
 use crate::types::reject::RejectionType;
 use crate::working::WorkingState;
 
@@ -61,7 +62,7 @@ fn command_retry_backoff(attempt: u32) -> Duration {
 /// leader-private — a follower holds none of it.
 pub(crate) struct Leader {
     /// Lazily-populated per-version machine cache (see [`handler::HandlerContext::machine`]).
-    definitions: HashMap<ObjectReference, Arc<StateMachine>>,
+    definitions: HashMap<ObjectRef<FlowVersionKind>, Arc<StateMachine>>,
     /// Shared eval environment; wrapped once (unlike the old `StreamProcessor`, which wrapped it per
     /// `run`), so both `process_command` and the single-shot `dispatch` lock it the same way.
     env: Arc<tokio::sync::Mutex<EvalEnv>>,

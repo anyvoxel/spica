@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::meta::ObjectReference;
+use crate::types::flow_version::FlowVersionKind;
+use crate::types::meta::{ObjectRef, RawObjectRef};
 use crate::types::thread::Thread;
 use crate::types::variables::Variables;
 use spica_machinery::Timestamp;
@@ -23,11 +24,12 @@ pub struct ThreadRecord {
     /// for the same reason as `ExecutionRecord`: `Thread`'s domain timing lives in `meta`, which
     /// would collide with this row's entry-timestamp fields at the same JSON level.
     pub value: Thread,
-    /// The thread's current variable scope (see `ExecutionRecord::variables`).
+    /// The thread's current variable scope — an `Assign` always targets a thread, so this is the
+    /// only place a run's variables are folded (see `VariablesAssigned`).
     pub variables: Variables,
     /// Owned nodes still in flight (active activities / timers / child threads). A completing or
     /// terminating thread waits for this projection-only set to drain before its terminal `ed`.
-    pub active_children: HashSet<ObjectReference>,
+    pub active_children: HashSet<RawObjectRef>,
     /// Birth entry moment (`ThreadCreated`), projection-derived — never a local `now()`.
     pub created_at: Timestamp,
     /// Latest applied entry's timestamp that touched this row.
@@ -39,7 +41,7 @@ impl ThreadRecord {
         self.value.clone()
     }
 
-    pub fn from_value(value: Thread, active_children: HashSet<ObjectReference>) -> Self {
+    pub fn from_value(value: Thread, active_children: HashSet<RawObjectRef>) -> Self {
         Self {
             value,
             variables: Variables::new(),
@@ -86,7 +88,7 @@ impl DerefMut for ThreadRecord {
 pub async fn resolve_thread_flow_version<S: ReadonlyStorageTxn + ?Sized>(
     storage: &S,
     thread: &ThreadRecord,
-) -> Result<ObjectReference, ExecutionError> {
+) -> Result<ObjectRef<FlowVersionKind>, ExecutionError> {
     let exec = storage
         .get_execution(&thread.value.execution)
         .await?

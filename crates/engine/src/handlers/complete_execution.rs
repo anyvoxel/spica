@@ -3,7 +3,8 @@ use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectKind, ObjectReference};
+use crate::types::meta::{ObjectKind, RawObjectRef};
+use crate::types::timer::TimerKind;
 
 /// Handles `CompleteExecution`: begins the success finish of a **top-level** `Execution` (the root
 /// run, terminal `Succeed`/`End` reached). Emits `ExecutionCompleting`, which fixes its output on
@@ -90,12 +91,14 @@ impl CompleteExecutionHandler {
 /// Shared by the `Execution` and `Thread` completion handlers.
 pub(super) fn cancel_timers(
     out: &mut Collector<'_>,
-    children: std::collections::HashSet<ObjectReference>,
+    children: std::collections::HashSet<RawObjectRef>,
 ) -> usize {
     let mut pending = 0usize;
     for child in children {
         if child.kind == ObjectKind::Timer {
-            out.append_command(Command::CancelTimer { timer: child });
+            out.append_command(Command::CancelTimer {
+                timer: child.typed::<TimerKind>(),
+            });
             pending += 1;
         }
     }

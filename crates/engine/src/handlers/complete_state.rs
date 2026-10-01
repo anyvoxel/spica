@@ -1,7 +1,7 @@
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::CompleteState;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::meta::{ErasedOwner, OwnerScope};
+use crate::types::meta::{HasRawObjectRef, OwnerScope};
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching
@@ -48,9 +48,9 @@ impl CompleteStateHandler {
             }
         };
         // An activity's owner slot admits only a `Thread`, so the row is read directly — no `kind`
-        // guard. Every consumer below takes the flat address storage and commands speak, so the
-        // erasure happens once here.
-        let scope_ref = act.value.meta.owner.clone().into_erased();
+        // guard. `OwnerScope::of_reference` is the one consumer that speaks a flat reference (it
+        // re-derives the kind it filters on), so the owner is erased for it here.
+        let scope_ref = act.value.meta.owner.clone();
         let Some(thread) = ctx.storage.get_thread(&scope_ref).await? else {
             return Ok(()); // owning scope gone — nothing to complete into.
         };
@@ -58,7 +58,7 @@ impl CompleteStateHandler {
             result,
             out,
             Some(activity.clone()),
-            OwnerScope::of_reference(&scope_ref),
+            OwnerScope::of_reference(scope_ref.as_raw_object_ref()),
             ctx.machine_for_thread(&thread).await
         );
         // The state to complete is the one this activity names: its own `state_path` locates the
@@ -68,7 +68,7 @@ impl CompleteStateHandler {
             result,
             out,
             Some(activity.clone()),
-            OwnerScope::of_reference(&scope_ref),
+            OwnerScope::of_reference(scope_ref.as_raw_object_ref()),
             sm.state_at(&act.value.state_path)
                 .map_err(ExecutionError::from)
         );

@@ -10,7 +10,7 @@ use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord, 
 use crate::types::error::ExecutionError;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
-use crate::types::meta::{ObjectKind, ObjectName, ObjectReference};
+use crate::types::meta::{ObjectKind, ObjectName, ObjectRef};
 
 /// The persisted projection of one object of any kind, in its typed record form — the value behind a
 /// `GetObject`/`ListObjects` read. Each variant names the entity kind it mirrors, so `kind()` is a
@@ -69,11 +69,12 @@ impl QueryListPage {
     }
 }
 
-/// Build the reference a point `get_*` storage read resolves by from a bare `(kind, name)` — the
-/// reads key rows by the addressing `name` alone, so a nil uid is a benign placeholder that never
-/// matches (the returned row carries the real uid back).
-pub(crate) fn ref_for(kind: ObjectKind, name: &ObjectName) -> ObjectReference {
-    ObjectReference::new(kind, name.clone(), ulid::Ulid::nil())
+/// Build the reference a point `get_*` storage read resolves by from a bare addressing `name` — the
+/// reads key rows by `name` alone, so a nil uid is a benign placeholder that never matches (the
+/// returned row carries the real uid back). The kind comes from `K`, which the caller's own
+/// `match kind` arm already pinned.
+pub(crate) fn ref_for<K: crate::types::meta::ObjectKindMarker>(name: &ObjectName) -> ObjectRef<K> {
+    ObjectRef::<K>::new(name.clone(), ulid::Ulid::nil())
 }
 
 /// List `kind`'s rows in storage-key order through the `Storage::list_kind` scan, deserializing each

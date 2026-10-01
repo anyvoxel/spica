@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::activity::Activity;
+use crate::types::activity::{Activity, ActivityKind};
 use crate::types::error::ExecutionError;
 use crate::types::execution::Execution;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
 use crate::types::id::RequestId;
-use crate::types::meta::ObjectReference;
+use crate::types::meta::ObjectRef;
 use crate::types::task::Task;
-use crate::types::thread::Thread;
+use crate::types::thread::{Thread, ThreadKind};
 use crate::types::timer::Timer;
 use crate::types::variables::Variables;
 
@@ -37,14 +37,14 @@ pub struct ExecutionCreated {
 /// Payload of [`Event::VariablesAssigned`] — the post-assign variable snapshot and its scope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariablesAssigned {
-    pub scope: ObjectReference,
+    pub scope: ObjectRef<ThreadKind>,
     pub variables: Variables,
 }
 
 /// Payload of [`Event::StateTransitioned`] — the resolved routing target and its result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateTransitioned {
-    pub activity: ObjectReference,
+    pub activity: ObjectRef<ActivityKind>,
     pub next: jsonptr::PointerBuf,
 }
 
@@ -114,7 +114,7 @@ pub enum Event {
     /// owning `Flow.latest_version` counter via its applier) without re-creating the flow aggregate.
     ///
     /// `request_id` echoes the originating command's [`RequestId`]; the StreamProcessor completes the
-    /// awaiting `create_flow` ack on this event and routes back the version's `ObjectReference`.
+    /// awaiting `create_flow` ack on this event and routes back the version's `RawObjectRef`.
     FlowVersionCreated(FlowVersionCreated),
 
     /// Result of `Command::CreateExecution` — a **top-level run**'s single creation record. A
@@ -207,10 +207,11 @@ pub enum Event {
     TimerCancelled { timer: Timer },
 
     /// Variables assigned by an Activity's `Assign`. Carries the full post-assign variable snapshot
-    /// for the owning **scope** projection (an `Execution` or a fan-out `Thread`) so replay does not
-    /// need to re-merge per-key diffs. The scope is addressed structurally: a top-level state assigns
-    /// into the `Execution`, a `Parallel`/`Map` branch state into its branch `Thread` — the applier
-    /// dispatches on the reference's kind (see `VariablesAssignedApplier`).
+    /// for the owning **scope** projection (always a `Thread`) so replay does not need to re-merge
+    /// per-key diffs. The scope is the assigning activity's owner (see [`ActivityKind::OwnedBy`]):
+    /// the run's derived root thread for a top-level state, the branch's thread for a `Parallel`/`Map`
+    /// branch state — a top-level run keeps its variables on that root thread, never on the execution
+    /// row.
     VariablesAssigned(VariablesAssigned),
 
     /// The state finished successfully and routed to its successor — `next` is the resolved

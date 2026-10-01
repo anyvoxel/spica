@@ -24,11 +24,11 @@ use spica_client::worker::{
 use spica_engine::{
     ActivatedTask, ActivityKind, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow,
     Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
-    ExecutionError, ExecutionStatus, FailTask, FlowKind, FlowName, FlowVersionCreated, Hook,
-    LogStream, NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectMetaBuilder, ObjectName,
-    ObjectReference, OwnerRef, PlainName, Reject, RequestId, RuntimeError, StatePath, StreamId,
-    Task, TaskApi, TaskCompleted, TasksClaimed, ThreadKind, ThreadOwner, TimerOwner, Timestamp,
-    Variables,
+    ExecutionError, ExecutionKind, ExecutionStatus, FailTask, FlowKind, FlowName,
+    FlowVersionCreated, FlowVersionKind, Hook, LogStream, NoOwner, ObjectKind, ObjectKindMarker,
+    ObjectMeta, ObjectMetaBuilder, ObjectName, ObjectRef, PlainName, RawObjectRef, Reject,
+    RequestId, RuntimeError, StatePath, StreamId, Task, TaskApi, TaskCompleted, TaskKind,
+    TasksClaimed, ThreadKind, ThreadOwner, TimerKind, TimerOwner, Timestamp, Variables,
 };
 use spica_machinery::{
     Clock, CountingIdGenerator, IdGenerator, ManualClock, SystemClock, SystemIdGenerator,
@@ -607,26 +607,36 @@ pub fn vars(pairs: &[(&str, Value)]) -> Variables {
 /// reverse lookup a settle is identified by. Like [`vars`] the literal lists its pairs, because a
 /// `HashMap`'s iteration order is seeded per process: a chain that pinned the order it happened to
 /// serialize in would only be reproducible within one run of the suite.
-pub fn indexed_refs(pairs: &[(usize, ObjectReference)]) -> HashMap<usize, ObjectReference> {
+pub fn indexed_refs<K: ObjectKindMarker>(
+    pairs: &[(usize, ObjectRef<K>)],
+) -> HashMap<usize, ObjectRef<K>> {
     pairs.iter().map(|(i, r)| (*i, r.clone())).collect()
 }
 
-/// A reference to the object `name` of kind `kind`, whose identity is the `n`-th uid minted.
-pub fn ref_to(kind: ObjectKind, object: &str, n: u64) -> ObjectReference {
-    ObjectReference::new(kind, name(object), uid(n))
+/// A reference to the object `object` of the kind the *slot* demands, whose identity is the `n`-th uid
+/// minted. The kind is carried by the type, so a fixture cannot build a value the field could not
+/// hold — a wrong-kind literal is a compile error, not a value the engine has to reject.
+pub fn ref_to<K: ObjectKindMarker>(object: &str, n: u64) -> ObjectRef<K> {
+    ObjectRef::new(name(object), uid(n))
+}
+
+/// A reference to the object `object` of kind `kind` as its *flat* address — the erased
+/// `RawObjectRef` a storage lookup or a heterogeneous collection takes.
+pub fn flat_ref_to(kind: ObjectKind, object: &str, n: u64) -> RawObjectRef {
+    RawObjectRef::new(kind, name(object), uid(n))
 }
 
 /// The owner slot of a **task**: the activity named `object`/`n`, in the slot's own type. A fixture
 /// cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime check.
-pub fn activity_owner(object: &str, n: u64) -> OwnerRef<ActivityKind> {
-    OwnerRef::new(name(object), uid(n))
+pub fn activity_owner(object: &str, n: u64) -> ObjectRef<ActivityKind> {
+    ObjectRef::new(name(object), uid(n))
 }
 
 /// [`activity_owner`] for a fixture already holding the activity's *flat* reference (an
-/// `ObjectReference` is what a storage lookup takes, so a fixture may legitimately carry the untyped
+/// `RawObjectRef` is what a storage lookup takes, so a fixture may legitimately carry the untyped
 /// address too). The slot's own checked conversion runs here, so a fixture naming the wrong kind
 /// fails at its own construction rather than building a record the engine cannot represent.
-pub fn activity_owner_of(reference: ObjectReference) -> OwnerRef<ActivityKind> {
+pub fn activity_owner_of(reference: RawObjectRef) -> ObjectRef<ActivityKind> {
     reference
         .try_into()
         .expect("fixture: a task's owner is an activity")
@@ -636,13 +646,13 @@ pub fn activity_owner_of(reference: ObjectReference) -> OwnerRef<ActivityKind> {
 /// top-level run's derived root thread, or a fan-out branch's thread (see `ActivityKind::OwnedBy`).
 /// A fixture cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime
 /// check.
-pub fn thread_owner(object: &str, n: u64) -> OwnerRef<ThreadKind> {
-    OwnerRef::new(name(object), uid(n))
+pub fn thread_owner(object: &str, n: u64) -> ObjectRef<ThreadKind> {
+    ObjectRef::new(name(object), uid(n))
 }
 
 /// [`thread_owner`] for a fixture already holding the thread's *flat* reference — the form a storage
 /// lookup takes, so a fixture seeding a thread row carries the untyped address too.
-pub fn thread_owner_of(reference: ObjectReference) -> OwnerRef<ThreadKind> {
+pub fn thread_owner_of(reference: RawObjectRef) -> ObjectRef<ThreadKind> {
     reference
         .try_into()
         .expect("fixture: an activity's owner is a thread")
@@ -651,19 +661,19 @@ pub fn thread_owner_of(reference: ObjectReference) -> OwnerRef<ThreadKind> {
 /// The owner slot of a **flow version**: the flow named `object`/`n`, in the slot's own type (see
 /// `FlowVersionKind::OwnedBy`). A fixture cannot ask for a kind the slot does not admit — the type
 /// carries the kind, not a runtime check.
-pub fn flow_owner(object: &str, n: u64) -> OwnerRef<FlowKind> {
-    OwnerRef::new(name(object), uid(n))
+pub fn flow_owner(object: &str, n: u64) -> ObjectRef<FlowKind> {
+    ObjectRef::new(name(object), uid(n))
 }
 
 /// The owner slot of a **thread** whose scope is the top-level run — a root thread, owned by the
 /// `Execution` it stands in for (see `ThreadOwner`).
 pub fn root_thread_owner(object: &str, n: u64) -> ThreadOwner {
-    ThreadOwner::Execution(OwnerRef::new(name(object), uid(n)))
+    ThreadOwner::Execution(ObjectRef::new(name(object), uid(n)))
 }
 
 /// [`root_thread_owner`] for a fixture already holding the execution's *flat* reference (the form a
 /// storage lookup takes, so a fixture may legitimately carry the untyped address too).
-pub fn root_thread_owner_of(execution: ObjectReference) -> ThreadOwner {
+pub fn root_thread_owner_of(execution: RawObjectRef) -> ThreadOwner {
     ThreadOwner::Execution(
         execution
             .try_into()
@@ -674,11 +684,11 @@ pub fn root_thread_owner_of(execution: ObjectReference) -> ThreadOwner {
 /// The owner slot of a **thread** fanned out by a container: `object`/`n` is the owning `Parallel`/
 /// `Map` activity (see `ThreadOwner`).
 pub fn fanout_thread_owner(object: &str, n: u64) -> ThreadOwner {
-    ThreadOwner::Activity(OwnerRef::new(name(object), uid(n)))
+    ThreadOwner::Activity(ObjectRef::new(name(object), uid(n)))
 }
 
 /// [`fanout_thread_owner`] for a fixture already holding the container activity's *flat* reference.
-pub fn fanout_thread_owner_of(activity: ObjectReference) -> ThreadOwner {
+pub fn fanout_thread_owner_of(activity: RawObjectRef) -> ThreadOwner {
     ThreadOwner::Activity(
         activity
             .try_into()
@@ -688,7 +698,7 @@ pub fn fanout_thread_owner_of(activity: ObjectReference) -> ThreadOwner {
 
 /// The owner slot of a **timer** armed by the run itself (an `ExecutionTimeout`), in the union's own
 /// type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
-pub fn execution_timer_owner_of(execution: ObjectReference) -> TimerOwner {
+pub fn execution_timer_owner_of(execution: RawObjectRef) -> TimerOwner {
     TimerOwner::Execution(
         execution
             .try_into()
@@ -699,11 +709,11 @@ pub fn execution_timer_owner_of(execution: ObjectReference) -> TimerOwner {
 /// The owner slot of a **timer** armed by the waiting activity (a `WaitResume`, a task retry or a
 /// task timeout): `object`/`n` is the owning activity.
 pub fn activity_timer_owner(object: &str, n: u64) -> TimerOwner {
-    TimerOwner::Activity(OwnerRef::new(name(object), uid(n)))
+    TimerOwner::Activity(ObjectRef::new(name(object), uid(n)))
 }
 
 /// [`activity_timer_owner`] for a fixture already holding the waiting activity's *flat* reference.
-pub fn activity_timer_owner_of(activity: ObjectReference) -> TimerOwner {
+pub fn activity_timer_owner_of(activity: RawObjectRef) -> TimerOwner {
     TimerOwner::Activity(
         activity
             .try_into()
@@ -810,7 +820,7 @@ impl Act {
 
 /// A call the external worker makes into a running execution. Addressed the way the worker's own API
 /// is — by the task's **name**, the scalar `poll_tasks` hands back — not by the engine's
-/// `ObjectReference`; the worker never learns the uid of what it settles.
+/// `RawObjectRef`; the worker never learns the uid of what it settles.
 #[derive(Clone, Debug)]
 pub enum Call {
     /// Claim up to `max_tasks` of `resource`, leasing each for `lease_seconds`. The request id is the
@@ -1127,7 +1137,7 @@ pub(crate) async fn virtual_run(
 ) -> (
     VirtualClient,
     Arc<spica_engine::InMemoryLogStream<EntryPayload>>,
-    ObjectReference,
+    ObjectRef<ExecutionKind>,
 ) {
     virtual_run_from(definition, input, 1).await
 }
@@ -1141,7 +1151,7 @@ pub(crate) async fn virtual_run_from(
 ) -> (
     VirtualClient,
     Arc<spica_engine::InMemoryLogStream<EntryPayload>>,
-    ObjectReference,
+    ObjectRef<ExecutionKind>,
 ) {
     let input: Value = serde_json::from_str(input).expect("an input literal is valid JSON");
     let (builder, log) = recording_builder();
@@ -1214,7 +1224,7 @@ async fn run_and_record(
 /// resulting rows by stream position, never by a pre-known reference. (There is no per-execution
 /// stream — a LogStream is one stream, so stream identity lives on the log, not the caller.)
 pub async fn submit_seed(
-    flow_version: ObjectReference,
+    flow_version: ObjectRef<FlowVersionKind>,
     input: Value,
     logstream: &(impl LogStream<EntryPayload> + ?Sized),
 ) -> Result<(), ExecutionError> {
@@ -1451,9 +1461,9 @@ impl Hook for CompositeHook {
                 // The durable event carries the timer's absolute deadline; re-arm the physical
                 // schedule from that persisted moment.
                 self.scheduler
-                    .schedule(&timer.meta.reference(), timer.deadline);
+                    .schedule(&timer.meta.typed_reference(), timer.deadline);
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.reference()),
+            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.typed_reference()),
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -1476,7 +1486,7 @@ struct EngineTimerSink {
 
 #[async_trait]
 impl TimerSink for EngineTimerSink {
-    async fn trigger(&self, timer: &ObjectReference) {
+    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
         let Some(engine) = self
             .engine
             .lock()
@@ -1646,12 +1656,13 @@ impl LocalClient {
         }
     }
 
-    /// Create a new flow version and return its created version's [`ObjectReference`].
+    /// Create a new flow version and return its created version's reference, in the kind a
+    /// `CreateExecution` binds to.
     pub(crate) async fn create_flow(
         &self,
         name: FlowName,
         definition: &str,
-    ) -> Result<ObjectReference, ExecutionError> {
+    ) -> Result<ObjectRef<FlowVersionKind>, ExecutionError> {
         // Fail fast: an unparseable definition can never enter the log or Storage.
         if serde_json::from_str::<spica_asl::StateMachine>(definition).is_err() {
             return Err(ExecutionError::Runtime(RuntimeError::InvalidDefinition(
@@ -1689,16 +1700,16 @@ impl LocalClient {
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        Ok(flow_version.meta.reference())
+        Ok(flow_version.meta.typed_reference())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id at birth.
     pub(crate) async fn start_for_revision(
         &self,
         name: ObjectName,
-        flow_version: ObjectReference,
+        flow_version: ObjectRef<FlowVersionKind>,
         input: Value,
-    ) -> Result<ObjectReference, ExecutionError> {
+    ) -> Result<ObjectRef<ExecutionKind>, ExecutionError> {
         // Boundary pre-check: the name is the execution's storage primary key (per-scope unique).
         if self
             .engine
@@ -1729,7 +1740,7 @@ impl LocalClient {
         };
         match event {
             Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
-                Ok(execution.meta.reference())
+                Ok(execution.meta.typed_reference())
             }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }
@@ -1858,7 +1869,7 @@ impl spica_engine::TaskApi for LocalClient {
             .ack
             .register(request_id, AckTarget::TaskCompleted)
             .await;
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        let task_ref = ObjectRef::<TaskKind>::new(task, ulid::Ulid::nil());
         self.engine
             .append_command(Command::CompleteTask(CompleteTask {
                 request_id,
@@ -1879,7 +1890,7 @@ impl spica_engine::TaskApi for LocalClient {
         task: ObjectName,
         error: ExecutionError,
     ) -> Result<(), ExecutionError> {
-        let task_ref = ObjectReference::new(ObjectKind::Task, task, ulid::Ulid::nil());
+        let task_ref = ObjectRef::<TaskKind>::new(task, ulid::Ulid::nil());
         self.engine
             .append_command(Command::FailTask(FailTask {
                 task: task_ref,

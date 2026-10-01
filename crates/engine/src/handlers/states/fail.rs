@@ -9,11 +9,12 @@ use crate::ActivityStatus;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
 use crate::handler::Collector;
+use crate::types::activity::ActivityKind;
 use crate::types::command::TerminationReason;
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectReference, OwnerScope};
+use crate::types::meta::{ObjectRef, OwnerScope};
 
 pub struct FailStateHandlerFactory;
 
@@ -48,7 +49,7 @@ impl StateHandler for FailStateHandler<'_> {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        _activity: ObjectReference,
+        _activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -138,6 +139,7 @@ mod tests {
     use crate::ActivityState;
     use crate::types::command::{Command, CompleteState, TerminateThread};
     use crate::types::event::Event;
+    use crate::types::meta::HasRawObjectRef;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus};
 
     // A `Fail` inherits the base's `activate` untouched and overrides only `finish`: the activation
@@ -184,9 +186,9 @@ mod tests {
         // No side effect, so nothing beyond the activity row itself was folded as its child.
         assert!(
             activated
-                .children(&thread_ref())
+                .children(thread_ref().as_raw_object_ref())
                 .await
-                .contains(&minted_activity_ref()),
+                .contains(minted_activity_ref().as_raw_object_ref()),
             "the failure is still a normal activation until the finish runs"
         );
     }

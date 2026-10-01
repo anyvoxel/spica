@@ -6,7 +6,7 @@
 //! the consumer owns both this contract's use and its wiring. They live **here** (not in
 //! `spica-engine`) because the engine never references them anymore — the seam is implemented and
 //! consumed entirely on this, downstream, side of the graph, and both traits carry only `spica-engine`
-//! value types ([`ObjectReference`](spica_engine::ObjectReference), [`Timestamp`](spica_engine::Timestamp)).
+//! value types ([`ObjectRef<TimerKind>`](spica_engine::ObjectRef), [`Timestamp`](spica_engine::Timestamp)).
 //!
 //! A scheduler is a **producer** of engine commands — a fired `TriggerTimer` must reach the log.
 //! Rather than the engine *pulling* fired commands back, the scheduler *pushes* into an injected
@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use spica_engine::{ObjectReference, Timestamp};
+use spica_engine::{ObjectRef, TimerKind, Timestamp};
 
 /// The write channel by which a fired timer's resumption reaches the log.
 ///
@@ -35,7 +35,7 @@ pub trait TimerSink: Send + Sync {
     /// write carries no `cause_id` — causal provenance of the fired trigger is derived from the
     /// entry that armed the timer, not from an explicit cause. The log assigns the append's position
     /// and its own stream id.
-    async fn trigger(&self, timer: &ObjectReference);
+    async fn trigger(&self, timer: &ObjectRef<TimerKind>);
 }
 
 /// Contract for the timer side-effect service.
@@ -58,10 +58,10 @@ pub trait Scheduler: Send + Sync {
     /// arm needs none and the `TimerSink::trigger` it drives none either. There is no stream to route
     /// to — a log is one stream, so the fired `TriggerTimer` is handed to the attached sink and the
     /// log stamps its own stream id when it is appended.
-    fn schedule(&self, timer: &ObjectReference, deadline: Timestamp);
+    fn schedule(&self, timer: &ObjectRef<TimerKind>, deadline: Timestamp);
 
     /// Cancel a previously-armed `timer` (a `TimerCancelled` event was applied).
-    fn cancel(&self, timer: &ObjectReference);
+    fn cancel(&self, timer: &ObjectRef<TimerKind>);
 
     /// Re-evaluate the armed timers against the clock's current reading — "time has moved, look
     /// again". Required **only** of a caller that moves the clock itself (a manual clock substituted

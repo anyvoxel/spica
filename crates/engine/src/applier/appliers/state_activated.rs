@@ -11,7 +11,11 @@ impl StateActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         activity: &Activity,
     ) -> Result<(), ExecutionError> {
-        let Some(act) = ctx.storage.get_activity(&activity.meta.reference()).await? else {
+        let Some(act) = ctx
+            .storage
+            .get_activity(&activity.meta.typed_reference())
+            .await?
+        else {
             return Ok(());
         };
         // Activation mutates only the domain value itself (processed input and, for Map, its

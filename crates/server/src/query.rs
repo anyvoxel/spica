@@ -3,16 +3,14 @@
 //! Both are non-blocking point-in-time reads delegated to the engine's read facade; this module is
 //! the single place engine rows cross into their wire mirrors.
 
-use spica_engine::{
-    ObjectKind, ObjectName, ObjectReference, OwnerKindMarker, QueryObject, TerminationReason,
-};
+use spica_engine::{ObjectKind, ObjectName, OwnerKindMarker, QueryObject, TerminationReason};
 use spica_proto::v1::{
     GetObjectRequest, GetObjectResponse, ListObjectsRequest, ListObjectsResponse,
     query_server::Query as QueryServiceTrait,
 };
 use tonic::{Request, Response, Status};
 
-use crate::common::{Svc, to_status};
+use crate::common::{Svc, proto_ref, to_status};
 
 /// Default page size when a `ListObjects` request omits `limit`.
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -115,16 +113,16 @@ fn proto_meta<K: spica_engine::ObjectKindMarker>(
         created_at_millis: meta.created_at.as_millis() as i64,
         updated_at_millis: meta.updated_at.as_millis() as i64,
         // The mirror is a flat address, so the owner crosses the wire seam here — the only way a
-        // typed slot leaves the engine's type vocabulary. A root object's `NoOwner` reads as absent.
-        owner: meta.owner.as_reference().map(proto_ref),
-    }
-}
-
-fn proto_ref(r: &ObjectReference) -> spica_proto::v1::ObjectReference {
-    spica_proto::v1::ObjectReference {
-        kind: r.kind.as_str().to_string(),
-        name: r.name.as_str(),
-        uid: r.uid.to_string(),
+        // typed slot leaves the engine's type vocabulary. An owner slot sums over kinds, so it is
+        // read as a raw reference (`to_raw_object_ref`); a root's `NoOwner` reads as absent.
+        owner: meta
+            .owner
+            .to_raw_object_ref()
+            .map(|r| spica_proto::v1::ObjectReference {
+                kind: r.kind.as_str().to_string(),
+                name: r.name.as_str(),
+                uid: r.uid.to_string(),
+            }),
     }
 }
 
@@ -192,11 +190,6 @@ fn to_proto_execution(e: &spica_engine::ExecutionRecord) -> spica_proto::v1::Exe
             .as_ref()
             .map(|v| serde_json::to_vec(v).unwrap_or_default())
             .unwrap_or_default(),
-        variables: e
-            .variables
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::to_vec(v).unwrap_or_default()))
-            .collect(),
         deadline_millis: e
             .value
             .deadline

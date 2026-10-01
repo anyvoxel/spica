@@ -3,7 +3,7 @@
 
 use crate::ApplierContext;
 use crate::types::error::ExecutionError;
-use crate::types::meta::ErasedOwner;
+use crate::types::meta::HasRawObjectRef;
 
 use crate::Task;
 
@@ -28,9 +28,9 @@ impl TaskActivatedApplier {
                 task.meta
                     .owner
                     .clone()
-                    // The slot is an `OwnerRef<ActivityKind>`; `active_children` speaks flat addresses,
+                    // The slot is an `ObjectRef<ActivityKind>`; `active_children` speaks flat addresses,
                     // so the owner crosses the erasure seam here.
-                    .into_erased(),
+                    .into_raw_object_ref(),
                 task.meta.reference(),
             )
             .await?;

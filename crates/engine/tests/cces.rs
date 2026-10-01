@@ -7,14 +7,15 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    ActivateTask, Activity, ActivityStatus, ClaimTasks, Command, CompleteState, CompleteTask,
-    CreateExecution, CreateFlow, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
-    ExecutionError, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus,
-    FlowVersion, FlowVersionCreated, InMemoryLogStream, LogStream, ObjectReference, OwnerRef,
-    RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError, SpawnThread,
-    StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted, TaskFailed, TaskStatus,
-    TasksClaimed, TerminateExecution, TerminateState, TerminationReason, Thread, ThreadKind,
-    ThreadStatus, Timer, TimerPurpose, TimerStatus, Timestamp, Variables, VariablesAssigned,
+    ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command, CompleteState,
+    CompleteTask, CreateExecution, CreateFlow, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated,
+    FlowName, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, HasRawObjectRef,
+    InMemoryLogStream, LogStream, ObjectRef, RawObjectRef, RejectionType, RequestId, RetryPolicy,
+    RetryState, RuntimeError, StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted,
+    TaskFailed, TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState,
+    TerminationReason, Thread, ThreadKind, ThreadOwner, ThreadStatus, Timer, TimerKind, TimerOwner,
+    TimerPurpose, TimerStatus, Timestamp, Variables, VariablesAssigned,
 };
 use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
 use spica_storage::InMemoryStorage;
@@ -24,12 +25,12 @@ fn parse_sm(definition: &str) -> StateMachine {
     serde_json::from_str(definition).expect("state machine should parse")
 }
 
-/// Build a distinct execution [`ObjectReference`] shaped exactly like `Execution::reference()`
-/// (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
-fn exec_ref() -> spica_engine::ObjectReference {
+/// Build a distinct execution reference shaped exactly like `Execution::reference()` (the generated
+/// `obj-<uid>` name + uid), so an in-memory storage round-trips by reference. The type carries the
+/// kind, so a fixture handed to a flat-address read says `.as_raw_object_ref()` itself.
+fn exec_ref() -> spica_engine::ObjectRef<ExecutionKind> {
     let uid: ulid::Ulid = ulid::Ulid::new();
-    spica_engine::ObjectReference::new(
-        spica_engine::ObjectKind::Execution,
+    spica_engine::ObjectRef::new(
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
             .generated_from_key(uid.0 as u64),
@@ -37,12 +38,11 @@ fn exec_ref() -> spica_engine::ObjectReference {
     )
 }
 
-/// Build a distinct activity [`ObjectReference`] shaped exactly like `Activity::reference()`
-/// (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
-fn act_ref() -> spica_engine::ObjectReference {
+/// Build a distinct activity reference shaped exactly like `Activity::reference()` (the generated
+/// `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
+fn act_ref() -> spica_engine::ObjectRef<ActivityKind> {
     let uid: ulid::Ulid = ulid::Ulid::new();
-    spica_engine::ObjectReference::new(
-        spica_engine::ObjectKind::Activity,
+    spica_engine::ObjectRef::new(
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
             .generated_from_key(uid.0 as u64),
@@ -50,12 +50,11 @@ fn act_ref() -> spica_engine::ObjectReference {
     )
 }
 
-/// Build the task [`ObjectReference`] for a task's raw id, shaped exactly like `Task::reference()`
-/// (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
-fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectReference {
+/// Build the task reference for a task's raw id, shaped exactly like `Task::reference()` (the
+/// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
+fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectRef<TaskKind> {
     let uid: ulid::Ulid = task;
-    spica_engine::ObjectReference::new(
-        spica_engine::ObjectKind::Task,
+    spica_engine::ObjectRef::new(
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
             .generated_from_key(uid.0 as u64),
@@ -63,12 +62,10 @@ fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectReference {
     )
 }
 
-/// Build the timer [`ObjectReference`] for a timer's raw id, shaped exactly like
-/// `Timer::reference()` (the generated `obj-<uid>` name + uid), so an in-memory storage round-trips
-/// by reference.
-fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectReference {
-    spica_engine::ObjectReference::new(
-        spica_engine::ObjectKind::Timer,
+/// Build the timer reference for a timer's raw id, shaped exactly like `Timer::reference()` (the
+/// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
+fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectRef<TimerKind> {
+    spica_engine::ObjectRef::new(
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
             .generated_from_key(timer.0 as u64),
@@ -80,17 +77,20 @@ fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectReference {
 /// derived root thread, which a top-level state hangs off. No thread row has to exist for such an
 /// edge to be projected (`add_child`/`remove_child` tolerate a missing parent), so a fixture whose
 /// subject is not the drain itself can name a stable stand-in instead of seeding a whole root thread.
-fn activity_root_thread_owner() -> OwnerRef<ThreadKind> {
+fn activity_root_thread_owner() -> ObjectRef<ThreadKind> {
     common::thread_owner("child", 4)
 }
 
-/// Pre-seed `sm` as a created flow version in `storage`, returning its [`ObjectReference`].
+/// Pre-seed `sm` as a created flow version in `storage`, returning its [`RawObjectRef`].
 /// Definition resolution happens from storage at dispatch time (the `CreateExecution` command
 /// carries only the flow version reference), so raw-seam drivers seed the definition directly rather
 /// than driving a `CreateFlow` command. The definition is stored in its raw ASL string form. Mirrors
 /// what the `FlowCreated` applier folds: a `Flow` row (by name, on first appearance) + a `FlowVersion`
 /// row (keyed by its `{flow_name}-{version}` name, executions bind to the reference).
-async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> ObjectReference {
+async fn seed_revision(
+    storage: &mut InMemoryStorage,
+    sm: StateMachine,
+) -> spica_engine::ObjectRef<FlowVersionKind> {
     let version = 1u32;
     let flow_name = FlowName::new("test_flow").expect("static name is valid");
     let version_name = FlowVersion::version_name(&flow_name, version);
@@ -98,7 +98,7 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
     let created_at = Timestamp::from_millis(0);
     // The owning Flow's reference, attached to the version below — same scope, uid nil (the flow's
     // name is its sole identity). The slot's type names the kind, so only name and uid are passed.
-    let owner = spica_engine::OwnerRef::<spica_engine::FlowKind>::new(
+    let owner = spica_engine::ObjectRef::<spica_engine::FlowKind>::new(
         spica_engine::ObjectName::plain("test_flow").expect("static name is valid"),
         ulid::Ulid::nil(),
     );
@@ -131,11 +131,7 @@ async fn seed_revision(storage: &mut InMemoryStorage, sm: StateMachine) -> Objec
         })
         .await
         .unwrap();
-    ObjectReference::new(
-        spica_engine::ObjectKind::FlowVersion,
-        version_name,
-        flow_version_uid,
-    )
+    spica_engine::ObjectRef::new(version_name, flow_version_uid)
 }
 
 /// Applies events to storage through [`dispatch_event`](spica_engine::dispatch_event), mirroring the event path of
@@ -192,7 +188,7 @@ struct AppendingSink {
 
 #[async_trait::async_trait]
 impl TimerSink for AppendingSink {
-    async fn trigger(&self, timer: &ObjectReference) {
+    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
         // Envelope the fired command with placeholders; the log stamps the real position and stream.
         // The fired `TriggerTimer` carries no cause — provenance is derived from the entry that armed it.
         self.log
@@ -215,9 +211,9 @@ impl TimerSink for AppendingSink {
 fn apply_event_to_scheduler(scheduler: &std::sync::Arc<InMemoryScheduler>, event: &Event) {
     match event {
         Event::TimerActivated { timer } => {
-            scheduler.schedule(&timer.meta.reference(), timer.deadline);
+            scheduler.schedule(&timer.meta.typed_reference(), timer.deadline);
         }
-        Event::TimerCancelled { timer } => scheduler.cancel(&timer.meta.reference()),
+        Event::TimerCancelled { timer } => scheduler.cancel(&timer.meta.typed_reference()),
         _ => {}
     }
 }
@@ -368,11 +364,11 @@ async fn storage_projects_execution_and_activity_state() {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({ "x": 1 }),
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -396,7 +392,7 @@ async fn storage_projects_execution_and_activity_state() {
                     activity_state: None,
                     retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(activity.uid)
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -409,23 +405,14 @@ async fn storage_projects_execution_and_activity_state() {
     projector
         .apply(
             &mut storage,
-            &Event::VariablesAssigned(VariablesAssigned {
-                scope: exec.clone(),
-                variables: Variables::from([("g".to_string(), json!("hi"))]),
-            }),
-        )
-        .await;
-    projector
-        .apply(
-            &mut storage,
             &Event::ExecutionCompleted {
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Completed,
                     input: json!({ "x": 1 }),
                     output: Some(json!({ "done": true })),
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -438,7 +425,6 @@ async fn storage_projects_execution_and_activity_state() {
 
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
     assert_eq!(e.status, ExecutionStatus::Completed);
-    assert_eq!(e.variables.get("g"), Some(&json!("hi")));
     assert_eq!(e.output, Some(json!({ "done": true })));
     assert!(matches!(e.status, ExecutionStatus::Completed));
 }
@@ -460,11 +446,11 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(100),
                             spica_engine::Timestamp::from_millis(100),
@@ -494,11 +480,11 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
             &Event::ExecutionCompleted {
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Completed,
                     input: json!({}),
                     output: Some(json!(true)),
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(100),
                             spica_engine::Timestamp::from_millis(300),
@@ -546,7 +532,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         activity_state: None,
         retry_state: None,
         output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid)
+        meta: spica_engine::ObjectMeta::builder(activity.uid())
             .timestamps(ts(at), ts(at))
             .with_owner(activity_root_thread_owner()),
     };
@@ -564,7 +550,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
             &mut storage,
             &Event::StateActivated {
                 activity: Activity {
-                    meta: spica_engine::ObjectMeta::builder(activity.uid)
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(ts(100), ts(200))
                         .with_owner(activity_root_thread_owner()),
                     ..act_birth(100)
@@ -592,7 +578,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         deadline: ts(500),
         meta: spica_engine::ObjectMeta::builder(timer)
             .timestamps(ts(100), ts(100))
-            .with_owner(common::execution_timer_owner_of(exec.clone())),
+            .with_owner(TimerOwner::Execution(exec.clone())),
     };
     projector
         .apply(
@@ -610,7 +596,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     status: TimerStatus::Completed,
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(ts(100), ts(150))
-                        .with_owner(common::execution_timer_owner_of(exec.clone())),
+                        .with_owner(TimerOwner::Execution(exec.clone())),
                     ..timer_birth
                 },
             },
@@ -630,7 +616,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
 
     // Task birth, then completion advances `updated_at`.
     let task_birth = Task {
-        execution: spica_engine::ObjectReference::nil(),
+        execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
         resource: "urn:svc".to_string(),
         arguments: json!({}),
         status: TaskStatus::Pending,
@@ -641,7 +627,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         retry_state: RetryState::default(),
         meta: spica_engine::ObjectMeta::builder(task)
             .timestamps(ts(100), ts(100))
-            .with_owner(common::activity_owner_of(activity.clone())),
+            .with_owner(activity.clone()),
     };
     projector
         .apply(
@@ -662,7 +648,7 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
                     lease_expires_at: None,
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(ts(100), ts(180))
-                        .with_owner(common::activity_owner_of(activity.clone())),
+                        .with_owner(activity.clone()),
                     ..task_birth
                 },
                 output: Value::Null,
@@ -703,11 +689,11 @@ async fn projection_records_create_and_update_timestamps() {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -726,10 +712,18 @@ async fn projection_records_create_and_update_timestamps() {
     projector
         .apply_at(
             &mut storage,
-            &Event::VariablesAssigned(VariablesAssigned {
-                scope: exec.clone(),
-                variables: Variables::from([("k".to_string(), json!(1))]),
-            }),
+            &Event::ExecutionCompleting {
+                execution: Execution {
+                    deadline: None,
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
+                    status: ExecutionStatus::Completing,
+                    input: json!({}),
+                    output: None,
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
+                        .timestamps(t(100), t(200))
+                        .with_owner(spica_engine::NoOwner::new()),
+                },
+            },
             t(200),
         )
         .await;
@@ -753,7 +747,7 @@ async fn projection_records_create_and_update_timestamps() {
                     activity_state: None,
                     retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(activity.uid)
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(t(200), t(200))
                         .with_owner(activity_root_thread_owner()),
                 },
@@ -775,7 +769,7 @@ async fn projection_records_create_and_update_timestamps() {
                     activity_state: None,
                     retry_state: None,
                     output: Some(json!(42)),
-                    meta: spica_engine::ObjectMeta::builder(activity.uid)
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(t(200), t(300))
                         .with_owner(activity_root_thread_owner()),
                 },
@@ -800,7 +794,7 @@ async fn projection_records_create_and_update_timestamps() {
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(t(400), t(400))
-                        .with_owner(common::execution_timer_owner_of(exec.clone())),
+                        .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
             t(400),
@@ -817,7 +811,7 @@ async fn projection_records_create_and_update_timestamps() {
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
                         .timestamps(t(400), t(450))
-                        .with_owner(common::execution_timer_owner_of(exec.clone())),
+                        .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
             t(450),
@@ -834,7 +828,7 @@ async fn projection_records_create_and_update_timestamps() {
             &mut storage,
             &Event::TaskActivated {
                 task: Task {
-                    execution: spica_engine::ObjectReference::nil(),
+                    execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                     resource: "urn:svc".to_string(),
                     arguments: json!({}),
                     status: TaskStatus::Pending,
@@ -845,7 +839,7 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(t(600), t(600))
-                        .with_owner(common::activity_owner_of(activity.clone())),
+                        .with_owner(activity.clone()),
                 },
             },
             t(600),
@@ -856,7 +850,7 @@ async fn projection_records_create_and_update_timestamps() {
             &mut storage,
             &Event::TaskFailed(TaskFailed {
                 task: Task {
-                    execution: spica_engine::ObjectReference::nil(),
+                    execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                     resource: "urn:svc".to_string(),
                     arguments: json!({}),
                     status: TaskStatus::Failed,
@@ -867,7 +861,7 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
                         .timestamps(t(600), t(650))
-                        .with_owner(common::activity_owner_of(activity.clone())),
+                        .with_owner(activity.clone()),
                 },
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
                     state: "S".to_string(),
@@ -1024,7 +1018,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .with_owner(common::root_thread_owner_of(exec.clone())),
+            .with_owner(ThreadOwner::Execution(exec.clone())),
     };
     let root_thread_ref = root_thread.meta.reference();
     let thread = Thread {
@@ -1039,7 +1033,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
         output: None,
         meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
             .at(spica_engine::Timestamp::from_millis(0))
-            .with_owner(common::fanout_thread_owner_of(activity.clone())),
+            .with_owner(ThreadOwner::Activity(activity.clone())),
     };
     let thread_ref = thread.meta.reference();
     let mut storage = InMemoryStorage::new();
@@ -1053,11 +1047,11 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                 request_id: RequestId::nil(),
                 execution: Execution {
                     deadline: None,
-                    flow_version: ObjectReference::nil(),
+                    flow_version: ObjectRef::<FlowVersionKind>::nil(),
                     status: ExecutionStatus::Running,
                     input: json!({}),
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(exec.uid)
+                    meta: spica_engine::ObjectMeta::builder(exec.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -1080,7 +1074,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
         .apply(
             &mut storage,
             &Event::VariablesAssigned(VariablesAssigned {
-                scope: root_thread_ref.clone(),
+                scope: common::thread_owner_of(root_thread_ref.clone()),
                 variables: Variables::from([("g".to_string(), json!("hi"))]),
             }),
         )
@@ -1100,7 +1094,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
                     activity_state: None,
                     retry_state: None,
                     output: None,
-                    meta: spica_engine::ObjectMeta::builder(activity.uid)
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
@@ -1121,21 +1115,29 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             },
         )
         .await;
-    let row = storage.get_thread(&thread_ref).await.unwrap().unwrap();
+    let row = storage
+        .get_thread(&thread_ref.clone().typed::<ThreadKind>())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.variables.get("g"), Some(&json!("hi")));
 
-    // A branch `Assign` targets the Thread scope: the applier must write into the thread's own
-    // variable snapshot rather than dropping it (the old Execution-only path missed it).
+    // A branch `Assign` targets the branch Thread: the applier writes into the thread's own
+    // variable snapshot, so the branch sees its own `$x` alongside the inherited `$g`.
     projector
         .apply(
             &mut storage,
             &Event::VariablesAssigned(VariablesAssigned {
-                scope: thread_ref.clone(),
+                scope: common::thread_owner_of(thread_ref.clone()),
                 variables: Variables::from([("x".to_string(), json!(1))]),
             }),
         )
         .await;
-    let row = storage.get_thread(&thread_ref).await.unwrap().unwrap();
+    let row = storage
+        .get_thread(&thread_ref.clone().typed::<ThreadKind>())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.variables.get("x"), Some(&json!(1)));
 }
 
@@ -1186,7 +1188,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .with_owner(common::root_thread_owner_of(exec.clone())),
+            .with_owner(ThreadOwner::Execution(exec.clone())),
     };
     let root_thread_ref = root_thread.meta.reference();
 
@@ -1199,11 +1201,11 @@ async fn terminate_execution_cancels_wait_and_drains() {
             request_id: RequestId::nil(),
             execution: Execution {
                 deadline: None,
-                flow_version: ObjectReference::nil(),
+                flow_version: ObjectRef::<FlowVersionKind>::nil(),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid)
+                meta: spica_engine::ObjectMeta::builder(exec.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1227,7 +1229,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 activity_state: None,
                 retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(activity.uid)
+                meta: spica_engine::ObjectMeta::builder(activity.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1246,7 +1248,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 activity_state: None,
                 retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(activity.uid)
+                meta: spica_engine::ObjectMeta::builder(activity.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1265,7 +1267,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .with_owner(common::activity_timer_owner_of(activity.clone())),
+                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -1280,8 +1282,8 @@ async fn terminate_execution_cancels_wait_and_drains() {
     let entries = processor
         .dispatch(
             &Command::TerminateExecution(TerminateExecution {
-                name: exec.name.clone(),
-                uid: Some(exec.uid),
+                name: exec.name().clone(),
+                uid: Some(exec.uid()),
                 reason: TerminationReason::Cancelled,
             }),
             &storage,
@@ -1369,7 +1371,7 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(common::execution_timer_owner_of(exec.clone())),
+                        .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
         )
@@ -1388,7 +1390,7 @@ async fn late_trigger_timer_after_cancel_is_noop() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(common::execution_timer_owner_of(exec.clone())),
+                        .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
         )
@@ -1439,7 +1441,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .with_owner(common::root_thread_owner_of(exec.clone())),
+            .with_owner(ThreadOwner::Execution(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1464,7 +1466,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
         activity_state: None,
         retry_state: None,
         output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid)
+        meta: spica_engine::ObjectMeta::builder(activity.uid())
             .timestamps(
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
@@ -1485,7 +1487,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid)
+                meta: spica_engine::ObjectMeta::builder(exec.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1510,7 +1512,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .with_owner(common::activity_timer_owner_of(activity.clone())),
+                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -1565,7 +1567,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
     assert!(
         entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity
+            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity.clone().into_raw_object_ref()
         )),
         "the fired timer must relay its settle so the stranded activity drains: {entries:?}"
     );
@@ -1603,7 +1605,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
     let entries = dispatch_command(
         &storage,
         Command::ContinueTerminate {
-            owner: activity.clone(),
+            owner: activity.clone().into_raw_object_ref(),
         },
     )
     .await;
@@ -1636,11 +1638,11 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
             request_id: RequestId::nil(),
             execution: Execution {
                 deadline: None,
-                flow_version: ObjectReference::nil(),
+                flow_version: ObjectRef::<FlowVersionKind>::nil(),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid)
+                meta: spica_engine::ObjectMeta::builder(exec.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1659,7 +1661,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
                 activity_state: None,
                 retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(activity.uid)
+                meta: spica_engine::ObjectMeta::builder(activity.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1678,7 +1680,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .with_owner(common::activity_timer_owner_of(activity.clone())),
+                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -1718,7 +1720,7 @@ async fn terminating_task_drains_when_its_deadline_timer_fires() {
     assert!(
         entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity
+            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity.clone().into_raw_object_ref()
         )),
         "a fired {purpose:?} timer must relay its settle even with no in-flight task: {entries:?}"
     );
@@ -1751,7 +1753,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .with_owner(common::root_thread_owner_of(exec.clone())),
+            .with_owner(ThreadOwner::Execution(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1774,7 +1776,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
         activity_state: None,
         retry_state: None,
         output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid)
+        meta: spica_engine::ObjectMeta::builder(activity.uid())
             .timestamps(
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
@@ -1795,7 +1797,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid)
+                meta: spica_engine::ObjectMeta::builder(exec.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1820,7 +1822,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .with_owner(common::activity_timer_owner_of(activity.clone())),
+                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -1893,7 +1895,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
             )
-            .with_owner(common::root_thread_owner_of(exec.clone())),
+            .with_owner(ThreadOwner::Execution(exec.clone())),
     };
     let thread_ref = thread.meta.reference();
 
@@ -1922,7 +1924,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
         activity_state: None,
         retry_state: None,
         output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid)
+        meta: spica_engine::ObjectMeta::builder(activity.uid())
             .timestamps(
                 spica_engine::Timestamp::from_millis(0),
                 spica_engine::Timestamp::from_millis(0),
@@ -1943,7 +1945,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid)
+                meta: spica_engine::ObjectMeta::builder(exec.uid())
                     .timestamps(
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
@@ -1968,7 +1970,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
                         spica_engine::Timestamp::from_millis(0),
                         spica_engine::Timestamp::from_millis(0),
                     )
-                    .with_owner(common::activity_timer_owner_of(activity.clone())),
+                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -2017,7 +2019,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
     assert!(
         entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Command(Command::ContinueComplete { owner }) if *owner == activity
+            EntryPayload::Command(Command::ContinueComplete { owner }) if *owner == activity.clone().into_raw_object_ref()
         )),
         "the drain of the completing activity must be issued: {entries:?}"
     );
@@ -2031,7 +2033,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
     let entries = dispatch_command(
         &storage,
         Command::ContinueComplete {
-            owner: activity.clone(),
+            owner: activity.clone().into_raw_object_ref(),
         },
     )
     .await;
@@ -2221,12 +2223,12 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
     // successful `CreateExecution` would have folded (the name is now the execution's primary key).
     let uid: ulid::Ulid = ulid::Ulid::new();
     let name = spica_engine::ObjectName::plain("dup_run").unwrap();
-    let _id = ObjectReference::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
+    let _id = RawObjectRef::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
     storage
         .put_execution(spica_engine::ExecutionRecord {
             value: Execution {
                 deadline: None,
-                flow_version: ObjectReference::nil(),
+                flow_version: ObjectRef::<FlowVersionKind>::nil(),
                 status: ExecutionStatus::Running,
                 input: Value::Null,
                 output: None,
@@ -2235,7 +2237,6 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
                     .at(Timestamp::from_millis(0))
                     .with_owner(spica_engine::NoOwner::new()),
             },
-            variables: Variables::new(),
             active_children: std::collections::HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2252,7 +2253,7 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
             &Command::CreateExecution(CreateExecution {
                 request_id: RequestId::new(),
                 name,
-                flow_version: ObjectReference::nil(),
+                flow_version: ObjectRef::<FlowVersionKind>::nil(),
                 input: Value::Null,
             }),
             &storage,
@@ -2294,12 +2295,12 @@ async fn seed_named_execution(
     uid: ulid::Ulid,
     status: ExecutionStatus,
 ) {
-    let _id = ObjectReference::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
+    let _id = RawObjectRef::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
     storage
         .put_execution(spica_engine::ExecutionRecord {
             value: Execution {
                 deadline: None,
-                flow_version: ObjectReference::nil(),
+                flow_version: ObjectRef::<FlowVersionKind>::nil(),
                 status,
                 input: Value::Null,
                 output: None,
@@ -2308,7 +2309,6 @@ async fn seed_named_execution(
                     .at(Timestamp::from_millis(0))
                     .with_owner(spica_engine::NoOwner::new()),
             },
-            variables: Variables::new(),
             active_children: std::collections::HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2496,73 +2496,43 @@ async fn create_flow_handler_rejects_malformed_definition_as_reject_record() {
     }
 }
 
-/// A command payload carries its owner as a flat address, so the wrong kind can only be caught at the
-/// one boundary that fills the slot. Both fan-out commands must refuse a foreign-kind owner with a
-/// `Reject(InvalidArgument)` — a settled outcome for the caller — rather than write a row whose owner
-/// its own slot could never read back, or (worse) silently drop the command.
-#[tokio::test]
-async fn owner_slot_boundaries_refuse_a_foreign_owner_kind_as_reject_records() {
-    let storage = InMemoryStorage::new();
-    let mut processor = StreamProcessor::new();
-    let thread_owner = spica_engine::ObjectReference::new(
+/// A command payload carries its owner in a *typed* slot, so a wrong kind cannot be built as a
+/// value at all. The one place it can still arrive is the wire, where the payload is decoded — and
+/// the slot's own `Deserialize` runs the checked conversion there, so a payload naming a thread where
+/// an activity belongs is refused on the way in rather than repaired into a row nothing could read.
+#[test]
+fn owner_slots_refuse_a_foreign_owner_kind_at_decode() {
+    let command = Command::ActivateTask(ActivateTask {
+        execution: exec_ref(),
+        owner: act_ref(),
+        task: task_ref(ulid::Ulid::from(9u128)),
+        resource: "service-a".to_string(),
+        arguments: json!({}),
+        retry_plan: Vec::new(),
+        deadline: None,
+    });
+    let wire = serde_json::to_value(&command).expect("a command is serializable");
+    // The same payload with only the owner's kind swapped — what a stale or buggy writer could still
+    // put on the wire.
+    let mut foreign = wire.clone();
+    foreign["ActivateTask"]["owner"] = serde_json::to_value(spica_engine::RawObjectRef::new(
         spica_engine::ObjectKind::Thread,
-        spica_engine::PlainName::new("branch")
-            .expect("static literal is a valid segment")
-            .generated_from_key(1),
+        common::name("branch"),
         ulid::Ulid::new(),
+    ))
+    .expect("a reference is serializable");
+
+    let error = serde_json::from_value::<Command>(foreign)
+        .expect_err("a foreign owner kind must not decode into a typed slot");
+    assert!(
+        error.to_string().contains("Thread"),
+        "the refusal names the kind it saw: {error}"
     );
-
-    let cases = [
-        (
-            "activate_task",
-            Command::ActivateTask(ActivateTask {
-                execution: exec_ref(),
-                owner: thread_owner.clone(),
-                task: task_ref(ulid::Ulid::from(9u128)),
-                resource: "service-a".to_string(),
-                arguments: json!({}),
-                retry_plan: Vec::new(),
-                deadline: None,
-            }),
-        ),
-        (
-            "spawn_thread",
-            Command::SpawnThread(SpawnThread {
-                owner: thread_owner.clone(),
-                execution: exec_ref(),
-                state_path: None,
-                index: 0,
-                start_at: "B".to_string(),
-                input: json!({}),
-            }),
-        ),
-    ];
-
-    for (handler, command) in cases {
-        let entries = processor
-            .dispatch(&command, &storage, EntryId::new(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            entries.len(),
-            1,
-            "{handler}: one response entry, got {entries:?}"
-        );
-        match &entries[0].payload {
-            EntryPayload::Reject(reject) => {
-                assert_eq!(
-                    reject.rejection_type,
-                    RejectionType::InvalidArgument,
-                    "{handler}: a foreign owner kind is the payload's fault: {reject:?}"
-                );
-                assert!(
-                    reject.rejection_reason.contains(handler),
-                    "{handler}: the refusal names the boundary: {reject:?}"
-                );
-            }
-            other => panic!("{handler}: expected Reject(InvalidArgument), got {other:?}"),
-        }
-    }
+    // The same payload with its own owner decodes: what was refused is the kind, not the shape.
+    assert_eq!(
+        serde_json::from_value::<Command>(wire).expect("its own shape decodes"),
+        command
+    );
 }
 
 #[tokio::test]
@@ -2772,7 +2742,7 @@ async fn engine_runs_many_create_flow_concurrently() {
         let id = id.expect("concurrent create_flow should succeed");
         assert_ne!(
             id,
-            ObjectReference::nil(),
+            ObjectRef::<FlowVersionKind>::nil(),
             "concurrent create_flow #{i} returned a real, distinct flow_version"
         );
     }
@@ -2798,12 +2768,12 @@ async fn seed_task(
     status: TaskStatus,
     worker_id: Option<String>,
     lease_expires_at: Option<Timestamp>,
-) -> spica_engine::ObjectReference {
+) -> spica_engine::ObjectRef<ActivityKind> {
     let owner = act_ref();
     storage
         .put_task(spica_engine::TaskRecord {
             value: Task {
-                execution: spica_engine::ObjectReference::nil(),
+                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 resource: "r".to_string(),
                 arguments: Value::Null,
                 status,
@@ -2814,7 +2784,7 @@ async fn seed_task(
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(task_id)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(common::activity_owner_of(owner.clone())),
+                    .with_owner(owner.clone()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2829,10 +2799,10 @@ async fn seed_task(
 /// the scope above it.
 async fn seed_owning_activity(
     storage: &mut InMemoryStorage,
-    activity: spica_engine::ObjectReference,
+    activity: spica_engine::ObjectRef<ActivityKind>,
 ) {
     let uid: ulid::Ulid = ulid::Ulid::new();
-    let owner = ObjectReference::new(
+    let owner = RawObjectRef::new(
         spica_engine::ObjectKind::Thread,
         spica_engine::PlainName::new("child")
             .expect("static literal is a valid segment")
@@ -2842,7 +2812,7 @@ async fn seed_owning_activity(
     storage
         .put_activity(spica_engine::ActivityRecord {
             value: Activity {
-                execution: spica_engine::ObjectReference::nil(),
+                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
                 status: ActivityStatus::Running,
                 raw_input: json!({ "x": 1 }),
@@ -2851,7 +2821,7 @@ async fn seed_owning_activity(
                 activity_state: None,
                 retry_state: None,
                 output: None,
-                meta: spica_engine::ObjectMeta::builder(activity.uid)
+                meta: spica_engine::ObjectMeta::builder(activity.uid())
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .with_owner(common::thread_owner_of(owner)),
             },
@@ -2910,7 +2880,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
     storage
         .put_task(spica_engine::TaskRecord {
             value: Task {
-                execution: spica_engine::ObjectReference::nil(),
+                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 resource: "other".to_string(),
                 arguments: Value::Null,
                 status: TaskStatus::Pending,
@@ -2921,7 +2891,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(other_resource)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(common::activity_owner_of(act_ref())),
+                    .with_owner(act_ref()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -3039,7 +3009,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
             &Event::TasksClaimed(TasksClaimed {
                 request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
-                    execution: spica_engine::ObjectReference::nil(),
+                    execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                     resource: "r".to_string(),
                     arguments: Value::Null,
                     status: TaskStatus::Running,
@@ -3053,7 +3023,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(common::activity_owner_of(act_ref())),
+                        .with_owner(act_ref()),
                 }],
             }),
         )
@@ -3079,7 +3049,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
             &Event::TasksClaimed(TasksClaimed {
                 request_id: spica_engine::RequestId::nil(),
                 tasks: vec![Task {
-                    execution: spica_engine::ObjectReference::nil(),
+                    execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                     resource: "r".to_string(),
                     arguments: Value::Null,
                     status: TaskStatus::Running,
@@ -3093,7 +3063,7 @@ async fn stale_task_leased_does_not_override_owner_or_settlement() {
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(common::activity_owner_of(act_ref())),
+                        .with_owner(act_ref()),
                 }],
             }),
         )
@@ -3473,7 +3443,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
     storage
         .put_task(spica_engine::TaskRecord {
             value: Task {
-                execution: spica_engine::ObjectReference::nil(),
+                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 resource: "r".to_string(),
                 arguments: Value::Null,
                 status: TaskStatus::Running,
@@ -3490,7 +3460,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
                 retry_state: RetryState::default(),
                 meta: spica_engine::ObjectMeta::builder(task)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(common::activity_owner_of(parent.clone())),
+                    .with_owner(parent.clone()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -3519,7 +3489,10 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
         })
         .expect("a matching retrier should emit TaskFailed (retry scheduled)");
     // Same task entity reused — no fresh task id, no separate RetryScheduled event.
-    assert_eq!(failed.meta.reference(), task_ref(task));
+    assert_eq!(
+        failed.meta.reference(),
+        task_ref(task).into_raw_object_ref()
+    );
     assert_eq!(
         failed.status,
         TaskStatus::Pending,
@@ -3554,7 +3527,7 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
     storage
         .put_task(spica_engine::TaskRecord {
             value: Task {
-                execution: spica_engine::ObjectReference::nil(),
+                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 resource: "r".to_string(),
                 arguments: Value::Null,
                 status: TaskStatus::Pending,
@@ -3569,7 +3542,7 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
                 },
                 meta: spica_engine::ObjectMeta::builder(task)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(common::activity_owner_of(act_ref())),
+                    .with_owner(act_ref()),
             },
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),

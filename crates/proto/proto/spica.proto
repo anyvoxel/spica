@@ -178,7 +178,8 @@ message FlowVersion {
   uint64 checksum = 4;
 }
 
-// The persisted projection row of a top-level execution, mirroring `Execution` + its `variables`.
+// The persisted projection row of a top-level execution, mirroring `Execution`. The run's variable
+// scope is not here: an `Assign` writes the derived root thread's row (see `message Thread`).
 message Execution {
   ObjectMeta meta = 1;
   // The immutable flow version this execution is bound to.
@@ -190,8 +191,9 @@ message Execution {
   bytes input = 5;
   // The decided success output (JSON), present once COMPLETED.
   bytes output = 6;
-  // The execution's current variable scope — `Variables` returned alongside the entity.
-  map<string, bytes> variables = 7;
+  // Field 7 was `map<string, bytes> variables`, removed: an `Assign` never wrote an execution row
+  // (its scope is always a thread), so the field only ever answered `{}`.
+  reserved 7;
   // The definition's `TimeoutSeconds` deadline (millis since epoch); empty when none. The run is
   // terminated by the `ExecutionTimeout` timer, which carries this same instant.
   int64 deadline_millis = 8;
