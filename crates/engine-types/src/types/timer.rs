@@ -108,17 +108,17 @@ mod tests {
     }
 
     /// A cancel moves the status and the transition stamp and nothing else: the identity its owner
-    /// tracks the timer by (`reference` — name and uid together), its deadline, purpose and execution
+    /// tracks the timer by (`RawObjectRef` — name and uid together), its deadline, purpose and execution
     /// all survive, so the applier can still detach the child edge under the name it was added with.
     #[test]
     fn cancel_moves_only_the_status_and_the_stamp() {
         let mut t = active_timer();
-        let before = t.meta.reference();
+        let before = t.meta.raw_object_ref();
         t.cancel(ts(200));
         assert_eq!(t.status, TimerStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
-        assert_eq!(t.meta.reference(), before);
+        assert_eq!(t.meta.raw_object_ref(), before);
         assert!(t.status.is_terminal(), "a cancelled timer is terminal");
         assert_eq!(t.deadline, ts(5_000));
         assert_eq!(t.purpose, TimerPurpose::WaitResume);

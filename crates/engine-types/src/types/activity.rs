@@ -147,7 +147,7 @@ impl ObjectKindMarker for ActivityKind {
 pub struct Activity {
     /// Shared identity + timing metadata. `meta.uid` is the activity's identity (durable object uid);
     /// the domain `created_at`/`updated_at` (stamped at each lifecycle-transition emit) live inside
-    /// `meta`. Use [`Self::reference`](crate::types::meta::ObjectMeta::reference) to obtain the
+    /// `meta`. Use [`Self::raw_object_ref`](crate::types::meta::ObjectMeta::raw_object_ref) to obtain the
     /// canonical [`RawObjectRef`].
     pub meta: ObjectMeta<ActivityKind>,
     /// The execution this activity belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s reference

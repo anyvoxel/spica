@@ -1778,8 +1778,11 @@ name = "spica-testing"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "jsonptr",
  "mockall",
+ "serde_json",
  "spica-engine-types",
+ "ulid",
 ]
 
 [[package]]

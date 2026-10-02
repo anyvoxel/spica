@@ -7,7 +7,7 @@
 //! public API — `Engine::start` → `create_flow` → `start_for_revision` → `wait_for_execution` — so
 //! the helpers exercise the same canonical path a server would.
 
-#![allow(dead_code)] // a given suite uses only some helpers; that is expected of a shared module
+#![allow(dead_code, unused_imports)] // a suite uses only some helpers; that is expected of a shared module
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -38,6 +38,19 @@ use spica_storage::InMemoryStorage;
 use tokio::sync::{Mutex, oneshot};
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
+
+// Record builders and chain assertions live in `spica-testing` now — a `tests/` suite is a separate
+// crate, so both are re-exported here and every suite keeps naming them through `common::`.
+pub use spica_testing::assertions::{
+    Stamps, assert_envelope, assert_typed_chain, payload_kind, payload_values,
+};
+pub use spica_testing::fixtures::{
+    FIRST_REQUEST_ID, VIRTUAL_EPOCH_MILLIS, activity_owner, activity_owner_of,
+    activity_timer_owner, activity_timer_owner_of, epoch, execution_timer_owner_of,
+    fanout_thread_owner, fanout_thread_owner_of, flat_ref_to, flow_name, flow_owner, indexed_refs,
+    meta, meta_root, meta_span, meta_span_root, name, path, pointer, ref_to, request,
+    root_thread_owner, root_thread_owner_of, stamp, thread_owner, thread_owner_of, uid, vars,
+};
 
 /// An in-process adapter presenting the engine's inbound [`spica_engine::TaskApi`] as the
 /// worker-facing [`spica_client::worker::TaskApi`], so an [`InMemoryTaskService`] can be driven against
@@ -225,515 +238,12 @@ fn learned_chain(log: &spica_engine::InMemoryLogStream<EntryPayload>) -> Vec<Ent
     payloads
 }
 
-/// The envelope contract, checked over the whole stream rather than pinned per record: what holds for
-/// *every* append is a rule, so a violation fails once with its own message instead of showing up as a
-/// wholesale diff of a per-record table.
-///
-/// - **positions** — one stream, and a dense 1-based position run: a gap means a lost append, an
-///   un-stamped `nil` position means an entry reached the log un-materialized, and a follower's
-///   watermark arithmetic (`W + 1`) depends on both;
-/// - **stamps** — the append stamps never go backwards (see [`assert_append_times`]);
-/// - **causes** — the batch/commit graph a follower replays by (see `assert_causal_chain`).
-pub fn assert_envelope(entries: &[&Entry]) {
-    let first = entries.first().expect("a run appends at least one entry");
-    for (position, entry) in entries.iter().enumerate() {
-        assert_eq!(
-            entry.stream_id, first.stream_id,
-            "the entry at index {position} carries a different stream id than the rest"
-        );
-        assert_eq!(
-            entry.entry_id.get(),
-            (position + 1) as i64,
-            "the entry at index {position} does not hold its own position; the log stamps a dense \
-             run starting at 1"
-        );
-    }
-    assert_append_times(entries);
-    assert_causal_chain(entries);
-}
-
-/// The log's own append stamps, in append order. The log *is* the order (by entry id), but a stamp
-/// that went backwards would make a time-sorted reading of the same history disagree with the causal
-/// one — the audit trail's value is that both agree.
-fn assert_append_times(entries: &[&Entry]) {
-    let mut previous: Option<u64> = None;
-    for (position, entry) in entries.iter().enumerate() {
-        let at = entry.timestamp.as_millis();
-        if let Some(previous) = previous {
-            assert!(
-                at >= previous,
-                "the append stamp went backwards at the entry at index {position}: {at} < {previous} ms"
-            );
-        }
-        previous = Some(at);
-    }
-}
-
-/// The causal graph. Every record a handler appends is stamped with the position of the command it
-/// was reacting to, so the stream is a sequence of **batches** — and a follower's commit watermark
-/// means exactly "the last batch's last record". The rules below state that shape:
-///
-/// 1. a cause points **backwards at a `Command`** — handlers append only in reaction to one, so a
-///    cause naming an event, or a later entry, is a broken link;
-/// 2. a command's records form **one** run, and a `Noop` carrying that same cause closes it. A run
-///    reopened after closing, a run left unclosed, or a `Noop` displaced from the run's end all break
-///    "one batch, committed once" — the invariant both replay and the commit protocol rest on;
-/// 3. a record with **no** cause is a worker-initiated append: it is a `Command`/`Reject`, the log's
-///    terminator `Noop` follows it, and it can never sit inside a batch.
-///
-/// The `Noop` terminators are deliberately absent from the chain table (they carry no payload worth
-/// reading), so this is the only thing standing between a lost commit marker and a green suite.
-fn assert_causal_chain(entries: &[&Entry]) {
-    // The batch in progress: its cause, and `None` once its commit marker has closed it.
-    let mut open: Option<EntryId> = None;
-    let mut committed: HashSet<EntryId> = HashSet::new();
-    for (position, entry) in entries.iter().enumerate() {
-        let Some(cause) = entry.cause_id else {
-            assert!(
-                open.is_none(),
-                "the entry at index {position} has no cause but interrupts the batch of {}",
-                open.expect("checked by the assertion above")
-            );
-            // A worker-initiated append is closed by the log's own terminator, so the record after it
-            // is that `Noop` — never another record of any kind.
-            if !matches!(entry.payload, EntryPayload::Noop) {
-                let next = entries.get(position + 1).unwrap_or_else(|| {
-                    panic!("the entry at index {position} was never terminated by a Noop")
-                });
-                assert!(
-                    next.cause_id.is_none() && matches!(next.payload, EntryPayload::Noop),
-                    "the entry at index {position} is un-terminated: the log closes a \
-                     worker-initiated append with a cause-less Noop, found {} instead",
-                    payload_kind_of(next)
-                );
-            }
-            continue;
-        };
-
-        if open != Some(cause) {
-            assert!(
-                open.is_none(),
-                "batch {} was never committed before batch {cause} started at the entry at index \
-                 {position}",
-                open.expect("checked by the assertion above")
-            );
-            assert!(
-                committed.insert(cause),
-                "batch {cause} was committed and then reopened at the entry at index {position}"
-            );
-            assert_cause_points_at_a_command(entries, cause, position);
-            open = Some(cause);
-        }
-        if matches!(entry.payload, EntryPayload::Noop) {
-            open = None; // This is the batch's commit marker: the run is closed.
-        }
-    }
-    assert!(
-        open.is_none(),
-        "the stream ends with batch {} uncommitted",
-        open.expect("checked by the assertion above")
-    );
-}
-
-/// Rule 1 of [`assert_causal_chain`]: the cause names an entry that is both **earlier** and a
-/// `Command`. `EntryId::nil()` (an un-stamped id) is negative, so it can never pass.
-fn assert_cause_points_at_a_command(entries: &[&Entry], cause: EntryId, position: usize) {
-    let index = usize::try_from(cause.get() - 1)
-        .ok()
-        .filter(|index| *index < position);
-    assert!(
-        matches!(
-            index
-                .and_then(|index| entries.get(index))
-                .map(|e| &e.payload),
-            Some(EntryPayload::Command(_))
-        ),
-        "the entry at index {position} is caused by {cause}, which is not an earlier Command"
-    );
-}
-
-/// `CreateFlow(CreateFlow { .. })` / `StateCompleting { activity: .. }` → the variant name. Read off
-/// the payload's derived `Debug` rendering rather than a hand-written match, so the helper does not
-/// have to be extended for every new variant.
-fn payload_kind(payload: &EntryPayload) -> String {
-    let rendered = match payload {
-        EntryPayload::Command(command) => format!("{command:?}"),
-        EntryPayload::Event(event) => format!("{event:?}"),
-        EntryPayload::Reject(reject) => format!("{reject:?}"),
-        EntryPayload::Noop => unreachable!("filtered out by learned_chain"),
-    };
-    rendered
-        .split(['(', ' ', '{'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// [`payload_kind`] for an entry that may be a `Noop`: the envelope checks report on entries a chain
-/// drops, so they need a kind for the one payload [`payload_kind`] refuses to name.
-fn payload_kind_of(entry: &Entry) -> String {
-    match &entry.payload {
-        EntryPayload::Noop => "Noop".to_string(),
-        other => payload_kind(other),
-    }
-}
-
-/// The values a payload carries, as a follower reading the log would parse them — minus the
-/// externally-tagged wrapper, which only repeats the kind. The payload is serialized (rather than its
-/// fields listed by hand) so that a field added to a command or event is *seen* by the timing walk
-/// below instead of slipping past it.
-fn payload_values(payload: &EntryPayload) -> Value {
-    let value = match payload {
-        EntryPayload::Command(command) => serde_json::to_value(command),
-        EntryPayload::Event(event) => serde_json::to_value(event),
-        EntryPayload::Reject(reject) => serde_json::to_value(reject),
-        EntryPayload::Noop => return Value::Null,
-    }
-    .expect("an engine payload is serializable");
-    match value {
-        Value::Object(map) if map.len() == 1 => {
-            map.into_iter().next().expect("the length was checked").1
-        }
-        other => other,
-    }
-}
-
-/// The timing invariants a stream must satisfy, checked while its chain is read: an object's birth is
-/// immutable and its update stamp never goes backwards — per object, and across the chain, which is
-/// what an appended stream must satisfy to be replayable in order. A typed chain pins those stamps
-/// literally, so it can say what they *are*; the invariants they carry hold for every run, so they are
-/// checked for every run rather than only for the cases that happen to state them.
-#[derive(Default)]
-struct Stamps {
-    born: HashMap<String, u64>,
-    last_update: HashMap<String, u64>,
-    last_update_overall: Option<u64>,
-    /// Collected rather than panicked on the spot, so one run reports every broken object instead of
-    /// only the first.
-    violations: Vec<String>,
-}
-
-impl Stamps {
-    fn learn_value(&mut self, value: &Value) {
-        match value {
-            Value::Object(map) => {
-                let uid = map.get("uid").and_then(Value::as_str);
-                let created = map.get("created_at").and_then(Value::as_u64);
-                let updated = map.get("updated_at").and_then(Value::as_u64);
-                if let (Some(uid), Some(created), Some(updated)) = (uid, created, updated) {
-                    self.check_times(uid, created, updated);
-                }
-                for child in map.values() {
-                    self.learn_value(child);
-                }
-            }
-            Value::Array(items) => items.iter().for_each(|item| self.learn_value(item)),
-            _ => {}
-        }
-    }
-
-    fn check_times(&mut self, uid: &str, created: u64, updated: u64) {
-        match self.born.get(uid) {
-            Some(born) if *born != created => self.violations.push(format!(
-                "{uid}: born at {born} ms but re-born at {created} ms"
-            )),
-            Some(_) => {}
-            None => {
-                self.born.insert(uid.to_string(), created);
-            }
-        }
-        if updated < created {
-            self.violations.push(format!(
-                "{uid}: updated at {updated} ms before its birth at {created} ms"
-            ));
-        }
-        let previous = self.last_update.insert(uid.to_string(), updated);
-        if let Some(previous) = previous
-            && updated < previous
-        {
-            self.violations.push(format!(
-                "{uid}: updated at {updated} ms after {previous} ms — went backwards"
-            ));
-        }
-        if let Some(previous) = self.last_update_overall
-            && updated < previous
-        {
-            self.violations.push(format!(
-                "the append order and the update stamps disagree: {updated} ms after {previous} ms"
-            ));
-        }
-        self.last_update_overall = Some(updated);
-    }
-
-    fn assert_times_are_sane(&self) {
-        assert!(
-            self.violations.is_empty(),
-            "timing invariants broken:\n  {}",
-            self.violations.join("\n  ")
-        );
-    }
-}
-
-/// Compare a typed chain record by record, naming the diverging record's position and its kind in the
-/// report — so a chain that took a different branch says *which* record and *what* it wrote, rather
-/// than handing the reader two twenty-record payload dumps to diff by eye.
-pub fn assert_typed_chain(actual: &[EntryPayload], expected: &[EntryPayload]) {
-    for (position, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(
-            actual,
-            expected,
-            "record {position} of the chain ({})",
-            payload_kind(actual)
-        );
-    }
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "chain length; the actual chain as the log holds it:\n{}",
-        typed_chain_literals(actual)
-    );
-}
-
-/// Render a typed chain as the log's own JSON — one record per line, in append order — so a length
-/// mismatch shows what the run actually wrote beside the expectation built in code.
-pub fn typed_chain_literals(chain: &[EntryPayload]) -> String {
-    chain
-        .iter()
-        .map(|payload| {
-            let json = serde_json::to_string(payload).expect("an engine payload is serializable");
-            format!("            r#\"{json}\"#,")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// The flow and execution names every lifecycle case runs under. Fixed rather than the randomized
 /// [`anonymous_name`]/[`execution_name`]: each test boots its own storage, so a literal name cannot
 /// collide, and a literal name is *itself* assertable — the chain then checks that the `FlowCreated`
 /// and `ExecutionCreated` acks echo the name that was submitted, which a random name cannot.
 const LIFECYCLE_FLOW: &str = "lifecycle_flow";
 const LIFECYCLE_EXECUTION: &str = "lifecycle_execution";
-
-/// The instant every stamp of a timer-free typed case carries — the [`VirtualClient`]'s own clock
-/// reading, which is what makes a timestamp assertable at all.
-pub fn epoch() -> Timestamp {
-    Timestamp::from_millis(VIRTUAL_EPOCH_MILLIS)
-}
-
-/// A stamp at `millis`, for the cases whose clock the test has advanced.
-pub fn stamp(millis: u64) -> Timestamp {
-    Timestamp::from_millis(millis)
-}
-
-/// The `n`-th identity the injected [`CountingIdGenerator`] mints (it starts at `1`), so a chain
-/// says which object a reference names by *how* it was minted rather than by a random ulid's text.
-pub fn uid(n: u64) -> ulid::Ulid {
-    ulid::Ulid::from(u128::from(n))
-}
-
-/// The `n`-th request id [`LocalClient::request_id`] mints — the same counter a run's acks are
-/// correlated by, offset to [`FIRST_REQUEST_ID`] so it never renders as a `uid` does.
-pub fn request(n: u64) -> RequestId {
-    RequestId::from(ulid::Ulid::from(u128::from(FIRST_REQUEST_ID + n)))
-}
-
-/// The object name a static literal spells, in either flavor — a plain user name (`lifecycle_flow`) or
-/// the generated `{base}-{n}` form of the engine's own addresses (`lifecycle_execution-0`), whose `-`
-/// a plain name may never carry.
-pub fn name(name: &str) -> ObjectName {
-    ObjectName::from_parsed(name).expect("a static literal is a valid object name")
-}
-
-/// A plain flow name, e.g. `lifecycle_flow` — the [`FlowName`] a `CreateFlow` addresses by.
-pub fn flow_name(name: &str) -> FlowName {
-    FlowName::new(name).expect("a static literal is a valid flow name")
-}
-
-/// The metadata a timer-free run mints for the object `object_name`, identified by the `n`-th uid:
-/// every object's own name plus the injected identity, stamped at the clock's single instant
-/// ([`epoch`]). The kind is the caller's business — it comes from `K`, resolved at the record the
-/// meta is written into, and so is the owner: a case with an owner finishes the builder with
-/// [`ObjectMetaBuilder::with_owner`], a root object uses [`meta_root`]. A case whose clock has been
-/// advanced builds its `ObjectMeta` through [`ObjectMeta::builder`] instead, since these stamps would
-/// be wrong for it.
-pub fn meta<K: ObjectKindMarker>(uid: ulid::Ulid, object_name: &str) -> ObjectMetaBuilder<K> {
-    ObjectMeta::builder(uid).name(name(object_name)).at(epoch())
-}
-
-/// [`meta`] with both stamps spelled out — for a case whose clock has been advanced (see
-/// [`TypedCase::acts`]), where an object minted before the move and updated by it carries two
-/// different instants.
-pub fn meta_span<K: ObjectKindMarker>(
-    uid: ulid::Ulid,
-    object_name: &str,
-    created: Timestamp,
-    updated: Timestamp,
-) -> ObjectMetaBuilder<K> {
-    ObjectMeta::builder(uid)
-        .name(name(object_name))
-        .timestamps(created, updated)
-}
-
-/// The metadata of a **root** object — a `Flow` or a top-level `Execution`, whose owner slot is
-/// [`NoOwner`] by type. The bound is that fact spelled at the call: no generic helper can hand out an
-/// ownerless meta for an object the type says is owned.
-pub fn meta_root<K: ObjectKindMarker<OwnedBy = NoOwner>>(
-    uid: ulid::Ulid,
-    object_name: &str,
-) -> ObjectMeta<K> {
-    meta(uid, object_name).with_owner(NoOwner::new())
-}
-
-/// [`meta_root`] with both stamps spelled out — see [`meta_span`].
-pub fn meta_span_root<K: ObjectKindMarker<OwnedBy = NoOwner>>(
-    uid: ulid::Ulid,
-    object_name: &str,
-    created: Timestamp,
-    updated: Timestamp,
-) -> ObjectMeta<K> {
-    meta_span(uid, object_name, created, updated).with_owner(NoOwner::new())
-}
-
-/// A variable scope's delta as an `Assign` writes it — a map, so the literal lists its pairs and the
-/// order they are listed in does not matter.
-pub fn vars(pairs: &[(&str, Value)]) -> Variables {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), v.clone()))
-        .collect()
-}
-
-/// A container's slot map — a `Map`'s `children` or a `Parallel`'s `branches`, both index → child, the
-/// reverse lookup a settle is identified by. Like [`vars`] the literal lists its pairs, because a
-/// `HashMap`'s iteration order is seeded per process: a chain that pinned the order it happened to
-/// serialize in would only be reproducible within one run of the suite.
-pub fn indexed_refs<K: ObjectKindMarker>(
-    pairs: &[(usize, ObjectRef<K>)],
-) -> HashMap<usize, ObjectRef<K>> {
-    pairs.iter().map(|(i, r)| (*i, r.clone())).collect()
-}
-
-/// A reference to the object `object` of the kind the *slot* demands, whose identity is the `n`-th uid
-/// minted. The kind is carried by the type, so a fixture cannot build a value the field could not
-/// hold — a wrong-kind literal is a compile error, not a value the engine has to reject.
-pub fn ref_to<K: ObjectKindMarker>(object: &str, n: u64) -> ObjectRef<K> {
-    ObjectRef::new(name(object), uid(n))
-}
-
-/// A reference to the object `object` of kind `kind` as its *flat* address — the erased
-/// `RawObjectRef` a storage lookup or a heterogeneous collection takes.
-pub fn flat_ref_to(kind: ObjectKind, object: &str, n: u64) -> RawObjectRef {
-    RawObjectRef::new(kind, name(object), uid(n))
-}
-
-/// The owner slot of a **task**: the activity named `object`/`n`, in the slot's own type. A fixture
-/// cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime check.
-pub fn activity_owner(object: &str, n: u64) -> ObjectRef<ActivityKind> {
-    ObjectRef::new(name(object), uid(n))
-}
-
-/// [`activity_owner`] for a fixture already holding the activity's *flat* reference (an
-/// `RawObjectRef` is what a storage lookup takes, so a fixture may legitimately carry the untyped
-/// address too). The slot's own checked conversion runs here, so a fixture naming the wrong kind
-/// fails at its own construction rather than building a record the engine cannot represent.
-pub fn activity_owner_of(reference: RawObjectRef) -> ObjectRef<ActivityKind> {
-    reference
-        .try_into()
-        .expect("fixture: a task's owner is an activity")
-}
-
-/// The owner slot of an **activity**: the thread named `object`/`n`, in the slot's own type — a
-/// top-level run's derived root thread, or a fan-out branch's thread (see `ActivityKind::OwnedBy`).
-/// A fixture cannot ask for a kind the slot does not admit — the type carries the kind, not a runtime
-/// check.
-pub fn thread_owner(object: &str, n: u64) -> ObjectRef<ThreadKind> {
-    ObjectRef::new(name(object), uid(n))
-}
-
-/// [`thread_owner`] for a fixture already holding the thread's *flat* reference — the form a storage
-/// lookup takes, so a fixture seeding a thread row carries the untyped address too.
-pub fn thread_owner_of(reference: RawObjectRef) -> ObjectRef<ThreadKind> {
-    reference
-        .try_into()
-        .expect("fixture: an activity's owner is a thread")
-}
-
-/// The owner slot of a **flow version**: the flow named `object`/`n`, in the slot's own type (see
-/// `FlowVersionKind::OwnedBy`). A fixture cannot ask for a kind the slot does not admit — the type
-/// carries the kind, not a runtime check.
-pub fn flow_owner(object: &str, n: u64) -> ObjectRef<FlowKind> {
-    ObjectRef::new(name(object), uid(n))
-}
-
-/// The owner slot of a **thread** whose scope is the top-level run — a root thread, owned by the
-/// `Execution` it stands in for (see `ThreadOwner`).
-pub fn root_thread_owner(object: &str, n: u64) -> ThreadOwner {
-    ThreadOwner::Execution(ObjectRef::new(name(object), uid(n)))
-}
-
-/// [`root_thread_owner`] for a fixture already holding the execution's *flat* reference (the form a
-/// storage lookup takes, so a fixture may legitimately carry the untyped address too).
-pub fn root_thread_owner_of(execution: RawObjectRef) -> ThreadOwner {
-    ThreadOwner::Execution(
-        execution
-            .try_into()
-            .expect("fixture: a root thread is owned by its execution"),
-    )
-}
-
-/// The owner slot of a **thread** fanned out by a container: `object`/`n` is the owning `Parallel`/
-/// `Map` activity (see `ThreadOwner`).
-pub fn fanout_thread_owner(object: &str, n: u64) -> ThreadOwner {
-    ThreadOwner::Activity(ObjectRef::new(name(object), uid(n)))
-}
-
-/// [`fanout_thread_owner`] for a fixture already holding the container activity's *flat* reference.
-pub fn fanout_thread_owner_of(activity: RawObjectRef) -> ThreadOwner {
-    ThreadOwner::Activity(
-        activity
-            .try_into()
-            .expect("fixture: a fan-out thread is owned by its container activity"),
-    )
-}
-
-/// The owner slot of a **timer** armed by the run itself (an `ExecutionTimeout`), in the union's own
-/// type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
-pub fn execution_timer_owner_of(execution: RawObjectRef) -> TimerOwner {
-    TimerOwner::Execution(
-        execution
-            .try_into()
-            .expect("fixture: an execution-timeout timer is owned by its run"),
-    )
-}
-
-/// The owner slot of a **timer** armed by the waiting activity (a `WaitResume`, a task retry or a
-/// task timeout): `object`/`n` is the owning activity.
-pub fn activity_timer_owner(object: &str, n: u64) -> TimerOwner {
-    TimerOwner::Activity(ObjectRef::new(name(object), uid(n)))
-}
-
-/// [`activity_timer_owner`] for a fixture already holding the waiting activity's *flat* reference.
-pub fn activity_timer_owner_of(activity: RawObjectRef) -> TimerOwner {
-    TimerOwner::Activity(
-        activity
-            .try_into()
-            .expect("fixture: a state timer is owned by its waiting activity"),
-    )
-}
-
-/// The JSON Pointer `/segments` (`""` being the document root) — the form a `StatePath` wraps.
-pub fn path(segments: &str) -> StatePath {
-    StatePath::from(pointer(segments))
-}
-
-/// [`path`] before it is wrapped: `StateTransitioned` carries the raw pointer.
-pub fn pointer(segments: &str) -> PointerBuf {
-    let mut buf = PointerBuf::new();
-    for segment in segments.split('/').filter(|s| !s.is_empty()) {
-        buf.push_back(segment);
-    }
-    buf
-}
 
 /// A point in a run's log that an [`Act`] must wait for.
 ///
@@ -1060,19 +570,6 @@ pub async fn run_raw_entries(definition: &str, input: &str) -> Vec<Entry> {
     engine.stop().await;
     entries
 }
-
-/// The first identity the harness mints for a **request** — deliberately far from `1`, where the
-/// engine's own identity counter begins. Both counters count, so a request id and a `uid` of the same
-/// ordinal would otherwise render as the same text: a typed chain literal pasted into the wrong field
-/// would then match, and a reader could not tell a correlation id from an incarnation id by eye.
-/// `1 << 32` sits in the band whose ULID rendering is all decimal (`…04000000`, incrementing) — as
-/// readable as the engine's `…00000001` and never mistakable for it.
-pub(crate) const FIRST_REQUEST_ID: u64 = 1 << 32;
-
-/// The instant a [`VirtualClient`]'s clock starts at. Any fixed value works — nothing compares it to
-/// the wall clock — but a round one keeps a failure's numbers readable, and starting far from the epoch
-/// means a deadline computed from it can never be mistaken for an un-set (`0`) timestamp.
-pub(crate) const VIRTUAL_EPOCH_MILLIS: u64 = 1_700_000_000_000;
 
 /// A window in which a scheduler keyed on *real* elapsed time would still be waiting. A virtual advance
 /// below skips minutes, so this real pause cannot let a real-time implementation fire — it only gives
@@ -1461,9 +958,9 @@ impl Hook for CompositeHook {
                 // The durable event carries the timer's absolute deadline; re-arm the physical
                 // schedule from that persisted moment.
                 self.scheduler
-                    .schedule(&timer.meta.typed_reference(), timer.deadline);
+                    .schedule(&timer.meta.object_ref(), timer.deadline);
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.typed_reference()),
+            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.object_ref()),
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -1700,7 +1197,7 @@ impl LocalClient {
                 "AckHook routes CreateFlow's ack only to a FlowVersionCreated event; got {event:?}"
             );
         };
-        Ok(flow_version.meta.typed_reference())
+        Ok(flow_version.meta.object_ref())
     }
 
     /// Start an execution against `flow_version`, returning the execution's id at birth.
@@ -1740,7 +1237,7 @@ impl LocalClient {
         };
         match event {
             Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
-                Ok(execution.meta.typed_reference())
+                Ok(execution.meta.object_ref())
             }
             _ => unreachable!("AckHook only delivers ExecutionCreated to this ack"),
         }

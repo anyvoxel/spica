@@ -7,12 +7,10 @@ use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::eval_env::{EvalEnv, extract_jsonata};
 use crate::handler::Collector;
-use crate::types::activity::ActivityKind;
 use crate::types::command::{ActivateState, Command};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::meta::ObjectRef;
 use crate::types::variables::Variables;
 
 pub struct ChoiceStateHandlerFactory;
@@ -100,7 +98,6 @@ impl StateHandler for ChoiceStateHandler<'_> {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -144,7 +141,7 @@ impl StateHandler for ChoiceStateHandler<'_> {
         // `emit_transition` (which also handles the `end`/`NoTerminal` cases) is bypassed.
         let next_path = activity_value.state_path.sibling(&rule_next);
         out.append_event(Event::StateTransitioned(StateTransitioned {
-            activity,
+            activity: activity_value.meta.object_ref(),
             next: next_path.as_ptr().to_owned(),
         }))
         .await;
@@ -165,9 +162,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{
-        Command, CompleteState, TerminateState, TerminateThread, TerminationReason,
-    };
+    use crate::types::command::{Command, CompleteState, TerminateState, TerminationReason};
     use crate::types::event::{StateTransitioned, VariablesAssigned};
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Variables};
 
@@ -213,7 +208,7 @@ mod tests {
         let activated = activate(
             &choice_state(vec![rule(ChoiceCondition::Bool(true), "P2")], None, None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -244,7 +239,7 @@ mod tests {
         let activated = activate(
             &choice_state(vec![rule(ChoiceCondition::Bool(true), "P2")], None, None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
         let Dispatch { store, .. } = activated;
@@ -443,10 +438,6 @@ mod tests {
                 EntryPayload::Command(Command::TerminateState(TerminateState {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
                 })),
             ]
         );

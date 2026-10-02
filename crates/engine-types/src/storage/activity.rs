@@ -19,6 +19,8 @@ use spica_machinery::Timestamp;
 pub struct ActivityRecord {
     /// The canonical ActivityRecord domain value reconstructed from the event stream.
     pub value: Activity,
+
+    // TODO：active_children 不应该放在 Record 里，应该找一个地方单独存储起来
     /// Owned nodes still in flight (e.g. this Wait's resume timer). Terminating waits on them.
     pub active_children: HashSet<RawObjectRef>,
     /// When this row's birth event (`StateActivating`) landed in the log. Projection-derived from the

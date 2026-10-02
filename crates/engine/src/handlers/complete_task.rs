@@ -1,10 +1,9 @@
-use crate::TaskStatus;
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::container::{ActivityContainer, Container};
 use crate::types::command::CompleteTask;
 use crate::types::event::{Event, TaskCompleted};
 use crate::types::meta::HasRawObjectRef;
-use crate::types::reject::RejectionType;
 
 /// Handles `CompleteTask`: a worker reported its claimed task **completed** (Zeebe `CompleteJob`).
 ///
@@ -49,51 +48,45 @@ impl CompleteTaskHandler {
             // A task that never existed in scope is a genuine refusal, not a silent no-op: the
             // awaiting worker must learn it settled nothing rather than hang on an unmatchable ack.
             Ok(None) => {
-                out.reject(
-                    *request_id,
+                return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!("task {task} not found or not activated"),
-                );
-                return Ok(());
+                ));
             }
             // A read fault is the engine's, not the command's: returned so the leader can retry it
             // rather than answering the awaiting worker with a silent nothing.
             Err(e) => return Err(e.into()),
         };
         // Settlement guard: must be leased to the reporting worker right now. A task not currently
-        // Running (still Pending, or already settled) is a wrong-state refusal; one leased to a
-        // *different* worker is a concurrent-conflict refusal. Both become a `Reject` so the worker
-        // is told why, and both keep the state advancing exactly once (duplicate/foreign settles are
-        // refused, never applied twice).
+        // Running (still Pending, or already settled) and one leased to a *different* worker are both
+        // refusals of the request's precondition — the caller's handle on the task is not the live one
+        // — so both are `InvalidState`, told apart by their reason. Both keep the state advancing
+        // exactly once (duplicate/foreign settles are refused, never applied twice).
         if !act.status.is_running() {
-            out.reject(
-                *request_id,
+            return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "task {} is not currently Running (status {:?}); settlement refused",
-                    act.value.meta.reference(),
+                    act.value.meta.raw_object_ref(),
                     act.status
                 ),
-            );
-            return Ok(());
+            ));
         }
         if act.worker_id.as_deref() != Some(worker_id.as_str()) || worker_id.is_empty() {
             tracing::warn!(
-                task = %act.value.meta.reference(),
+                task = %act.value.meta.raw_object_ref(),
                 reported = %worker_id,
                 leased = ?act.worker_id,
                 "worker tried to complete a task it does not lease; report rejected"
             );
-            out.reject(
-                *request_id,
-                RejectionType::StateConflict,
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
                 format!(
                     "task {} is leased to {:?}, not {worker_id}; settlement refused",
-                    act.value.meta.reference(),
+                    act.value.meta.raw_object_ref(),
                     act.worker_id,
                 ),
-            );
-            return Ok(());
+            ));
         }
 
         let activity_id = act.meta.owner.clone();
@@ -101,24 +94,23 @@ impl CompleteTaskHandler {
         // from the activity it resumes, so an ownerless settle is refused here — while the worker is
         // still waiting on an answer — rather than discovered as a no-op after `TaskCompleted` is
         // already on the log, which would strand the owning state with nothing left to resume it.
-        let Some(container) = ActivityContainer::open(ctx.storage, activity_id.clone()).await
+        // `InvalidState` as for the guards above: the row the worker holds is no longer the live
+        // incarnation of a settleable task, because its owner is gone. Deliberately neither
+        // `ProcessingError` — which the log reserves for a command that outlived its retry budget —
+        // nor `Unexpected`, whose retry could only repeat this conclusion later: a row is never
+        // removed, so the owning activity cannot come back, and the worker is blocked on the ack.
+        let Some(container) = ActivityContainer::open(ctx.storage, activity_id.clone()).await?
         else {
-            out.reject(
-                *request_id,
-                RejectionType::ProcessingError,
-                format!("task {task} has no live activity owner {activity_id}; internal fault"),
-            );
-            return Ok(());
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("task {task} has no live activity owner {activity_id}; settlement refused"),
+            ));
         };
 
         // Emit the completed task entity (lease cleared, status terminal) and resume the owning Task
         // state's `complete`. The concrete output travels alongside (feeds the activity's raw_output).
         let mut task_value = act.value();
-        task_value.status = TaskStatus::Completed;
-        task_value.worker_id = None;
-        task_value.lease_expires_at = None;
-        // Stamp the completion moment; `created_at` is already carried on `task_value`.
-        task_value.meta.with_update_at(ctx.now());
+        task_value.complete(ctx.now());
         let completed = Event::TaskCompleted(TaskCompleted {
             request_id: *request_id,
             task: task_value,

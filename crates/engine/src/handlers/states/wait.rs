@@ -214,9 +214,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{
-        ActivateState, Command, TerminateState, TerminateThread, TerminationReason,
-    };
+    use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::{HasRawObjectRef, ObjectMeta};
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
@@ -275,7 +273,7 @@ mod tests {
         let activated = activate(
             &wait_state(Some(30), Some("P2")),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -296,7 +294,7 @@ mod tests {
 
         // The timer is folded as the waiting activity's child — the edge the complete step reads to
         // decide whether the state may finish yet.
-        let timer = resume_timer(resume_at).meta.reference();
+        let timer = resume_timer(resume_at).meta.raw_object_ref();
         assert!(
             activated
                 .children(minted_activity_ref().as_raw_object_ref())
@@ -316,7 +314,7 @@ mod tests {
         let activated = activate(
             &state,
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
         let Dispatch { store, .. } = activated;
@@ -395,7 +393,7 @@ mod tests {
         let activated = activate(
             &wait_state(Some(MAX_WAIT_SECONDS + 1), Some("P2")),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -415,10 +413,6 @@ mod tests {
                 EntryPayload::Command(Command::TerminateState(TerminateState {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
                 })),
             ]
         );

@@ -26,50 +26,22 @@ use crate::StatePath;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink};
 use crate::handlers::dispatch::build_state_handlers;
+use crate::storage::ReadonlyStorageTxn;
 use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::execution::ExecutionKind;
 use crate::types::id::EntryId;
-use crate::types::meta::{
-    ObjectMeta, ObjectName, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner,
-};
+use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner};
 use crate::types::thread::ThreadKind;
 use crate::working::WorkingState;
 use crate::{
     Activity, ActivityKind, ActivityState, ActivityStatus, Entry, EntryPayload, Thread,
-    ThreadStatus, Timestamp,
+    ThreadStatus,
 };
 
 // ── deterministic inputs ────────────────────────────────────────────────────
 
-/// The instant every stamp reads: one `ManualClock` reading serves an activity's meta, each
-/// envelope's timestamp and the deadlines a state decides, so `at()` pins them all at once.
-pub fn at() -> Timestamp {
-    Timestamp::from_millis(1_000)
-}
-
-/// The `n`-th identity a [`CountingIdGenerator`] mints (it starts at `1`). The seeded references use
-/// ids far above that range, so a *freshly minted* object reads as `uid(1)`, `uid(2)`, … rather than
-/// blending into the objects the test wrote down itself.
-pub fn uid(n: u64) -> ulid::Ulid {
-    ulid::Ulid::from(u128::from(n))
-}
-
-pub fn obj_name(name: &str) -> ObjectName {
-    ObjectName::from_parsed(name).expect("a static literal is a valid object name")
-}
-
-pub fn pointer(document: &str) -> jsonptr::PointerBuf {
-    let mut buf = jsonptr::PointerBuf::new();
-    for segment in document.split('/').filter(|s| !s.is_empty()) {
-        buf.push_back(segment);
-    }
-    buf
-}
-
-pub fn path(document: &str) -> StatePath {
-    StatePath::from(pointer(document))
-}
+pub(crate) use crate::handlers::fixtures::{at, obj_name, path, uid};
 
 /// The input a seeded activity carries — the same value [`seeded_scope`] seeds on the thread, so the
 /// scope's variables and the activity's input agree.
@@ -315,16 +287,14 @@ impl Dispatch {
 
     /// The committed activity row at `reference`, or `None` where nothing was folded.
     pub async fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Option<ActivityRecord> {
-        self.store
-            .get_activity(reference)
+        Storage::get_activity(&self.store, reference)
             .await
             .expect("the in-memory store reads")
     }
 
     /// The committed refs still attached to `reference` as its children.
     pub async fn children(&self, reference: &RawObjectRef) -> HashSet<RawObjectRef> {
-        self.store
-            .get_children(reference.clone())
+        Storage::get_children(&self.store, reference.clone())
             .await
             .expect("the in-memory store reads")
     }
@@ -332,17 +302,16 @@ impl Dispatch {
 
 /// Drive `state`'s inherited [`StateHandler::activate`](crate::handlers::state_handler::StateHandler)
 /// once over a working overlay — the leader's shape, so the emitted `StateActivating`/`StateActivated`
-/// (and any timer a state arms) fold into the transaction and a later read sees them. `scope` seeds
-/// the store beforehand, and the batch is committed afterwards as the leader's driver does, so the
+/// (and any timer a state arms) fold into the transaction and a later read sees them. `scope` is the
+/// row the leader would already have read and screened for it, seeded here so the fold has an owner to
+/// attach the activity to, and the batch is committed afterwards as the leader's driver does, so the
 /// fold lands on the store's committed face — which is what the assertions read.
-pub async fn activate(state: &State, cmd: &ActivateState, scope: Option<ThreadRecord>) -> Dispatch {
+pub async fn activate(state: &State, cmd: &ActivateState, scope: ThreadRecord) -> Dispatch {
     let mut store = InMemoryStorage::new();
-    if let Some(thread) = scope {
-        store
-            .put_thread(thread)
-            .await
-            .expect("the in-memory store seeds a thread row");
-    }
+    store
+        .put_thread(scope.clone())
+        .await
+        .expect("the in-memory store seeds a thread row");
 
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
     let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
@@ -369,13 +338,13 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: Option<ThreadRe
         };
         // The scope's own type is the command's, so a fixture cannot name a kind the slot does not
         // admit — the dispatch has nothing left to check.
-        let owner = cmd.owner.clone();
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")
-            .activate(&mut ctx, &mut out, cmd, owner)
-            .await;
-    }
+            .activate(&mut ctx, &mut out, cmd, &scope)
+            .await
+            .expect("the base refuses nothing once the dispatcher admitted the scope");
+    };
     let entries = out.into_entries();
     work.commit(None).await.expect("the batch commits");
 
@@ -384,7 +353,8 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: Option<ThreadRe
 
 /// Drive `state`'s inherited [`StateHandler::complete`](crate::handlers::state_handler::StateHandler)
 /// once over `store` — the mirror of [`activate`], seeded either from a preceding activation's store or
-/// from [`complete_store`].
+/// from [`complete_store`]. The two rows the dispatcher would have read and screened are read back out
+/// of the overlay here, exactly as `dispatch_command`'s `CompleteState` path reads them.
 pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState) -> Dispatch {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
     let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
@@ -399,6 +369,16 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
     let mut definitions = HashMap::new();
     let state_handlers = build_state_handlers();
     {
+        let act = work
+            .get_activity(&cmd.activity)
+            .await
+            .expect("the in-memory store reads")
+            .expect("the activity row is seeded before a complete is driven");
+        let thread = work
+            .get_thread(&act.value.meta.owner)
+            .await
+            .expect("the in-memory store reads")
+            .expect("the owning thread row is seeded before a complete is driven");
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: &work,
@@ -410,8 +390,9 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")
-            .complete(&mut ctx, &mut out, cmd)
-            .await;
+            .complete(&mut ctx, &mut out, cmd, &act, &thread)
+            .await
+            .expect("the base refuses nothing once the dispatcher admitted the rows");
     }
     let entries = out.into_entries();
     work.commit(None).await.expect("the batch commits");

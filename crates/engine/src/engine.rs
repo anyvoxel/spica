@@ -336,7 +336,7 @@ impl EngineInner {
         storage
             .flow_version_of(name.clone(), flow.latest_version)
             .await?
-            .map(|ver| ver.meta.typed_reference())
+            .map(|ver| ver.meta.object_ref())
             .ok_or_else(|| {
                 ExecutionError::Runtime(RuntimeError::InvalidDefinition(format!(
                     "flow {name} has no version {}",
@@ -439,7 +439,7 @@ impl EngineInner {
                     "flow {name} has no version {version}"
                 )))
             })?;
-        Ok(ver.meta.typed_reference())
+        Ok(ver.meta.object_ref())
     }
 
     /// Read one persisted object of any kind from the current projection by `(kind, name)` — the

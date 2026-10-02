@@ -73,14 +73,14 @@ impl ObjectKindMarker for ExecutionKind {
 /// branch or `Map` item is a different, dedicated entity type ([`Thread`](crate::Thread)) with its
 /// own `state_path`/owner; it is **never** an `Execution`. Consequently an `Execution` needs neither a
 /// `state_path` (it always resolves against the machine's top-level `States`) nor a
-/// `root_execution` (it is its own root — its `reference()` IS the flat query anchor). Removing those
+/// `root_execution` (it is its own root — its `raw_object_ref()` IS the flat query anchor). Removing those
 /// two fields is exactly what makes the type self-describing: no consumer must inspect fields to
 /// decide whether an `Execution` is a root or a branch, because it is always a root.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Execution {
     /// The object identity + shared metadata (k8s-style `ObjectMeta` reuse). **`meta.uid` IS the
-    /// execution's never-reused identity ulid** (there is no separate bare `id` — [`Self::reference`]
+    /// execution's never-reused identity ulid** (there is no separate bare `id` — [`Self::raw_object_ref`]
     /// bundles `meta.name` + `meta.uid` for anyone who must address this execution). `meta.name` is a
     /// generated placeholder (`obj-<uid>`) until user naming (P2); the domain
     /// `created_at`/`updated_at` live here likewise. A top-level execution has **no owner** — the
@@ -112,5 +112,94 @@ pub struct Execution {
 impl Execution {
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    /// Enter the success finish at `at`: the run is `Completing`, waiting on its owned children. The
+    /// output is fixed **here** rather than at the terminal — what a run completes with is decided
+    /// when its finish begins, and the terminal event only carries that value forward.
+    pub fn begin_completing(&mut self, output: Value, at: Timestamp) {
+        self.status = ExecutionStatus::Completing;
+        self.output = Some(output);
+        self.meta.with_update_at(at);
+    }
+
+    /// Land the success terminal at `at`, once no child is left to drain. The output is **not**
+    /// written here: the finish already fixed it, and callers advance the very value that finish
+    /// produced, so the terminal can never re-decide — or drop — what the run completes with.
+    pub fn complete(&mut self, at: Timestamp) {
+        self.status = ExecutionStatus::Completed;
+        self.meta.with_update_at(at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::types::meta::ObjectName;
+
+    fn ts(ms: u64) -> Timestamp {
+        Timestamp::from_millis(ms)
+    }
+
+    /// A running run born at `ts(0)` with no output — each case drives the transition it is about.
+    fn running_execution() -> Execution {
+        Execution {
+            meta: ObjectMeta::builder(ulid::Ulid::new())
+                .timestamps(ts(0), ts(0))
+                .with_owner(NoOwner::new()),
+            flow_version: ObjectRef::new(
+                ObjectName::from_parsed("flow-1").expect("a version name is a valid object name"),
+                ulid::Ulid::nil(),
+            ),
+            status: ExecutionStatus::Running,
+            deadline: None,
+            input: Value::Null,
+            output: None,
+        }
+    }
+
+    /// The success finish fixes the output where it begins: `Completing` already carries the value the
+    /// terminal will hand back, and only the transition stamp moves — `created_at` rides unchanged.
+    #[test]
+    fn beginning_the_finish_fixes_the_output_before_the_terminal() {
+        let mut exec = running_execution();
+        exec.begin_completing(json!({ "n": 1 }), ts(500));
+
+        assert_eq!(exec.status, ExecutionStatus::Completing);
+        assert_eq!(exec.output, Some(json!({ "n": 1 })));
+        assert_eq!(exec.meta.created_at, ts(0));
+        assert_eq!(exec.meta.updated_at, ts(500));
+    }
+
+    /// Landing the terminal advances the status onto the value the finish already fixed — the output
+    /// is carried, not re-written — and stamps the moment the terminal lands, not the one the finish
+    /// began.
+    #[test]
+    fn the_terminal_lands_on_the_value_the_finish_fixed() {
+        let mut exec = running_execution();
+        exec.begin_completing(json!({ "n": 1 }), ts(500));
+        exec.complete(ts(900));
+
+        assert_eq!(exec.status, ExecutionStatus::Completed);
+        assert_eq!(
+            exec.output,
+            Some(json!({ "n": 1 })),
+            "the terminal carries the value the finish fixed"
+        );
+        assert_eq!(exec.meta.created_at, ts(0));
+        assert_eq!(exec.meta.updated_at, ts(900));
+        assert!(exec.is_terminal());
+    }
+
+    /// The terminal writes nothing but the status and the transition stamp: a run taken straight to
+    /// the terminal keeps the output it had, so no caller can lose a fixed value on the way.
+    #[test]
+    fn the_terminal_does_not_touch_the_output() {
+        let mut exec = running_execution();
+        exec.complete(ts(900));
+
+        assert_eq!(exec.output, None, "the terminal never invents an output");
     }
 }

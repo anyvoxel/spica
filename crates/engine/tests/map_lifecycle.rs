@@ -13,9 +13,9 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
     Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, MapActivityState,
-    ObjectKind, RuntimeError, SpawnThread, StateTransitioned, TerminateExecution, TerminateState,
-    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind,
-    TimerPurpose, TimerStatus, WaitActivityState,
+    ObjectKind, Reject, RejectionType, RequestId, RuntimeError, SpawnThread, StateTransitioned,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
+    ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -2896,6 +2896,11 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
             }),
             EntryPayload::Command(Command::CancelTimer {
                 timer: ref_to::<TimerKind>("lifecycle_execution-8", 12),
+            }),
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason: "terminate_thread: thread thread/lifecycle_execution-0 is already Terminating; termination refused".to_string(),
             }),
             EntryPayload::Event(Event::TimerCancelled {
                 timer: Timer {

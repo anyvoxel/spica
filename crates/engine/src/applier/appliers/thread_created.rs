@@ -40,7 +40,10 @@ impl ThreadCreatedApplier {
         // top-level Execution, whose own drain waits on the root thread running its machine.
         let owner = thread.meta.owner.clone();
         ctx.storage
-            .add_child(owner.as_raw_object_ref().clone(), thread.meta.reference())
+            .add_child(
+                owner.as_raw_object_ref().clone(),
+                thread.meta.raw_object_ref(),
+            )
             .await?;
         // Fold the thread's own `index` into the container's ordered fan-out map, so the owning
         // `Parallel`/`Map` aggregates branch/item outputs in declaration order at its convergence.
@@ -57,12 +60,12 @@ impl ThreadCreatedApplier {
                 Some(ActivityState::Map(progress)) => {
                     progress
                         .children
-                        .insert(thread.index, thread.meta.typed_reference());
+                        .insert(thread.index, thread.meta.object_ref());
                 }
                 Some(ActivityState::Parallel(progress)) => {
                     progress
                         .branches
-                        .insert(thread.index, thread.meta.typed_reference());
+                        .insert(thread.index, thread.meta.object_ref());
                 }
                 // A `Wait` owns no fan-out — its only child is its resume timer — so no thread is
                 // ever spawned under one and there is nothing to fold. Leaving the row untouched
@@ -78,7 +81,7 @@ impl ThreadCreatedApplier {
                     };
                     progress
                         .branches
-                        .insert(thread.index, thread.meta.typed_reference());
+                        .insert(thread.index, thread.meta.object_ref());
                 }
             }
             act.with_update_at(ctx.timestamp);

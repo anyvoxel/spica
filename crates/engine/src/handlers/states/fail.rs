@@ -9,12 +9,11 @@ use crate::ActivityStatus;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
 use crate::handler::Collector;
-use crate::types::activity::ActivityKind;
 use crate::types::command::TerminationReason;
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectRef, OwnerScope};
+use crate::types::meta::OwnerScope;
 
 pub struct FailStateHandlerFactory;
 
@@ -49,7 +48,6 @@ impl StateHandler for FailStateHandler<'_> {
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        _activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -162,7 +160,7 @@ mod tests {
         let activated = activate(
             &fail_state(Some("ErrorA"), None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 

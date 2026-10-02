@@ -14,7 +14,7 @@ impl StateTerminatedApplier {
     ) -> Result<(), ExecutionError> {
         if let Some(act) = ctx
             .storage
-            .get_activity(&activity.meta.typed_reference())
+            .get_activity(&activity.meta.object_ref())
             .await?
         {
             let parent = act
@@ -32,7 +32,7 @@ impl StateTerminatedApplier {
             row.updated_at = ctx.timestamp;
             ctx.storage.put_activity(row).await?;
             ctx.storage
-                .remove_child(parent, activity.meta.reference())
+                .remove_child(parent, activity.meta.raw_object_ref())
                 .await?;
         }
         Ok(())

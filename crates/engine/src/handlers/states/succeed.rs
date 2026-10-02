@@ -72,7 +72,7 @@ mod tests {
         let activated = activate(
             &succeed_state(None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 

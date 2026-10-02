@@ -37,22 +37,25 @@ pub struct Reject {
 /// The stable classification of *why* a command was rejected — the engine's analogue of Zeebe's
 /// SBE `RejectionType` enum (NULL_VAL aside). Each variant names a distinct way a well-formed
 /// command can fail to apply, so callers can branch on semantics rather than parsing free-text
-/// reasons. Future enrichment (e.g. an `ExceededBatchRecordSize`) can be added as new variants.
+/// reasons.
+///
+/// The set is **not** a one-to-one mirror of Zeebe's, in either direction: Zeebe's
+/// `UNAUTHORIZED`/`FORBIDDEN` are absent because authorization is not a layer this engine has, its
+/// `EXCEEDED_BATCH_RECORD_SIZE` is a log-level concern rather than a command outcome, and the
+/// cases Zeebe folds into `INVALID_STATE` — a wrong-state target, a stale incarnation, a lease
+/// stolen mid-flight — all arrive here as `InvalidState` too. Future enrichment can be added as
+/// new variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectionType {
-    /// The command is not applicable in the current context, but the state was not *wrong* — there
-    /// was simply nothing for it to do. (Zeebe `NOT_APPLICABLE`.)
-    NotApplicable,
     /// The command payload is structurally invalid — e.g. a `CreateFlow` whose definition does not
     /// parse as a `StateMachine`. (Zeebe `INVALID_ARGUMENT`.)
     InvalidArgument,
-    /// The command cannot be applied because the target is in the wrong state. (Zeebe `INVALID_STATE`.)
+    /// The command cannot be applied because the target is in the wrong state — including the cases
+    /// where it is *not the incarnation the caller assumed*: a lease taken by another worker, a name
+    /// now pointing at a different object. (Zeebe `INVALID_STATE`.)
     InvalidState,
     /// The command references an entity that does not exist. (Zeebe `NOT_FOUND`.)
     NotFound,
-    /// The command's preconditions conflict with current state — e.g. racing concurrent appends.
-    /// (Zeebe `STATE_CONFLICT`.)
-    StateConflict,
     /// An entity the command would create already exists — e.g. a `CreateFlow` on a duplicate name.
     /// (Zeebe `ALREADY_EXISTS`.)
     AlreadyExists,
@@ -63,11 +66,9 @@ pub enum RejectionType {
 impl std::fmt::Display for RejectionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            RejectionType::NotApplicable => "NOT_APPLICABLE",
             RejectionType::InvalidArgument => "INVALID_ARGUMENT",
             RejectionType::InvalidState => "INVALID_STATE",
             RejectionType::NotFound => "NOT_FOUND",
-            RejectionType::StateConflict => "STATE_CONFLICT",
             RejectionType::AlreadyExists => "ALREADY_EXISTS",
             RejectionType::ProcessingError => "PROCESSING_ERROR",
         };

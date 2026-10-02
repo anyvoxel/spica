@@ -10,6 +10,7 @@
 //! remaining owners still settle via [`child_settled`](super::child_completed::child_settled).
 
 use crate::ActivityStatus;
+use crate::StorageError;
 use crate::handler::{Collector, HandlerContext};
 use crate::storage::{ActivityRecord, ReadonlyStorageTxn};
 use crate::types::activity::ActivityKind;
@@ -26,14 +27,20 @@ pub(crate) trait Container {
     /// while it can still be answered — a `Reject` for a worker-reported settle — rather than
     /// discovered as a silent no-op after the terminal event is already on the log.
     ///
-    /// `None` answers a *missing row* only. Which impl runs is decided by the owner's kind at the call
-    /// site, so the parameter's own type is the kind this container owns — an owner of another kind is
-    /// unrepresentable rather than a case to fold into the `None` the caller reports.
+    /// `None` answers a *missing row* only: a read that **faults** is `Err`, so a store that hiccups
+    /// is never mistaken for an owner that is gone. The distinction decides the caller's answer — a
+    /// missing row is a refusal it records, a fault is one the leader retries. Which impl runs is
+    /// decided by the owner's kind at the call site, so the parameter's own type is the kind this
+    /// container owns — an owner of another kind is unrepresentable rather than a case to fold into
+    /// the `None` the caller reports.
     ///
     /// This read is the *existence* check only. The hooks re-read the row: the settle's own batch
     /// rewrites it (draining the child, folding the payload), so the row read here is stale by the
     /// time a hook decides on it.
-    async fn open(storage: &dyn ReadonlyStorageTxn, owner: ObjectRef<ActivityKind>) -> Option<Self>
+    async fn open(
+        storage: &dyn ReadonlyStorageTxn,
+        owner: ObjectRef<ActivityKind>,
+    ) -> Result<Option<Self>, StorageError>
     where
         Self: Sized;
 
@@ -93,12 +100,13 @@ impl Container for ActivityContainer {
     async fn open(
         storage: &dyn ReadonlyStorageTxn,
         owner: ObjectRef<ActivityKind>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, StorageError> {
         // The call site picks this impl from the owner's kind, and the parameter's own type is that
         // kind — an owner of another kind is unrepresentable rather than a case to check.
-        // TODO：如果 owner 不存在，是不是也应该是一个 Reject？
-        storage.get_activity(&owner).await.ok().flatten()?;
-        Some(Self { activity: owner })
+        if storage.get_activity(&owner).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self { activity: owner }))
     }
 
     async fn after_child_completed(
@@ -187,53 +195,39 @@ mod tests {
     use serde_json::{Value, json};
     use spica_machinery::{Clock, CountingIdGenerator, IdGenerator, ManualClock};
     use spica_storage::InMemoryStorage;
+    use spica_testing::MockReadonlyStorageTxn;
 
     use super::{ActivityContainer, Container};
     use crate::StatePath;
+    use crate::StorageError;
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink};
     use crate::handlers::dispatch::build_state_handlers;
+    use crate::handlers::fixtures::{at, object_ref};
     use crate::storage::{ActivityRecord, Storage};
     use crate::types::activity::ActivityKind;
     use crate::types::command::{Command, CompleteState, TerminationReason};
     use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
-    use crate::types::meta::{
-        HasRawObjectRef, ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef,
-    };
+    use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef};
     use crate::types::task::TaskKind;
     use crate::types::thread::ThreadKind;
     use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
-    use crate::{Activity, ActivityStatus, EntryPayload, Timestamp};
-
-    /// The instant every stamp reads: one `ManualClock` reading serves the seeded activity's meta and
-    /// the collector's envelopes alike.
-    fn at() -> Timestamp {
-        Timestamp::from_millis(1_000)
-    }
-
-    /// A seeded address of the kind the caller names in the type — so a fixture reaches a typed slot
-    /// without a conversion, and cannot name a kind that slot does not admit.
-    fn reference<K: ObjectKindMarker>(name: &str, uid: u64) -> ObjectRef<K> {
-        ObjectRef::new(
-            ObjectName::from_parsed(name).expect("a static literal is a valid object name"),
-            ulid::Ulid::from(u128::from(uid)),
-        )
-    }
+    use crate::{Activity, ActivityStatus, EntryPayload};
 
     fn activity_ref() -> ObjectRef<ActivityKind> {
-        reference("execution-0", 90)
+        object_ref("execution-0", 90)
     }
 
     /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits.
     fn thread_owner() -> ObjectRef<ThreadKind> {
-        reference("execution-1", 80)
+        object_ref("execution-1", 80)
     }
 
     /// The child handed to the container — a settled `Task`, the only kind that routes here so far.
     fn task_ref() -> ObjectRef<TaskKind> {
-        reference("execution-0", 91)
+        object_ref("execution-0", 91)
     }
 
     /// A seeded activity row with `children` live children still attached. `raw_output` stands in for
@@ -251,7 +245,7 @@ mod tests {
                 .name(activity_ref().name().clone())
                 .at(at())
                 .with_owner(thread_owner()),
-            execution: reference::<ExecutionKind>("execution", 70),
+            execution: object_ref::<ExecutionKind>("execution", 70),
             state_path: StatePath::from(path),
             status,
             raw_input: json!({ "in": 1 }),
@@ -262,7 +256,7 @@ mod tests {
             output: None,
         };
         let live = (0..children)
-            .map(|n| reference::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
+            .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
             .collect::<HashSet<_>>();
         let mut row = ActivityRecord::from_value(activity, live);
         row.born(at());
@@ -292,6 +286,7 @@ mod tests {
         let state_handlers = build_state_handlers();
         let container = ActivityContainer::open(&work, activity_ref())
             .await
+            .expect("the store reads cleanly")
             .expect("the seeded activity resolves its container");
         {
             let mut ctx = HandlerContext {
@@ -327,8 +322,28 @@ mod tests {
         assert!(
             ActivityContainer::open(&work, activity_ref())
                 .await
+                .expect("the store reads cleanly")
                 .is_none(),
             "a missing activity row must not yield a container"
+        );
+    }
+
+    /// A read that **faults** is `Err`, never `None`. The two answers are what the callers refuse on:
+    /// a missing row is a decision they record, a fault is one the leader retries — so folding the
+    /// fault into `None` (the `.ok()` this seam used to carry) would turn a hiccup into a refusal.
+    /// Pinned here rather than per caller, since both handlers answer it through this one contract.
+    #[tokio::test]
+    async fn a_faulted_owner_read_is_not_a_missing_owner() {
+        let mut store = MockReadonlyStorageTxn::new();
+        store
+            .expect_get_activity()
+            .times(1)
+            .return_once(|_| Err(StorageError::Backend("injected storage fault".to_string())));
+        assert!(
+            ActivityContainer::open(&store, activity_ref())
+                .await
+                .is_err(),
+            "a fault must surface, not read as a missing row"
         );
     }
 

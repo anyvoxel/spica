@@ -314,7 +314,7 @@ pub enum Command {
     /// Drive an execution to an abnormal finish with `reason`. Addressed by `name` (the execution's
     /// per-scope-unique primary key, matching `CreateExecution`); the optional `uid` is an
     /// **incarnation guard** — when set, only the named execution with exactly this `uid` is
-    /// terminated (a stale/wrong incarnation is refused with a `StateConflict` `Reject`), while
+    /// terminated (a stale/wrong incarnation is refused with an `InvalidState` `Reject`), while
     /// `None` addresses by name alone. Produces `ExecutionTerminating`, terminates active children
     /// (states / timers), and `ExecutionTerminated{reason}` once drained.
     TerminateExecution(TerminateExecution),
@@ -381,8 +381,9 @@ pub enum Command {
     /// `TimedOut`. Idempotent if the owner already moved past.
     TriggerTimer { timer: ObjectRef<TimerKind> },
 
-    /// Cancel a pending timer (e.g. the execution's `TimeoutSeconds` once it finishes). Idempotent —
-    /// a no-op if the timer already completed/cancelled.
+    /// Cancel a pending timer (e.g. the execution's `TimeoutSeconds` once it finishes). Refused with
+    /// an `InvalidState` reject when the timer is already terminal — the scheduler's fire can
+    /// overtake this command — and with `NotFound` when the row is absent entirely.
     CancelTimer { timer: ObjectRef<TimerKind> },
 
     // ── Task (external-resource call, Zeebe-style lease lifecycle) ─────────────
@@ -411,7 +412,8 @@ pub enum Command {
     /// acknowledgment channel (`AckOutcome::Granted`). Allocation stays in the StreamProcessor's
     /// serialized, lock-holding dispatch, so the grant is decided where the projection is read.
     /// `request_id` correlates the caller's `poll_tasks` with the returned task list (the
-    /// `TasksClaimed` event echoes it back).
+    /// `TasksClaimed` event echoes it back). Refused with `InvalidArgument` when `lease_seconds` is too
+    /// large for the clock to add — the awaiting caller gets that refusal instead of an empty grant.
     ClaimTasks(ClaimTasks),
 
     /// A worker reported its claimed task completed successfully (Zeebe `CompleteJob`). Validated by

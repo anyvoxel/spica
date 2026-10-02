@@ -16,9 +16,10 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
     Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind,
-    ParallelActivityState, RuntimeError, SpawnThread, StateTransitioned, TerminateExecution,
-    TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, Timer,
-    TimerKind, TimerPurpose, TimerStatus, WaitActivityState,
+    ParallelActivityState, Reject, RejectionType, RequestId, RuntimeError, SpawnThread,
+    StateTransitioned, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
+    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus,
+    WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -3333,6 +3334,11 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
             EntryPayload::Command(Command::CancelTimer {
                 timer: ref_to::<TimerKind>("lifecycle_execution-6", 10),
             }),
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason: "terminate_thread: thread thread/lifecycle_execution-0 is already Terminating; termination refused".to_string(),
+            }),
             EntryPayload::Event(Event::TimerCancelled {
                 timer: Timer {
                     meta: meta(uid(10), "lifecycle_execution-6")
@@ -3469,9 +3475,13 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
     run_typed_case(&case).await;
 }
 
+/// Both branches fail. The first failure's `TerminateState` opens P's close and takes the owning
+/// thread down with it; the second branch's settle fails P again, and that `TerminateState` is still
+/// recorded and drained — but the thread is already terminating, so nothing escalates a second time
+/// and the run terminates once.
 #[rustfmt::skip]
 #[tokio::test]
-async fn parallel_two_failing_branches_absorb_a_duplicate_termination() {
+async fn parallel_two_failing_branches_terminate_the_run_once() {
     let definition = r#"{
     "StartAt": "P",
     "States": {
@@ -3886,16 +3896,6 @@ async fn parallel_two_failing_branches_absorb_a_duplicate_termination() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
@@ -4000,6 +4000,29 @@ async fn parallel_two_failing_branches_absorb_a_duplicate_termination() {
                     output: None,
                 },
             }),
+            EntryPayload::Event(Event::StateTerminated {
+                activity: Activity {
+                    meta: meta(uid(5), "lifecycle_execution-1")
+                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                    state_path: path("/States/P"),
+                    status: ActivityStatus::Terminated(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                            state: "Boom".to_string(),
+                            error: "BranchBoom".to_string(),
+                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                        }),
+                    }),
+                    raw_input: json!({"n": 1}),
+                    input: Some(json!({"n": 1})),
+                    raw_output: None,
+                    activity_state: Some(ActivityState::Parallel(ParallelActivityState {
+                        branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
+                    })),
+                    retry_state: None,
+                    output: None,
+                },
+            }),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -4046,29 +4069,6 @@ async fn parallel_two_failing_branches_absorb_a_duplicate_termination() {
                         }),
                     }),
                     input: json!({"n": 1}),
-                    output: None,
-                },
-            }),
-            EntryPayload::Event(Event::StateTerminated {
-                activity: Activity {
-                    meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States/P"),
-                    status: ActivityStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
-                    raw_input: json!({"n": 1}),
-                    input: Some(json!({"n": 1})),
-                    raw_output: None,
-                    activity_state: Some(ActivityState::Parallel(ParallelActivityState {
-                        branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
-                    })),
-                    retry_state: None,
                     output: None,
                 },
             }),

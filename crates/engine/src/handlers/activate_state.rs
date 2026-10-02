@@ -1,17 +1,18 @@
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ActivateState;
-use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::meta::{HasRawObjectRef, OwnerScope};
+use crate::types::error::ExecutionError;
+use crate::types::thread::ThreadStatus;
 
 /// Dispatches `Command::ActivateState` to the matching
 /// [`StateHandlerRegistry::create`](crate::handlers::state_handler::StateHandlerRegistry::create)
-/// bound handler. It is deliberately thin: it resolves the owning scope + state definition only far
-/// enough to create a handler bound to it, then hands the command + resolved definition to the base
+/// bound handler. It is deliberately thin: it reads the owning thread once — resolving the state
+/// definition from that same row and screening its liveness — then hands the command, the resolved
+/// definition and the row it read to the base
 /// [`StateHandler::activate`](crate::handlers::state_handler::StateHandler::activate),
 /// which owns the whole orchestration (constructing the activity, emitting
-/// `StateActivating`/`StateActivated`, and running the state's activate hooks). The base re-loads
-/// the scope to build the activity context (working-overlay reads are cheap); this dispatcher never
-/// builds it.
+/// `StateActivating`/`StateActivated`, and running the state's activate hooks). Every precondition
+/// lives here because this is the one place the scope is read.
 pub struct ActivateStateHandler;
 
 impl Default for ActivateStateHandler {
@@ -35,46 +36,70 @@ impl ActivateStateHandler {
             ..
         } = payload;
 
-        // TODO：owner 解析不到时把整个 execution 终结掉，对于一条本身没有问题的命令来说太重了；
-        // 这里是否应该改为 reject，等 「状态无法绑定 owner」 的语义定下来后再定。
         // Resolve the owning thread + its machine/state definition just far enough to pick the right
-        // handler. No activity is minted here — the base `StateHandler::activate` constructs it (and
-        // re-checks the scope's liveness), so a resolution failure (thread/definition gone) fails the
-        // execution directly: nothing has been persisted to attach a state-level terminate to. The
-        // slot admits only a `Thread`, so the row is read directly.
-        // A fault reading the owning thread is not a decision about this state — it is returned so the
-        // leader can retry the command, or refuse it once the retry budget is spent.
+        // handler, and screen the scope here — the base `StateHandler::activate` receives this row
+        // rather than re-reading it. No activity is minted here: nothing is persisted for a refused
+        // command to attach a state-level terminate to, and the command itself may be perfectly valid,
+        // so ending the run would kill a run that did nothing wrong. The slot admits only a `Thread`,
+        // so the row is read directly. A fault reading it is not a decision about this state — it is
+        // returned so the leader can retry the command.
         let thread = match ctx.storage.get_thread(owner).await? {
             Some(t) => t,
             None => {
-                out.terminate(
-                    None,
-                    OwnerScope::of_reference(execution.as_raw_object_ref()),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "thread {}",
-                        owner.as_raw_object_ref()
-                    ))),
-                );
-                return Ok(());
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!(
+                        "activate_state: owning thread {owner} of execution {execution} does not exist"
+                    ),
+                ));
             }
         };
-        let sm = fail_or!(
-            result,
-            out,
-            None,
-            OwnerScope::of_reference(execution.as_raw_object_ref()),
-            ctx.machine_for_thread(&thread).await
-        );
+        // A thread past Running has already had its outcome opened (completing, or swept by an
+        // ancestor's termination), so a fresh activation on it names the wrong incarnation rather than
+        // duplicating anything — refused like the sibling handlers' non-Running guards. Checked before
+        // the definition lookup below: the scope's own status is the cheaper and more fundamental gate.
+        if !thread.value.status.is_running() {
+            let phase = match thread.value.status {
+                ThreadStatus::Completing => "Completing",
+                ThreadStatus::Terminating(_) => "Terminating",
+                _ => "terminal",
+            };
+            tracing::warn!(thread = %owner, status = ?thread.value.status,
+                "activation arrived for a thread that is not Running; refused");
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("activate_state: thread {owner} is already {phase}; activation refused"),
+            ));
+        }
+        // As in `CompleteStateHandler`: an engine fault is the leader's to retry, anything else is the
+        // projection's and refused like the miss above.
+        let sm = match ctx.machine_for_thread(&thread).await {
+            Ok(sm) => sm,
+            Err(ExecutionError::Infra(e)) => return Err(ProcessingError::Unexpected(e.into())),
+            Err(e) => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!("activate_state: thread {owner} cannot resolve its machine: {e}"),
+                ));
+            }
+        };
         // `Command::ActivateState` carries the state's full path, so it is self-locating: the
         // lookup is the document's own walk, and the enclosing `States` table is never inferred
-        // from the owning scope's stored path.
-        let state_def = fail_or!(
-            result,
-            out,
-            None,
-            OwnerScope::of_reference(execution.as_raw_object_ref()),
-            sm.state_at(state_path).map_err(ExecutionError::from)
-        );
+        // from the owning scope's stored path. Nothing validates a successor path before it is
+        // dispatched — `emit_transition` and the `Choice` router both extend it with an unchecked
+        // `sibling(next)` — so a miss here is how a flow whose `Next`/`StartAt` names no reachable
+        // state surfaces, refused on the same footing as the two misses above.
+        let state_def = match sm.state_at(state_path) {
+            Ok(def) => def,
+            Err(e) => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!(
+                        "activate_state: state {state_path:?} is not defined by the machine that thread {owner} binds to: {e}"
+                    ),
+                ));
+            }
+        };
 
         // Every `State` variant has a registered factory (see `build_state_handlers` + the
         // `registry.len() == 8` coverage test), so a miss here is an engine regression — fail loud
@@ -83,7 +108,11 @@ impl ActivateStateHandler {
             .state_handlers
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
-        handler.activate(ctx, out, payload, owner.clone()).await;
+        // The base receives the already-read, already-screened row (the payload carries its own owner,
+        // so nothing is threaded beside it), so it has no gate to re-run and no store fault of its own
+        // to surface; a refusal from it is still the leader's to route, not this dispatcher's to
+        // reinterpret.
+        handler.activate(ctx, out, payload, &thread).await?;
 
         Ok(())
     }

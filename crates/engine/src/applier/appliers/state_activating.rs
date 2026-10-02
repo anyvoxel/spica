@@ -22,7 +22,7 @@ impl StateActivatingApplier {
         // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_activity(row).await?;
-        super::bump_generated_seq(ctx.storage, &activity.meta.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &activity.meta.raw_object_ref().name).await?;
         ctx.storage
             .add_child(
                 activity
@@ -32,7 +32,7 @@ impl StateActivatingApplier {
                     // A thread is the only thing that can own an activity, so the storage seam needs
                     // no `kind` guard — and storage speaks flat addresses.
                     .into_raw_object_ref(),
-                activity.meta.reference(),
+                activity.meta.raw_object_ref(),
             )
             .await?;
         Ok(())

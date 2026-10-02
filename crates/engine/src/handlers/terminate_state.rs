@@ -1,9 +1,10 @@
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{
     Command, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
 use crate::types::event::Event;
-use crate::types::meta::{HasRawObjectRef, ObjectKind};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, OwnerScope};
 use crate::types::task::TaskKind;
 use crate::types::thread::ThreadKind;
 use crate::types::timer::TimerKind;
@@ -12,6 +13,14 @@ use crate::types::timer::TimerKind;
 /// `reason`. Emits `StateTerminating`, sweeps the activity's owned children (M1: only timers —
 /// e.g. a Wait cancelled mid-flight), and emits `StateTerminated{reason}` immediately when the
 /// activity is childless, then runs the inline child-settled reaction so its parent drains.
+///
+/// It is also the one place a failing state's **scope** is taken down: an activity is always owned by
+/// a [`Thread`](crate::Thread) (the slot's own type — a top-level run's derived root thread, or a
+/// fan-out branch/item thread), so the site that opened the failure never has to name it, and the
+/// root-relays-to-the-run dialect lives here rather than at every failing site. The scope is only
+/// told when it is still `Running`: a thread already completing or terminating was reached by an
+/// ancestor's sweep, which is tearing this activity down on the way (this command is that sweep's
+/// own), and a second termination for it would only be refused.
 #[derive(Default)]
 pub struct TerminateStateHandler;
 
@@ -23,9 +32,20 @@ impl TerminateStateHandler {
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
         let TerminateState { activity, reason } = p;
+        // Nothing ever removes a row, and an activity row is written by the batch that activates it —
+        // before any sweep could name it — so a miss is the log and the projection disagreeing (a forged
+        // command, or a corrupt store) rather than an activity that outlived its teardown. A fault
+        // reading the row is neither, and is returned so the leader can retry it.
         let act = match ctx.storage.get_activity(activity).await? {
             Some(a) => a,
-            None => return Ok(()), // gone already; nothing to terminate.
+            None => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!(
+                        "terminate_state: activity {activity} does not exist; termination refused"
+                    ),
+                ));
+            }
         };
         // Status dispatch before the normal path. Anything other than Running is a duplicate —
         // another handler already claimed the close. The Fail + TerminateExecution cascade
@@ -72,6 +92,27 @@ impl TerminateStateHandler {
             S::Terminating(_) => return Ok(()),
         }
         let _ = TerminationReason::Cancelled; // referenced above
+
+        // Only a scope that still has to be told is worth reaching for, and the read happens before
+        // the first record goes out so a fault is returned while the activity is still untouched. A
+        // thread row that is gone cannot be redirected — an anomaly (rows are never removed) that
+        // must not hold up the activity's own unwind.
+        let owner = act.value.meta.owner.clone();
+        let owner_running = match ctx.storage.get_thread(&owner).await? {
+            Some(t) => t.value.status.is_running(),
+            None => false,
+        };
+
+        // The failure reaches the scope the activity runs in, from the same step that opens the
+        // activity's close. A fan-out branch/item thread is reachable only by the reference-addressed
+        // `TerminateThread`; a root thread's own termination relays up to the run (see
+        // `TerminateThreadHandler`), so a state failure anywhere still takes the whole run down.
+        // Ahead of `StateTerminating`: an ancestor being torn down sweeps this activity as one of its
+        // children, so the scope's command is what carries the reason outward while the activity's own
+        // records stay the tail of the close.
+        if owner_running {
+            super::emit_scope_termination(out, &OwnerScope::Thread(owner), reason.clone());
+        }
 
         // Every record emitted below is this row *after* its own write, so each carries the moment of
         // that write rather than the stored stamp: re-reading the activity would date a termination

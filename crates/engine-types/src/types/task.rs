@@ -250,6 +250,24 @@ impl Task {
         self.status = TaskStatus::Cancelled;
         self.meta.with_update_at(at);
     }
+
+    /// Mark this task completed at `at`: the row copies forward with only the terminal status, the
+    /// released lease and the transition stamp moved.
+    ///
+    /// The lease is **released here**, unlike [`Self::cancel`]: a cancelled task left the worker's
+    /// call un-answered, so its hold is deliberately left standing, whereas a completed one has
+    /// already answered — nothing is left for the lease to protect, and the terminal status withholds
+    /// the task from every future poll either way.
+    ///
+    /// The whole `meta` must travel unchanged. Re-deriving the name from the kind and uid alone would
+    /// rename the node, and a task's owner matches the child it holds by name — a renamed task never
+    /// drains, so the settle that completed it stalls.
+    pub fn complete(&mut self, at: Timestamp) {
+        self.status = TaskStatus::Completed;
+        self.worker_id = None;
+        self.lease_expires_at = None;
+        self.meta.with_update_at(at);
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +388,7 @@ mod tests {
     }
 
     /// A cancel moves the status and the transition stamp and nothing else: the identity its owner
-    /// matches the child by (`reference` — name and uid together), the delivery lease, and the retry
+    /// matches the child by (`RawObjectRef` — name and uid together), the delivery lease, and the retry
     /// run-state all survive, so the cancelling sweep can still detach the edge it holds.
     #[test]
     fn cancel_moves_only_the_status_and_the_stamp() {
@@ -378,12 +396,12 @@ mod tests {
         t.worker_id = Some("w1".to_string());
         t.lease_expires_at = Some(ts(1_000));
         t.retry_state.attempts = 2;
-        let before = t.meta.reference();
+        let before = t.meta.raw_object_ref();
         t.cancel(ts(200));
         assert_eq!(t.status, TaskStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
-        assert_eq!(t.meta.reference(), before);
+        assert_eq!(t.meta.raw_object_ref(), before);
         assert_eq!(
             t.worker_id.as_deref(),
             Some("w1"),
@@ -391,6 +409,40 @@ mod tests {
         );
         assert_eq!(t.lease_expires_at, Some(ts(1_000)));
         assert_eq!(t.retry_state.attempts, 2);
+    }
+
+    /// Completing releases the lease a claim left behind — where a cancel deliberately keeps it — and
+    /// moves nothing else: the identity the owner matches on survives, and `created_at` is untouched.
+    #[test]
+    fn complete_releases_the_lease_and_moves_only_the_stamp() {
+        let mut t = at_status(TaskStatus::Running);
+        t.claim("w1", ts(1_000), ts(0));
+        let before = t.meta.raw_object_ref();
+        t.complete(ts(200));
+
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.worker_id, None, "the settled task is nobody's to hold");
+        assert_eq!(t.lease_expires_at, None);
+        assert_eq!(t.meta.created_at, ts(0));
+        assert_eq!(t.meta.updated_at, ts(200));
+        assert_eq!(
+            t.meta.raw_object_ref(),
+            before,
+            "a settle never renames the node"
+        );
+        assert!(t.status.is_terminal());
+    }
+
+    /// A completed task is terminal, so no poll may ever grant it again — the released lease is not
+    /// what withholds it.
+    #[test]
+    fn a_completed_task_is_terminal_and_never_claimable() {
+        let mut t = at_status(TaskStatus::Running);
+        t.claim("w1", ts(1_000), ts(0));
+        t.complete(ts(200));
+
+        assert!(!t.is_claimable_at(ts(200)));
+        assert!(!t.is_claimable_at(ts(10_000)));
     }
 
     /// A cancelled task is terminal, so no poll may ever grant it again — including the poll that

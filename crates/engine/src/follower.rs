@@ -179,7 +179,7 @@ mod tests {
         let Event::FlowVersionCreated(created) = event else {
             panic!("the fixture emits a flow-version create; got {event:?}");
         };
-        created.flow_version.meta.typed_reference()
+        created.flow_version.meta.object_ref()
     }
 
     /// Read a row through the store's **committed** face — the only face the Noop commit writes, so a

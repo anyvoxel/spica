@@ -1,3 +1,4 @@
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, SpawnThread};
 use crate::types::event::Event;
@@ -41,15 +42,35 @@ impl SpawnThreadHandler {
             input,
         } = p;
 
-        // The `owner` Parallel activity must still be running (it may have since been terminated —
-        // e.g. a sibling branch failed and drained the Parallel). If it is gone or no longer
-        // accepting children, the fan-out is a no-op: the child simply never spawns.
-        let owner_activity = match ctx.storage.get_activity(owner).await {
-            Ok(Some(a)) => a,
-            _ => return Ok(()), // owner gone — the fan-out is dropped.
+        // A fan-out is always emitted while its container is `Running` — both `after_activated` sites
+        // activate it in the same batch, and the `Map` replenish runs only on the `Running` arm — and the
+        // leader dispatches in append order, so a command that could stop the container is always
+        // appended *after* this one. An owner that is missing, or present but no longer `Running`, is
+        // therefore the log and the projection disagreeing rather than a command that arrived late:
+        // refused, not dropped silently. A fault reading the row is neither, and is returned so the
+        // leader can retry it.
+        let owner_activity = match ctx.storage.get_activity(owner).await? {
+            Some(a) => a,
+            None => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!("spawn_thread: owner activity {owner} not found"),
+                ));
+            }
         };
         if !owner_activity.status.is_running() {
-            return Ok(()); // owner not running — the fan-out is dropped.
+            tracing::warn!(
+                owner = %owner,
+                status = ?owner_activity.status,
+                "fan-out against a container that is no longer Running; refused"
+            );
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "spawn_thread: owner activity {owner} is {:?}, not Running; fan-out refused",
+                    owner_activity.status
+                ),
+            ));
         }
 
         // The child Thread runs against the *same* machine version as its owner: the owning
@@ -62,8 +83,18 @@ impl SpawnThreadHandler {
         // Resolve the owning thread to inherit the tree's top-level anchor (`execution`): the child
         // Thread shares the owner's tree, so the anchor is taken verbatim while the Thread itself is
         // the child's `owner`. The slot admits only a `Thread`, so the row is read directly.
+        //
+        // Nothing ever removes a row, and an activity's owner slot is written in the batch that births
+        // it — with a thread created in that same batch. An activity that is here, naming a thread that
+        // is not, is therefore the log and the projection disagreeing, not a fan-out that arrived
+        // late: refused, like the two arms above.
         let Some(owner_thread) = ctx.storage.get_thread(&scope_ref).await? else {
-            return Ok(()); // owning thread gone — nothing to bind the child to.
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!(
+                    "spawn_thread: owner activity {owner} names thread {scope_ref}, which does not exist; fan-out refused"
+                ),
+            ));
         };
         let root_execution = owner_thread.value.execution.clone();
 
@@ -76,7 +107,7 @@ impl SpawnThreadHandler {
         // verbatim through every nesting level — so a branch thread still names its root run — and
         // its suffix is a random tail via `PlainName::to_generated`, decoupled from the thread's own
         // `uid`. Not the opaque `child-<uid>` placeholder. Minted once and reused for the reference
-        // and the serialized `meta.name`, so the storage row key (`thread.meta.reference()`) matches
+        // and the serialized `meta.name`, so the storage row key (`thread.meta.raw_object_ref()`) matches
         // the sibling `ActivateState` owner.
         let thread_name = execution
             .name()

@@ -11,11 +11,7 @@ impl ThreadCompletingApplier {
         ctx: &mut ApplierContext<'_>,
         thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut row) = ctx
-            .storage
-            .get_thread(&thread.meta.typed_reference())
-            .await?
-        {
+        if let Some(mut row) = ctx.storage.get_thread(&thread.meta.object_ref()).await? {
             row.status = ThreadStatus::Completing;
             row.output = thread.output.clone();
             // Keep the projected domain `updated_at` in step with the event's (handler-stamped).

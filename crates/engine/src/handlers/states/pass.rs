@@ -56,11 +56,7 @@ mod tests {
     use super::super::harness::*;
     use super::*;
     use crate::storage::Storage;
-    use crate::types::command::{
-        ActivateState, Command, CompleteState, TerminateExecution, TerminateState,
-        TerminationReason,
-    };
-    use crate::types::error::{ExecutionError, RuntimeError};
+    use crate::types::command::{ActivateState, Command, CompleteState};
     use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
     use crate::types::meta::HasRawObjectRef;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Variables};
@@ -90,7 +86,7 @@ mod tests {
         let activated = activate(
             &pass_state(Some("P2")),
             &activate_cmd(path("/States/P"), json!({"n": 1})),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -141,65 +137,6 @@ mod tests {
         );
     }
 
-    /// A scope that is gone is not the state's problem: the base fails the execution — unwinding the
-    /// activity it had already constructed — rather than mislabeling the miss as a flow-definition
-    /// error. The failure is routed at the **execution** (not at the owning thread the command named),
-    /// because a scope that cannot be read is exactly the case where the tree's own route is what the
-    /// caller must fail.
-    #[tokio::test]
-    async fn activate_on_a_missing_scope_terminates_the_execution() {
-        let activated = activate(
-            &pass_state(Some("P2")),
-            &activate_cmd(path("/States/P"), json!({"n": 1})),
-            None,
-        )
-        .await;
-
-        let reason = TerminationReason::Failed {
-            error: ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                "thread {}",
-                thread_ref()
-            ))),
-        };
-        assert_eq!(
-            activated.chain(),
-            vec![
-                EntryPayload::Command(Command::TerminateState(TerminateState {
-                    activity: minted_activity_ref(),
-                    reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                    name: execution_ref().name().clone(),
-                    uid: Some(execution_ref().uid()),
-                    reason,
-                })),
-            ]
-        );
-        // A failure emits commands only: nothing was folded, so the activity has no row.
-        assert!(
-            activated.activity(&minted_activity_ref()).await.is_none(),
-            "a failed activate folds no activity row"
-        );
-    }
-
-    /// A scope past accepting a transition (a competing terminator won the race) makes a late
-    /// `activate` a no-op — no events, no commands, no fold.
-    #[tokio::test]
-    async fn activate_on_a_non_running_scope_is_a_no_op() {
-        let activated = activate(
-            &pass_state(Some("P2")),
-            &activate_cmd(path("/States/P"), json!({"n": 1})),
-            Some(seeded_scope(ThreadStatus::Completed)),
-        )
-        .await;
-
-        assert!(activated.chain().is_empty());
-        assert!(
-            activated.activity(&minted_activity_ref()).await.is_none(),
-            "a skipped activate folds no activity row"
-        );
-    }
-
     /// `activate` never applies the state's own projection: `Assign` and `Output` belong to
     /// `complete`/`finish`, so the processed input reaches `CompleteState` untransformed and no
     /// `VariablesAssigned` is emitted yet. A `Pass` whose `Output` would rewrite the result proves the
@@ -217,7 +154,7 @@ mod tests {
         let activated = activate(
             &state,
             &activate_cmd(path("/States/P"), json!({"n": 1})),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 

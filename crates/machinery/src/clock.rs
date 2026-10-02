@@ -59,11 +59,11 @@ impl ManualClock {
     /// construction — the engine's causal reading of time (a stamp never precedes its cause) holds
     /// without the caller having to preserve it.
     pub fn advance(&self, by: Duration) -> Timestamp {
-        let next = Timestamp::from_millis(
-            self.millis
-                .load(Ordering::SeqCst)
-                .saturating_add(by.as_millis() as u64),
-        );
+        // A span the millisecond count cannot hold saturates rather than wrapping: `as_millis()` is a
+        // `u128`, and narrowing it would fold the step modulo 2^64 — a test driving time forward by an
+        // absurd span would land somewhere plausible-looking instead of at the far end of the range.
+        let step = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        let next = Timestamp::from_millis(self.millis.load(Ordering::SeqCst).saturating_add(step));
         self.set(next);
         next
     }
@@ -99,6 +99,17 @@ mod tests {
 
         clock.set(Timestamp::from_millis(42));
         assert_eq!(clock.now(), Timestamp::from_millis(42));
+    }
+
+    #[test]
+    fn a_step_past_the_end_of_the_range_saturates() {
+        let clock = ManualClock::new(Timestamp::from_millis(1_000));
+
+        assert_eq!(
+            clock.advance(Duration::from_secs(u64::MAX / 1000 + 1)),
+            Timestamp::from_millis(u64::MAX),
+            "an unrepresentable step lands at the far end, not at a wrapped nearby instant"
+        );
     }
 
     #[test]

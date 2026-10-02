@@ -29,7 +29,7 @@ impl TaskFailedApplier {
     ) -> Result<(), ExecutionError> {
         let TaskFailed { task, .. } = event;
         let retryable = task.status == TaskStatus::Pending;
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.object_ref()).await? {
             // See `task_completed`: the slot's type admits only an activity owner.
             let parent = t.meta.owner.clone();
             // Fold the entity verbatim (status, cleared worker/lease, + the retry bookkeeping the
@@ -50,7 +50,7 @@ impl TaskFailedApplier {
                 // Terminal failure: drain the task from its owning activity (the sweep + duplicate
                 // guard). `error` is not folded — it drives the state's `Catch`/`TerminateState`.
                 ctx.storage
-                    .remove_child(parent.into_raw_object_ref(), task.meta.reference())
+                    .remove_child(parent.into_raw_object_ref(), task.meta.raw_object_ref())
                     .await?;
             }
         }

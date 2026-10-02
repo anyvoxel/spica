@@ -38,7 +38,7 @@ impl ObjectKindMarker for FlowVersionKind {
 /// (validated at the create boundary, parsed on demand at execution and cached).
 ///
 /// Its identity is a k8s-style `meta.name` (`{flow_name}-{version}`, the **storage key**) plus a
-/// `meta.uid` (the version's never-reused ulid) — [`Self::reference`] bundles them into an
+/// `meta.uid` (the version's never-reused ulid) — [`Self::raw_object_ref`] bundles them into an
 /// [`RawObjectRef`] that any consumer can address it by.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,7 +139,7 @@ mod tests {
             definition: String::new(),
             checksum: FlowVersion::definition_checksum(""),
         };
-        let r = version.meta.reference();
+        let r = version.meta.raw_object_ref();
         assert_eq!(r.kind, ObjectKind::FlowVersion);
         assert_eq!(r.name, version.meta.name);
         assert_eq!(r.uid, uid);

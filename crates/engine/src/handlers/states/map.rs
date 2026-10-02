@@ -13,7 +13,7 @@ use crate::types::command::{Command, SpawnThread, TerminateState, TerminationRea
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{HasRawObjectRef, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, ActivityStatus, MapActivityState, Variables};
 
@@ -119,7 +119,7 @@ impl StateHandler for MapStateHandler<'_> {
         } else {
             progress.max_concurrency.min(progress.total)
         };
-        let activity = activity_value.meta.typed_reference();
+        let activity = activity_value.meta.object_ref();
         let owner = activity.clone();
         let pointer = activity_value.state_path.item_processor();
         let start_at = self
@@ -185,7 +185,6 @@ impl StateHandler for MapStateHandler<'_> {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -194,7 +193,7 @@ impl StateHandler for MapStateHandler<'_> {
             out,
             activity_value.execution.clone(),
             activity_value.meta.owner.clone(),
-            activity,
+            activity_value.meta.object_ref(),
             &activity_value.state_path,
             &activity_value.raw_input,
             None,
@@ -445,9 +444,9 @@ impl MapStateHandler<'_> {
     }
 
     /// Fail the `Map` activity — the ASL "any item failure (beyond tolerance) ⇒ whole Map fails" rule
-    /// (with the default 0 tolerance, that is *any* failure). Emits the activity's failure ed and throws
-    /// `TerminateExecution` on the owning execution from the same step, mirroring
-    /// `parallel.rs::fail_parallel`; the sweep then stops the still-in-flight sibling items.
+    /// (with the default 0 tolerance, that is *any* failure). Emits the activity's failure ed, and the
+    /// activity's own terminate is what stops the still-in-flight sibling items: the sweep it runs
+    /// takes down this Map's item children, recursively.
     ///
     /// The activity is terminated by *issuing* its termination rather than by writing its terminal
     /// records here. A hand-written `StateTerminated` marks the activity terminal before the owning
@@ -463,14 +462,9 @@ impl MapStateHandler<'_> {
         reason: TerminationReason,
     ) {
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.meta.typed_reference(),
+            activity: activity.meta.object_ref(),
             reason: reason.clone(),
         }));
-        super::super::emit_scope_termination(
-            out,
-            &OwnerScope::Thread(activity.meta.owner.clone()),
-            reason,
-        );
     }
 
     /// The `Map`'s success finish: with all items converged, project the state result — `$states.result`
@@ -489,7 +483,7 @@ impl MapStateHandler<'_> {
         variables: &Variables,
         aggregated: Value,
     ) {
-        let activity_ref = activity.meta.typed_reference();
+        let activity_ref = activity.meta.object_ref();
         let owner = activity.meta.owner.clone();
         // `$states.result` / the default state result is the aggregated per-item output array;
         // `Output`, when present, projects over it (so a Map can reshape that array).
@@ -502,20 +496,29 @@ impl MapStateHandler<'_> {
         .with_assign_ctx(Some(&activity.raw_input))
         .build();
         let mut local_scope = variables.clone();
-        fail_or!(
-            out,
-            Some(activity_ref.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
-                .await
-        );
-        let output_value = fail_or!(
-            out,
-            Some(activity_ref.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            self.project_output(env, self.output(), &states, &local_scope, aggregated)
-                .await
-        );
+        if let Err(e) = self
+            .apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
+            .await
+        {
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity_ref.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
+            return;
+        }
+        let output_value = match self
+            .project_output(env, self.output(), &states, &local_scope, aggregated)
+            .await
+        {
+            Ok(output_value) => output_value,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_ref.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return;
+            }
+        };
 
         // `finish_map` only borrows `activity`, so it advances a fresh copy in place through the
         // completing → completed lifecycle moments.
@@ -554,7 +557,7 @@ mod tests {
     use super::super::harness::*;
     use super::*;
     use crate::storage::{ActivityRecord, ThreadRecord};
-    use crate::types::command::{CompleteThread, TerminateThread};
+    use crate::types::command::CompleteThread;
     use crate::{EntryPayload, MapActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
@@ -633,7 +636,7 @@ mod tests {
                 None,
             ),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -664,7 +667,7 @@ mod tests {
         let activated = activate(
             &map_state(None, None, None),
             &activate_cmd(path("/States/P"), items.clone()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -694,7 +697,7 @@ mod tests {
         let activated = activate(
             &map_state(None, None, None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -718,10 +721,6 @@ mod tests {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
                 })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
-                })),
             ]
         );
     }
@@ -733,7 +732,7 @@ mod tests {
         let activated = activate(
             &map_state(Some(MapItems::Array(vec![])), Some(2), Some(true)),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -1019,16 +1018,12 @@ mod tests {
         };
         assert_eq!(
             completed.chain(),
-            vec![
-                EntryPayload::Command(Command::TerminateState(TerminateState {
+            vec![EntryPayload::Command(Command::TerminateState(
+                TerminateState {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
-                })),
-            ]
+                }
+            )),]
         );
     }
 

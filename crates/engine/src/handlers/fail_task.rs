@@ -1,5 +1,6 @@
 use spica_asl::State;
 
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{FailTask, TerminationReason};
 use crate::types::error::ExecutionError;
@@ -10,12 +11,13 @@ use crate::{ActivityKind, ActivityStatus, RetrierAttemptState, TaskStatus};
 /// Handles `FailTask`: a claimed task was reported **failed** (Zeebe `FailJob`), or the engine's own
 /// deadline backstop (`TaskTimeout`) marked it failed.
 ///
-/// Idempotent and lease-guarded like [`CompleteTaskHandler`](self::super::CompleteTaskHandler): a
-/// no-op unless the task is not yet terminal. A *worker* report must hold the lease right now
-/// (`Running` to the reporting `worker_id`) — a foreign or duplicate report drops; an
-/// *engine-authoritative* failure (empty `worker_id`, e.g. the `TimeoutSeconds` backstop) may settle
-/// any non-terminal task. This is the source of Zeebe's at-least-once contract: only the current
-/// lease holder (or the engine deadline) advances the state once.
+/// Lease-guarded like [`CompleteTaskHandler`](self::super::CompleteTaskHandler): a task that is already
+/// terminal is refused (its settlement happened once, and a second report must not repeat it), and a
+/// *worker* report must hold the lease right now — `Running` to the reporting `worker_id` — so a
+/// foreign report is refused rather than applied. An *engine-authoritative* failure (empty `worker_id`,
+/// e.g. the `TimeoutSeconds` backstop) may settle any non-terminal task. This is the source of Zeebe's
+/// at-least-once contract: only the current lease holder (or the engine deadline) advances the state
+/// once.
 ///
 /// The task **decides its own retry** from its frozen `retry_plan` ([[task-retry-model]] stage 2):
 /// on a matching retrier with budget remaining, the *same* task entity re-queues to `Pending` gated
@@ -40,26 +42,63 @@ impl FailTaskHandler {
 
         let act = match ctx.storage.get_task(task).await? {
             Some(t) => t,
-            // The task never activated — as far as this command is concerned there is nothing to fail,
-            // and a duplicate is not distinguishable from a lost race (both settle to nothing).
-            None => return Ok(()),
+            // The task a report names is born in the batch that activates it and nothing ever removes a
+            // row, so a miss means the report was forged into the log or the projection is corrupt — the
+            // command's own precondition. A task that never activated leaves nothing to fail, and the
+            // refusal is the entry this command owes either way.
+            None => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!("fail_task: task {task} does not exist; failure refused"),
+                ));
+            }
         };
         if act.status.is_terminal() {
-            return Ok(()); // already settled — a duplicate fail is a no-op.
+            // A duplicate report, or one racing the settle that got there first (a worker's report
+            // against an engine `TaskTimeout` backstop, or vice versa): the failure's intent is already
+            // satisfied, and the state must still advance exactly once. Refused rather than dropped —
+            // this report is fire-and-forget, so the durable record is the only account of why a
+            // reported failure settled nothing.
+            tracing::warn!(
+                task = %act.value.meta.raw_object_ref(),
+                status = ?act.status,
+                reported = %worker_id,
+                "failure reported for a task that is already settled; refused"
+            );
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "fail_task: task {} is already {:?}; failure refused",
+                    act.value.meta.raw_object_ref(),
+                    act.status
+                ),
+            ));
         }
+
+        // TODO：这个检查最好是放在 Task 的函数中
         let reported_by_worker = !worker_id.is_empty();
         if reported_by_worker {
             // A worker reporting a failure must own the lease right now (Zeebe job-owner check).
-            // Anything else — a task not yet claimed, or one re-leased after expiry — is a foreign
-            // report and drops.
+            // Anything else — a task not yet claimed, or one re-leased after expiry — is a report
+            // against a handle that is no longer the live one: refused so the durable log says why the
+            // report settled nothing. The report is fire-and-forget, so no caller is told in band.
             if !act.status.is_running() || act.worker_id.as_deref() != Some(worker_id.as_str()) {
                 tracing::warn!(
-                    task = %act.value.meta.reference(),
+                    task = %act.value.meta.raw_object_ref(),
                     reported = %worker_id,
                     leased = ?act.worker_id,
-                    "worker tried to fail a task it does not lease; report rejected"
+                    status = ?act.status,
+                    "worker tried to fail a task it does not lease; report refused"
                 );
-                return Ok(());
+                return Err(ProcessingError::Rejected(
+                    RejectionType::InvalidState,
+                    format!(
+                        "fail_task: task {} is not leased to {worker_id} (status {:?}, leased to {:?}); report refused",
+                        act.value.meta.raw_object_ref(),
+                        act.status,
+                        act.worker_id
+                    ),
+                ));
             }
         }
 
@@ -67,6 +106,7 @@ impl FailTaskHandler {
         // runtime check — the task's own owner needs no erasure to name the activity it fails.
         let activity_id = act.meta.owner.clone();
 
+        // TODO：应当作为 Task 的函数
         // Build the failing task entity with the lease cleared; the retry decision below mutates it.
         let mut task_value = act.value();
         task_value.worker_id = None;

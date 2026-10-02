@@ -1,4 +1,4 @@
-use crate::TimerStatus;
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteState, FailTask, TerminationReason, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -7,9 +7,10 @@ use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, OwnerScope, Tim
 use crate::types::task::TaskKind;
 use crate::types::timer::TimerKind;
 
-/// Handles `TriggerTimer`: a timer's deadline elapsed. Idempotent (a no-op if the timer is gone or
-/// already terminal). Dispatches by `purpose`: `WaitResume` fires the owning state;
-/// `ExecutionTimeout` terminates the owning execution `TimedOut`.
+/// Handles `TriggerTimer`: a timer's deadline elapsed. A fire for a timer that is gone or no longer
+/// `Active` is refused, not acted on — the durable record of a fire that lost its race. Dispatches by
+/// `purpose`: `WaitResume` fires the owning state; `ExecutionTimeout` terminates the owning execution
+/// `TimedOut`.
 #[derive(Default)]
 pub struct TriggerTimerHandler;
 
@@ -20,12 +21,36 @@ impl TriggerTimerHandler {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
+        // A timer row is written by the batch that arms it, and the scheduler only learns to fire it
+        // once that batch is durable — so a miss is the log and the projection disagreeing (a forged
+        // command, or a corrupt store), not a fire that outlived its timer. Nothing ever removes a row,
+        // so an already-fired timer keeps its row and lands in the status guard below instead.
         let act = match ctx.storage.get_timer(timer).await? {
             Some(t) => t,
-            None => return Ok(()), // timer never armed; nothing to do.
+            None => {
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!("trigger_timer: timer {timer} does not exist; fire refused"),
+                ));
+            }
         };
-        if act.value.status != TimerStatus::Active {
-            return Ok(()); // already completed/cancelled — a duplicate fire is a no-op.
+        // A duplicate fire, or one racing the `CancelTimer` that swept the timer first: the target is
+        // in the wrong state, told apart from the miss above by its reason. The fire is recorded rather
+        // than swallowed, so the durable log explains why the deadline went unenforced.
+        if !act.value.status.is_active() {
+            tracing::warn!(
+                timer = %timer,
+                status = ?act.value.status,
+                purpose = ?act.value.purpose,
+                "fire arrived for a timer that is no longer Active; refused"
+            );
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "trigger_timer: timer {timer} is {:?}, not Active; fire refused",
+                    act.value.status
+                ),
+            ));
         }
 
         out.append_event(Event::TimerTriggered {

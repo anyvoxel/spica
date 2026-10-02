@@ -13,7 +13,7 @@ impl StateActivatedApplier {
     ) -> Result<(), ExecutionError> {
         let Some(act) = ctx
             .storage
-            .get_activity(&activity.meta.typed_reference())
+            .get_activity(&activity.meta.object_ref())
             .await?
         else {
             return Ok(());

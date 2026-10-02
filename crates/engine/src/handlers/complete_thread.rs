@@ -1,3 +1,4 @@
+use crate::RejectionType;
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution, CompleteThread};
@@ -26,15 +27,46 @@ impl CompleteThreadHandler {
     ) -> Result<(), ProcessingError> {
         let CompleteThread { thread, output } = p;
         // Addressed by kind: `CompleteThread` is only ever dispatched for a `Thread`, so the row is
-        // read directly.
+        // read directly. Nothing ever removes a row, and a thread row is written by the batch that
+        // creates it — before anything could complete it — so a miss is the log and the projection
+        // disagreeing (a forged command, or a corrupt store) rather than a thread that outlived its own
+        // finish. A fault reading the row is neither, and is returned so the leader can retry it.
         let Some(thread_row) = ctx.storage.get_thread(thread).await? else {
-            return Ok(()); // gone already — nothing to complete.
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("complete_thread: thread {thread} does not exist; completion refused"),
+            ));
         };
-        let thread_ref = thread_row.meta.reference();
+        let thread_ref = thread_row.meta.raw_object_ref();
+        // A thread that is already finishing or terminal: the success finish's intent is already
+        // satisfied. The duplicate is a race rather than a bug — a branch thread reaching its terminal
+        // hop drafts this command while its container's own sweep drafts `TerminateThread` for the same
+        // thread, and the leader dispatches in append order, so whichever lands second finds the thread
+        // past `Running`. Refused rather than dropped, so the durable log records that this finish was a
+        // duplicate rather than leaving it indistinguishable from one that applied.
         if !thread_row.value.status.is_running() {
-            return Ok(()); // idempotency: already finishing or terminal.
+            // The durable reason names the phase rather than the whole status: `{:?}` would embed the
+            // nested termination error's `Debug` in the log's own text, which no reader of a rejection
+            // needs — the status travels on the trace line below instead.
+            let phase = match thread_row.value.status {
+                ThreadStatus::Completing => "Completing",
+                ThreadStatus::Terminating(_) => "Terminating",
+                _ => "terminal",
+            };
+            tracing::warn!(
+                thread = %thread_ref,
+                status = ?thread_row.value.status,
+                "completion arrived for a thread that is already past Running; refused"
+            );
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "complete_thread: thread {thread_ref} is already {phase}; completion refused"
+                ),
+            ));
         }
 
+        // TODO：应该指 thread 的一个函数
         let mut completing_thread = thread_row.value();
         completing_thread.status = ThreadStatus::Completing;
         completing_thread.output = Some(output.clone());
