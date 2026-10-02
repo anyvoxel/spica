@@ -89,7 +89,7 @@ impl std::fmt::Display for ObjectKind {
 ///
 /// [`ObjectMeta`] is parameterised by it, so a meta cannot be built for one kind and read back as
 /// another: the kind is never a stored value that could drift from the record holding it, and
-/// [`ObjectMeta::reference`] derives it from the type alone. [`Self::OwnedBy`] applies the same
+/// [`ObjectMeta::raw_object_ref`] derives it from the type alone. [`Self::OwnedBy`] applies the same
 /// discipline one edge up the tree, so reading an owner never means branching on a runtime kind.
 pub trait ObjectKindMarker {
     const KIND: ObjectKind;
@@ -480,7 +480,7 @@ impl OwnerScope {
     /// type again. Those anchors are minted by the engine itself, so a reference that names no scope
     /// is an anomaly, not a decision: it yields `None` — the caller records the failure without a
     /// scope and the log names the address — rather than panicking the processor on a corrupt payload.
-    pub fn of_reference(reference: &RawObjectRef) -> Option<Self> {
+    pub fn of_raw_object_ref(reference: &RawObjectRef) -> Option<Self> {
         match reference.kind {
             ObjectKind::Execution => ObjectRef::<ExecutionKind>::try_from(reference.clone())
                 .ok()
@@ -560,9 +560,9 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for KindTag<K> {
 /// Common metadata shared by every spica object (k8s-style `ObjectMeta` reuse).
 ///
 /// The object's kind is the `K` parameter, not a mutable field: `ObjectMeta<TaskKind>` *is* a task's
-/// meta, so the kind cannot be edited into disagreement with the record that holds it, the per-object
-/// `Task::reference`/`Timer::reference`/… helpers collapse into one [`Self::reference`], and a payload
-/// whose `kind` disagrees with the reading type is rejected rather than silently re-typed.
+/// meta, so the kind cannot be edited into disagreement with the record that holds it, one
+/// [`Self::raw_object_ref`] serves every kind, and a payload whose `kind` disagrees with the reading
+/// type is rejected rather than silently re-typed.
 ///
 /// Consolidates the identity, scoping, and timing facts that were historically copied across the
 /// domain entities, so future shared fields (e.g. optimistic-concurrency `resource_version`) land
@@ -665,16 +665,17 @@ impl<K: ObjectKindMarker> ObjectMeta<K> {
         ObjectMetaBuilder::new(uid)
     }
 
-    /// The canonical reference to this object — the one implementation for every kind, replacing the
-    /// per-object `reference()` helpers that each hard-coded their own kind.
-    pub fn reference(&self) -> RawObjectRef {
+    /// The canonical address of this object — the one implementation for every kind, replacing the
+    /// per-object `reference` helpers that each hard-coded their own kind. Named after its return type,
+    /// [`RawObjectRef`], the form the storage contract speaks.
+    pub fn raw_object_ref(&self) -> RawObjectRef {
         RawObjectRef::new(K::KIND, self.name.clone(), self.uid)
     }
 
-    /// The same address as [`Self::reference`], in the type `K` already is — for a site that must
+    /// The same address as [`Self::raw_object_ref`], in the type `K` already is — for a site that must
     /// hand it to a typed slot (a command payload's activity/thread id) and would otherwise rebuild
-    /// it from `name`/`uid` by hand.
-    pub fn typed_reference(&self) -> ObjectRef<K> {
+    /// it from `name`/`uid` by hand. Named after its return type, [`ObjectRef`].
+    pub fn object_ref(&self) -> ObjectRef<K> {
         ObjectRef::new(self.name.clone(), self.uid)
     }
 
@@ -791,7 +792,7 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
 ///
 /// Used as both:
 /// - an **owner** ([`ObjectMeta::owner`]) — the object `<kind>/<name>` that owns this one; and
-/// - a general **handle** to any object (e.g. [`crate::FlowVersion::reference`]) — the
+/// - a general **handle** to any object (e.g. [`ObjectMeta::raw_object_ref`]) — the
 ///   `(name, uid)` pair, where `name` is the referenced
 ///   object's own `ObjectName` and `uid` its `meta.uid`.
 ///
@@ -963,7 +964,7 @@ mod tests {
             .with_owner(NoOwner::new());
         assert_eq!(meta.created_at, meta.updated_at);
         assert_eq!(meta.owner, NoOwner::new()); // roots have no owner — as a type, not a missing field
-        assert_eq!(meta.reference().kind, ObjectKind::Execution); // the kind is `K`'s, not a field
+        assert_eq!(meta.raw_object_ref().kind, ObjectKind::Execution); // the kind is `K`'s, not a field
         meta.with_update_at(ts(2000));
         assert_eq!(meta.updated_at, ts(2000));
         assert_eq!(meta.created_at, ts(1000)); // created_at is immutable
@@ -987,7 +988,7 @@ mod tests {
         assert_eq!(json.get("owner"), None, "wire: {json}");
         let back: ObjectMeta<TestKind> = serde_json::from_value(json).expect("meta deserializes");
         assert_eq!(back, meta);
-        assert_eq!(back.reference().kind, ObjectKind::Execution);
+        assert_eq!(back.raw_object_ref().kind, ObjectKind::Execution);
     }
 
     #[test]
@@ -1162,7 +1163,7 @@ mod tests {
             ulid::Ulid::new(),
         );
         assert_eq!(
-            OwnerScope::of_reference(&run),
+            OwnerScope::of_raw_object_ref(&run),
             Some(OwnerScope::Execution(ObjectRef::new(
                 run.name.clone(),
                 run.uid
@@ -1175,7 +1176,7 @@ mod tests {
             ulid::Ulid::new(),
         );
         assert_eq!(
-            OwnerScope::of_reference(&thread),
+            OwnerScope::of_raw_object_ref(&thread),
             Some(OwnerScope::Thread(ObjectRef::new(
                 thread.name.clone(),
                 thread.uid
@@ -1183,7 +1184,7 @@ mod tests {
         );
 
         // A nil reference is a `FlowVersion` placeholder: no scope, so no scope termination.
-        assert_eq!(OwnerScope::of_reference(&RawObjectRef::nil()), None);
+        assert_eq!(OwnerScope::of_raw_object_ref(&RawObjectRef::nil()), None);
     }
 
     /// A thread's owner slot admits exactly the two scopes a thread can hang off, and the union adds

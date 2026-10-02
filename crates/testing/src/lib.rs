@@ -14,6 +14,16 @@
 //! A `mock!` block restates the trait's signatures rather than deriving them. That duplication is
 //! checked: the expansion implements the trait, so a method added to or changed on the real trait
 //! fails this crate's build instead of letting a stale double drift.
+//!
+//! Two other kinds of test support live here for the same reason — a `tests/` suite is a separate
+//! crate and sees nothing of the crate it tests:
+//!
+//! - [`fixtures`] builds engine-types values by hand (references, metadata, owners, paths), so a
+//!   chain's expected records can name their objects deterministically;
+//! - [`assertions`] states the shape every appended entry chain must have.
+//!
+//! Both are built out of `spica-engine-types` alone. That is the boundary: anything needing the
+//! engine itself stays where the engine can see it, since this crate is a dev-dependency of it.
 
 use std::collections::HashSet;
 
@@ -25,6 +35,9 @@ use spica_engine_types::{
     FlowVersionKind, ObjectRef, RawObjectRef, StorageError, TaskKind, TaskRecord, ThreadKind,
     ThreadRecord, TimerKind, TimerRecord, Timestamp,
 };
+
+pub mod assertions;
+pub mod fixtures;
 
 mock! {
     /// A read-only store a test scripts per call. Every method it does *not* expect panics when

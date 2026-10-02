@@ -13,7 +13,7 @@ impl StateCompletingApplier {
     ) -> Result<(), ExecutionError> {
         if let Some(act) = ctx
             .storage
-            .get_activity(&activity.meta.typed_reference())
+            .get_activity(&activity.meta.object_ref())
             .await?
         {
             // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.

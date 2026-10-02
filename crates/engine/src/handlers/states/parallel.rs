@@ -13,7 +13,7 @@ use crate::types::command::{Command, SpawnThread, TerminateState, TerminationRea
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::meta::{ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, ActivityStatus, Variables};
 
@@ -97,7 +97,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         variables: &Variables,
         _states: &Value,
     ) -> Result<(), ExecutionError> {
-        let activity = activity_value.meta.typed_reference();
+        let activity = activity_value.meta.object_ref();
         let owner = activity.clone();
         for (index, branch) in self.state.branches.iter().enumerate() {
             let pointer = activity_value.state_path.branch(index);
@@ -158,7 +158,6 @@ impl StateHandler for ParallelStateHandler<'_> {
         &self,
         _env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -167,7 +166,7 @@ impl StateHandler for ParallelStateHandler<'_> {
             out,
             activity_value.execution.clone(),
             activity_value.meta.owner.clone(),
-            activity,
+            activity_value.meta.object_ref(),
             &activity_value.state_path,
             &activity_value.raw_input,
             None,
@@ -288,10 +287,9 @@ impl StateHandler for ParallelStateHandler<'_> {
 }
 
 impl ParallelStateHandler<'_> {
-    /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. Emits
-    /// the activity's failure ed and throws `TerminateExecution` on the owning execution from the same
-    /// step, mirroring `fail.rs`; the activity's own `TerminateState` sweep is what stops the
-    /// surviving sibling branches (see `fail_parallel`'s body).
+    /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. Emits the
+    /// activity's failure ed; the activity's own terminate is what stops the surviving sibling
+    /// branches, since the sweep it runs takes down the branch threads this activity owns.
     async fn fail_parallel(
         &self,
         out: &mut Collector<'_>,
@@ -304,14 +302,9 @@ impl ParallelStateHandler<'_> {
         // duplicate — so the surviving branch threads, and the timers they armed, are never stopped
         // and outlive a run that has already ended. The state's own terminate handler sweeps them.
         out.append_command(Command::TerminateState(TerminateState {
-            activity: activity.meta.typed_reference(),
+            activity: activity.meta.object_ref(),
             reason: reason.clone(),
         }));
-        super::super::emit_scope_termination(
-            out,
-            &OwnerScope::Thread(activity.meta.owner.clone()),
-            reason,
-        );
     }
 
     /// The `Parallel`'s success finish: with all branches converged, project the state result —
@@ -343,20 +336,29 @@ impl ParallelStateHandler<'_> {
         .with_assign_ctx(Some(&activity_value.raw_input))
         .build();
         let mut local_scope = variables.clone();
-        fail_or!(
-            out,
-            Some(activity.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
-                .await
-        );
-        let output_value = fail_or!(
-            out,
-            Some(activity.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            self.project_output(env, self.output(), &states, &local_scope, aggregated)
-                .await
-        );
+        if let Err(e) = self
+            .apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
+            .await
+        {
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
+            return;
+        }
+        let output_value = match self
+            .project_output(env, self.output(), &states, &local_scope, aggregated)
+            .await
+        {
+            Ok(output_value) => output_value,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return;
+            }
+        };
 
         // `finish_parallel` only borrows `activity_value`, so it advances a fresh copy in place
         // through the completing → completed lifecycle moments.
@@ -395,7 +397,7 @@ mod tests {
     use super::super::harness::*;
     use super::*;
     use crate::storage::{ActivityRecord, ThreadRecord};
-    use crate::types::command::{ActivateState, CompleteThread, TerminateThread};
+    use crate::types::command::{ActivateState, CompleteThread};
     use crate::types::event::StateTransitioned;
     use crate::types::meta::HasRawObjectRef;
     use crate::{EntryPayload, ParallelActivityState, ThreadStatus};
@@ -445,7 +447,7 @@ mod tests {
         let activated = activate(
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -498,7 +500,7 @@ mod tests {
         let activated = activate(
             &parallel_state(vec![], None, Some(true)),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -713,16 +715,12 @@ mod tests {
 
         assert_eq!(
             completed.chain(),
-            vec![
-                EntryPayload::Command(Command::TerminateState(TerminateState {
+            vec![EntryPayload::Command(Command::TerminateState(
+                TerminateState {
                     activity: minted_activity_ref(),
                     reason: failure.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason: failure,
-                })),
-            ]
+                }
+            )),]
         );
     }
 
@@ -794,16 +792,12 @@ mod tests {
         };
         assert_eq!(
             completed.chain(),
-            vec![
-                EntryPayload::Command(Command::TerminateState(TerminateState {
+            vec![EntryPayload::Command(Command::TerminateState(
+                TerminateState {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
-                })),
-            ]
+                }
+            )),]
         );
     }
 }

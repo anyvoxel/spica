@@ -22,7 +22,7 @@ impl TaskActivatedApplier {
         // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
         row.born(ctx.timestamp);
         ctx.storage.put_task(row).await?;
-        super::bump_generated_seq(ctx.storage, &task.meta.reference().name).await?;
+        super::bump_generated_seq(ctx.storage, &task.meta.raw_object_ref().name).await?;
         ctx.storage
             .add_child(
                 task.meta
@@ -31,7 +31,7 @@ impl TaskActivatedApplier {
                     // The slot is an `ObjectRef<ActivityKind>`; `active_children` speaks flat addresses,
                     // so the owner crosses the erasure seam here.
                     .into_raw_object_ref(),
-                task.meta.reference(),
+                task.meta.raw_object_ref(),
             )
             .await?;
         // No handler is invoked here (M1 used to `invoke` as a post-commit side effect). The task is

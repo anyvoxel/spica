@@ -304,7 +304,7 @@ mod tests {
     }
 
     /// An execution reference for the given uid (`obj-<uid>` generated name), matching
-    /// `Execution::reference()` so the uid/key round-trips.
+    /// `meta.raw_object_ref()` so the uid/key round-trips.
     fn exec_ref(uid: Ulid) -> ObjectRef<ExecutionKind> {
         ObjectRef::new(
             PlainName::new("child")
@@ -315,7 +315,7 @@ mod tests {
     }
 
     /// An activity reference for the given uid (`obj-<uid>` generated name), matching
-    /// `Activity::reference()` so the uid/key round-trips.
+    /// `meta.raw_object_ref()` so the uid/key round-trips.
     fn act_ref(uid: Ulid) -> ObjectRef<ActivityKind> {
         ObjectRef::new(
             PlainName::new("child")
@@ -326,7 +326,7 @@ mod tests {
     }
 
     /// A task reference for the given uid (`obj-<uid>` generated name), matching
-    /// `Task::reference()` so the uid/key round-trips.
+    /// `meta.raw_object_ref()` so the uid/key round-trips.
     fn task_ref(uid: Ulid) -> ObjectRef<TaskKind> {
         ObjectRef::new(
             PlainName::new("child")
@@ -337,7 +337,7 @@ mod tests {
     }
 
     /// A timer reference for the given uid (`obj-<uid>` generated name), matching
-    /// `Timer::reference()` so the uid/key round-trips.
+    /// `meta.raw_object_ref()` so the uid/key round-trips.
     fn timer_ref(uid: Ulid) -> ObjectRef<TimerKind> {
         ObjectRef::new(
             PlainName::new("child")

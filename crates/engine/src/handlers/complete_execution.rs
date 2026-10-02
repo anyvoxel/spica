@@ -1,7 +1,6 @@
-use crate::ExecutionStatus;
+use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, CompleteExecution};
-use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
 use crate::types::meta::{ObjectKind, RawObjectRef};
 use crate::types::timer::TimerKind;
@@ -28,41 +27,50 @@ impl CompleteExecutionHandler {
         // Addressed by kind: `CompleteExecution` is only ever dispatched for a top-level `Execution`,
         // so the row is read directly.
         // A fault reading the row is not a decision about this command — it is returned so the leader
-        // can retry it; a *missing* row still fails the execution in place, as it always has.
+        // can retry it. A *missing* row is refused, mirroring `terminate_execution`: this command is
+        // the root thread's own relay (`complete_thread`), so a legitimate relay always names a row
+        // that exists, and the refusal is the command's precondition failing rather than the engine's.
+        // Terminating here would answer a gone row with a `TerminateExecution` for that same gone row,
+        // which `terminate_execution` would refuse in turn — a ghost entry, not an outcome.
         let exec = match ctx.storage.get_execution(execution).await? {
             Some(e) => e,
             None => {
-                out.fail_execution(
-                    execution,
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "execution {execution}"
-                    ))),
-                );
-                return Ok(());
+                return Err(ProcessingError::Rejected(
+                    RejectionType::NotFound,
+                    format!("complete_execution: execution {execution} not found"),
+                ));
             }
         };
         if !exec.value.status.is_running() {
-            return Ok(()); // idempotency: already finishing or terminal.
+            // This relay lost a race: the run is already finishing or terminal, so the termination
+            // cascade (a cancel, a timeout) or an earlier finish owns its outcome. The command's
+            // precondition — a running run to complete — does not hold, so it is refused rather than
+            // swallowed: the `Reject` is the one followup entry this command owes, and the only
+            // record that explains why it applied nothing. Mirrors `terminate_execution`.
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "complete_execution: execution {execution} is {:?}, not running",
+                    exec.value.status
+                ),
+            ));
         }
 
+        // The finish is built once and advanced in place: the terminal is the *same* value carried
+        // forward, so nothing the finish fixed can go missing between the two events. The event gets
+        // a copy because appending consumes it.
         let mut completing_execution = exec.value();
-        completing_execution.status = ExecutionStatus::Completing;
-        completing_execution.output = Some(output.clone());
-        // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
-        // construction, not from Entry metadata); `created_at` is carried forward unchanged.
-        completing_execution.meta.with_update_at(ctx.now());
+        completing_execution.begin_completing(output.clone(), ctx.now());
         out.append_event(Event::ExecutionCompleting {
-            execution: completing_execution,
+            execution: completing_execution.clone(),
         })
         .await;
 
         let children = exec.active_children.clone();
         let pending_children = cancel_timers(out, children);
         if pending_children == 0 {
-            let mut completed_execution = exec.value();
-            completed_execution.status = ExecutionStatus::Completed;
-            completed_execution.output = Some(output.clone());
-            completed_execution.meta.with_update_at(ctx.now());
+            let mut completed_execution = completing_execution;
+            completed_execution.complete(ctx.now());
             // Completion is observable durably: `start` returns the execution id and the caller's
             // `wait_for_execution` poll surfaces this terminal `ExecutionCompleted` from Storage. No
             // deferred ack is needed — terminal notification travels through the poll rather than an

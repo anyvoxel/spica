@@ -15,9 +15,9 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
     EntryPayload, Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind,
     ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated,
-    FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState, RetryPolicy,
-    RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed, TaskKind,
-    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
+    FlowVersionKind, ObjectKind, Reject, RejectionType, RequestId, RetrierAttemptState,
+    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed,
+    TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
     TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose,
     TimerStatus,
 };
@@ -2503,12 +2503,6 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
-                },
-            })),
             EntryPayload::Event(Event::TaskActivated {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
@@ -2528,6 +2522,12 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     },
                 },
             }),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
+                },
+            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -2635,6 +2635,11 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
             }),
             EntryPayload::Command(Command::ContinueTerminate {
                 owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+            }),
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason: "terminate_thread: thread thread/lifecycle_execution-0 is already Terminating; termination refused".to_string(),
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {

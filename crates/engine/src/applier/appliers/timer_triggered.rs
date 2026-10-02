@@ -15,7 +15,7 @@ impl TimerTriggeredApplier {
         ctx: &mut ApplierContext<'_>,
         timer: &Timer,
     ) -> Result<(), ExecutionError> {
-        if let Some(mut t) = ctx.storage.get_timer(&timer.meta.typed_reference()).await? {
+        if let Some(mut t) = ctx.storage.get_timer(&timer.meta.object_ref()).await? {
             let parent = t.value.meta.owner.clone();
             t.value.status = TimerStatus::Completed;
             // Sync the domain value's transition stamp from the event (the row's own `updated_at` is
@@ -24,7 +24,7 @@ impl TimerTriggeredApplier {
             t.with_update_at(ctx.timestamp);
             ctx.storage.put_timer(t).await?;
             ctx.storage
-                .remove_child(parent.into_raw_object_ref(), timer.meta.reference())
+                .remove_child(parent.into_raw_object_ref(), timer.meta.raw_object_ref())
                 .await?;
         }
         Ok(())

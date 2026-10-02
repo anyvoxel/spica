@@ -133,10 +133,6 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// This thread's canonical [`RawObjectRef`] — the `(kind, name, uid)` triple a consumer uses
-    /// to address it (`kind = Thread`, `name = meta.name`, `uid = meta.uid`). Mirrors
-    /// [`Execution::reference`](crate::types::execution::Execution::reference); Storage keys the row
-    /// by this reference and reads it back by reference.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
     }

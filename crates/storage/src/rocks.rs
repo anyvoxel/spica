@@ -240,23 +240,23 @@ impl Storage for RocksStorage {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.meta.typed_reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.object_ref()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.meta.typed_reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.object_ref()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.meta.typed_reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.typed_reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.meta.typed_reference()), &task)
+        self.put_row(self.keys.task(&task.meta.object_ref()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`, exactly like
@@ -569,23 +569,23 @@ impl StorageTxn for RocksTxn {
     }
 
     async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.execution(&exec.meta.typed_reference()), &exec)
+        self.put_row(self.keys.execution(&exec.meta.object_ref()), &exec)
     }
 
     async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.thread(&thread.meta.typed_reference()), &thread)
+        self.put_row(self.keys.thread(&thread.meta.object_ref()), &thread)
     }
 
     async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.activity(&act.meta.typed_reference()), &act)
+        self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
     }
 
     async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.typed_reference()), &timer)
+        self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
     async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
-        self.put_row(self.keys.task(&task.meta.typed_reference()), &task)
+        self.put_row(self.keys.task(&task.meta.object_ref()), &task)
     }
 
     /// Read-modify-write `parent`'s `active_children` minus `child`: read the (read-your-writes)
@@ -748,7 +748,7 @@ mod tests {
         RetryState, Task, TaskStatus, Timer, TimerOwner, TimerPurpose, TimerStatus, Timestamp,
     };
 
-    /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
+    /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
     fn test_exec_ref() -> ObjectRef<ExecutionKind> {
         let uid = ulid::Ulid::new();
         ObjectRef::new(
@@ -759,7 +759,7 @@ mod tests {
         )
     }
 
-    /// A distinct timer reference (`child-<uid>`), matching a `Timer::reference()`.
+    /// A distinct timer reference (`child-<uid>`), matching a `meta.raw_object_ref()`.
     fn timer_ref() -> ObjectRef<TimerKind> {
         let uid = ulid::Ulid::new();
         ObjectRef::new(
@@ -809,7 +809,7 @@ mod tests {
                 .await
                 .unwrap();
             let got = store.get_execution(&id).await.unwrap().unwrap();
-            assert_eq!(got.meta.typed_reference(), id);
+            assert_eq!(got.meta.object_ref(), id);
         }
         // Reopened store must still see the row (durability via RocksDB WAL across a drop/reopen).
         {
@@ -821,7 +821,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .typed_reference(),
+                    .object_ref(),
                 id
             );
         }
@@ -928,7 +928,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .typed_reference(),
+                    .object_ref(),
                 timer_ref
             );
             // the execution row is untouched by writing a timer
@@ -939,7 +939,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .meta
-                    .typed_reference(),
+                    .object_ref(),
                 id
             );
         }

@@ -1,3 +1,4 @@
+use crate::RejectionType;
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::activity::ActivityKind;
@@ -27,13 +28,44 @@ impl TerminateThreadHandler {
     ) -> Result<(), ProcessingError> {
         let TerminateThread { thread, reason } = p;
         // Addressed by kind: `TerminateThread` is only ever dispatched for a `Thread`, so the row is
-        // read directly.
+        // read directly. Nothing ever removes a row, and a thread row is written by the batch that
+        // creates it — before anything could name it in a sweep — so a miss is the log and the
+        // projection disagreeing (a forged command, or a corrupt store) rather than a thread that
+        // outlived its teardown. A fault reading the row is neither, and is returned so the leader can
+        // retry it.
         let Some(thread_row) = ctx.storage.get_thread(thread).await? else {
-            return Ok(()); // gone already — nothing to terminate.
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("terminate_thread: thread {thread} does not exist; termination refused"),
+            ));
         };
-        let thread_ref = thread_row.meta.reference();
+        let thread_ref = thread_row.meta.raw_object_ref();
+        // A thread that is already finishing or terminal: the sweep's intent is already satisfied, and
+        // the duplicate is *expected* — one branch thread is reachable from its container's own sweep
+        // and from the run-level cascade, so two of them can tear the same branch down. Refused rather
+        // than dropped, so the durable log records that this sweep was a duplicate rather than leaving
+        // a bogus one indistinguishable from an absorbed one.
         if !thread_row.value.status.is_running() {
-            return Ok(()); // already finishing or terminal — a later event wins.
+            // The durable reason names the phase rather than the whole status: `{:?}` would embed the
+            // nested termination error's `Debug` in the log's own text, which no reader of a rejection
+            // needs — the status travels on the trace line below instead.
+            let phase = match thread_row.value.status {
+                ThreadStatus::Terminating(_) => "Terminating",
+                ThreadStatus::Completing => "Completing",
+                _ => "terminal",
+            };
+            tracing::warn!(
+                thread = %thread_ref,
+                status = ?thread_row.value.status,
+                reason = ?reason,
+                "termination arrived for a thread that is already past Running; refused"
+            );
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "terminate_thread: thread {thread_ref} is already {phase}; termination refused"
+                ),
+            ));
         }
 
         let mut terminating_thread = thread_row.value();

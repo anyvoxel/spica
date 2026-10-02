@@ -5,7 +5,7 @@ use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpos
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
 use crate::types::execution::ExecutionKind;
-use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef, OwnerScope};
+use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef};
 use crate::types::thread::ThreadKind;
 
 /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
@@ -42,16 +42,10 @@ impl CreateExecutionHandler {
         // irrelevant to the read.
         let probe = ObjectRef::<ExecutionKind>::new(name.clone(), ulid::Ulid::nil());
         if let Ok(Some(_)) = ctx.storage.get_execution(&probe).await {
-            tracing::warn!(
-                name = %name.as_str(),
-                "create_execution: rejecting — execution already exists"
-            );
-            out.reject(
-                *request_id,
+            return Err(ProcessingError::Rejected(
                 RejectionType::AlreadyExists,
                 format!("create_execution: execution {name} already exists"),
-            );
-            return Ok(());
+            ));
         }
 
         // Mint the execution's durable identity here: a fresh `uid` plus the caller-supplied `name`.
@@ -60,27 +54,45 @@ impl CreateExecutionHandler {
         // never re-dispatched), so a re-dispatch mints a fresh consistent uid.
         let uid: ulid::Ulid = ctx.mint();
         let id = ObjectRef::<ExecutionKind>::new(name.clone(), uid);
-        // Resolve the machine this execution binds to. This is the first use of the version in a
-        // fresh StreamProcessor — it loads the definition (keyed by the version's object reference)
-        // from Storage into the cache. If the version is missing (definition GC'd), the execution
-        // cannot run and fails before any state is entered.
-        let sm = fail_or!(
-            result,
-            out,
-            None,
-            Some(OwnerScope::Execution(id.clone())),
-            ctx.machine(flow_version).await
-        );
+
+        // Resolve the machine this execution binds to. This is the first use of the version in a fresh
+        // StreamProcessor — it loads the definition (keyed by the version's object reference) from
+        // Storage into the cache. A version that is missing (definition GC'd) or whose stored definition
+        // no longer parses cannot produce a run, and re-dispatching would not change that, so the
+        // command is refused rather than fanned out into a termination: there is no execution row yet to
+        // terminate, and a termination carries no `request_id`, so it could never reach the `start`
+        // caller awaiting this command.
+        let sm = ctx.machine(flow_version).await.map_err(|e| {
+            ProcessingError::Rejected(
+                RejectionType::InvalidArgument,
+                format!(
+                    "create_execution: flow version {flow_version} cannot be resolved for execution \
+                     {name}: {e}"
+                ),
+            )
+        })?;
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
         // birth event, so the run's own `deadline` and the `ExecutionTimeout` timer that enforces it are
-        // written from one computation and cannot disagree. An overflow is a definition error with no
-        // instant to record: the run is still born (with `deadline: None`) and fails right below.
+        // written from one computation and cannot disagree. A `TimeoutSeconds` the clock cannot add is a
+        // malformed definition, so it is refused *before* the run exists: accepting it, birthing the
+        // execution, and then failing it immediately would leave a dead row standing for a command the
+        // engine had already decided not to apply — and would answer the caller with a creation that
+        // succeeded rather than a refusal.
         let timeout = sm.timeout_seconds.filter(|secs| *secs > 0);
         let deadline = timeout.and_then(|secs| {
             ctx.now()
                 .checked_add(std::time::Duration::from_secs(secs as u64))
         });
-        let overflowed = timeout.is_some() && deadline.is_none();
+        if timeout.is_some() && deadline.is_none() {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidArgument,
+                format!(
+                    "create_execution: execution {name} cannot start: TimeoutSeconds overflows the \
+                     absolute deadline"
+                ),
+            ));
+        }
+
         // Build the birth event once and emit it; an injected `Hook` observer wakes the awaiting `start`
         // caller from this same event (the `request_id` it echoes), so no separate ack echo is needed.
         let created_event = Event::ExecutionCreated(ExecutionCreated {
@@ -108,15 +120,6 @@ impl CreateExecutionHandler {
         // `wait_for_execution`).
         out.append_event(created_event).await;
 
-        if overflowed {
-            out.fail_execution(
-                &id,
-                ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                    "TimeoutSeconds overflows the absolute deadline".into(),
-                )),
-            );
-            return Ok(());
-        }
         if let Some(deadline) = deadline {
             // The ExecutionTimeout timer is generated **here** (inline): mint the
             // timer's durable uid, and derive the timer's name as `{execution.name}-{8-char-suffix}`
@@ -134,6 +137,7 @@ impl CreateExecutionHandler {
             let base = match id.name().as_plain() {
                 Some(p) => p,
                 None => {
+                    // TODO：这里貌似应该是不可能发生的事情
                     out.fail_execution(
                         &id,
                         ExecutionError::Runtime(RuntimeError::InvalidDefinition(
@@ -181,6 +185,7 @@ impl CreateExecutionHandler {
         let root_states = StatePath::root();
         let start_at = sm.start_at.clone();
         out.append_event(Event::ThreadCreated {
+            // TODO：应该提供一个 Thread::new 函数？
             thread: crate::Thread {
                 meta: ObjectMeta::builder(root_uid)
                     .name(root_name)
@@ -210,5 +215,174 @@ impl CreateExecutionHandler {
         }));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use spica_machinery::{Clock, CountingIdGenerator, IdGenerator, ManualClock};
+    use spica_testing::MockReadonlyStorageTxn;
+
+    use super::CreateExecutionHandler;
+    use crate::eval_env::EvalEnv;
+    use crate::handler::{Collector, HandlerContext, ProcessingError};
+    use crate::handlers::dispatch::build_state_handlers;
+    use crate::handlers::fixtures::{at, obj_name, object_ref};
+    use crate::types::command::CreateExecution;
+    use crate::types::id::{EntryId, RequestId};
+    use crate::types::meta::{ObjectMeta, ObjectRef};
+    use crate::{
+        EntryPayload, FlowKind, FlowVersion, FlowVersionKind, RejectionType, StorageError,
+    };
+
+    /// The version the run binds to. Its name is load-bearing: `HandlerContext::machine` loads the
+    /// definition by exactly this reference, so the seeded row has to answer to it.
+    fn flow_version_ref() -> ObjectRef<FlowVersionKind> {
+        object_ref("lifecycle_flow-1", 2)
+    }
+
+    /// A definition whose `TimeoutSeconds` is the largest `i64` the ASL model admits: normalizing it
+    /// into an absolute deadline needs a millisecond count past `u64::MAX`, so the machine parses
+    /// cleanly while the deadline cannot be computed. That gap is the only input the guard exists for.
+    fn overflowing_definition() -> String {
+        json!({
+            "StartAt": "P",
+            "TimeoutSeconds": i64::MAX,
+            "States": { "P": { "Type": "Pass", "End": true } }
+        })
+        .to_string()
+    }
+
+    /// The handler exercised against a **mock** read-only store: the two reads `CreateExecution` makes
+    /// — the execution-name probe and the version's definition — are the only ones scripted, so any
+    /// further read panics. Both the outcome and the entries are returned, because for this guard the
+    /// *absence* of a birth event is as much the point as the refusal itself.
+    async fn create_over(
+        store: &MockReadonlyStorageTxn,
+    ) -> (Result<(), ProcessingError>, Vec<EntryPayload>) {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
+        let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
+        let mut out = Collector::new(EntryId::new(1), None, clock.clone(), ids.clone());
+        let mut env = EvalEnv::new();
+        let mut definitions = HashMap::new();
+        let state_handlers = build_state_handlers();
+        let mut ctx = HandlerContext {
+            env: &mut env,
+            storage: store,
+            clock,
+            ids,
+            definitions: &mut definitions,
+            state_handlers: &state_handlers,
+        };
+        let result = CreateExecutionHandler
+            .handle(
+                &CreateExecution {
+                    request_id: RequestId::nil(),
+                    name: obj_name("lifecycle_execution"),
+                    flow_version: flow_version_ref(),
+                    input: json!({ "n": 1 }),
+                },
+                &mut ctx,
+                &mut out,
+            )
+            .await;
+        (
+            result,
+            out.into_entries().into_iter().map(|e| e.payload).collect(),
+        )
+    }
+
+    /// A store whose name probe finds nothing and whose version publishes `definition`.
+    fn store_over(definition: &str) -> MockReadonlyStorageTxn {
+        let mut store = MockReadonlyStorageTxn::new();
+        store
+            .expect_get_execution()
+            .times(1)
+            .return_const(Ok::<_, StorageError>(None));
+        let version = FlowVersion {
+            meta: ObjectMeta::builder(flow_version_ref().uid())
+                .name(flow_version_ref().name().clone())
+                .at(at())
+                .with_owner(object_ref::<FlowKind>("lifecycle_flow", 1)),
+            version: 1,
+            definition: definition.to_string(),
+            checksum: 0,
+        };
+        store
+            .expect_get_flow_version()
+            .times(1)
+            .return_once(move |_| Ok(Some(version)));
+        store
+    }
+
+    /// A store whose name probe finds nothing and whose version row does not exist — the "definition
+    /// GC'd out from under a command that names it" case.
+    fn store_without_version() -> MockReadonlyStorageTxn {
+        let mut store = MockReadonlyStorageTxn::new();
+        store
+            .expect_get_execution()
+            .times(1)
+            .return_const(Ok::<_, StorageError>(None));
+        store
+            .expect_get_flow_version()
+            .times(1)
+            .return_const(Ok::<_, StorageError>(None));
+        store
+    }
+
+    /// A definition that cannot be resolved is refused, and refused as the *command's* failure: the run
+    /// is never born, and no termination is fanned out — a termination for a row that does not exist
+    /// could not answer this command's `request_id` either, so the awaiting `start` caller would be left
+    /// with nothing to wake it.
+    #[tokio::test]
+    async fn an_unresolvable_definition_is_refused_before_the_run_is_born() {
+        let store = store_without_version();
+        let (result, entries) = create_over(&store).await;
+        let Err(err) = result else {
+            panic!("a missing flow version must be refused, not accepted");
+        };
+        let ProcessingError::Rejected(ty, reason) = err else {
+            panic!(
+                "an unresolvable definition is the command's failure, not the engine's: {err:?}"
+            );
+        };
+        assert_eq!(ty, RejectionType::InvalidArgument);
+        assert!(
+            reason.contains(&flow_version_ref().to_string()),
+            "the refusal names the version it could not resolve: {reason}"
+        );
+        assert!(
+            entries.is_empty(),
+            "the refusal fans out no termination for a row that does not exist: {entries:?}"
+        );
+    }
+
+    /// A `TimeoutSeconds` the clock cannot add is refused as a malformed definition, and refused
+    /// **before the run exists**: no `ExecutionCreated` reaches the log, so a caller is never handed a
+    /// creation that "succeeded" and then died. The window between the two reads is closed — the
+    /// version is read once and the refusal follows from its definition alone.
+    #[tokio::test]
+    async fn an_unrepresentable_timeout_is_refused_before_the_run_is_born() {
+        let store = store_over(&overflowing_definition());
+        let (result, entries) = create_over(&store).await;
+        let Err(err) = result else {
+            panic!("an unaddable TimeoutSeconds must be refused, not accepted");
+        };
+        let ProcessingError::Rejected(ty, reason) = err else {
+            panic!("a malformed definition is the command's failure, not the engine's: {err:?}");
+        };
+        assert_eq!(ty, RejectionType::InvalidArgument);
+        assert!(
+            reason.contains("lifecycle_execution"),
+            "the refusal names the execution that cannot start: {reason}"
+        );
+        assert!(
+            entries.is_empty(),
+            "the refusal leaves no birth event behind it: {entries:?}"
+        );
     }
 }

@@ -40,16 +40,16 @@ impl TerminateExecutionHandler {
                 ));
             }
         };
-        let exec_ref = exec.meta.reference();
+        let exec_ref = exec.meta.raw_object_ref();
 
         // Optional incarnation guard: with a caller-supplied `uid`, only that exact incarnation may be
         // terminated. A mismatch means the name now points at a different execution than the caller
-        // started — refuse with a `StateConflict` Reject rather than terminating the wrong run.
+        // started — a stale handle, refused as `InvalidState` rather than terminating the wrong run.
         if let Some(want) = uid
             && want != &exec_ref.uid
         {
             return Err(ProcessingError::Rejected(
-                RejectionType::StateConflict,
+                RejectionType::InvalidState,
                 format!(
                     "terminate_execution: execution {name} is incarnation {}, not {want}",
                     exec_ref.uid

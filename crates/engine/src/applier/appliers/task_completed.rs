@@ -24,7 +24,7 @@ impl TaskCompletedApplier {
         // is folded into the activity's `raw_output`: it is the state's raw result before the
         // complete step's `Output` projection, distinct from the immutable processed input recorded
         // during `StateActivated`.
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.object_ref()).await? {
             // An activity is the only thing that can own a task (the slot's own type), so the fold
             // needs no `kind` guard here.
             let parent = t.meta.owner.clone();
@@ -40,7 +40,7 @@ impl TaskCompletedApplier {
                 ctx.storage.put_activity(act).await?;
             }
             ctx.storage
-                .remove_child(parent.into_raw_object_ref(), task.meta.reference())
+                .remove_child(parent.into_raw_object_ref(), task.meta.raw_object_ref())
                 .await?;
         }
         Ok(())

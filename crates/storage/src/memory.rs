@@ -776,7 +776,7 @@ mod tests {
         Execution, ExecutionStatus, ObjectRef, PlainName, RetryState, Task, TaskStatus, Timestamp,
     };
 
-    /// A distinct execution reference (`obj-<uid>`), matching `Execution::reference()`.
+    /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
     fn test_exec_ref() -> ObjectRef<ExecutionKind> {
         let uid = ulid::Ulid::new();
         ObjectRef::new(

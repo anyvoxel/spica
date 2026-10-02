@@ -6,16 +6,18 @@ use std::mem::Discriminant;
 
 use super::{emit_state_completed, emit_transition};
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::storage::{ActivityRecord, ThreadRecord};
 use crate::types::activity::ActivityKind;
-use crate::types::command::{ActivateState, Command, CompleteState};
+use crate::types::command::{
+    ActivateState, Command, CompleteState, TerminateState, TerminationReason,
+};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
-use crate::types::id::RequestId;
-use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
-use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
+use crate::{Activity, ActivityStatus, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
 /// (via [`Self::state`], the single source of truth for the dispatch-table key) and builds a
@@ -193,14 +195,17 @@ pub trait StateHandler: Send + Sync {
     /// wait for whatever is left. The default waits on the generic child set — a state owning no
     /// children is trivially `Ready`, and a state whose child *is* its completion trigger (`Wait`'s
     /// resume timer, a container's fan-out) needs no cleanup of its own.
+    ///
+    /// The activity's reference is derived from the value rather than passed beside it: the row was
+    /// read by that very reference, so `meta` is its source of truth and the two cannot disagree.
     async fn on_completing(
         &self,
         ctx: &mut HandlerContext<'_>,
         _out: &mut Collector<'_>,
-        activity: &ObjectRef<ActivityKind>,
-        _activity_value: &Activity,
+        activity_value: &Activity,
     ) -> FinishReadiness {
-        match self.live_children(ctx, activity).await {
+        let activity = activity_value.meta.object_ref();
+        match self.live_children(ctx, &activity).await {
             Some(0) => FinishReadiness::Ready,
             Some(pending) => FinishReadiness::Waiting { pending },
             None => FinishReadiness::Gone,
@@ -255,12 +260,12 @@ pub trait StateHandler: Send + Sync {
     /// transition, so every state on that path (`Pass`/`Succeed`/`Wait`/`Task`) shares one
     /// implementation instead of four copies. `Fail` overrides it to terminate instead, `Choice` to
     /// route by its resolved rule, and a container to its own defensive finish. An error is turned
-    /// into a terminate by the base.
+    /// into a terminate by the base. The activity's reference is derived from `activity_value` here for
+    /// the same reason as in [`on_completing`](Self::on_completing).
     async fn finish(
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ExecutionError> {
@@ -292,7 +297,7 @@ pub trait StateHandler: Send + Sync {
             out,
             activity_value.execution.clone(),
             owner.clone(),
-            activity,
+            activity_value.meta.object_ref(),
             &activity_value.state_path,
             &output_value,
             self.next(),
@@ -305,9 +310,9 @@ pub trait StateHandler: Send + Sync {
     /// Apply a state's `Assign` delta (when present) onto the scope variables in place, emitting
     /// `VariablesAssigned` for the owning scope when the eval yields a non-empty object — the
     /// complete-step projection every state shares. `Ok(())` when no assign is present or it applies
-    /// cleanly; an eval failure or a non-object result returns `Err`, which the caller's `fail_or!`
-    /// turns into the same terminate + return the inline block used to produce. Kept on the base so an
-    /// `Assign` is handled identically across states rather than copy-pasted.
+    /// cleanly; an eval failure or a non-object result returns `Err`, which the caller turns into a
+    /// `TerminateState` for the activity. Kept on the base so an `Assign` is handled identically across
+    /// states rather than copy-pasted.
     async fn apply_assign(
         &self,
         out: &mut Collector<'_>,
@@ -343,8 +348,8 @@ pub trait StateHandler: Send + Sync {
     }
 
     /// Evaluate a state's complete-step `Output` (when present) against the folded scope; without
-    /// one, the state's raw result passes through. An eval failure returns `Err`, which the caller's
-    /// `fail_or!` turns into the terminate + return shared by every state.
+    /// one, the state's raw result passes through. An eval failure returns `Err`, which the caller turns
+    /// into a `TerminateState` for the activity.
     async fn project_output(
         &self,
         env: &mut EvalEnv,
@@ -364,19 +369,23 @@ pub trait StateHandler: Send + Sync {
     /// The `Command::ActivateState` flow, owned by the base. Its only input is the typed
     /// [`ActivateState`] payload; the bound definition supplies the typed state and the activity is
     /// constructed here, so the actual fan-out/owner/meta derivation lives once. Receiving the
-    /// payload by its own type (not `&Command`) makes the dispatch a compile-time guarantee.
-    /// `owner` is that payload's owner in the slot's own type: the dispatcher already refused a
-    /// foreign kind, so the base never has to guard it (and a command's owner is checked once).
+    /// payload by its own type (not `&Command`) makes the dispatch a compile-time guarantee, and the
+    /// payload carries its owner in the slot's own type, so no owner argument is threaded beside it.
+    /// `thread` is the row the dispatcher already read for that owner — it resolves the definition
+    /// from the same row and screened it for liveness before admitting the command, so the base
+    /// re-reads nothing and every remaining failure of its own is a domain one that settles the run in
+    /// place. The `Err` half of the return type is the shape of that contract, kept for a precondition
+    /// landing back in this layer; no arm returns one today.
     async fn activate(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &ActivateState,
-        owner: ObjectRef<ThreadKind>,
-    ) {
+        thread: &ThreadRecord,
+    ) -> Result<(), ProcessingError> {
         let ActivateState {
             execution,
-            owner: _,
+            owner,
             state_path,
             input,
         } = cmd;
@@ -411,36 +420,10 @@ pub trait StateHandler: Send + Sync {
         );
 
         // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
-        // fan-out thread for a branch/item — which the slot's own type guarantees, so this read needs
-        // no `kind` guard. Reading the concrete row is exactly what yields the variables the hooks
-        // evaluate against and confirms the thread still accepts transitions.
-        let scope = match ctx.storage.get_thread(&owner).await {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    Some(OwnerScope::Execution(execution.clone())),
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "thread {}",
-                        owner.as_raw_object_ref()
-                    ))),
-                );
-                return;
-            }
-            Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    Some(OwnerScope::Execution(execution.clone())),
-                    e.into(),
-                );
-                return;
-            }
-        };
-        if !scope.value.status.is_running() {
-            return; // scope not running — a rescheduled activate is a no-op.
-        }
-
-        let variables = scope.variables.clone();
+        // fan-out thread for a branch/item — which the slot's own type guarantees. The row arrives
+        // already read and screened, and it is exactly what yields the variables the hooks evaluate
+        // against.
+        let variables = thread.variables.clone();
         let state_name = activity_value.state_path.state_name();
 
         self.initialize(&mut activity_value).await;
@@ -468,12 +451,15 @@ pub trait StateHandler: Send + Sync {
         {
             Ok(input) => input,
             Err(e) => {
-                out.terminate(
-                    Some(activity.clone()),
-                    Some(OwnerScope::Thread(owner.clone())),
-                    e,
-                );
-                return;
+                // Past the first emit: the run's death *is* this command's outcome, so it settles here
+                // rather than leaving `StateActivating`/`StateActivated` and a Reject on one entry.
+                // Only the activity is named — its scope (the row read above) is taken down by the
+                // handler that runs this terminate, so nothing here names it a second time.
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return Ok(());
             }
         };
         activity_value.input = Some(input.clone());
@@ -492,12 +478,11 @@ pub trait StateHandler: Send + Sync {
             .after_activated(ctx.env, out, &activity_value, &variables, &states)
             .await
         {
-            out.terminate(
-                Some(activity.clone()),
-                Some(OwnerScope::Thread(owner.clone())),
-                e,
-            );
-            return;
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
+            return Ok(());
         }
 
         // (2.7)
@@ -507,65 +492,30 @@ pub trait StateHandler: Send + Sync {
                 output: input.clone(),
             }));
         }
+
+        Ok(())
     }
 
     /// The `Command::CompleteState` flow, owned by the base — the mirror of [`Self::activate`]. The
-    /// only input is the typed [`CompleteState`] payload (receiving it by its own type rather than as
-    /// loose `activity`/`output` parameters makes the dispatch a compile-time guarantee), and every
-    /// step below is identical across states: load the activity, run the liveness / Terminating-race
-    /// guards, open the finish with `StateCompleting` (folding the command's raw result in), hand the
-    /// unfinished children to [`on_completing`](Self::on_completing) and defer if it says to wait,
-    /// resolve the owning scope and its variables, and hand into the per-state [`finish`](Self::finish).
+    /// typed [`CompleteState`] payload supplies the activity and the raw result; `act` and `thread`
+    /// are the rows the dispatcher already read for them, screened for liveness before it admitted the
+    /// command, so the base re-reads nothing and what remains is domain work identical across states:
+    /// open the finish with `StateCompleting` (folding the command's raw result in), hand the
+    /// unfinished children to [`on_completing`](Self::on_completing) and defer if it says to wait, and
+    /// hand into the per-state [`finish`](Self::finish) with the scope's variables. The `Err` half of
+    /// the return type is the same contract as `activate`'s: kept for a precondition landing back in
+    /// this layer, with no arm returning one today.
     async fn complete(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &CompleteState,
-    ) {
+        act: &ActivityRecord,
+        thread: &ThreadRecord,
+    ) -> Result<(), ProcessingError> {
         let CompleteState { activity, output } = cmd;
 
-        // (3.1) Load the activity the command names. A missing row means the activity is gone (or was
-        // never a state's) — fail the execution, with no activity to attach a state-level terminate to.
-        // TODO：拿到 activity 之后，如果遇到错误不应该是直接 terminate（有些临时性质的错误应该重试）。
-        let act = match ctx.storage.get_activity(activity).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                // The row that would name the owning scope is the very thing that is missing, so the
-                // failure is recorded at the activity level alone and the log names the address.
-                out.terminate(
-                    Some(activity.clone()),
-                    None,
-                    ExecutionError::Runtime(RuntimeError::StateNotFound(format!(
-                        "activity {activity}"
-                    ))),
-                );
-                return;
-            }
-            Err(e) => {
-                out.terminate(Some(activity.clone()), None, e.into());
-                return;
-            }
-        };
-
-        // (3.2) A cancel (or a competing terminator) already won on this activity: the command lost the
-        // race, so the success finish no longer applies. Refuse it durably with the nil id an internal
-        // command carries — a rejection still leaves a trace, unlike a silent no-op. Recovering the
-        // activity's *own* terminal is deliberately not this step's job: the child whose settle stranded
-        // it drives that drain (see [`crate::handlers::trigger_timer`]), so emitting `StateTerminated`
-        // from here would duplicate a terminal event the settle path already owns.
-        if act.value.status != ActivityStatus::Running {
-            out.reject(
-                RequestId::nil(),
-                RejectionType::InvalidState,
-                format!(
-                    "activity {activity} is {:?}, not Running; cannot complete",
-                    act.value.status
-                ),
-            );
-            return;
-        }
-
-        // (3.3) Open the finish now that this command has won the activity. Emitting here — before the
+        // (3.1) Open the finish now that this command has won the activity. Emitting here — before the
         // children below are dealt with — is what makes the decision durable rather than provisional:
         // a step that defers on a live child leaves the activity `Completing` (not `Running`), so the
         // child's eventual settle drives the drain through the generic `Completing` path instead of
@@ -581,15 +531,12 @@ pub trait StateHandler: Send + Sync {
         })
         .await;
 
-        // (3.4) Hand the disposition of this state's unfinished children to the state itself (see
+        // (3.2) Hand the disposition of this state's unfinished children to the state itself (see
         // `on_completing`): it cleans up whatever must not outlive its own decision, and reports
         // whether the finish may run now. A wait leaves the activity `Completing`, so the last child's
         // settle drives the drain (see `continue_`) and nothing re-drives `complete` — which is why the
-        // decision had to be durable before this point (3.3).
-        match self
-            .on_completing(ctx, out, activity, &activity_value)
-            .await
-        {
+        // decision had to be durable before this point (3.1).
+        match self.on_completing(ctx, out, &activity_value).await {
             FinishReadiness::Ready => {}
             FinishReadiness::Waiting { pending } => {
                 tracing::debug!(
@@ -597,38 +544,27 @@ pub trait StateHandler: Send + Sync {
                     children = pending,
                     "state is Completing but its children have not all drained; finish deferred"
                 );
-                return;
+                return Ok(());
             }
-            FinishReadiness::Gone => return,
+            FinishReadiness::Gone => return Ok(()),
         }
 
-        // The activity's owner is always a `Thread` (see `activate`), so — as there — the concrete row
-        // is read directly. The owner is taken from the *persisted row* rather than from the command,
-        // so this read is also what supplies the variables `finish` evaluates against.
-        let owner = act.value.meta.owner.clone();
-        let scope = match ctx.storage.get_thread(&owner).await {
-            Ok(Some(t)) => t,
-            Ok(None) => return, // owning thread already gone — nothing to complete into.
-            Err(_) => return,
-        };
-        if !scope.value.status.is_running() {
-            return; // owner is past accepting a new transition; a late CompleteState is a no-op.
+        // (3.3) The scope's variables as of the transition, and the per-state finish — the projection
+        // (`$states.result` / `Assign` / `Output`) plus the `Next`/`End` routing. The row arrives as the
+        // activity's owner (an activity is always owned by a `Thread`), read by the dispatcher, so
+        // nothing here re-derives it; `activity_value` is the value (3.1) already opened the finish
+        // with, so its `Completing` status and folded raw result carry forward into whichever lifecycle
+        // the finish emits.
+        let variables = thread.variables.clone();
+        if let Err(e) = self.finish(ctx.env, out, &activity_value, &variables).await {
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
+            return Ok(());
         }
 
-        // (3.5) The scope's variables as of the transition, and the per-state finish — the projection
-        // (`$states.result` / `Assign` / `Output`) plus the `Next`/`End` routing. `activity_value` is
-        // the value (3.3) already opened the finish with, so its `Completing` status and folded raw
-        // result carry forward into whichever lifecycle the finish emits.
-        let variables = scope.variables.clone();
-        let finished = self
-            .finish(ctx.env, out, activity.clone(), &activity_value, &variables)
-            .await;
-        fail_or!(
-            out,
-            Some(activity.clone()),
-            Some(OwnerScope::Thread(owner)),
-            finished
-        );
+        Ok(())
     }
 }
 #[cfg(test)]

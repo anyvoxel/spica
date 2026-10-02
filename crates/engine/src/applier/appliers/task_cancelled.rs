@@ -17,7 +17,7 @@ impl TaskCancelledApplier {
         // Mark the task Cancelled and drain it from its owning activity. The physical call is left
         // running; a later `CompleteTask` for this task is swallowed by the `CompleteTaskHandler`'s
         // non-`Running` guard.
-        if let Some(mut t) = ctx.storage.get_task(&task.meta.typed_reference()).await? {
+        if let Some(mut t) = ctx.storage.get_task(&task.meta.object_ref()).await? {
             let parent = t
                 .meta
                 .owner
@@ -30,7 +30,7 @@ impl TaskCancelledApplier {
             t.with_update_at(ctx.timestamp);
             ctx.storage.put_task(t).await?;
             ctx.storage
-                .remove_child(parent, task.meta.reference())
+                .remove_child(parent, task.meta.raw_object_ref())
                 .await?;
         }
         Ok(())

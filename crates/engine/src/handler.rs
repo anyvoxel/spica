@@ -152,18 +152,25 @@ impl<'a> Collector<'a> {
         self.entries.push(self.build(payload));
     }
 
-    /// Emit a definitive failure: `TerminateState` (if the failing context is a state) plus a
-    /// scope termination of the owning scope with [`TerminationReason::Failed`]. Handlers own their
-    /// failures: on an eval/decision error they emit the failure themselves (cohesive with the site
-    /// that produced it), so `handle` always produces an outcome and returns `()`. The activity-level
-    /// [`Command::TerminateState`] runs the state's terminate path (StateTerminating +
-    /// StateTerminated, plus descendant cleanup) rather than marking the activity in place.
+    /// Emit a definitive failure: the two arguments name its victims independently, each optional.
+    /// Handlers own their failures: on an eval/decision error they emit the failure themselves
+    /// (cohesive with the site that produced it), so `handle` always produces an outcome and returns
+    /// `()`. The activity-level [`Command::TerminateState`] runs the state's terminate path
+    /// (StateTerminating + StateTerminated, plus descendant cleanup) rather than marking the activity
+    /// in place.
     ///
-    /// `scope` is `None` when the site could not resolve one (the activity row that would name it
-    /// could not be read): the failure is then recorded at the activity level alone, and the log
-    /// names that activity rather than terminating into an address no object answers to.
+    /// A failing **state** needs no `scope`: it always has one (an activity is owned by a `Thread`,
+    /// the slot's own type), and that scope's own termination is emitted by
+    /// [`TerminateStateHandler`](crate::handlers::TerminateStateHandler) as part of running the
+    /// command — so the branch-vs-root dialect, and the decision whether the scope still needs
+    /// telling, live in one place instead of at every failing site.
     ///
-    /// `activity` is the state that failed — `None` at a site with no state context (see
+    /// `scope` therefore names a scope *above* the activity's own, which is the one thing a site can
+    /// state about a failure that the activity itself does not: a definition error that ends the whole
+    /// run reaches for an [`OwnerScope::Execution`] and leaves the failing activity to the sweep
+    /// cascade, or names both.
+    ///
+    /// `activity` is `None` at a site with no state context (see
     /// [`fail_execution`](Self::fail_execution)).
     pub fn terminate(
         &mut self,
@@ -172,18 +179,14 @@ impl<'a> Collector<'a> {
         error: ExecutionError,
     ) {
         let reason = TerminationReason::Failed { error };
-        if let Some(activity) = activity.clone() {
+        if let Some(activity) = activity {
             self.append_command(Command::TerminateState(TerminateState {
                 activity,
                 reason: reason.clone(),
             }));
         }
-        match scope {
-            Some(scope) => crate::handlers::emit_scope_termination(self, &scope, reason),
-            None => tracing::error!(
-                activity = ?activity,
-                "terminal fail with no resolvable scope; cannot terminate"
-            ),
+        if let Some(scope) = scope {
+            crate::handlers::emit_scope_termination(self, &scope, reason);
         }
     }
 
@@ -279,6 +282,7 @@ impl HandlerContext<'_> {
         self.clock.now()
     }
 
+    // TODO：这个函数的名称并不太合适
     /// A fresh `uid` for an object this dispatch creates, read from the injected [`IdGenerator`] —
     /// see [`Self::clock`] for why ids, like time, are an input rather than an ambient read. Kept as
     /// a method so a handler never has to remember which of the two (this or the [`Collector`]) to

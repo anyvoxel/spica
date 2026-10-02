@@ -15,12 +15,18 @@ use crate::types::task::TaskKind;
 /// The owning activity's container is resolved *before* the cancel is written, because this settle is
 /// the sweep's own last move for a `Task` child and it is what lets the `Terminating` owner that
 /// issued the sweep converge in the same batch. An owner that is already gone makes the cancel
-/// pointless, so it is reported rather than written against a row nothing can drain.
+/// pointless, so it is refused rather than written against a row nothing can drain.
 ///
 /// A `Task` row the store has never seen is likewise nothing to cancel, but it is an invariant
 /// violation rather than an idempotent replay — the sweep read that child off a live owner — so it is
 /// refused with a `NotFound` [`Reject`](crate::Reject) rather than dropped silently: every command
-/// owes one followup entry, and this dispatch has no `Event` to give.
+/// owes one followup entry, and this dispatch has no `Event` to give. A **missing owner** is refused
+/// on the same grounds and with the same entry, but as [`RejectionType::InvalidState`]: the task
+/// itself is live, so this is not a caller naming something absent — it is the world not being in a
+/// state where the cancel applies.
+///
+/// A read that *faults* is neither: it is the engine's own failure, so it propagates as
+/// [`ProcessingError::Unexpected`] for the leader to retry before giving up.
 #[derive(Default)]
 pub struct CancelTaskHandler;
 
@@ -39,13 +45,11 @@ impl CancelTaskHandler {
             ));
         };
         let owner = task_value.meta.owner.clone();
-        let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await else {
-            tracing::warn!(
-                task = %task,
-                owner = %owner,
-                "cancel settle has no live owning activity; cancel dropped"
-            );
-            return Ok(());
+        let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("task {task} has no live activity owner {owner}; cancel refused"),
+            ));
         };
         task_value.cancel(ctx.now());
         out.append_event(Event::TaskCancelled { task: task_value })
@@ -71,12 +75,13 @@ mod tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, ProcessingError};
     use crate::handlers::dispatch::build_state_handlers;
+    use crate::handlers::fixtures::{at, object_ref};
     use crate::storage::{ActivityRecord, TaskRecord};
     use crate::types::event::Event;
     use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
     use crate::types::meta::HasRawObjectRef;
-    use crate::types::meta::{ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef, RawObjectRef};
+    use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef};
     use crate::types::reject::RejectionType;
     use crate::types::task::TaskKind;
     use crate::{
@@ -84,35 +89,20 @@ mod tests {
         ThreadKind, Timestamp,
     };
 
-    /// The instant every stamp reads: one `ManualClock` reading serves the seeded rows' meta and the
-    /// collector's envelopes alike.
-    fn at() -> Timestamp {
-        Timestamp::from_millis(1_000)
-    }
-
-    /// A seeded address of the kind the caller names in the type — so a fixture reaches a typed slot
-    /// without a conversion, and cannot name a kind that slot does not admit.
-    fn reference<K: ObjectKindMarker>(name: &str, uid: u64) -> ObjectRef<K> {
-        ObjectRef::new(
-            ObjectName::from_parsed(name).expect("a static literal is a valid object name"),
-            ulid::Ulid::from(u128::from(uid)),
-        )
-    }
-
     /// The task's owner slot: an activity, the only kind it admits.
     fn activity_ref() -> ObjectRef<ActivityKind> {
-        reference("execution-0", 90)
+        object_ref("execution-0", 90)
     }
 
     /// The owning activity's own owner — a `Thread`, the only kind an activity's slot admits.
     fn thread_owner() -> ObjectRef<ThreadKind> {
-        reference("execution-1", 80)
+        object_ref("execution-1", 80)
     }
 
     /// The cancel target. Its name is load-bearing: the cancelled task keeps its own meta, and a
     /// renamed task is one its owner can no longer match against the child it owns.
     fn task_ref() -> ObjectRef<TaskKind> {
-        reference("execution-0", 91)
+        object_ref("execution-0", 91)
     }
 
     /// The live task the sweep cancels, owned by [`activity_ref`] and leased to `w1`.
@@ -122,7 +112,7 @@ mod tests {
                 .name(task_ref().name().clone())
                 .at(at())
                 .with_owner(activity_ref()),
-            execution: reference::<ExecutionKind>("execution", 70),
+            execution: object_ref::<ExecutionKind>("execution", 70),
             resource: "service-a".to_string(),
             arguments: json!({ "in": 1 }),
             status: TaskStatus::Running,
@@ -148,7 +138,7 @@ mod tests {
                 .name(activity_ref().name().clone())
                 .at(at())
                 .with_owner(thread_owner()),
-            execution: reference::<ExecutionKind>("execution", 70),
+            execution: object_ref::<ExecutionKind>("execution", 70),
             state_path: StatePath::from(path),
             status,
             raw_input: json!({ "in": 1 }),
@@ -303,11 +293,37 @@ mod tests {
             );
         }
 
-        /// An owner that is gone has nothing to drain the task, so the cancel is dropped — no entry
-        /// at all, not even a refusal — rather than written against a row nothing can detach. The
-        /// owner is read exactly **once** here: resolution finds nothing, so the settle never re-reads.
+        /// A **fault on the owner read** is the engine's failure, exactly as a fault on the task read
+        /// is — and this is what `Container::open`'s `Result` is for. Folding it into `None` would make
+        /// a store that hiccuped read as an owner that is gone, turning a retryable fault into a
+        /// refusal. The owner is read exactly once: the resolution faulted, so the settle never runs.
         #[tokio::test]
-        async fn a_gone_owner_drops_the_cancel() {
+        async fn a_faulted_owner_read_surfaces_as_unexpected() {
+            let (task, _) = live_world();
+            let mut store = MockReadonlyStorageTxn::new();
+            store
+                .expect_get_task()
+                .times(1)
+                .return_once(move |_| Ok(Some(task)));
+            store.expect_get_activity().times(1).return_once(move |_| {
+                Err(StorageError::Backend("injected storage fault".to_string()))
+            });
+            let err = cancel_over(&store)
+                .await
+                .expect_err("a store that cannot read is not the command's failure");
+            assert!(
+                matches!(err, ProcessingError::Unexpected(_)),
+                "an owner read fault is the engine's, never a refusal: {err:?}"
+            );
+        }
+
+        /// An owner that is gone has nothing to drain the task, so the cancel is refused as a
+        /// wrong-state [`RejectionType::InvalidState`] — the world is not in a state where the cancel
+        /// applies — rather than written against a row nothing can detach. Its `request_id` is the nil
+        /// one, since the sweep is not an awaiting caller (`Leader::dispatch_once`). The owner is read
+        /// exactly **once** here: resolution finds nothing, so the settle never re-reads.
+        #[tokio::test]
+        async fn a_gone_owner_is_a_wrong_state_refusal() {
             let (task, _) = live_world();
             let mut store = MockReadonlyStorageTxn::new();
             store
@@ -318,10 +334,21 @@ mod tests {
                 .expect_get_activity()
                 .times(1)
                 .return_const(Ok::<_, StorageError>(None));
-            let chain = cancel_over(&store)
+            let err = cancel_over(&store)
                 .await
-                .expect("a gone owner is a decision, not a fault");
-            assert!(chain.is_empty(), "nothing may be written: {chain:?}");
+                .expect_err("a cancel with no owner to drain must be refused");
+            let ProcessingError::Rejected(ty, reason) = err else {
+                panic!("a missing owner is a refusal, not a read fault: {err:?}");
+            };
+            assert_eq!(ty, RejectionType::InvalidState);
+            assert!(
+                reason.contains(&task_ref().to_string()),
+                "the refusal names the task it could not cancel: {reason}"
+            );
+            assert!(
+                reason.contains(&activity_ref().to_string()),
+                "the refusal names the owner that is gone: {reason}"
+            );
         }
     }
 }

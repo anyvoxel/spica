@@ -73,7 +73,7 @@ enum DeferredFinish {
 /// (`Assign`/`Output`) and the `Next`/`End` routing the base `complete` step would have run had the
 /// children already drained. Without this the drain hop would close the activity with an unprojected
 /// result and leave the execution parked on a completed state. A projection failure terminates the
-/// activity here — the same policy as the base's `fail_or!`.
+/// activity here — the same policy as the base `complete` step's.
 async fn finish_activity_via_state(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
@@ -105,7 +105,7 @@ async fn finish_activity_via_state(
     };
     let variables = thread.variables.clone();
     if let Err(e) = handler
-        .finish(ctx.env, out, node.clone(), &activity_value, &variables)
+        .finish(ctx.env, out, &activity_value, &variables)
         .await
     {
         tracing::warn!(
@@ -243,11 +243,10 @@ async fn finish_execution(
     }
     match &exec.status {
         ExecutionStatus::Completing => {
-            let output = exec.output.clone().unwrap_or(Default::default());
+            // The row already carries what the finish fixed (`output` was written when it entered
+            // `Completing`), so the terminal advances the stored value rather than re-deriving one.
             let mut completed_execution = exec.value();
-            completed_execution.status = ExecutionStatus::Completed;
-            completed_execution.output = Some(output.clone());
-            completed_execution.meta.with_update_at(ctx.now());
+            completed_execution.complete(ctx.now());
             out.append_event(Event::ExecutionCompleted {
                 execution: completed_execution,
             })

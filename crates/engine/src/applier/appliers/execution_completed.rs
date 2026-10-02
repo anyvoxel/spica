@@ -15,7 +15,7 @@ impl ExecutionCompletedApplier {
     ) -> Result<(), ExecutionError> {
         if let Some(mut exec) = ctx
             .storage
-            .get_execution(&execution.meta.typed_reference())
+            .get_execution(&execution.meta.object_ref())
             .await?
         {
             exec.status = ExecutionStatus::Completed;

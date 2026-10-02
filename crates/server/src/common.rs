@@ -98,12 +98,10 @@ pub(crate) fn to_status(e: ExecutionError) -> Status {
             RejectionType::AlreadyExists => Status::already_exists(reject.rejection_reason),
             RejectionType::NotFound => Status::not_found(reject.rejection_reason),
             RejectionType::InvalidArgument => Status::invalid_argument(reject.rejection_reason),
-            // The remaining types are "wrong state / nothing to do / concurrent conflict" — all
-            // preconditions of the request that are not satisfied, so failed_precondition is the
-            // honest fit (Zeebe INVALID_STATE / STATE_CONFLICT equivalents).
-            RejectionType::InvalidState
-            | RejectionType::NotApplicable
-            | RejectionType::StateConflict => Status::failed_precondition(reject.rejection_reason),
+            // The remaining types are "wrong state / nothing to do" — all preconditions of the
+            // request that are not satisfied, so failed_precondition is the honest fit (Zeebe
+            // INVALID_STATE).
+            RejectionType::InvalidState => Status::failed_precondition(reject.rejection_reason),
             RejectionType::ProcessingError => Status::internal(reject.rejection_reason),
         },
         // A runtime/domain failure. Structural faults the caller can fix (a bad definition, a
@@ -151,14 +149,11 @@ mod tests {
             to_status(rejected(RejectionType::InvalidArgument)).code(),
             Code::InvalidArgument
         );
-        // Wrong-state / conflict class → failed_precondition, not a masked INTERNAL.
-        for kind in [
-            RejectionType::InvalidState,
-            RejectionType::NotApplicable,
-            RejectionType::StateConflict,
-        ] {
-            assert_eq!(to_status(rejected(kind)).code(), Code::FailedPrecondition);
-        }
+        // Wrong-state class → failed_precondition, not a masked INTERNAL.
+        assert_eq!(
+            to_status(rejected(RejectionType::InvalidState)).code(),
+            Code::FailedPrecondition
+        );
         assert_eq!(
             to_status(rejected(RejectionType::ProcessingError)).code(),
             Code::Internal

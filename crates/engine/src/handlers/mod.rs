@@ -1,33 +1,3 @@
-/// Evaluate `$expr` (a `Result`); on `Ok` yield the value, on `Err` emit the failure to `$out`
-/// (`TerminateState` for `$activity` if `Some`, plus the scope termination of `$scope`) and
-/// `return`. The failure path always goes through `Collector::terminate` so a failing site records
-/// its own outcome cohesively before the lifecycle cascade unwinds.
-///
-/// Two forms, because the failure arm has to return the *caller's* type: the plain form belongs to a
-/// helper whose caller owns the outcome (the state terminated in-band, so the helper returns `()`),
-/// while `result` belongs to a handler's own dispatch body, which ends by telling the leader it
-/// produced no outcome.
-macro_rules! fail_or {
-    (result, $out:expr, $activity:expr, $scope:expr, $expr:expr) => {
-        match $expr {
-            Ok(v) => v,
-            Err(e) => {
-                $out.terminate($activity, $scope, e);
-                return Ok(());
-            }
-        }
-    };
-    ($out:expr, $activity:expr, $scope:expr, $expr:expr) => {
-        match $expr {
-            Ok(v) => v,
-            Err(e) => {
-                $out.terminate($activity, $scope, e);
-                return;
-            }
-        }
-    };
-}
-
 mod activate_state;
 mod activate_task;
 mod cancel_task;
@@ -44,6 +14,8 @@ mod create_execution;
 mod create_flow;
 mod dispatch;
 mod fail_task;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod spawn_thread;
 pub(crate) mod state_handler;
 mod states;
@@ -82,7 +54,8 @@ use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    ActivateState, Command, CompleteThread, TerminateExecution, TerminateThread, TerminationReason,
+    ActivateState, Command, CompleteThread, TerminateExecution, TerminateState, TerminateThread,
+    TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -159,7 +132,7 @@ pub(super) async fn cancel_activity_timers(
         else {
             continue;
         };
-        if t.value.status != crate::TimerStatus::Active {
+        if !t.value.status.is_active() {
             continue; // already terminal — a fired/cancelled timer is no longer a live child.
         }
         let mut timer_value = t.value.clone();
@@ -344,17 +317,21 @@ pub(super) async fn complete_activity(
     .with_error_output(error_output)
     .build();
     let mut local_scope = variables.clone();
-    // A thread is the only thing that can own an activity (the slot's own type), so the owners below
-    // need no `kind` guard.
+    // A thread is the only thing that can own an activity (the slot's own type), so the owner below
+    // needs no `kind` guard.
     let owner = activity_value.meta.owner.clone();
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
-        let evaluated = fail_or!(
-            out,
-            Some(activity.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            env.eval_json(&assign_value, &states, &local_scope)
-        );
+        let evaluated = match env.eval_json(&assign_value, &states, &local_scope) {
+            Ok(evaluated) => evaluated,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return;
+            }
+        };
         match evaluated {
             Value::Object(map) => {
                 if !map.is_empty() {
@@ -369,25 +346,30 @@ pub(super) async fn complete_activity(
                 }
             }
             _ => {
-                out.terminate(
-                    Some(activity.clone()),
-                    Some(OwnerScope::Thread(owner.clone())),
-                    ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                        "Assign must evaluate to a JSON object".to_string(),
-                    )),
-                );
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                            "Assign must evaluate to a JSON object".to_string(),
+                        )),
+                    },
+                }));
                 return;
             }
         }
     }
 
     let output_value = match output {
-        Some(o) => fail_or!(
-            out,
-            Some(activity.clone()),
-            Some(OwnerScope::Thread(owner.clone())),
-            env.eval_json(o, &states, &local_scope)
-        ),
+        Some(o) => match env.eval_json(o, &states, &local_scope) {
+            Ok(output_value) => output_value,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return;
+            }
+        },
         None => raw_result.clone(),
     };
 

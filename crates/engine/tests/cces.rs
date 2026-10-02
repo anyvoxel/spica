@@ -7,13 +7,14 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command, CompleteState,
-    CompleteTask, CreateExecution, CreateFlow, Entry, EntryId, EntryPayload, Event, Execution,
-    ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated,
-    FlowName, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, HasRawObjectRef,
-    InMemoryLogStream, LogStream, ObjectRef, RawObjectRef, RejectionType, RequestId, RetryPolicy,
-    RetryState, RuntimeError, StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted,
-    TaskFailed, TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState,
+    ActivateState, ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command,
+    CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
+    Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
+    ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus, FlowVersion,
+    FlowVersionCreated, FlowVersionKind, HasRawObjectRef, InMemoryLogStream, LogStream, ObjectRef,
+    RawObjectRef, RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError, SpawnThread,
+    StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted, TaskFailed, TaskKind,
+    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
     TerminationReason, Thread, ThreadKind, ThreadOwner, ThreadStatus, Timer, TimerKind, TimerOwner,
     TimerPurpose, TimerStatus, Timestamp, Variables, VariablesAssigned,
 };
@@ -25,7 +26,7 @@ fn parse_sm(definition: &str) -> StateMachine {
     serde_json::from_str(definition).expect("state machine should parse")
 }
 
-/// Build a distinct execution reference shaped exactly like `Execution::reference()` (the generated
+/// Build a distinct execution reference shaped exactly like `meta.raw_object_ref()` (the generated
 /// `obj-<uid>` name + uid), so an in-memory storage round-trips by reference. The type carries the
 /// kind, so a fixture handed to a flat-address read says `.as_raw_object_ref()` itself.
 fn exec_ref() -> spica_engine::ObjectRef<ExecutionKind> {
@@ -38,7 +39,7 @@ fn exec_ref() -> spica_engine::ObjectRef<ExecutionKind> {
     )
 }
 
-/// Build a distinct activity reference shaped exactly like `Activity::reference()` (the generated
+/// Build a distinct activity reference shaped exactly like `meta.raw_object_ref()` (the generated
 /// `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
 fn act_ref() -> spica_engine::ObjectRef<ActivityKind> {
     let uid: ulid::Ulid = ulid::Ulid::new();
@@ -50,7 +51,7 @@ fn act_ref() -> spica_engine::ObjectRef<ActivityKind> {
     )
 }
 
-/// Build the task reference for a task's raw id, shaped exactly like `Task::reference()` (the
+/// Build the task reference for a task's raw id, shaped exactly like `meta.raw_object_ref()` (the
 /// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
 fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectRef<TaskKind> {
     let uid: ulid::Ulid = task;
@@ -62,7 +63,7 @@ fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectRef<TaskKind> {
     )
 }
 
-/// Build the timer reference for a timer's raw id, shaped exactly like `Timer::reference()` (the
+/// Build the timer reference for a timer's raw id, shaped exactly like `meta.raw_object_ref()` (the
 /// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
 fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectRef<TimerKind> {
     spica_engine::ObjectRef::new(
@@ -70,6 +71,17 @@ fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectRef<TimerKind> {
             .expect("static literal is a valid segment")
             .generated_from_key(timer.0 as u64),
         timer,
+    )
+}
+
+/// Build the thread reference for a thread's raw id, shaped exactly like `meta.raw_object_ref()` (the
+/// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
+fn thread_ref(thread: ulid::Ulid) -> spica_engine::ObjectRef<ThreadKind> {
+    spica_engine::ObjectRef::new(
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(thread.0 as u64),
+        thread,
     )
 }
 
@@ -211,9 +223,9 @@ impl TimerSink for AppendingSink {
 fn apply_event_to_scheduler(scheduler: &std::sync::Arc<InMemoryScheduler>, event: &Event) {
     match event {
         Event::TimerActivated { timer } => {
-            scheduler.schedule(&timer.meta.typed_reference(), timer.deadline);
+            scheduler.schedule(&timer.meta.object_ref(), timer.deadline);
         }
-        Event::TimerCancelled { timer } => scheduler.cancel(&timer.meta.typed_reference()),
+        Event::TimerCancelled { timer } => scheduler.cancel(&timer.meta.object_ref()),
         _ => {}
     }
 }
@@ -1020,7 +1032,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             )
             .with_owner(ThreadOwner::Execution(exec.clone())),
     };
-    let root_thread_ref = root_thread.meta.reference();
+    let root_thread_ref = root_thread.meta.raw_object_ref();
     let thread = Thread {
         execution: exec.clone(),
         state_path: jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
@@ -1035,7 +1047,7 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             .at(spica_engine::Timestamp::from_millis(0))
             .with_owner(ThreadOwner::Activity(activity.clone())),
     };
-    let thread_ref = thread.meta.reference();
+    let thread_ref = thread.meta.raw_object_ref();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
 
@@ -1190,7 +1202,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
             )
             .with_owner(ThreadOwner::Execution(exec.clone())),
     };
-    let root_thread_ref = root_thread.meta.reference();
+    let root_thread_ref = root_thread.meta.raw_object_ref();
 
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -1343,13 +1355,14 @@ async fn terminate_execution_cancels_wait_and_drains() {
     assert!(exec.active_children.is_empty(), "execution fully drained");
 }
 
-// ── Race guard: a late TriggerTimer after a cancel must be a no-op ──────────
+// ── Race guard: a late TriggerTimer after a cancel must be refused ──────────
 
 #[tokio::test]
-async fn late_trigger_timer_after_cancel_is_noop() {
+async fn late_trigger_timer_after_cancel_is_refused() {
     // An armed timer is cancelled in storage first; then a stale TriggerTimer arrives (a fire
-    // that was already in flight). The handler must see the timer's terminal state and emit
-    // nothing — no TimerTriggered, no TerminateExecution.
+    // that was already in flight). The handler must see the timer's terminal state and act on
+    // nothing — no TimerTriggered, no TerminateExecution — recording the refusal instead, so the
+    // durable log explains why the deadline went unenforced.
     let timer = ulid::Ulid::new();
     let exec = exec_ref();
     // The payload type isn't pinned by later use here (the log is only constructed then dropped),
@@ -1407,11 +1420,249 @@ async fn late_trigger_timer_after_cancel_is_noop() {
         )
         .await
         .unwrap();
+    let rejects: Vec<_> = out
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a stale TriggerTimer owes exactly one Reject and nothing else: {out:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a timer already past Active is the wrong-state case, not a missing row: {out:?}"
+    );
     assert!(
-        out.is_empty(),
-        "a stale TriggerTimer must produce no entries: {out:?}"
+        !out.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TimerTriggered { .. })
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a refused fire must neither fire the timer nor terminate its run: {out:?}"
     );
     drop(logstream);
+}
+
+/// A `TriggerTimer` naming a timer that does not exist is refused rather than dropped silently. The row
+/// is written by the batch that arms the timer and the scheduler only fires it once that batch is
+/// durable, so a miss is the log and the projection disagreeing — the command's own precondition, and
+/// the one entry it owes either way.
+#[tokio::test]
+async fn trigger_timer_without_a_row_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::TriggerTimer {
+            timer: timer_ref(ulid::Ulid::new()),
+        },
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a fire for a timer that does not exist still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing timer row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::TimerTriggered { .. })
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a refused fire must neither fire the timer nor terminate its run: {entries:?}"
+    );
+}
+
+/// A `TerminateThread` naming a thread that does not exist is refused rather than dropped silently: a
+/// thread row is written by the batch that creates it, before anything could name it in a sweep, and
+/// nothing ever removes a row — so a miss is the log and the projection disagreeing, not a teardown that
+/// arrived after its thread was gone.
+#[tokio::test]
+async fn terminate_thread_without_a_row_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::TerminateThread(TerminateThread {
+            thread: thread_ref(ulid::Ulid::new()),
+            reason: TerminationReason::Cancelled,
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a sweep for a thread that does not exist still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing thread row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::ThreadTerminating { .. })
+                | EntryPayload::Event(Event::ThreadTerminated { .. })
+        )),
+        "a refused sweep must not open or close a termination for the row that is gone: {entries:?}"
+    );
+}
+
+/// A `CompleteThread` naming a thread that does not exist is refused rather than dropped silently: a
+/// thread row is written by the batch that creates it, before anything could complete it, and nothing
+/// ever removes a row — so a miss is the log and the projection disagreeing, not a finish that arrived
+/// after its thread was gone.
+#[tokio::test]
+async fn complete_thread_without_a_row_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteThread(CompleteThread {
+            thread: thread_ref(ulid::Ulid::new()),
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a finish for a thread that does not exist still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing thread row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::ThreadCompleting { .. })
+                | EntryPayload::Event(Event::ThreadCompleted { .. })
+        )),
+        "a refused finish must not open or close a completion for the row that is gone: {entries:?}"
+    );
+}
+
+/// A thread that has already left `Running` — here one torn down by its container's sweep — is refused
+/// rather than dropped: the success finish's intent is already satisfied, but the durable log should
+/// say the second arrival was a duplicate instead of leaving it indistinguishable from one that
+/// applied.
+#[tokio::test]
+async fn complete_thread_for_a_thread_already_past_running_is_refused() {
+    let mut storage = InMemoryStorage::new();
+    let thread = thread_ref(ulid::Ulid::new());
+    seed_thread_owned_by_execution_at(
+        &mut storage,
+        thread.clone(),
+        exec_ref(),
+        ThreadStatus::Terminating(TerminationReason::Cancelled),
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteThread(CompleteThread {
+            thread,
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a duplicate finish still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a thread past Running is the wrong state, not a missing one: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::ThreadCompleting { .. })
+                | EntryPayload::Event(Event::ThreadCompleted { .. })
+        )),
+        "a refused duplicate must not re-open a completion for a thread already finishing: {entries:?}"
+    );
+}
+
+/// A `TerminateState` naming an activity that does not exist is refused rather than dropped silently: an
+/// activity row is written by the batch that activates it, before any sweep could name it, and nothing
+/// ever removes a row — so a miss is the log and the projection disagreeing, not a teardown that arrived
+/// after its activity was gone.
+#[tokio::test]
+async fn terminate_state_without_a_row_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::TerminateState(TerminateState {
+            activity: act_ref(),
+            reason: TerminationReason::Cancelled,
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a teardown for an activity that does not exist still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing activity row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateTerminating { .. })
+                | EntryPayload::Event(Event::StateTerminated { .. })
+        )),
+        "a refused teardown must not open or close a termination for the row that is gone: {entries:?}"
+    );
 }
 
 // ── Race guard: a cancel racing a Wait's timer fire must still drain ─────────
@@ -1443,7 +1694,7 @@ async fn terminating_wait_drains_when_its_timer_fires_first() {
             )
             .with_owner(ThreadOwner::Execution(exec.clone())),
     };
-    let thread_ref = thread.meta.reference();
+    let thread_ref = thread.meta.raw_object_ref();
 
     // The refused `CompleteState` still resolves the owning scope's machine before it can reject, so
     // the definition the activity's `state_path` points into must be resolvable from storage.
@@ -1755,7 +2006,7 @@ async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
             )
             .with_owner(ThreadOwner::Execution(exec.clone())),
     };
-    let thread_ref = thread.meta.reference();
+    let thread_ref = thread.meta.raw_object_ref();
 
     let mut storage = InMemoryStorage::new();
     let revision = seed_revision(
@@ -1897,7 +2148,7 @@ async fn deferred_complete_drains_through_the_states_own_finish() {
             )
             .with_owner(ThreadOwner::Execution(exec.clone())),
     };
-    let thread_ref = thread.meta.reference();
+    let thread_ref = thread.meta.raw_object_ref();
 
     let mut storage = InMemoryStorage::new();
     let revision = seed_revision(
@@ -2334,7 +2585,7 @@ async fn terminate_execution_guards_and_rejects_problems() {
     )
     .await;
 
-    // (a) uid mismatch → a single StateConflict Reject, never a termination.
+    // (a) uid mismatch → a single InvalidState Reject, never a termination.
     let entries = processor
         .dispatch(
             &Command::TerminateExecution(TerminateExecution {
@@ -2356,11 +2607,11 @@ async fn terminate_execution_guards_and_rejects_problems() {
         EntryPayload::Reject(r) => {
             assert_eq!(
                 r.rejection_type,
-                RejectionType::StateConflict,
-                "incarnation guard must be StateConflict: {r:?}"
+                RejectionType::InvalidState,
+                "incarnation guard must be InvalidState: {r:?}"
             );
         }
-        other => panic!("expected Reject(StateConflict), got {other:?}"),
+        other => panic!("expected Reject(InvalidState), got {other:?}"),
     }
 
     // (b) unknown name → a single NotFound Reject.
@@ -2809,12 +3060,32 @@ async fn seed_owning_activity(
             .generated_from_key(uid.0 as u64),
         uid,
     );
+    seed_activity_owned_by(storage, activity, common::thread_owner_of(owner)).await;
+}
+
+/// Seed the `Running` activity row named by `activity`, owned by `owner` — the row a settle or a
+/// complete reads to find the scope above it.
+async fn seed_activity_owned_by(
+    storage: &mut InMemoryStorage,
+    activity: spica_engine::ObjectRef<ActivityKind>,
+    owner: ObjectRef<ThreadKind>,
+) {
+    seed_activity_owned_by_at(storage, activity, owner, ActivityStatus::Running).await;
+}
+
+/// The same row with an explicit status, for the cases about an owner that has already left `Running`.
+async fn seed_activity_owned_by_at(
+    storage: &mut InMemoryStorage,
+    activity: spica_engine::ObjectRef<ActivityKind>,
+    owner: ObjectRef<ThreadKind>,
+    status: ActivityStatus,
+) {
     storage
         .put_activity(spica_engine::ActivityRecord {
             value: Activity {
                 execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
                 state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
-                status: ActivityStatus::Running,
+                status,
                 raw_input: json!({ "x": 1 }),
                 input: Some(json!({ "x": 1 })),
                 raw_output: None,
@@ -2823,12 +3094,50 @@ async fn seed_owning_activity(
                 output: None,
                 meta: spica_engine::ObjectMeta::builder(activity.uid())
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(common::thread_owner_of(owner)),
+                    .with_owner(owner),
             },
             active_children: std::collections::HashSet::new(),
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
         })
+        .await
+        .unwrap();
+}
+
+/// Seed the `Running` thread row named by `thread`, bound to `execution` — the row an
+/// `ActivateState` resolves its machine from. The row's meta carries no explicit name, so it keys
+/// under the same generated `child-<uid>` a [`thread_ref`] builds.
+async fn seed_thread_owned_by_execution(
+    storage: &mut InMemoryStorage,
+    thread: ObjectRef<ThreadKind>,
+    execution: ObjectRef<ExecutionKind>,
+) {
+    seed_thread_owned_by_execution_at(storage, thread, execution, ThreadStatus::Running).await;
+}
+
+/// The same row with an explicit status, for the cases about a thread that has already left `Running`.
+async fn seed_thread_owned_by_execution_at(
+    storage: &mut InMemoryStorage,
+    thread: ObjectRef<ThreadKind>,
+    execution: ObjectRef<ExecutionKind>,
+    status: ThreadStatus,
+) {
+    storage
+        .put_thread(spica_engine::ThreadRecord::from_value(
+            Thread {
+                meta: spica_engine::ObjectMeta::builder(thread.uid())
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .with_owner(ThreadOwner::Execution(execution.clone())),
+                execution,
+                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+                start_at: "S".into(),
+                index: 0,
+                status,
+                input: json!({}),
+                output: None,
+            },
+            std::collections::HashSet::new(),
+        ))
         .await
         .unwrap();
 }
@@ -2919,7 +3228,7 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
             _ => None,
         })
         .flatten()
-        .map(|t| (t.meta.reference().uid, &t.status, &t.worker_id))
+        .map(|t| (t.meta.raw_object_ref().uid, &t.status, &t.worker_id))
         .collect();
     // Exactly the two `Pending` tasks of `resource "r"` are leased to w2; the live lease, the settled,
     // the cancelled and the foreign-resource tasks are untouched.
@@ -3099,8 +3408,9 @@ async fn complete_by_foreign_worker_is_rejected() {
     )
     .await;
     // A foreign worker's complete is a request/response refusal: the hander emits a `Reject`
-    // (StateConflict — the task is leased to another worker) so the awaiting worker learns why, rather
-    // than a silent no-op leaving it to hang on an unmatchable ack.
+    // (InvalidState — the task is leased to another worker, so the reporter's handle on it is stale)
+    // so the awaiting worker learns why, rather than a silent no-op leaving it to hang on an
+    // unmatchable ack.
     let rejects: Vec<_> = entries
         .iter()
         .filter_map(|e| match &e.payload {
@@ -3115,7 +3425,7 @@ async fn complete_by_foreign_worker_is_rejected() {
     );
     assert_eq!(
         rejects[0].rejection_type,
-        spica_engine::RejectionType::StateConflict
+        spica_engine::RejectionType::InvalidState
     );
 }
 
@@ -3213,8 +3523,8 @@ async fn complete_without_a_live_owning_activity_is_refused() {
     );
     assert_eq!(
         rejects[0].rejection_type,
-        RejectionType::ProcessingError,
-        "an ownerless settle is an internal fault, not a wrong-state refusal"
+        RejectionType::InvalidState,
+        "an ownerless settle is the stale-incarnation case the sibling guards refuse, not an engine fault"
     );
     assert!(
         !entries
@@ -3230,17 +3540,681 @@ async fn complete_without_a_live_owning_activity_is_refused() {
     );
 }
 
+/// A `CompleteExecution` naming a row that does not exist is refused, and refused *as* the command's
+/// own precondition: the command is the root thread's relay (`complete_thread`), so it only ever
+/// names a run that exists. Answering it with a termination cascade would fan out a
+/// `TerminateExecution` for the very row that is gone, which that handler refuses in turn — so the
+/// single `Reject` is the whole outcome, and the one followup entry every command owes.
+#[tokio::test]
+async fn complete_execution_without_a_row_is_refused_not_terminated() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteExecution(CompleteExecution {
+            execution: exec_ref(),
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a command whose row is gone still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a gone row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "the refusal must not fan out a termination for the row that is gone: {entries:?}"
+    );
+}
+
+/// A `CompleteExecution` arriving after the run has already decided its outcome is refused, not
+/// swallowed: this relay lost a race to the termination cascade (a cancel, a timeout), so the
+/// command's precondition — a running run to complete — no longer holds. The single `Reject` is the
+/// one followup entry the command owes, and the log's only explanation for why nothing was applied.
+#[tokio::test]
+async fn complete_execution_on_a_finishing_run_is_refused_not_swallowed() {
+    let mut storage = InMemoryStorage::new();
+    let name = spica_engine::ObjectName::plain("swept_run").expect("a valid user name");
+    let uid: ulid::Ulid = ulid::Ulid::new();
+    seed_named_execution(
+        &mut storage,
+        name.clone(),
+        uid,
+        ExecutionStatus::Terminating(TerminationReason::Cancelled),
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteExecution(CompleteExecution {
+            execution: ObjectRef::<ExecutionKind>::new(name, uid),
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a relay onto a finishing run still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a run that already decided its outcome is a wrong-state refusal: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::ExecutionCompleting { .. })
+        )),
+        "a refused relay must not re-open a run that is already finishing: {entries:?}"
+    );
+}
+
+/// A `CompleteState` naming an activity that does not exist is refused, and refused *as* the command's
+/// own precondition: the row is born in the same batch as its activation and nothing removes it, so a
+/// miss means the command was forged or the projection is corrupt. Terminating a missing row is not an
+/// answer — `TerminateState` no-ops on one, and no scope is resolvable to fail either — so the single
+/// `Reject` is the whole outcome, and the one followup entry every command owes.
+#[tokio::test]
+async fn complete_state_without_a_row_is_refused_not_terminated() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity: act_ref(),
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a command whose row is gone still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a gone row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateState(_))
+        )),
+        "the refusal must not fan out a termination for the row that is gone: {entries:?}"
+    );
+}
+
+/// The same judgement one hop out: the activity row exists but the thread its owner slot names does
+/// not. Rows are never removed, so the pair is a corrupt projection or a forged command — refused as
+/// the command's own precondition. Answering it with silence would leave the command with no entry at
+/// all *and* no state handler to pick from, since resolving the machine is what needs the thread.
+#[tokio::test]
+async fn complete_state_without_its_owning_thread_is_refused_not_swallowed() {
+    let mut storage = InMemoryStorage::new();
+    // The seeded activity's owner is a throwaway thread that is never written, which is exactly the
+    // shape under test. One ref, bound once: `act_ref()` mints a fresh uid per call, so seeding with
+    // one and dispatching with another would address two different rows and pin the miss one hop too
+    // early.
+    let activity = act_ref();
+    seed_owning_activity(&mut storage, activity.clone()).await;
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity,
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a command whose owning scope is gone still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing owning thread is the command's own precondition: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateCompleting { .. })
+        )),
+        "no finish may open for an activity whose owner cannot be resolved: {entries:?}"
+    );
+}
+
+/// A `SpawnThread` whose owning container activity does not exist is refused rather than dropped
+/// silently: the owner row is written in the same batch as the fan-out and nothing ever removes a
+/// row, so a miss means the command was forged or the projection is corrupt — the command's own
+/// precondition, and the one entry it owes either way.
+#[tokio::test]
+async fn spawn_thread_without_its_owner_activity_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::SpawnThread(SpawnThread {
+            owner: act_ref(),
+            execution: exec_ref(),
+            state_path: Some(
+                jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
+                    .unwrap()
+                    .into(),
+            ),
+            index: 0,
+            start_at: "S".into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a fan-out with no container to fan under still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a gone owner is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::ThreadCreated { .. }))),
+        "no child may be created under an owner that does not exist: {entries:?}"
+    );
+}
+
+/// One hop past the miss: the owner row is there, but it has already left `Running` (here: a container
+/// drained by an outer cancel). A fan-out is only ever emitted while its container is `Running` and
+/// commands are dispatched in append order, so this pair is the log and the projection disagreeing —
+/// refused, not dropped silently the way a late branch would be.
+#[tokio::test]
+async fn spawn_thread_whose_owner_is_no_longer_running_is_refused_not_dropped() {
+    let mut storage = InMemoryStorage::new();
+    // The owning thread is written too, so the status is the only thing that can account for the
+    // refusal — the guard under test precedes every use of the thread below.
+    let thread_uid: ulid::Ulid = ulid::Ulid::new();
+    let thread_ref = ObjectRef::<ThreadKind>::new(
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(thread_uid.0 as u64),
+        thread_uid,
+    );
+    storage
+        .put_thread(spica_engine::ThreadRecord::from_value(
+            Thread {
+                meta: spica_engine::ObjectMeta::builder(thread_uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .with_owner(ThreadOwner::Execution(exec_ref())),
+                execution: exec_ref(),
+                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+                start_at: "S".into(),
+                index: 0,
+                status: ThreadStatus::Running,
+                input: json!({}),
+                output: None,
+            },
+            std::collections::HashSet::new(),
+        ))
+        .await
+        .unwrap();
+    // One ref, bound once: `act_ref()` mints a fresh uid per call, and the row seeded below is what the
+    // command must name for the guard under test to be the thing that refuses.
+    let activity = act_ref();
+    seed_activity_owned_by_at(
+        &mut storage,
+        activity.clone(),
+        thread_ref,
+        ActivityStatus::Terminated(TerminationReason::Cancelled),
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::SpawnThread(SpawnThread {
+            owner: activity,
+            execution: exec_ref(),
+            state_path: Some(
+                jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
+                    .unwrap()
+                    .into(),
+            ),
+            index: 0,
+            start_at: "S".into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a fan-out into a container that is gone still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a container that left Running is the wrong-state case, not a missing row: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::ThreadCreated { .. }))),
+        "no child may be created under a container that is no longer Running: {entries:?}"
+    );
+}
+
+/// One hop past that: the owner row is there and still `Running`, but the thread its owner slot names is
+/// not. Nothing removes a row, and that slot is written in the batch that births the activity, so the
+/// pair is the log and the projection disagreeing — refused, not dropped silently.
+#[tokio::test]
+async fn spawn_thread_without_its_owning_thread_is_refused_not_dropped() {
+    let mut storage = InMemoryStorage::new();
+    // The activity's owner is a thread that is never written, which is exactly the shape under test.
+    // One ref, bound once: `act_ref()` mints a fresh uid per call, so seeding with one and dispatching
+    // with another would pin the miss one hop too early.
+    let activity = act_ref();
+    let thread_uid: ulid::Ulid = ulid::Ulid::new();
+    let thread_ref = ObjectRef::<ThreadKind>::new(
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(thread_uid.0 as u64),
+        thread_uid,
+    );
+    seed_activity_owned_by(&mut storage, activity.clone(), thread_ref).await;
+    let entries = dispatch_command(
+        &storage,
+        Command::SpawnThread(SpawnThread {
+            owner: activity,
+            execution: exec_ref(),
+            state_path: Some(
+                jsonptr::PointerBuf::parse("/States/P/Branches/0/States")
+                    .unwrap()
+                    .into(),
+            ),
+            index: 0,
+            start_at: "S".into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a fan-out whose tree cannot be resolved still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "an activity naming a thread that does not exist is the command's own precondition: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::ThreadCreated { .. }))),
+        "no child may be created under an owner whose tree cannot be resolved: {entries:?}"
+    );
+}
+
+/// One hop past the misses, the machine itself fails to resolve: the owning thread exists, but the run
+/// it belongs to never does. The command may still be perfectly valid, so the run is refused rather
+/// than terminated — terminating would kill it for a context failure it did not cause, and the single
+/// `Reject` is the entry the command owes either way.
+#[tokio::test]
+async fn complete_state_whose_machine_cannot_resolve_is_refused_not_terminated() {
+    let mut storage = InMemoryStorage::new();
+    // One ref, bound once: `act_ref()` mints a fresh uid per call, so seeding with one and dispatching
+    // with another would address two different rows and make the activity miss, not the machine, the
+    // failure under test.
+    let activity = act_ref();
+    let root: ulid::Ulid = ulid::Ulid::new();
+    let exec = ObjectRef::<ExecutionKind>::new(
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(root.0 as u64),
+        root,
+    );
+    let thread_uid: ulid::Ulid = ulid::Ulid::new();
+    let thread_ref = ObjectRef::<ThreadKind>::new(
+        spica_engine::PlainName::new("child")
+            .expect("static literal is a valid segment")
+            .generated_from_key(thread_uid.0 as u64),
+        thread_uid,
+    );
+    // The thread row is written but the execution it names is not: resolving the machine reads that
+    // execution for the tree's shared flow version, so this is where the failure surfaces.
+    storage
+        .put_thread(spica_engine::ThreadRecord::from_value(
+            Thread {
+                meta: spica_engine::ObjectMeta::builder(thread_uid)
+                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                    .with_owner(ThreadOwner::Execution(exec.clone())),
+                execution: exec,
+                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+                start_at: "S".into(),
+                index: 0,
+                status: ThreadStatus::Running,
+                input: json!({}),
+                output: None,
+            },
+            std::collections::HashSet::new(),
+        ))
+        .await
+        .unwrap();
+    seed_activity_owned_by(&mut storage, activity.clone(), thread_ref).await;
+    let entries = dispatch_command(
+        &storage,
+        Command::CompleteState(CompleteState {
+            activity,
+            output: json!({ "ok": true }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a command whose machine cannot be resolved still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "an unresolvable machine is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateState(_))
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a context failure must not terminate a run that did nothing wrong: {entries:?}"
+    );
+}
+
+/// An `ActivateState` whose owning thread does not exist is refused, not answered by terminating the
+/// whole run: the command may be perfectly valid, and nothing has been persisted to attach a
+/// state-level terminate to. Rows are never removed and a thread row is written by the batch that
+/// creates it — before anything could emit an activation into it — so the miss is the log and the
+/// projection disagreeing: the command's own precondition.
+#[tokio::test]
+async fn activate_state_without_its_owning_thread_is_refused_not_terminated() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::ActivateState(ActivateState {
+            execution: exec_ref(),
+            owner: thread_ref(ulid::Ulid::new()),
+            state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "an activation with no owning thread still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing owning thread is the command's own precondition: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateState(_))
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a context failure must not terminate a run that did nothing wrong: {entries:?}"
+    );
+}
+
+/// A thread that exists but has already left `Running` cannot take a new activation. Nothing is in
+/// flight that the command would duplicate, so it is not a duplicate to swallow: it names the wrong
+/// incarnation — the thread already had its outcome opened — and is refused on the same footing as the
+/// sibling handlers' non-Running guards.
+#[tokio::test]
+async fn activate_state_on_a_thread_past_running_is_refused() {
+    let mut storage = InMemoryStorage::new();
+    let execution = exec_ref();
+    let thread = thread_ref(ulid::Ulid::new());
+    seed_thread_owned_by_execution_at(
+        &mut storage,
+        thread.clone(),
+        execution.clone(),
+        ThreadStatus::Completed,
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::ActivateState(ActivateState {
+            execution,
+            owner: thread,
+            state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "an activation on a settled thread owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a thread past Running names the wrong incarnation: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateState(_))
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a command on a thread that already settled must not terminate the run: {entries:?}"
+    );
+}
+
+/// The same judgement one hop out: the thread row exists but the run it belongs to never does, so the
+/// machine cannot resolve. Still the command's precondition, still refused rather than terminated.
+#[tokio::test]
+async fn activate_state_whose_machine_cannot_resolve_is_refused_not_terminated() {
+    let mut storage = InMemoryStorage::new();
+    // The thread row names an execution that is never written; resolving the machine reads that
+    // execution for the tree's shared flow version, so this is where the failure surfaces.
+    let thread = thread_ref(ulid::Ulid::new());
+    seed_thread_owned_by_execution(&mut storage, thread.clone(), exec_ref()).await;
+    let entries = dispatch_command(
+        &storage,
+        Command::ActivateState(ActivateState {
+            execution: exec_ref(),
+            owner: thread,
+            state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "an unresolvable machine still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "an unresolvable machine is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Command(Command::TerminateState(_))
+                | EntryPayload::Command(Command::TerminateExecution(_))
+        )),
+        "a context failure must not terminate a run that did nothing wrong: {entries:?}"
+    );
+}
+
+/// A resolvable machine that does not define the state being entered — what an unchecked successor
+/// path (`Next`/`StartAt` naming no reachable state) looks like from here. Refused on the same
+/// footing as the two misses above, so the durable log names the bad path instead of an activation
+/// that could not proceed.
+#[tokio::test]
+async fn activate_state_naming_a_state_its_machine_does_not_define_is_refused() {
+    let mut storage = InMemoryStorage::new();
+    let sm = parse_sm(r#"{ "StartAt": "S", "States": { "S": { "Type": "Succeed" } } }"#);
+    let flow_version = seed_revision(&mut storage, sm).await;
+    let execution = exec_ref();
+    storage
+        .put_execution(spica_engine::ExecutionRecord {
+            value: Execution {
+                deadline: None,
+                flow_version,
+                status: ExecutionStatus::Running,
+                input: Value::Null,
+                output: None,
+                meta: spica_engine::ObjectMeta::builder(execution.uid())
+                    .at(Timestamp::from_millis(0))
+                    .with_owner(spica_engine::NoOwner::new()),
+            },
+            active_children: std::collections::HashSet::new(),
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        })
+        .await
+        .unwrap();
+    let thread = thread_ref(ulid::Ulid::new());
+    seed_thread_owned_by_execution(&mut storage, thread.clone(), execution.clone()).await;
+    let entries = dispatch_command(
+        &storage,
+        Command::ActivateState(ActivateState {
+            execution,
+            owner: thread,
+            state_path: jsonptr::PointerBuf::parse("/States/NoSuchState")
+                .unwrap()
+                .into(),
+            input: json!({}),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a state the machine does not define still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a successor path naming no state is the command's own precondition: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(
+            &e.payload,
+            EntryPayload::Event(Event::StateActivating { .. })
+        )),
+        "no activity may be minted for a state that does not exist: {entries:?}"
+    );
+}
+
 #[tokio::test]
 async fn late_complete_after_steal_or_cancel_is_refused() {
     let mut storage = InMemoryStorage::new();
-    // A helper asserting that a settle on a task not currently Running *for* the reporting worker is
-    // refused with a single `Reject` of the expected kind (the request/response delivery), never a
-    // silent no-op — the reporting worker is told why.
-    async fn assert_refused(
-        storage: &InMemoryStorage,
-        task: ulid::Ulid,
-        expected: spica_engine::RejectionType,
-    ) {
+    // A helper asserting that a settle on a task this worker does not hold is refused with a single
+    // `Reject` (the request/response delivery), never a silent no-op — the reporting worker is told
+    // why. Every case here shares the one `InvalidState` classification, so the *reason* is what has
+    // to tell them apart: asserting only the type would still pass if the handler collapsed the
+    // ownership check into the status check.
+    async fn assert_refused(storage: &InMemoryStorage, task: ulid::Ulid, reason_fragment: &str) {
         let entries = dispatch_command(
             storage,
             Command::CompleteTask(CompleteTask {
@@ -3263,7 +4237,15 @@ async fn late_complete_after_steal_or_cancel_is_refused() {
             1,
             "a settle on a task this worker does not hold must produce exactly one Reject: {entries:?}"
         );
-        assert_eq!(rejects[0].rejection_type, expected);
+        assert_eq!(
+            rejects[0].rejection_type,
+            spica_engine::RejectionType::InvalidState
+        );
+        assert!(
+            rejects[0].rejection_reason.contains(reason_fragment),
+            "the refusal must say why: expected {reason_fragment:?} in {:?}",
+            rejects[0].rejection_reason
+        );
     }
 
     // Stolen by a second worker once the first one's lease lapsed: the task runs for `w2` now, so the
@@ -3277,17 +4259,17 @@ async fn late_complete_after_steal_or_cancel_is_refused() {
         Some(live_lease()),
     )
     .await;
-    assert_refused(&storage, stolen, RejectionType::StateConflict).await;
+    assert_refused(&storage, stolen, "is leased to").await;
 
     // A task no worker ever leased has no leaseholder to accept a settle from.
     let unclaimed = ulid::Ulid::new();
     seed_task(&mut storage, unclaimed, TaskStatus::Pending, None, None).await;
-    assert_refused(&storage, unclaimed, RejectionType::InvalidState).await;
+    assert_refused(&storage, unclaimed, "is not currently Running").await;
 
     // Same for a cancelled task.
     let cancelled = ulid::Ulid::new();
     seed_task(&mut storage, cancelled, TaskStatus::Cancelled, None, None).await;
-    assert_refused(&storage, cancelled, RejectionType::InvalidState).await;
+    assert_refused(&storage, cancelled, "is not currently Running").await;
 }
 
 #[tokio::test]
@@ -3364,11 +4346,106 @@ async fn lapsed_lease_is_reclaimed_by_a_fresh_poll() {
             _ => None,
         })
         .expect("a task whose lease lapsed must be grantable again");
-    assert_eq!(granted.meta.reference().uid, task);
+    assert_eq!(granted.meta.raw_object_ref().uid, task);
     assert_eq!(granted.worker_id.as_deref(), Some("w2"));
     assert!(
         granted.lease_expires_at > Some(Timestamp::from_millis(1000)),
         "the second lease must be a fresh window, not the lapsed one"
+    );
+}
+
+/// A `FailTask` naming a task that does not exist is refused rather than dropped silently: a task row
+/// is written by the batch that activates it and nothing ever removes a row, so a miss is the report
+/// forged into the log or a corrupt projection — the command's own precondition. The report is
+/// fire-and-forget, so the `Reject` is the only account of why it settled nothing.
+#[tokio::test]
+async fn fail_task_without_a_row_is_refused_not_dropped() {
+    let storage = InMemoryStorage::new();
+    let entries = dispatch_command(
+        &storage,
+        Command::FailTask(FailTask {
+            task: task_ref(ulid::Ulid::new()),
+            worker_id: "w1".into(),
+            error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                message: "x".into(),
+            }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a report for a task that does not exist still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::NotFound,
+        "a missing task row is the command's own precondition, not an engine fault: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskFailed(_)))),
+        "a refused report must not settle the row that is gone: {entries:?}"
+    );
+}
+
+/// The second half of the settle-once contract: a task that already settled is refused, so a duplicate
+/// report — or one racing the engine's own `TaskTimeout` backstop — cannot advance the state twice.
+#[tokio::test]
+async fn fail_task_for_an_already_settled_task_is_refused() {
+    let mut storage = InMemoryStorage::new();
+    // Settled by a *different* worker's earlier report: what the duplicate is told apart by is the
+    // terminal status, not the lease, so the reporter here still holds a (stale) lease.
+    let task = ulid::Ulid::new();
+    seed_task(
+        &mut storage,
+        task,
+        TaskStatus::Failed,
+        Some("w1".into()),
+        Some(Timestamp::from_millis(1000)),
+    )
+    .await;
+    let entries = dispatch_command(
+        &storage,
+        Command::FailTask(FailTask {
+            task: task_ref(task),
+            worker_id: "w1".into(),
+            error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                message: "x".into(),
+            }),
+        }),
+    )
+    .await;
+    let rejects: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EntryPayload::Reject(rej) => Some(rej),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejects.len(),
+        1,
+        "a duplicate report still owes exactly one Reject: {entries:?}"
+    );
+    assert_eq!(
+        rejects[0].rejection_type,
+        RejectionType::InvalidState,
+        "a settled task is the wrong state, not a missing one: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskFailed(_)))),
+        "a refused duplicate must not settle the task a second time: {entries:?}"
     );
 }
 
@@ -3396,9 +4473,26 @@ async fn fail_settlement_requires_lease_or_engine_authority() {
         }),
     )
     .await;
+    // Refused, not silently dropped: the report is fire-and-forget, so the `Reject` is the only
+    // account of why a failure reported by a worker that does not hold the lease settled nothing.
+    assert_eq!(
+        entries.len(),
+        1,
+        "a foreign worker's fail owes exactly one response entry: {entries:?}"
+    );
+    match &entries[0].payload {
+        EntryPayload::Reject(reject) => assert_eq!(
+            reject.rejection_type,
+            RejectionType::InvalidState,
+            "a foreign lease is the wrong state, not a missing row: {reject:?}"
+        ),
+        other => panic!("expected a Reject record, got {other:?}"),
+    }
     assert!(
-        entries.is_empty(),
-        "a foreign worker's fail must be a no-op: {entries:?}"
+        !entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskFailed(_)))),
+        "a refused report must not settle the task: {entries:?}"
     );
 
     // The engine-authoritative backstop (empty worker_id, e.g. the TaskTimeout deadline) settles any
@@ -3490,7 +4584,7 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
         .expect("a matching retrier should emit TaskFailed (retry scheduled)");
     // Same task entity reused — no fresh task id, no separate RetryScheduled event.
     assert_eq!(
-        failed.meta.reference(),
+        failed.meta.raw_object_ref(),
         task_ref(task).into_raw_object_ref()
     );
     assert_eq!(

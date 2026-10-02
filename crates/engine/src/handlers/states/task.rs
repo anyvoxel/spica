@@ -7,7 +7,6 @@ use super::super::{cancel_activity_timers, emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext};
 use crate::log::Timestamp;
-use crate::types::activity::ActivityKind;
 use crate::types::command::{ActivateTask, Command, TimerPurpose};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::meta::ObjectRef;
@@ -92,7 +91,7 @@ impl StateHandler for TaskStateHandler<'_> {
             Err(e) => (None, Some(e)),
         };
 
-        let activity = activity_value.meta.typed_reference();
+        let activity = activity_value.meta.object_ref();
         let task_uid = out.mint();
         // The task's reference is minted with a name derived from the owning execution's plain base
         // (finding #13), exactly like the activity (#3) and timer (#11) names — not the opaque
@@ -151,11 +150,11 @@ impl StateHandler for TaskStateHandler<'_> {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        activity: &ObjectRef<ActivityKind>,
-        _activity_value: &Activity,
+        activity_value: &Activity,
     ) -> FinishReadiness {
+        let activity = activity_value.meta.object_ref();
         cancel_activity_timers(ctx, out, activity.clone()).await;
-        match self.live_children(ctx, activity).await {
+        match self.live_children(ctx, &activity).await {
             Some(0) => FinishReadiness::Ready,
             Some(pending) => FinishReadiness::Waiting { pending },
             None => FinishReadiness::Gone,
@@ -239,9 +238,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{
-        ActivateState, TerminateState, TerminateThread, TerminationReason,
-    };
+    use crate::types::command::{ActivateState, TerminateState, TerminationReason};
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::ObjectMeta;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
@@ -306,7 +303,7 @@ mod tests {
                 Some("P2"),
             ),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -346,7 +343,7 @@ mod tests {
         let activated = activate(
             &task_state(None, None, Some("P2")),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -380,7 +377,7 @@ mod tests {
         let activated = activate(
             &task_state(None, Some(0), Some("P2")),
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
 
@@ -398,16 +395,12 @@ mod tests {
         );
         assert_eq!(
             &chain[3..],
-            vec![
-                EntryPayload::Command(Command::TerminateState(TerminateState {
+            vec![EntryPayload::Command(Command::TerminateState(
+                TerminateState {
                     activity: minted_activity_ref(),
                     reason: reason.clone(),
-                })),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
-                })),
-            ]
+                }
+            )),]
         );
     }
 
@@ -423,7 +416,7 @@ mod tests {
         let activated = activate(
             &state,
             &activate_cmd(path("/States/P"), seeded_input()),
-            Some(seeded_scope(ThreadStatus::Running)),
+            seeded_scope(ThreadStatus::Running),
         )
         .await;
         let Dispatch { store, .. } = activated;

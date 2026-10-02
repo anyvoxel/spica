@@ -49,20 +49,17 @@ impl CreateFlowHandler {
         // already validated by `Engine::create_flow`, but a replayed or forged command must not
         // write a definition that `HandlerContext::machine` would later fail to parse. Reads the
         // string, discards the model — the durable record stays the raw string.
+        //
+        // A malformed definition is the *command's* failure, so it is refused: `dispatch_once` turns
+        // the rejection into the command's single response entry — a `Reject` the awaiting caller (and
+        // the log) receives as a definitive `INVALID_ARGUMENT`, and the one `log_reject` traces — so
+        // there is nothing for this site to record itself. This is the Zeebe model: a
+        // well-formed-but-unapplicable command gets a COMMAND_REJECTION, not silence.
         if serde_json::from_str::<spica_asl::StateMachine>(definition).is_err() {
-            // Creating a definition has no execution entity to fail, so a malformed definition
-            // cannot be turned into an execution failure; instead we **reject** the command — emit a
-            // `Reject` record so the awaiting caller (and the log) receive a definitive
-            // `INVALID_ARGUMENT` response rather than a silent no-entry handler return. This is the
-            // Zeebe model: a well-formed-but-unapplicable command gets a COMMAND_REJECTION, not
-            // silence.
-            tracing::warn!(name = %name, "create_flow: rejecting malformed definition");
-            out.reject(
-                *request_id,
+            return Err(ProcessingError::Rejected(
                 RejectionType::InvalidArgument,
                 format!("create_flow: malformed definition for flow {name}"),
-            );
-            return Ok(());
+            ));
         }
 
         // `CreateFlow` creates a **new** flow only. The `Engine` boundary rejects an existing name
@@ -98,6 +95,7 @@ impl CreateFlowHandler {
         // StreamProcessor routes the caller's ack on `FlowVersionCreated` (see `Event::FlowVersionCreated`).
         out.append_event(Event::FlowCreated(FlowCreated {
             request_id: *request_id,
+            // TODO：是不是提供一个 new 函数比较好？
             flow: Flow {
                 // The flow carries its real, user-supplied name (the primary key) plus a fresh
                 // `meta.uid` — every object has an independent incarnation id.
