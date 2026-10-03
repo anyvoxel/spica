@@ -68,9 +68,9 @@ impl FailTaskHandler {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "fail_task: task {} is already {:?}; failure refused",
+                    "fail_task: task {} is already {}; failure refused",
                     act.value.meta.raw_object_ref(),
-                    act.status
+                    act.status.phase()
                 ),
             ));
         }
@@ -93,9 +93,9 @@ impl FailTaskHandler {
                 return Err(ProcessingError::Rejected(
                     RejectionType::InvalidState,
                     format!(
-                        "fail_task: task {} is not leased to {worker_id} (status {:?}, leased to {:?}); report refused",
+                        "fail_task: task {} is not leased to {worker_id} (status {}, leased to {:?}); report refused",
                         act.value.meta.raw_object_ref(),
-                        act.status,
+                        act.status.phase(),
                         act.worker_id
                     ),
                 ));

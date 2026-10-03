@@ -137,6 +137,18 @@ impl TaskStatus {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
         )
     }
+
+    /// The status as one word per variant — what a durable rejection reason may interpolate, so every
+    /// handler's refusal names the same phase the trace line carries rather than the status's `Debug`.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            TaskStatus::Pending => "Pending",
+            TaskStatus::Running => "Running",
+            TaskStatus::Completed => "Completed",
+            TaskStatus::Failed => "Failed",
+            TaskStatus::Cancelled => "Cancelled",
+        }
+    }
 }
 
 /// The [`ObjectKindMarker`] tying a [`Task`]'s meta to [`ObjectKind::Task`].
@@ -238,35 +250,57 @@ impl Task {
         self.retry_state.next_available_at = None;
     }
 
-    /// Mark this task cancelled at `at`: the row copies forward with only the terminal status and
-    /// the transition stamp moved. The delivery lease is deliberately left as it stands — the worker's
-    /// own call is not disturbed by a cancel, and the terminal status is what withholds the task from
-    /// every future poll.
+    /// Move this task to `Cancelled` at `at`: the row copies forward with only the terminal status
+    /// and the transition stamp moved. Only an in-flight task has a cancellation to take, so a settled
+    /// one is **refused** and left untouched — the invariant lives here rather than at each caller, so
+    /// no call site can forget to ask first.
+    ///
+    /// The `Err` is one sentence naming *why* the transition was declined (the object's own state),
+    /// for the caller to fold into its durable rejection reason — the caller alone knows which object
+    /// and which command it is refusing.
+    ///
+    /// The delivery lease is deliberately left as it stands — the worker's own call is not disturbed by
+    /// a cancel, and the terminal status is what withholds the task from every future poll.
     ///
     /// The whole `meta` must travel unchanged. Re-deriving the name from the kind and uid alone would
     /// rename the node, and a task's owner matches the child it holds by name — a renamed task never
     /// drains, so the teardown that cancelled it stalls.
-    pub fn cancel(&mut self, at: Timestamp) {
+    pub fn mark_cancelled(&mut self, at: Timestamp) -> Result<(), String> {
+        if self.status.is_terminal() {
+            return Err(format!(
+                "only an in-flight task can be cancelled, but it is {}",
+                self.status.phase()
+            ));
+        }
         self.status = TaskStatus::Cancelled;
         self.meta.with_update_at(at);
+        Ok(())
     }
 
-    /// Mark this task completed at `at`: the row copies forward with only the terminal status, the
-    /// released lease and the transition stamp moved.
+    /// Move this task to `Completed` at `at`: the row copies forward with only the terminal status, the
+    /// released lease and the transition stamp moved. Only a `Running` (leased) task has a settlement
+    /// to take, so a pending or already settled one is refused and left untouched.
     ///
-    /// The lease is **released here**, unlike [`Self::cancel`]: a cancelled task left the worker's
-    /// call un-answered, so its hold is deliberately left standing, whereas a completed one has
-    /// already answered — nothing is left for the lease to protect, and the terminal status withholds
-    /// the task from every future poll either way.
+    /// The lease is **released here**, unlike [`Self::mark_cancelled`]: a cancelled task left the
+    /// worker's call un-answered, so its hold is deliberately left standing, whereas a completed one
+    /// has already answered — nothing is left for the lease to protect, and the terminal status
+    /// withholds the task from every future poll either way.
     ///
     /// The whole `meta` must travel unchanged. Re-deriving the name from the kind and uid alone would
     /// rename the node, and a task's owner matches the child it holds by name — a renamed task never
     /// drains, so the settle that completed it stalls.
-    pub fn complete(&mut self, at: Timestamp) {
+    pub fn mark_completed(&mut self, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_running() {
+            return Err(format!(
+                "only a Running task can be completed, but it is {}",
+                self.status.phase()
+            ));
+        }
         self.status = TaskStatus::Completed;
         self.worker_id = None;
         self.lease_expires_at = None;
         self.meta.with_update_at(at);
+        Ok(())
     }
 }
 
@@ -397,7 +431,8 @@ mod tests {
         t.lease_expires_at = Some(ts(1_000));
         t.retry_state.attempts = 2;
         let before = t.meta.raw_object_ref();
-        t.cancel(ts(200));
+        t.mark_cancelled(ts(200))
+            .expect("a Running task has a cancel to take");
         assert_eq!(t.status, TaskStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
@@ -418,7 +453,8 @@ mod tests {
         let mut t = at_status(TaskStatus::Running);
         t.claim("w1", ts(1_000), ts(0));
         let before = t.meta.raw_object_ref();
-        t.complete(ts(200));
+        t.mark_completed(ts(200))
+            .expect("a Running task has a settle to take");
 
         assert_eq!(t.status, TaskStatus::Completed);
         assert_eq!(t.worker_id, None, "the settled task is nobody's to hold");
@@ -439,7 +475,8 @@ mod tests {
     fn a_completed_task_is_terminal_and_never_claimable() {
         let mut t = at_status(TaskStatus::Running);
         t.claim("w1", ts(1_000), ts(0));
-        t.complete(ts(200));
+        t.mark_completed(ts(200))
+            .expect("a Running task has a settle to take");
 
         assert!(!t.is_claimable_at(ts(200)));
         assert!(!t.is_claimable_at(ts(10_000)));
@@ -453,13 +490,61 @@ mod tests {
         let mut t = at_status(TaskStatus::Running);
         t.claim("w1", ts(1_000), ts(0));
         assert!(!t.is_claimable_at(ts(999)));
-        t.cancel(ts(200));
+        t.mark_cancelled(ts(200))
+            .expect("a Running task has a cancel to take");
         assert!(t.status.is_terminal());
         assert!(
             !t.is_claimable_at(ts(1_000)),
             "a lapsed lease must not free a cancelled task"
         );
         assert!(!t.is_claimable_at(ts(10_000)));
+    }
+
+    /// A task that already settled has no cancellation to take: the transition is refused and the row
+    /// is left untouched, so a late (or duplicate) `CancelTask` can never rewrite an outcome that
+    /// already landed. Every terminal end is covered — the refusal names the state it found, so the
+    /// three are told apart by the reason alone.
+    #[test]
+    fn a_terminal_task_refuses_to_be_cancelled_and_stays_untouched() {
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut t = at_status(status);
+            let before = t.clone();
+            let reason = t
+                .mark_cancelled(ts(200))
+                .expect_err("a terminal task has no cancel to take");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the task was found in: {reason}"
+            );
+            assert_eq!(t, before, "a refused cancel writes nothing");
+        }
+    }
+
+    /// A settle only lands on a `Running` (leased) task: one still `Pending` was never handed to a
+    /// worker, so it has nothing to settle, and one already terminal has settled. Both are refused and
+    /// left untouched, so the terminal can never be reached without a claim.
+    #[test]
+    fn only_a_running_task_has_a_settle_to_take() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Completed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut t = at_status(status);
+            let before = t.clone();
+            let reason = t
+                .mark_completed(ts(200))
+                .expect_err("only a Running task has a settle to take");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the task was found in: {reason}"
+            );
+            assert_eq!(t, before, "a refused settle writes nothing");
+        }
     }
 
     /// A task's owner slot admits an `Activity` and nothing else: the row reads back with the same

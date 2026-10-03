@@ -48,6 +48,18 @@ impl ThreadStatus {
             ThreadStatus::Running | ThreadStatus::Completing | ThreadStatus::Completed => None,
         }
     }
+    /// The status as one word per variant — what a durable rejection reason may interpolate. `{:?}`
+    /// is unusable there: `Terminating`/`Terminated` carry a nested termination reason, whose `Debug`
+    /// would be embedded in the log's own text.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            ThreadStatus::Running => "Running",
+            ThreadStatus::Completing => "Completing",
+            ThreadStatus::Terminating(_) => "Terminating",
+            ThreadStatus::Completed => "Completed",
+            ThreadStatus::Terminated(_) => "Terminated",
+        }
+    }
 }
 
 /// The [`ObjectKindMarker`] tying a [`Thread`]'s meta to [`ObjectKind::Thread`].

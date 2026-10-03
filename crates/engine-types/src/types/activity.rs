@@ -48,6 +48,18 @@ impl ActivityStatus {
             ActivityStatus::Completed | ActivityStatus::Terminated(_)
         )
     }
+    /// The status as one word per variant — what a durable rejection reason may interpolate. `{:?}`
+    /// is unusable there: `Terminating`/`Terminated` carry a nested termination reason, whose `Debug`
+    /// would be embedded in the log's own text.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            ActivityStatus::Running => "Running",
+            ActivityStatus::Completing => "Completing",
+            ActivityStatus::Terminating(_) => "Terminating",
+            ActivityStatus::Completed => "Completed",
+            ActivityStatus::Terminated(_) => "Terminated",
+        }
+    }
 }
 
 /// The **state-specific runtime repository** of an Activity — data only a container state carries,

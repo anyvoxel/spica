@@ -4261,15 +4261,16 @@ async fn late_complete_after_steal_or_cancel_is_refused() {
     .await;
     assert_refused(&storage, stolen, "is leased to").await;
 
-    // A task no worker ever leased has no leaseholder to accept a settle from.
+    // A task no worker ever leased has no settle to take: the status refuses it before the lease is
+    // ever looked at.
     let unclaimed = ulid::Ulid::new();
     seed_task(&mut storage, unclaimed, TaskStatus::Pending, None, None).await;
-    assert_refused(&storage, unclaimed, "is not currently Running").await;
+    assert_refused(&storage, unclaimed, "but it is Pending").await;
 
     // Same for a cancelled task.
     let cancelled = ulid::Ulid::new();
     seed_task(&mut storage, cancelled, TaskStatus::Cancelled, None, None).await;
-    assert_refused(&storage, cancelled, "is not currently Running").await;
+    assert_refused(&storage, cancelled, "but it is Cancelled").await;
 }
 
 #[tokio::test]

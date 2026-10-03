@@ -67,8 +67,8 @@ impl SpawnThreadHandler {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "spawn_thread: owner activity {owner} is {:?}, not Running; fan-out refused",
-                    owner_activity.status
+                    "spawn_thread: owner activity {owner} is {}, not Running; fan-out refused",
+                    owner_activity.status.phase()
                 ),
             ));
         }
