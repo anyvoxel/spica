@@ -64,8 +64,8 @@ impl TerminateExecutionHandler {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "terminate_execution: execution {name} is {:?}, not running",
-                    exec.status
+                    "terminate_execution: execution {name} is {}, not running",
+                    exec.status.phase()
                 ),
             ));
         }

@@ -24,6 +24,16 @@ impl TimerStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, TimerStatus::Completed | TimerStatus::Cancelled)
     }
+
+    /// The status as one word per variant — what a durable rejection reason may interpolate, so every
+    /// handler's refusal names the same phase the trace line carries rather than the status's `Debug`.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            TimerStatus::Active => "Active",
+            TimerStatus::Completed => "Completed",
+            TimerStatus::Cancelled => "Cancelled",
+        }
+    }
 }
 
 /// The [`ObjectKindMarker`] tying a [`Timer`]'s meta to [`ObjectKind::Timer`].
@@ -64,16 +74,29 @@ pub struct Timer {
 }
 
 impl Timer {
-    /// Mark this timer cancelled at `at`: the row copies forward with only the terminal status and
-    /// the transition stamp moved.
+    /// Move this timer to `Cancelled` at `at`: the row copies forward with only the terminal status
+    /// and the transition stamp moved. Only an `Active` timer has a cancellation to take, so a timer
+    /// that already fired or was cancelled is **refused** — and left untouched; the invariant lives
+    /// here rather than at each caller, so no call site can forget to ask first.
+    ///
+    /// The `Err` is one sentence naming *why* the transition was declined (the object's own state),
+    /// for the caller to fold into its durable rejection reason — the caller alone knows which object
+    /// and which command it is refusing.
     ///
     /// The whole `meta` must travel unchanged. A timer may be custom-named
     /// (`{execution.name}-{suffix}`), and re-deriving that name would address a node its owner never
     /// added as a child — the child edge would then never detach, so the cancelling sweep would leave
     /// the timer live forever.
-    pub fn cancel(&mut self, at: Timestamp) {
+    pub fn mark_cancelled(&mut self, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_active() {
+            return Err(format!(
+                "only an Active timer can be cancelled, but it is {}",
+                self.status.phase()
+            ));
+        }
         self.status = TimerStatus::Cancelled;
         self.meta.with_update_at(at);
+        Ok(())
     }
 }
 
@@ -114,7 +137,7 @@ mod tests {
     fn cancel_moves_only_the_status_and_the_stamp() {
         let mut t = active_timer();
         let before = t.meta.raw_object_ref();
-        t.cancel(ts(200));
+        t.mark_cancelled(ts(200)).expect("an active timer cancels");
         assert_eq!(t.status, TimerStatus::Cancelled);
         assert_eq!(t.meta.created_at, ts(0));
         assert_eq!(t.meta.updated_at, ts(200));
@@ -161,15 +184,23 @@ mod tests {
         assert!(msg.contains("admits only Execution or Activity"), "{msg}");
     }
 
-    /// Cancelling an already-cancelled timer is a stamp-only write, never a resurrection — the
-    /// handlers guard on `is_active` before they get here, and this is what that guard protects.
+    /// A timer past `Active` refuses the transition and is left exactly as it was — a fired timer is
+    /// never rewritten into a cancelled one, and a second cancel never re-stamps. This is the guard
+    /// the handlers used to keep before calling: it lives on the type now, so no call site can skip it.
     #[test]
-    fn a_cancelled_timer_stays_terminal_however_often_it_is_cancelled() {
-        let mut t = active_timer();
-        t.cancel(ts(200));
-        t.cancel(ts(300));
-        assert_eq!(t.status, TimerStatus::Cancelled);
-        assert_eq!(t.meta.updated_at, ts(300), "the later cancel re-stamps");
-        assert!(t.status.is_terminal() && !t.status.is_active());
+    fn a_terminal_timer_refuses_to_be_cancelled_and_stays_untouched() {
+        for status in [TimerStatus::Cancelled, TimerStatus::Completed] {
+            let mut t = active_timer();
+            t.status = status;
+            let before = t.clone();
+            let reason = t
+                .mark_cancelled(ts(300))
+                .expect_err("a terminal timer has no cancellation to take");
+            assert!(
+                reason.contains(status.phase()),
+                "the reason names the state the timer was found in: {reason}"
+            );
+            assert_eq!(t, before, "a refused cancel writes nothing");
+        }
     }
 }

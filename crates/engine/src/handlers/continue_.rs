@@ -246,7 +246,11 @@ async fn finish_execution(
             // The row already carries what the finish fixed (`output` was written when it entered
             // `Completing`), so the terminal advances the stored value rather than re-deriving one.
             let mut completed_execution = exec.value();
-            completed_execution.complete(ctx.now());
+            // The arm is the transition's own precondition, so this can only decline if the row moved
+            // under the read above — a race this hop answers with nothing, exactly as a missing row.
+            if completed_execution.mark_completed(ctx.now()).is_err() {
+                return Ok(());
+            }
             out.append_event(Event::ExecutionCompleted {
                 execution: completed_execution,
             })

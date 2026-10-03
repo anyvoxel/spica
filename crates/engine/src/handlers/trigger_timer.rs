@@ -47,8 +47,8 @@ impl TriggerTimerHandler {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "trigger_timer: timer {timer} is {:?}, not Active; fire refused",
-                    act.value.status
+                    "trigger_timer: timer {timer} is {}, not Active; fire refused",
+                    act.value.status.phase()
                 ),
             ));
         }

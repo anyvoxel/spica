@@ -44,6 +44,16 @@ impl CancelTaskHandler {
                 format!("task {task} not found; cancel dropped"),
             ));
         };
+        // The transition owns its own precondition: a task that already settled (or was already
+        // cancelled) has no cancellation to take, and is left untouched rather than rewritten into a
+        // cancelled one. Checked before the owner read below — this refusal needs nothing but the row
+        // already in hand.
+        if let Err(reason) = task_value.mark_cancelled(ctx.now()) {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("task {task} cannot be cancelled: {reason}"),
+            ));
+        }
         let owner = task_value.meta.owner.clone();
         let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await? else {
             return Err(ProcessingError::Rejected(
@@ -51,7 +61,6 @@ impl CancelTaskHandler {
                 format!("task {task} has no live activity owner {owner}; cancel refused"),
             ));
         };
-        task_value.cancel(ctx.now());
         out.append_event(Event::TaskCancelled { task: task_value })
             .await;
         container

@@ -132,11 +132,12 @@ pub(super) async fn cancel_activity_timers(
         else {
             continue;
         };
-        if !t.value.status.is_active() {
-            continue; // already terminal — a fired/cancelled timer is no longer a live child.
+        let mut timer_value = t.value;
+        // A fired/cancelled timer is no longer a live child: the transition declines it, so this
+        // sweep keeps no second copy of that guard to stay in step with.
+        if timer_value.mark_cancelled(ctx.now()).is_err() {
+            continue;
         }
-        let mut timer_value = t.value.clone();
-        timer_value.cancel(ctx.now());
         out.append_event(crate::types::event::Event::TimerCancelled { timer: timer_value })
             .await;
     }

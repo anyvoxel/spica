@@ -50,6 +50,18 @@ impl ExecutionStatus {
             }
         }
     }
+    /// The status as one word per variant — what a durable rejection reason may interpolate. `{:?}`
+    /// is unusable there: `Terminating`/`Terminated` carry a nested termination reason, whose `Debug`
+    /// would be embedded in the log's own text.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            ExecutionStatus::Running => "Running",
+            ExecutionStatus::Completing => "Completing",
+            ExecutionStatus::Terminating(_) => "Terminating",
+            ExecutionStatus::Completed => "Completed",
+            ExecutionStatus::Terminated(_) => "Terminated",
+        }
+    }
 }
 
 /// The [`ObjectKindMarker`] tying an [`Execution`]'s meta to [`ObjectKind::Execution`].
@@ -117,18 +129,44 @@ impl Execution {
     /// Enter the success finish at `at`: the run is `Completing`, waiting on its owned children. The
     /// output is fixed **here** rather than at the terminal — what a run completes with is decided
     /// when its finish begins, and the terminal event only carries that value forward.
-    pub fn begin_completing(&mut self, output: Value, at: Timestamp) {
+    ///
+    /// Only a `Running` run has a finish to begin, so one that is already finishing or terminal is
+    /// **refused** and left untouched — the invariant lives here rather than at each caller, so no call
+    /// site can forget to ask first.
+    ///
+    /// The `Err` is one sentence naming *why* the transition was declined (the object's own state),
+    /// for the caller to fold into its durable rejection reason — the caller alone knows which object
+    /// and which command it is refusing.
+    pub fn mark_completing(&mut self, output: Value, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_running() {
+            return Err(format!(
+                "only a Running execution can begin completing, but it is {}",
+                self.status.phase()
+            ));
+        }
         self.status = ExecutionStatus::Completing;
         self.output = Some(output);
         self.meta.with_update_at(at);
+        Ok(())
     }
 
     /// Land the success terminal at `at`, once no child is left to drain. The output is **not**
     /// written here: the finish already fixed it, and callers advance the very value that finish
     /// produced, so the terminal can never re-decide — or drop — what the run completes with.
-    pub fn complete(&mut self, at: Timestamp) {
+    ///
+    /// Only a `Completing` run has a terminal to land: a run still `Running` has not begun its finish
+    /// (its output is undecided), and one already terminal has landed — both are **refused**, so the
+    /// terminal can never be jumped to from a phase that skipped the finish.
+    pub fn mark_completed(&mut self, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_completing() {
+            return Err(format!(
+                "only a Completing execution can be completed, but it is {}",
+                self.status.phase()
+            ));
+        }
         self.status = ExecutionStatus::Completed;
         self.meta.with_update_at(at);
+        Ok(())
     }
 }
 
@@ -165,7 +203,8 @@ mod tests {
     #[test]
     fn beginning_the_finish_fixes_the_output_before_the_terminal() {
         let mut exec = running_execution();
-        exec.begin_completing(json!({ "n": 1 }), ts(500));
+        exec.mark_completing(json!({ "n": 1 }), ts(500))
+            .expect("a Running execution has a finish to begin");
 
         assert_eq!(exec.status, ExecutionStatus::Completing);
         assert_eq!(exec.output, Some(json!({ "n": 1 })));
@@ -179,8 +218,10 @@ mod tests {
     #[test]
     fn the_terminal_lands_on_the_value_the_finish_fixed() {
         let mut exec = running_execution();
-        exec.begin_completing(json!({ "n": 1 }), ts(500));
-        exec.complete(ts(900));
+        exec.mark_completing(json!({ "n": 1 }), ts(500))
+            .expect("a Running execution has a finish to begin");
+        exec.mark_completed(ts(900))
+            .expect("a Completing execution has a terminal to land");
 
         assert_eq!(exec.status, ExecutionStatus::Completed);
         assert_eq!(
@@ -193,13 +234,59 @@ mod tests {
         assert!(exec.is_terminal());
     }
 
-    /// The terminal writes nothing but the status and the transition stamp: a run taken straight to
-    /// the terminal keeps the output it had, so no caller can lose a fixed value on the way.
+    /// The terminal writes nothing but the status and the transition stamp: a `Completing` row whose
+    /// output was never fixed — one crafted outside `mark_completing` — keeps the output it had, so no
+    /// caller can lose or invent a value on the way to the terminal.
     #[test]
     fn the_terminal_does_not_touch_the_output() {
         let mut exec = running_execution();
-        exec.complete(ts(900));
+        exec.status = ExecutionStatus::Completing;
+        exec.mark_completed(ts(900))
+            .expect("a Completing execution has a terminal to land");
 
         assert_eq!(exec.output, None, "the terminal never invents an output");
+        assert_eq!(exec.status, ExecutionStatus::Completed);
+        assert_eq!(exec.meta.updated_at, ts(900));
+    }
+
+    /// A finish only begins from `Running`: a run already finishing or terminal has none to begin, and
+    /// is refused and left untouched — so no call site can restart a finish, or re-decide the output
+    /// one already fixed.
+    #[test]
+    fn only_a_running_execution_begins_a_finish() {
+        for status in [ExecutionStatus::Completing, ExecutionStatus::Completed] {
+            let mut exec = running_execution();
+            exec.status = status.clone();
+            exec.output = Some(json!({ "decided": true }));
+            let before = exec.clone();
+            let reason = exec
+                .mark_completing(json!({ "ignored": true }), ts(500))
+                .expect_err("a run past Running has no finish to begin");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the run was found in: {reason}"
+            );
+            assert_eq!(exec, before, "a refused finish writes nothing");
+        }
+    }
+
+    /// The terminal only lands from `Completing`: a run still `Running` has not begun its finish (its
+    /// output is undecided) and one already terminal has landed — both refused, so the terminal can
+    /// never be jumped to from a phase that skipped the finish.
+    #[test]
+    fn only_a_completing_execution_lands_the_terminal() {
+        for status in [ExecutionStatus::Running, ExecutionStatus::Completed] {
+            let mut exec = running_execution();
+            exec.status = status.clone();
+            let before = exec.clone();
+            let reason = exec
+                .mark_completed(ts(900))
+                .expect_err("only a Completing run has a terminal to land");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the run was found in: {reason}"
+            );
+            assert_eq!(exec, before, "a refused terminal writes nothing");
+        }
     }
 }

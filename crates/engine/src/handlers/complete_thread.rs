@@ -7,9 +7,10 @@ use crate::types::meta::{HasRawObjectRef, ThreadOwner};
 
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
-/// output on its row, cancels any owned timers, and — once children drain (immediately if none) —
-/// emits `ThreadCompleted` then runs the inline `child_completed::child_settled` so the owning
-/// container Activity converges once its last branch/item drains.
+/// output on its row; nothing else can be pending — a thread owns activities only, and the activity
+/// relaying this completion has already drained — so `ThreadCompleted` follows in the same batch and
+/// the inline `child_completed::child_settled` lets the owning container Activity converge once its
+/// last branch/item drains.
 ///
 /// Mirrors [`CompleteExecutionHandler`](super::complete_execution::CompleteExecutionHandler) but is
 /// `Thread`-only: a top-level `Execution`'s success is driven by that handler, so the two verbs (and
@@ -45,14 +46,7 @@ impl CompleteThreadHandler {
         // past `Running`. Refused rather than dropped, so the durable log records that this finish was a
         // duplicate rather than leaving it indistinguishable from one that applied.
         if !thread_row.value.status.is_running() {
-            // The durable reason names the phase rather than the whole status: `{:?}` would embed the
-            // nested termination error's `Debug` in the log's own text, which no reader of a rejection
-            // needs — the status travels on the trace line below instead.
-            let phase = match thread_row.value.status {
-                ThreadStatus::Completing => "Completing",
-                ThreadStatus::Terminating(_) => "Terminating",
-                _ => "terminal",
-            };
+            let phase = thread_row.value.status.phase();
             tracing::warn!(
                 thread = %thread_ref,
                 status = ?thread_row.value.status,
@@ -78,9 +72,11 @@ impl CompleteThreadHandler {
         })
         .await;
 
-        let children = thread_row.active_children.clone();
-        let pending_children = super::complete_execution::cancel_timers(out, children);
-        if pending_children == 0 {
+        // A thread owns **activities only** — a deadline belongs to the activity that armed it
+        // (`TimerOwner` has no `Thread` variant) — and the activity relaying this completion has
+        // already drained, so an empty set is the ordinary case: the thread finishes here and hands its
+        // result up to its owner.
+        if thread_row.active_children.is_empty() {
             let mut completed_thread = thread_row.value();
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
@@ -114,14 +110,19 @@ impl CompleteThreadHandler {
                     .await;
                 }
             }
-        } else {
-            tracing::debug!(
-                thread = %thread_ref,
-                pending = pending_children,
-                "thread completing deferred: waiting on owned children"
-            );
+            return Ok(());
         }
 
-        Ok(())
+        // Anything still attached is the row's `active_children` disagreeing with the lifecycle rather
+        // than a child to wait on: there is no deadline here to cancel, and an activity a thread could
+        // still be waiting on is the very one relaying this completion. Refused rather than closed
+        // over, and a refusal strands nothing — the child's own settle drains the thread.
+        Err(ProcessingError::Rejected(
+            RejectionType::InvalidState,
+            format!(
+                "complete_thread: thread {thread_ref} still owns {} live child(ren); completion refused",
+                thread_row.active_children.len()
+            ),
+        ))
     }
 }

@@ -536,7 +536,7 @@ async fn task_settled_before_a_claim_is_refused() {
             EntryPayload::Reject(Reject {
                 request_id: request(3),
                 rejection_type: RejectionType::InvalidState,
-                rejection_reason: "task task/lifecycle_execution-2 is not currently Running (status Pending); settlement refused".to_string(),
+                rejection_reason: "task task/lifecycle_execution-2 cannot be completed: only a Running task can be completed, but it is Pending".to_string(),
             }),
             EntryPayload::Command(Command::ClaimTasks(ClaimTasks {
                 request_id: request(2),

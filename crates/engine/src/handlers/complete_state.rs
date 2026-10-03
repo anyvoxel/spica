@@ -2,7 +2,6 @@ use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::CompleteState;
 use crate::types::error::ExecutionError;
-use crate::types::thread::ThreadStatus;
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching
@@ -104,8 +103,8 @@ impl CompleteStateHandler {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "activity {activity} is {:?}, not Running; cannot complete",
-                    act.value.status
+                    "activity {activity} is {}, not Running; cannot complete",
+                    act.value.status.phase()
                 ),
             ));
         }
@@ -114,11 +113,7 @@ impl CompleteStateHandler {
         // owner left to accept it. Refused on the activity's footing above rather than swallowed — a
         // silent skip would leave this command with neither of the two entries it owes.
         if !thread.value.status.is_running() {
-            let phase = match thread.value.status {
-                ThreadStatus::Completing => "Completing",
-                ThreadStatus::Terminating(_) => "Terminating",
-                _ => "terminal",
-            };
+            let phase = thread.value.status.phase();
             tracing::warn!(thread = %owner, status = ?thread.value.status,
                 "completion arrived for a thread that is not Running; refused");
             return Err(ProcessingError::Rejected(

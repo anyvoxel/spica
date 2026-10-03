@@ -2,7 +2,6 @@ use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::ActivateState;
 use crate::types::error::ExecutionError;
-use crate::types::thread::ThreadStatus;
 
 /// Dispatches `Command::ActivateState` to the matching
 /// [`StateHandlerRegistry::create`](crate::handlers::state_handler::StateHandlerRegistry::create)
@@ -59,11 +58,7 @@ impl ActivateStateHandler {
         // duplicating anything — refused like the sibling handlers' non-Running guards. Checked before
         // the definition lookup below: the scope's own status is the cheaper and more fundamental gate.
         if !thread.value.status.is_running() {
-            let phase = match thread.value.status {
-                ThreadStatus::Completing => "Completing",
-                ThreadStatus::Terminating(_) => "Terminating",
-                _ => "terminal",
-            };
+            let phase = thread.value.status.phase();
             tracing::warn!(thread = %owner, status = ?thread.value.status,
                 "activation arrived for a thread that is not Running; refused");
             return Err(ProcessingError::Rejected(
