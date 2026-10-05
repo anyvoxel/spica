@@ -451,10 +451,11 @@ declare_owner! {
 declare_owner! {
     /// The owner slot of a **Timer**: the scope whose deadline it is, of the two scopes that arm one.
     ///
-    /// An `ExecutionTimeout` is armed by the top-level run itself, while a `WaitResume`, a task retry or a
-    /// task timeout is armed by the activity that is waiting — so the slot is the same `Execution`-or-
-    /// `Activity` sum as a thread's, but its own type: a timer's owner is a fact about timers, so
-    /// widening it later must not widen a thread's by accident.
+    /// A run's `TimeoutSeconds` is armed by the run itself, while a state's own `Seconds`/
+    /// `TimeoutSeconds` is armed by the activity holding the deadline — so the slot is the same
+    /// `Execution`-or-`Activity` sum as a thread's, but its own type: a timer's owner is a fact about
+    /// timers, so widening it later must not widen a thread's by accident. Nothing else on the timer
+    /// says what the deadline is *for*: the owner is both who holds it and why it exists.
     TimerOwner {
         Execution => ExecutionKind,
         Activity => ActivityKind,

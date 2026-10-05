@@ -1,7 +1,7 @@
 use crate::RejectionType;
 use crate::StatePath;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::types::command::{ActivateState, Command, CreateExecution, TimerPurpose};
+use crate::types::command::{ActivateState, Command, CreateExecution};
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
 use crate::types::execution::ExecutionKind;
@@ -72,7 +72,7 @@ impl CreateExecutionHandler {
             )
         })?;
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
-        // birth event, so the run's own `deadline` and the `ExecutionTimeout` timer that enforces it are
+        // birth event, so the run's own `deadline` and the timer that enforces it are
         // written from one computation and cannot disagree. A `TimeoutSeconds` the clock cannot add is a
         // malformed definition, so it is refused *before* the run exists: accepting it, birthing the
         // execution, and then failing it immediately would leave a dead row standing for a command the
@@ -121,7 +121,7 @@ impl CreateExecutionHandler {
         out.append_event(created_event).await;
 
         if let Some(deadline) = deadline {
-            // The ExecutionTimeout timer is generated **here** (inline): mint the
+            // The run's own deadline timer is generated **here** (inline): mint the
             // timer's durable uid, and derive the timer's name as `{execution.name}-{8-char-suffix}`
             // (k8s generateName style `PlainName::to_generated`, which mints its own suffix uid
             // internally) — deterministic and replay-safe, since this `TimerActivated` lands in the
@@ -160,7 +160,6 @@ impl CreateExecutionHandler {
                     // timer slot, never an activity's.
                     .with_owner(crate::types::meta::TimerOwner::Execution(id.clone())),
                 execution: id.clone(),
-                purpose: TimerPurpose::ExecutionTimeout,
                 status: crate::TimerStatus::Active,
                 deadline,
             };

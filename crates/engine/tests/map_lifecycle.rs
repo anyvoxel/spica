@@ -15,7 +15,7 @@ use spica_engine::{
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, MapActivityState,
     ObjectKind, Reject, RejectionType, RequestId, RuntimeError, SpawnThread, StateTransitioned,
     TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
-    ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus, WaitActivityState,
+    ThreadStatus, Timer, TimerKind, TimerStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -2138,17 +2138,6 @@ async fn map_item_failure_fails_the_run() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -2168,6 +2157,17 @@ async fn map_item_failure_fails_the_run() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "M".to_string(),
+                        error: "Map item failed".to_string(),
+                        output: Box::new(json!(null)),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
@@ -2612,7 +2612,6 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     meta: meta(uid(12), "lifecycle_execution-8")
                         .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -2770,13 +2769,9 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {// Map.Thread-2
                 thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
+                // Swept, not failing: the survivor is torn down because the Map is going down, so it
+                // carries `Cancelled` rather than a sibling item's error.
+                reason: TerminationReason::Cancelled,
             })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
@@ -2797,26 +2792,11 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
-            })),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),   // 重复对 /States/M 进行终止
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
+                // The root thread sweeps the Map: the run-level teardown reaches it, so it arrives as a
+                // sweep even though the thread above it relays a `Failed` upward.
+                reason: TerminationReason::Cancelled,
             })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {  // Map.Thread-2
@@ -2826,66 +2806,31 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 1,
-                    status: ThreadStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "M".to_string(),
-                            error: "Map item failed".to_string(),
-                            output: Box::new(json!(null)),
-                        }),
-                    }),
+                    status: ThreadStatus::Terminating(TerminationReason::Cancelled),
                     input: json!(2),
                     output: None,
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-7", 11),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
+                reason: TerminationReason::Cancelled,
             })),
-            EntryPayload::Event(Event::ExecutionTerminating {
-                execution: Execution {
-                    deadline: None,
-                    meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
-                    status: ExecutionStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "M".to_string(),
-                            error: "Map item failed".to_string(),
-                            output: Box::new(json!(null)),
-                        }),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason:
+                    "terminate_state: activity activity/lifecycle_execution-1 is terminating; \
+                    termination refused — the drain owns its terminal"
+                        .to_string(),
             }),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "M".to_string(),
-                        error: "Map item failed".to_string(),
-                        output: Box::new(json!(null)),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
-                    status: ActivityStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "M".to_string(),
-                            error: "Map item failed".to_string(),
-                            output: Box::new(json!(null)),
-                        }),
-                    }),
+                    status: ActivityStatus::Terminating(TerminationReason::Cancelled),
+
                     raw_input: json!(2),
                     input: Some(json!(2)),
                     raw_output: None,
@@ -2897,17 +2842,11 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
             EntryPayload::Command(Command::CancelTimer {
                 timer: ref_to::<TimerKind>("lifecycle_execution-8", 12),
             }),
-            EntryPayload::Reject(Reject {
-                request_id: RequestId::nil(),
-                rejection_type: RejectionType::InvalidState,
-                rejection_reason: "terminate_thread: thread thread/lifecycle_execution-0 is already Terminating; termination refused".to_string(),
-            }),
             EntryPayload::Event(Event::TimerCancelled {
                 timer: Timer {
                     meta: meta(uid(12), "lifecycle_execution-8")
                         .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Cancelled,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -2921,13 +2860,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/M/ItemProcessor/States/Slow"),
-                    status: ActivityStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "M".to_string(),
-                            error: "Map item failed".to_string(),
-                            output: Box::new(json!(null)),
-                        }),
-                    }),
+                    status: ActivityStatus::Terminated(TerminationReason::Cancelled),
                     raw_input: json!(2),
                     input: Some(json!(2)),
                     raw_output: None,
@@ -2947,13 +2880,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     state_path: path("/States/M/ItemProcessor/States"),
                     start_at: "Pick".to_string(),
                     index: 1,
-                    status: ThreadStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "M".to_string(),
-                            error: "Map item failed".to_string(),
-                            output: Box::new(json!(null)),
-                        }),
-                    }),
+                    status: ThreadStatus::Terminated(TerminationReason::Cancelled),
                     input: json!(2),
                     output: None,
                 },
@@ -3009,8 +2936,32 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "M".to_string(),
+                        error: "Map item failed".to_string(),
+                        output: Box::new(json!(null)),
+                    }),
+                },
+            })),
+            EntryPayload::Event(Event::ExecutionTerminating {
+                execution: Execution {
+                    deadline: None,
+                    meta: meta_root(uid(3), "lifecycle_execution"),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
+                    status: ExecutionStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                            state: "M".to_string(),
+                            error: "Map item failed".to_string(),
+                            output: Box::new(json!(null)),
+                        }),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
             }),
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
@@ -3213,13 +3164,6 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -3235,6 +3179,13 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Map MaxConcurrency expression must evaluate to a non-negative integer".to_string())),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,

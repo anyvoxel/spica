@@ -264,15 +264,10 @@ fn to_proto_activity(a: &spica_engine::ActivityRecord) -> spica_proto::v1::Activ
 }
 
 fn to_proto_timer(t: &spica_engine::TimerRecord) -> spica_proto::v1::Timer {
-    use spica_proto::v1::{TimerPurpose as P, TimerStatus as S};
+    use spica_proto::v1::TimerStatus as S;
     spica_proto::v1::Timer {
         meta: Some(proto_meta(&t.value.meta)),
         execution: Some(proto_ref(&t.value.execution)),
-        purpose: match t.value.purpose {
-            spica_engine::TimerPurpose::ExecutionTimeout => P::ExecutionTimeout as i32,
-            spica_engine::TimerPurpose::WaitResume => P::WaitResume as i32,
-            spica_engine::TimerPurpose::TaskTimeout => P::TaskTimeout as i32,
-        },
         status: match t.value.status {
             spica_engine::TimerStatus::Active => S::Active as i32,
             spica_engine::TimerStatus::Completed => S::Completed as i32,

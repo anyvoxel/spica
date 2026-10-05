@@ -205,17 +205,6 @@ async fn fail_with_explicit_error_and_cause() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "F".to_string(),
-                        error: "E1".to_string(),
-                        output: Box::new(json!({"Error": "E1", "Cause": "boom"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -235,6 +224,17 @@ async fn fail_with_explicit_error_and_cause() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "F".to_string(),
+                        error: "E1".to_string(),
+                        output: Box::new(json!({"Error": "E1", "Cause": "boom"})),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
@@ -470,17 +470,6 @@ async fn fail_without_error_or_cause_defaults() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "F".to_string(),
-                        error: "States.Fail".to_string(),
-                        output: Box::new(json!({})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -500,6 +489,17 @@ async fn fail_without_error_or_cause_defaults() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "F".to_string(),
+                        error: "States.Fail".to_string(),
+                        output: Box::new(json!({})),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
@@ -816,17 +816,6 @@ async fn fail_error_and_cause_as_jsonata() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "F".to_string(),
-                        error: "E-42".to_string(),
-                        output: Box::new(json!({"Error": "E-42", "Cause": "bad input"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -846,6 +835,17 @@ async fn fail_error_and_cause_as_jsonata() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "F".to_string(),
+                        error: "E-42".to_string(),
+                        output: Box::new(json!({"Error": "E-42", "Cause": "bad input"})),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,

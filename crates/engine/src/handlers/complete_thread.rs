@@ -1,16 +1,17 @@
 use crate::RejectionType;
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::types::command::{Command, CompleteExecution, CompleteThread};
+use crate::handlers::container::{ActivityContainer, Container, ExecutionContainer};
+use crate::types::command::CompleteThread;
 use crate::types::event::Event;
-use crate::types::meta::{HasRawObjectRef, ThreadOwner};
+use crate::types::meta::ThreadOwner;
 
 /// Handles `CompleteThread`: begins the success finish of a fan-out `Thread` (a `Parallel` branch's
 /// or a `Map` item's terminal `Succeed`/`End` reached). Emits `ThreadCompleting`, which fixes its
 /// output on its row; nothing else can be pending — a thread owns activities only, and the activity
 /// relaying this completion has already drained — so `ThreadCompleted` follows in the same batch and
-/// the inline `child_completed::child_settled` lets the owning container Activity converge once its
-/// last branch/item drains.
+/// the settle is handed to the owner's [`Container`], which lets the owning container Activity
+/// converge once its last branch/item drains (or closes the run, for a root thread).
 ///
 /// Mirrors [`CompleteExecutionHandler`](super::complete_execution::CompleteExecutionHandler) but is
 /// `Thread`-only: a top-level `Execution`'s success is driven by that handler, so the two verbs (and
@@ -81,33 +82,51 @@ impl CompleteThreadHandler {
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
             completed_thread.meta.with_update_at(ctx.now());
-            out.append_event(Event::ThreadCompleted {
-                thread: completed_thread,
-            })
-            .await;
-            let owner = thread_row.value.meta.owner.clone();
-            // Which parent the settled thread reports to is decided by the *type* of its owner, not by
-            // a kind comparison: the two parents converge a thread's result in entirely different ways.
-            match owner {
-                // Root thread (owned by the Execution): its success *is* the run's success. The
-                // `ThreadCompleted` applier has already drained the root thread from the execution's
-                // `active_children`, so `CompleteExecution` now closes the run.
+
+            // Which parent the settled thread reports to is decided by the *type* of its owner — a
+            // `ThreadOwner` sum, so each variant names its own container — never by comparing a
+            // runtime kind. The container is resolved *before* `ThreadCompleted`: an ownerless settle
+            // is refused while it can still be answered, rather than discovered as a no-op once the
+            // terminal event is already on the log. The hook then lets the owner decide what the
+            // settle *means* (a run closes; a `Parallel`/`Map` converges).
+            match thread_row.value.meta.owner.clone() {
                 ThreadOwner::Execution(execution) => {
-                    out.append_command(Command::CompleteExecution(CompleteExecution {
-                        execution,
-                        output: output.clone(),
-                    }));
-                }
-                // A fan-out thread is owned by its container Activity; run the inline reaction so the
-                // parallel/map converges once its last branch/item drains.
-                ThreadOwner::Activity(activity) => {
-                    super::child_completed::child_settled(
-                        ctx,
-                        out,
-                        activity.into_raw_object_ref(),
-                        thread_ref.clone(),
-                    )
+                    let Some(container) =
+                        ExecutionContainer::open(ctx.storage, execution.clone()).await?
+                    else {
+                        return Err(ProcessingError::Rejected(
+                            RejectionType::InvalidState,
+                            format!(
+                                "complete_thread: thread {thread_ref} has no live execution owner \
+                                 {execution}; completion refused"
+                            ),
+                        ));
+                    };
+                    out.append_event(Event::ThreadCompleted {
+                        thread: completed_thread,
+                    })
                     .await;
+                    container.after_child_completed(ctx, out, &thread_ref).await;
+                }
+                // A fan-out thread is owned by its container Activity; the hook runs the settle so the
+                // parallel/map converges (or replenishes) through the state's own decision.
+                ThreadOwner::Activity(activity) => {
+                    let Some(container) =
+                        ActivityContainer::open(ctx.storage, activity.clone()).await?
+                    else {
+                        return Err(ProcessingError::Rejected(
+                            RejectionType::InvalidState,
+                            format!(
+                                "complete_thread: thread {thread_ref} has no live activity owner \
+                                 {activity}; completion refused"
+                            ),
+                        ));
+                    };
+                    out.append_event(Event::ThreadCompleted {
+                        thread: completed_thread,
+                    })
+                    .await;
+                    container.after_child_completed(ctx, out, &thread_ref).await;
                 }
             }
             return Ok(());

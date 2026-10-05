@@ -660,7 +660,6 @@ pub(crate) fn log_event(event: &Event) {
             debug!(
                 timer = %timer.meta.raw_object_ref(),
                 parent = ?timer.meta.owner,
-                purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
                 "timer activated"
             );
@@ -669,7 +668,6 @@ pub(crate) fn log_event(event: &Event) {
             debug!(
                 timer = %timer.meta.raw_object_ref(),
                 parent = ?timer.meta.owner,
-                purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
                 "timer completed"
             );
@@ -678,7 +676,6 @@ pub(crate) fn log_event(event: &Event) {
             debug!(
                 timer = %timer.meta.raw_object_ref(),
                 parent = ?timer.meta.owner,
-                purpose = %format!("{:?}", timer.purpose),
                 deadline_ms = timer.deadline.as_millis(),
                 "timer cancelled"
             );

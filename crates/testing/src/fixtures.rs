@@ -210,8 +210,8 @@ pub fn fanout_thread_owner_of(activity: RawObjectRef) -> ThreadOwner {
     )
 }
 
-/// The owner slot of a **timer** armed by the run itself (an `ExecutionTimeout`), in the union's own
-/// type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
+/// The owner slot of a **timer** armed by the run itself (a run's `TimeoutSeconds`), in the union's
+/// own type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
 pub fn execution_timer_owner_of(execution: RawObjectRef) -> TimerOwner {
     TimerOwner::Execution(
         execution
@@ -220,8 +220,8 @@ pub fn execution_timer_owner_of(execution: RawObjectRef) -> TimerOwner {
     )
 }
 
-/// The owner slot of a **timer** armed by the waiting activity (a `WaitResume`, a task retry or a
-/// task timeout): `object`/`n` is the owning activity.
+/// The owner slot of a **timer** armed by the waiting activity (a `Wait`'s `Seconds` or a state's
+/// `TimeoutSeconds`): `object`/`n` is the owning activity.
 pub fn activity_timer_owner(object: &str, n: u64) -> TimerOwner {
     TimerOwner::Activity(ObjectRef::new(name(object), uid(n)))
 }

@@ -210,6 +210,25 @@ impl ExecutionError {
             ExecutionError::Infra(_) | ExecutionError::Rejected(_) => None,
         }
     }
+
+    /// Whether this error is intercepted by an ASL `ErrorEquals` array — the one matching rule
+    /// `Retry` and `Catch` share.
+    ///
+    /// `States.ALL` matches any error name and must stand alone (checked first, so a malformed array
+    /// listing it beside real names still catches everything). `States.TaskFailed` matches any name
+    /// except `States.Timeout`. Otherwise the error's own name must be a member of the array, so a
+    /// name the engine never produces (a lambda-specific one) matches only when listed verbatim —
+    /// matching is by the ASL reserved [`Self::error_name`], never by a variant's shape.
+    pub fn matches_error_names(&self, error_equals: &[String]) -> bool {
+        if error_equals.iter().any(|s| s == "States.ALL") {
+            return true;
+        }
+        let name = self.error_name();
+        if error_equals.iter().any(|s| s == "States.TaskFailed") {
+            return name != "States.Timeout";
+        }
+        error_equals.iter().any(|s| s == name)
+    }
 }
 
 // An infra (log/storage) fault reached directly with `?` in an engine-internal fn returning
@@ -252,5 +271,35 @@ impl From<spica_asl::StatePathError> for ExecutionError {
             StatePathError::Malformed(msg) => RuntimeError::InvalidDefinition(msg),
             StatePathError::NotFound(msg) => RuntimeError::StateNotFound(msg),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wildcard contract both `Retry` and `Catch` match through: `States.ALL` catches any name,
+    /// `States.TaskFailed` catches everything *except* a timeout (the spec singles it out so a retry
+    /// ladder cannot silently swallow a deadline), and anything else must be named verbatim.
+    #[test]
+    fn error_names_match_the_asl_wildcards() {
+        let timeout = ExecutionError::Runtime(RuntimeError::TimedOut {
+            message: "t".into(),
+        });
+        let cancelled = ExecutionError::Runtime(RuntimeError::Cancelled {
+            message: "c".into(),
+        });
+
+        assert!(timeout.matches_error_names(&["States.ALL".into()]));
+        assert!(cancelled.matches_error_names(&["States.TaskFailed".into()]));
+        assert!(
+            !timeout.matches_error_names(&["States.TaskFailed".into()]),
+            "a timeout is the one name TaskFailed does not cover"
+        );
+        assert!(timeout.matches_error_names(&["States.Timeout".into()]));
+        assert!(
+            !timeout.matches_error_names(&["Some.Other".into()]),
+            "an unnamed error is not intercepted"
+        );
     }
 }

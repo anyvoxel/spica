@@ -13,11 +13,12 @@
 //! [`finish_activity_via_state`]).
 
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::container::{ActivityContainer, Container, ExecutionContainer};
 use crate::types::activity::ActivityKind;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
 use crate::types::execution::ExecutionKind;
-use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef, ThreadOwner};
 use crate::types::thread::{ThreadKind, ThreadStatus};
 
 /// Emit a drained-and-finishing `node`'s terminal (by kind and status), then deliver the settled
@@ -58,26 +59,22 @@ pub(crate) async fn finish_node(
 
 /// Outcome of routing a drained `Completing` activity through its own state handler.
 enum DeferredFinish {
-    /// The state's `finish` ran — the terminal, its projection and its routing are emitted, so the
-    /// caller may relay the settled activity up to its owner.
+    /// The state's `after_completing` ran — the terminal and its routing are emitted, so the caller may
+    /// relay the settled activity up to its owner.
     Handled,
     /// The state could no longer be resolved (owner scope or definition gone): the caller closes the
     /// activity generically so its parent still drains.
     Unresolvable,
-    /// The projection failed and the activity was terminated here; the terminate's own drain owns the
-    /// rest, so the caller must not relay.
-    Terminated,
 }
 
-/// Finish a drained `Completing` activity through its own state handler, reproducing the projection
-/// (`Assign`/`Output`) and the `Next`/`End` routing the base `complete` step would have run had the
-/// children already drained. Without this the drain hop would close the activity with an unprojected
-/// result and leave the execution parked on a completed state. A projection failure terminates the
-/// activity here — the same policy as the base `complete` step's.
+/// Finish a drained `Completing` activity through its own state's complete step: the children have
+/// already drained (see `finish_activity`'s guard), so `after_completing` runs the same terminal,
+/// projection and `Next`/`End` routing the `complete` step would have run had they drained before it.
+/// Without this hop the drained activity would be closed with an unprojected result and leave the
+/// execution parked on a completed state.
 async fn finish_activity_via_state(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
-    node: &ObjectRef<ActivityKind>,
     act: &crate::storage::ActivityRecord,
 ) -> Result<DeferredFinish, ProcessingError> {
     let activity_value = act.value();
@@ -104,22 +101,14 @@ async fn finish_activity_via_state(
         return Ok(DeferredFinish::Unresolvable); // no registered handler — engine regression.
     };
     let variables = thread.variables.clone();
-    if let Err(e) = handler
-        .finish(ctx.env, out, &activity_value, &variables)
-        .await
-    {
-        tracing::warn!(
-            activity = %node,
-            error = %e,
-            "deferred state finish failed; terminating the activity"
-        );
-        out.terminate(
-            Some(node.clone()),
-            Some(OwnerScope::Execution(activity_value.execution.clone())),
-            e,
-        );
-        return Ok(DeferredFinish::Terminated);
-    }
+    // The drain runs the state's own complete step. The hop lands only on a drained-and-finishing
+    // activity (see `finish_activity`'s guard), so `after_completing` takes its drained arm and emits
+    // the terminal; it runs no projection on the container's defensive arm, and a leaf's projection
+    // failure is turned into its own `TerminateState` inside the state — so a surfacing `Err` here is a
+    // read fault that is the dispatch's, returned rather than swallowed.
+    handler
+        .after_completing(ctx, out, &activity_value, &variables)
+        .await?;
     Ok(DeferredFinish::Handled)
 }
 
@@ -139,9 +128,8 @@ async fn finish_activity(
     }
     match &act.value.status {
         ActivityStatus::Completing => {
-            match finish_activity_via_state(ctx, out, node, &act).await? {
+            match finish_activity_via_state(ctx, out, &act).await? {
                 DeferredFinish::Handled => {}
-                DeferredFinish::Terminated => return Ok(()),
                 DeferredFinish::Unresolvable => {
                     // Defensive fallback: use the activity's raw result when present, otherwise the
                     // state's processed input remains the default output.
@@ -217,13 +205,35 @@ async fn finish_thread(
         }
         _ => return Ok(()),
     }
-    Box::pin(super::child_completed::child_settled(
-        ctx,
-        out,
-        thread.value.meta.owner.clone().into_raw_object_ref(),
-        node.clone().into_raw_object_ref(),
-    ))
-    .await;
+    // The drained thread hands its settle to its owner's `Container` — the same reaction point the
+    // inline path uses (see `complete_thread`/`terminate_thread`) — so a root thread that drains
+    // *here*, after the last of its own children settled, starts its run's teardown exactly as one
+    // that had nothing to wait for does. A kind-routed `child_settled` would not: it has no arm for
+    // a still-`Running` run, which is where that teardown has to come from.
+    let child = node.clone().into_raw_object_ref();
+    let terminated = matches!(thread.status, ThreadStatus::Terminating(_));
+    match thread.value.meta.owner.clone() {
+        ThreadOwner::Execution(execution) => {
+            // A missing owner row is "already closed", the same answer a missing thread gets above; a
+            // fault reading it is the dispatch's, and is returned.
+            if let Some(container) = ExecutionContainer::open(ctx.storage, execution).await? {
+                if terminated {
+                    container.after_child_terminated(ctx, out, &child).await;
+                } else {
+                    container.after_child_completed(ctx, out, &child).await;
+                }
+            }
+        }
+        ThreadOwner::Activity(activity) => {
+            if let Some(container) = ActivityContainer::open(ctx.storage, activity).await? {
+                if terminated {
+                    container.after_child_terminated(ctx, out, &child).await;
+                } else {
+                    container.after_child_completed(ctx, out, &child).await;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -256,10 +266,15 @@ async fn finish_execution(
             })
             .await;
         }
-        ExecutionStatus::Terminating(reason) => {
+        ExecutionStatus::Terminating(_) => {
+            // The reason was written when the teardown began (`mark_terminating`), so the terminal
+            // advances the stored value rather than re-deriving one — same as the Completing arm above.
             let mut terminated_execution = exec.value();
-            terminated_execution.status = ExecutionStatus::Terminated(reason.clone());
-            terminated_execution.meta.with_update_at(ctx.now());
+            // The arm is the transition's own precondition, so this can only decline if the row moved
+            // under the read above — a race this hop answers with nothing, exactly as a missing row.
+            if terminated_execution.mark_terminated(ctx.now()).is_err() {
+                return Ok(());
+            }
             out.append_event(Event::ExecutionTerminated {
                 execution: terminated_execution,
             })

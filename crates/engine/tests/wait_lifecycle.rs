@@ -16,8 +16,8 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
     Event, Execution, ExecutionCreated, ExecutionKind, ExecutionStatus, Flow, FlowCreated,
     FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind, StateTransitioned,
-    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus,
-    VariablesAssigned, WaitActivityState,
+    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus, VariablesAssigned,
+    WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -128,7 +128,6 @@ async fn wait_seconds_literal_routes_on_its_next() {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                 },
@@ -149,7 +148,6 @@ async fn wait_seconds_literal_routes_on_its_next() {
                         5,
                     ))),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                 },
@@ -478,7 +476,6 @@ async fn wait_until_a_literal_timestamp() {
                     meta: meta(uid(6), "lifecycle_execution-2")
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
                 },
@@ -491,7 +488,6 @@ async fn wait_until_a_literal_timestamp() {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
                 },
@@ -783,7 +779,6 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
                 },
@@ -796,7 +791,6 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                     meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
                 },

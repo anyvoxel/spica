@@ -9,7 +9,7 @@
 //! - [`complete`] opens a `CompleteState`, taking the store a preceding `activate` left behind (or a
 //!   hand-seeded one from [`complete_store`]). Continuing on that store is what lets a `Wait`/`Task`
 //!   test reach its `complete` with the timer child its own activation armed still attached — the
-//!   child state the two states' `on_completing` are actually written to handle.
+//!   child state the two states' `after_completing` are actually written to handle.
 //!
 //! Both drivers dispatch through [`build_state_handlers`]'s registry rather than a named factory, so
 //! every test also covers the `State` → handler selection.
@@ -80,7 +80,7 @@ pub fn fanout_thread_owner(activity: ObjectRef<ActivityKind>) -> ThreadOwner {
     ThreadOwner::Activity(activity)
 }
 
-/// The owner slot of a **timer** armed by the waiting activity (a `WaitResume` or task timeout): the
+/// The owner slot of a **timer** armed by the waiting activity (a state's own deadline): the
 /// `Activity` variant of [`TimerOwner`].
 pub fn activity_timer_owner(activity: ObjectRef<ActivityKind>) -> TimerOwner {
     TimerOwner::Activity(activity)
@@ -157,7 +157,7 @@ pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
 
 /// A `Running` activity row at `/States/P`, owned by [`thread_ref`] and carrying `input` as both its
 /// raw and processed input — the row a `CompleteState` names. `children` are the child refs still
-/// attached (a `Wait`'s resume timer, a `Task`'s deadline); the state's own `on_completing` is what
+/// attached (a `Wait`'s resume timer, a `Task`'s deadline); the state's own `after_completing` is what
 /// disposes of them.
 pub fn seeded_activity(
     input: Value,

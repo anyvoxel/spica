@@ -26,7 +26,7 @@ pub use types::activity::{
 pub use types::command::{
     ActivateState, ActivateTask, ClaimTasks, Command, CompleteExecution, CompleteState,
     CompleteTask, CompleteThread, CreateExecution, CreateFlow, FailTask, SpawnThread,
-    TerminateExecution, TerminateState, TerminateThread, TerminationReason, TimerPurpose,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
 pub use types::error::{ExecutionError, InfraError, RuntimeError, StorageError};
 pub use types::event::{

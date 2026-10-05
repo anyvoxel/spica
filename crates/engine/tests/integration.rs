@@ -690,7 +690,7 @@ async fn end_to_end_dataflow() {
 async fn unserved_task_fails_via_timeout_not_definition() {
     // With no worker for its Resource, a Task is *not* rejected up front — Zeebe semantics: an
     // unclaimed task simply stays queued/claimable (Pending). If the state sets `TimeoutSeconds`, the
-    // engine's `TaskTimeout` backstop fails it after that window, so the terminal outcome is a
+    // engine's `TimeoutSeconds` backstop fails it after that window, so the terminal outcome is a
     // deterministic `TimedOut` — not the M1 `InvalidDefinition` "no worker" guard, which is gone.
     let sm = parse_sm(
         r#"{
@@ -1183,7 +1183,7 @@ async fn task_retry_exhausted_no_catch_terminates() {
 #[tokio::test]
 async fn task_timeout_with_catch() {
     // A Task with `TimeoutSeconds` that never settles (a handler sleeping past the deadline): the
-    // `TaskTimeout` timer fails it with `States.Timeout`, which the `Catch` routes to a fallback.
+    // `TimeoutSeconds` timer fails it with `States.Timeout`, which the `Catch` routes to a fallback.
     let sm = parse_sm(
         r#"{
           "StartAt": "T",

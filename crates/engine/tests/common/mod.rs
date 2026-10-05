@@ -813,7 +813,7 @@ pub fn anonymous_name() -> FlowName {
 
 /// A throwaway, collision-free execution name for tests that don't care about the (now required)
 /// user-supplied execution name. Uses the plain (**user**) form — a `CreateExecution` execution is
-/// user-named by contract, and a generated child (e.g. the ExecutionTimeout timer) derives its own
+/// user-named by contract, and a generated child (e.g. the run's `TimeoutSeconds` timer) derives its own
 /// name from this *plain* base, so it must not itself be generated. The random `_<ulid>` tail keeps
 /// it collision-free without `-`.
 pub fn execution_name() -> ObjectName {

@@ -58,34 +58,23 @@ impl CompleteTaskHandler {
             Err(e) => return Err(e.into()),
         };
         // Settlement guard: only a `Running` (leased) task has a settlement to take, and it must be
-        // leased to the reporting worker right now. A task not currently Running (still Pending, or
-        // already settled) and one leased to a *different* worker are both refusals of the request's
-        // precondition — the caller's handle on the task is not the live one — so both are
-        // `InvalidState`, told apart by their reason. Both keep the state advancing exactly once
-        // (duplicate/foreign settles are refused, never applied twice). The status half of that is the
-        // transition's own precondition, checked here because the transition is the first thing this
-        // step needs: a refused settle has done nothing yet.
+        // leased to the reporting worker right now. The whole guard lives in the transition itself
+        // (`mark_completed`), so the caller cannot honor one half and forget the other: a task not
+        // currently Running (still Pending, or already settled) and one leased to a *different* worker
+        // are both refusals of the request's precondition — the caller's handle on the task is not the
+        // live one — so both are `InvalidState`, told apart by their reason. Both keep the state
+        // advancing exactly once (duplicate/foreign settles are refused, never applied twice).
         let mut task_value = act.value();
-        if let Err(reason) = task_value.mark_completed(ctx.now()) {
-            return Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!("task {task} cannot be completed: {reason}"),
-            ));
-        }
-        if act.worker_id.as_deref() != Some(worker_id.as_str()) || worker_id.is_empty() {
+        if let Err(reason) = task_value.mark_completed(worker_id, ctx.now()) {
             tracing::warn!(
                 task = %act.value.meta.raw_object_ref(),
                 reported = %worker_id,
                 leased = ?act.worker_id,
-                "worker tried to complete a task it does not lease; report rejected"
+                "task settlement refused: {reason}"
             );
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
-                format!(
-                    "task {} is leased to {:?}, not {worker_id}; settlement refused",
-                    act.value.meta.raw_object_ref(),
-                    act.worker_id,
-                ),
+                format!("task {task} cannot be completed: {reason}"),
             ));
         }
 
@@ -109,17 +98,17 @@ impl CompleteTaskHandler {
 
         // Emit the completed task entity (lease cleared, status terminal) — the very value the
         // transition above advanced — and resume the owning Task state's `complete`. The concrete
-        // output travels alongside (feeds the activity's raw_output).
-        let completed = Event::TaskCompleted(TaskCompleted {
+        // output travels alongside (feeds the activity's raw_output). The success settlement echoes
+        // the worker's own request id back on the event; the `AckHook` observer wakes the awaiting
+        // `TaskApi::complete` with it (the request/response contract that lets it report this
+        // settlement was applied).
+        out.append_event(Event::TaskCompleted(TaskCompleted {
             request_id: *request_id,
             task: task_value,
             output: output.clone(),
-        });
-        // The success settlement echoes the worker's own request id back on the event; the `AckHook`
-        // observer wakes the awaiting `TaskApi::complete` with it (the request/response contract that
-        // lets it report this settlement was applied).
-        out.append_event(completed).await;
-        // The activity's own `TaskTimeout` child needs no sweep here: the Task state declares it
+        }))
+        .await;
+        // The activity's own `TimeoutSeconds` child needs no sweep here: the Task state declares it
         // supervisory, so the base complete step cancels it before it finishes. (A claim leaves no
         // child at all — the delivery lease is a field on the task, not a timer.)
         //

@@ -125,16 +125,16 @@ mod tests {
     use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
     use crate::{
-        Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Timer, TimerPurpose,
-        TimerStatus, Timestamp,
+        Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Timer, TimerStatus,
+        Timestamp,
     };
 
-    /// The timer's owner slot filled by an activity — the scope a `WaitResume` deadline is armed under.
+    /// The timer's owner slot filled by an activity — the scope a state's deadline is armed under.
     fn activity_ref() -> ObjectRef<ActivityKind> {
         object_ref("execution-0", 90)
     }
 
-    /// The same slot filled by a run — the scope an `ExecutionTimeout` is armed under.
+    /// The same slot filled by a run — the scope its own `TimeoutSeconds` is armed under.
     fn execution_ref() -> ObjectRef<ExecutionKind> {
         object_ref("execution", 70)
     }
@@ -158,7 +158,6 @@ mod tests {
                 .at(at())
                 .with_owner(owner),
             execution: execution_ref(),
-            purpose: TimerPurpose::WaitResume,
             status,
             deadline: Timestamp::from_millis(2_000),
         };
@@ -167,7 +166,7 @@ mod tests {
         row
     }
 
-    /// The activity a `WaitResume` timer hangs under, with `children` still live so the drain the
+    /// The activity a state's deadline hangs under, with `children` still live so the drain the
     /// cancel triggers is observable: the container may only converge an owner with nothing in flight.
     fn seeded_activity(status: ActivityStatus, children: HashSet<RawObjectRef>) -> ActivityRecord {
         let activity = Activity {
@@ -190,7 +189,7 @@ mod tests {
         row
     }
 
-    /// The run an `ExecutionTimeout` timer hangs under. A run is the root of its tree, so it owns no
+    /// The run its own `TimeoutSeconds` timer hangs under. A run is the root of its tree, so it owns no
     /// ownerless slot; its children are the deadline and (once running) its root thread.
     fn seeded_execution(
         status: ExecutionStatus,

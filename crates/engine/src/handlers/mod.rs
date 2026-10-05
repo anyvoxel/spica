@@ -61,7 +61,8 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::execution::ExecutionKind;
-use crate::types::meta::{ObjectKind, ObjectRef, OwnerScope};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, OwnerScope};
+use crate::types::task::TaskKind;
 use crate::types::thread::ThreadKind;
 use crate::types::timer::TimerKind;
 use crate::{Activity, ActivityStatus};
@@ -97,13 +98,14 @@ pub(super) fn emit_scope_termination(
     }
 }
 
-/// Cancel every active timer child of `activity`. A `Task` state's
-/// [`on_completing`](state_handler::StateHandler::on_completing) calls this for its own timers — a
-/// `TaskTimeout` only bounds the state, so it is swept as part of finishing rather
-/// than waited out. The task **failure** handlers call it directly too, for the paths that never reach
-/// `complete` (a retry re-queues the task, a terminal failure routes to `Catch`/terminate): a settled
-/// attempt must leave no live child behind. Idempotent: a timer already fired or cancelled is not an
-/// active child and is simply skipped.
+/// Cancel every active timer child of `activity`. The two paths an activity owns its `TimeoutSeconds`
+/// deadline through both call it: a `Task` state's
+/// [`after_completing`](state_handler::StateHandler::after_completing) for the `complete` step, and
+/// [`complete_activity`] for a finish that never opens that step (the exiting `Catch` route) — the
+/// timer bounds the state, so it is swept as part of finishing rather than waited out. A `Task`
+/// failure reaches neither: a retry leaves the deadline armed (it bounds the state across its
+/// retries) and a terminal one is swept by the activity's own terminate. Idempotent: a timer already
+/// fired or cancelled is not an active child and is simply skipped.
 ///
 /// Emits the `TimerCancelled` **events** directly (rather than `CancelTimer` commands) so they fold
 /// into the *current* batch, ahead of whatever the caller does next — a `CancelTimer` command would
@@ -121,7 +123,7 @@ pub(super) async fn cancel_activity_timers(
     };
     for child in act.active_children {
         if child.kind != ObjectKind::Timer {
-            continue; // only timer children matter here (M1 task activities own none other).
+            continue; // only timer children are swept here; the task child follows its own settle.
         }
         let Some(t) = ctx
             .storage
@@ -237,15 +239,14 @@ pub(super) async fn emit_state_completed(
 /// (`{execution.name}-{8-char-suffix}`) from the owning execution, then emit `Event::TimerActivated`
 /// — the fact that both folds the timer row and arms the physical deadline (see
 /// `TimerActivatedApplier`). Inlined rather than a `Command` so the arm lands in the same causal
-/// batch as the state decision that triggers it (create_execution already does this for its
-/// ExecutionTimeout). The name is decoupled from the timer's `uid` and must be carried forward by
+/// batch as the state decision that triggers it (create_execution already does this for the run's
+/// own deadline). The name is decoupled from the timer's `uid` and must be carried forward by
 /// later timer events (`TimerTriggered`/`TimerCancelled` preserve the row's meta instead of
 /// re-deriving it).
 pub(super) async fn emit_timer(
     out: &mut Collector<'_>,
     execution: ObjectRef<ExecutionKind>,
     owner: &Activity,
-    purpose: crate::types::command::TimerPurpose,
     deadline: crate::log::Timestamp,
 ) {
     let timer_uid: ulid::Ulid = out.mint();
@@ -256,7 +257,6 @@ pub(super) async fn emit_timer(
     out.append_event(Event::TimerActivated {
         timer: crate::Timer {
             execution,
-            purpose,
             status: crate::TimerStatus::Active,
             deadline,
             meta: crate::types::meta::ObjectMeta::builder(timer_uid)
@@ -275,7 +275,8 @@ pub(super) async fn emit_timer(
 
 /// Shared tail of a successful state completion (Wait resume; Pass/Succeed/Choice now carry their
 /// own because their finish differs): evaluates `Assign` (emitting `VariablesAssigned`), evaluates
-/// `Output` (defaults to input), emits `StateCompleted`, then the routing via [`emit_transition`].
+/// `Output` (defaults to input), sweeps the activity's own deadlines, emits `StateCompleted`, then the
+/// routing via [`emit_transition`].
 ///
 /// `StateCompleting` (the ing) is **not** emitted here — each state's `complete` opens the finish with
 /// it, so this helper only carries the successful projection tail for paths that already opened the
@@ -286,7 +287,7 @@ pub(super) async fn emit_timer(
 /// projection, then run the inline child-settled reaction that drains the parent (once drained).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_activity(
-    env: &mut EvalEnv,
+    ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     activity: ObjectRef<ActivityKind>,
     activity_value: &Activity,
@@ -323,7 +324,7 @@ pub(super) async fn complete_activity(
     let owner = activity_value.meta.owner.clone();
     if let Some(assign_obj) = assign {
         let assign_value = Value::Object(assign_obj.0.clone());
-        let evaluated = match env.eval_json(&assign_value, &states, &local_scope) {
+        let evaluated = match ctx.env.eval_json(&assign_value, &states, &local_scope) {
             Ok(evaluated) => evaluated,
             Err(e) => {
                 out.append_command(Command::TerminateState(TerminateState {
@@ -361,7 +362,7 @@ pub(super) async fn complete_activity(
     }
 
     let output_value = match output {
-        Some(o) => match env.eval_json(o, &states, &local_scope) {
+        Some(o) => match ctx.env.eval_json(o, &states, &local_scope) {
             Ok(output_value) => output_value,
             Err(e) => {
                 out.append_command(Command::TerminateState(TerminateState {
@@ -373,6 +374,34 @@ pub(super) async fn complete_activity(
         },
         None => raw_result.clone(),
     };
+
+    // A completion disposes of the activity's own deadlines: a `TimeoutSeconds` deadline only *bounds*
+    // the state, so a state that finished early — the `Catch` exit below — must leave no live timer
+    // child behind.
+    // Swept here, by the completion, rather than by each caller: `StateCompleting` is deliberately not
+    // emitted above, so this path never reaches the `complete` step's own `after_completing` sweep, and
+    // the timer belongs to the activity that armed it either way.
+    cancel_activity_timers(ctx, out, activity.clone()).await;
+
+    // A catcher takes the failure the attempt produced, so the attempt's in-flight call is abandoned
+    // with it: the task has no state left to report to, and the complete step that would have swept it
+    // (`after_completing`) never opens on this exit. Cancelled as the activity's own child, exactly as the
+    // terminate path sweeps one — the child is a bystander here too, so it carries no reason.
+    // TODO(fan-out Catch): a `Parallel`/`Map` catching a failure must dispose of its in-flight child
+    // executions/threads the same way; a `Task` is the only kind reachable today.
+    if let Ok(children) = ctx
+        .storage
+        .get_children(activity.as_raw_object_ref().clone())
+        .await
+    {
+        for child in children {
+            if child.kind == ObjectKind::Task {
+                out.append_command(Command::CancelTask {
+                    task: child.typed::<TaskKind>(),
+                });
+            }
+        }
+    }
 
     // `complete_activity` only borrows `activity_value`, so the completed payload is a fresh copy
     // advanced in place — `state_completed_value` was removed.

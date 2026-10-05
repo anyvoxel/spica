@@ -85,7 +85,7 @@ async fn ticking_under_the_wall_clock_appends_nothing() {
     client.stop().await;
 }
 
-/// A run's `deadline` is the run's own answer to "when is it due"; the `ExecutionTimeout` timer is what
+/// A run's `deadline` is the run's own answer to "when is it due"; its `TimeoutSeconds` timer is what
 /// actually enforces it. Both are written from one computation when the run is created, so the two
 /// carriers must name the *same* instant — a reader that found them disagreeing would have to trust one
 /// of them arbitrarily. The clock is then moved onto that instant, so the value asserted is the one that
@@ -106,7 +106,7 @@ async fn a_runs_deadline_is_the_instant_its_timeout_timer_carries() {
             matches!(
                 &entry.payload,
                 EntryPayload::Event(Event::TimerActivated { timer })
-                    if timer.purpose == spica_engine::TimerPurpose::ExecutionTimeout
+                    if matches!(timer.meta.owner, spica_engine::TimerOwner::Execution(_))
             )
         })
     })
@@ -139,7 +139,7 @@ async fn a_runs_deadline_is_the_instant_its_timeout_timer_carries() {
         .iter()
         .find_map(|entry| match &entry.payload {
             EntryPayload::Event(Event::TimerActivated { timer })
-                if timer.purpose == spica_engine::TimerPurpose::ExecutionTimeout =>
+                if matches!(timer.meta.owner, spica_engine::TimerOwner::Execution(_)) =>
             {
                 Some(timer.deadline)
             }

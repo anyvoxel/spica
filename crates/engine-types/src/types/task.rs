@@ -3,6 +3,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 
 use crate::types::activity::ActivityKind;
+use crate::types::error::ExecutionError;
 use crate::types::execution::ExecutionKind;
 use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef};
 use spica_machinery::Timestamp;
@@ -69,6 +70,16 @@ impl RetryPolicy {
             _ => raw,
         };
         capped.ceil().max(1.0) as u64
+    }
+
+    /// Whether this retrier has an attempt left after `attempts` retries it has already scheduled.
+    ///
+    /// `MaxAttempts` is an `i64` because the definition file holds one; a non-positive value is a
+    /// definition the spec gives no meaning to, and it grants **no** budget rather than wrapping a
+    /// negative into a near-infinite retry ladder — the failure it guards is one an execution would
+    /// otherwise never escape.
+    pub fn has_budget_after(&self, attempts: u32) -> bool {
+        attempts < self.max_attempts.max(0) as u32
     }
 }
 
@@ -213,6 +224,19 @@ pub struct Task {
     pub retry_state: RetryState,
 }
 
+/// What a [`Task::handle_failure`] report did to the task — a named value rather than a `bool`
+/// because the two answers drive different work at the reporter: a retry emits the failure and stops,
+/// a terminal one also has to hand the failure to the state that invoked the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureOutcome {
+    /// A retrier matched with budget left: the *same* task re-queued to `Pending`, gated by
+    /// `next_available_at`. It is claimed again later; nothing else is notified.
+    Retried,
+    /// No retrier matched, or every matching one is out of budget: the task is terminally `Failed`
+    /// and the failure belongs to the invoking state's policy now.
+    Terminal,
+}
+
 impl Task {
     /// Whether a worker may claim this task *at* `now`: a `Pending` task whose retry backoff gate has
     /// lapsed, or a `Running` task whose delivery lease has expired.
@@ -277,9 +301,13 @@ impl Task {
         Ok(())
     }
 
-    /// Move this task to `Completed` at `at`: the row copies forward with only the terminal status, the
-    /// released lease and the transition stamp moved. Only a `Running` (leased) task has a settlement
-    /// to take, so a pending or already settled one is refused and left untouched.
+    /// Move this task to `Completed` at `at` as the act of `worker_id`: the row copies forward with
+    /// only the terminal status, the released lease and the transition stamp moved. Only a `Running`
+    /// (leased) task has a settlement to take, and that settlement is valid **only from the worker it
+    /// is currently leased to** — a pending / already settled task, or one leased to a *different*
+    /// worker, is refused and left untouched. Both halves live here rather than at the caller so no
+    /// call site can honor one and forget the other; an empty `worker_id` never leases and so can
+    /// never settle.
     ///
     /// The lease is **released here**, unlike [`Self::mark_cancelled`]: a cancelled task left the
     /// worker's call un-answered, so its hold is deliberately left standing, whereas a completed one
@@ -289,11 +317,17 @@ impl Task {
     /// The whole `meta` must travel unchanged. Re-deriving the name from the kind and uid alone would
     /// rename the node, and a task's owner matches the child it holds by name — a renamed task never
     /// drains, so the settle that completed it stalls.
-    pub fn mark_completed(&mut self, at: Timestamp) -> Result<(), String> {
+    pub fn mark_completed(&mut self, worker_id: &str, at: Timestamp) -> Result<(), String> {
         if !self.status.is_running() {
             return Err(format!(
                 "only a Running task can be completed, but it is {}",
                 self.status.phase()
+            ));
+        }
+        if worker_id.is_empty() || self.worker_id.as_deref() != Some(worker_id) {
+            return Err(format!(
+                "it is leased to {:?}, not {worker_id}",
+                self.worker_id
             ));
         }
         self.status = TaskStatus::Completed;
@@ -302,11 +336,96 @@ impl Task {
         self.meta.with_update_at(at);
         Ok(())
     }
+
+    /// Take one **failure report** against this task and move it to whichever life comes next: a
+    /// re-queued `Pending` when a retrier still has budget (the same row, claimed again later), or a
+    /// terminal `Failed` otherwise.
+    ///
+    /// Deciding it here rather than at the reporting site keeps the four halves — the lease the report
+    /// must hold, whether a retrier matches, whether its budget is spent, and the backoff gate — in one
+    /// place, where no call site can honor one and forget another. The `Err` is one sentence naming the
+    /// declined precondition, for the caller to fold into its durable rejection reason.
+    ///
+    /// A *worker* report (`worker_id` non-empty) must hold the lease right now, so a foreign or stale
+    /// report is refused rather than applied; an **engine-authoritative** one (empty `worker_id`, the
+    /// `TimeoutSeconds` backstop) may settle any non-terminal task. That asymmetry is where Zeebe's
+    /// at-least-once contract lives: only the live lease holder, or the engine's own deadline, advances
+    /// a task once. The lease is released either way — the report answers the worker's call.
+    pub fn handle_failure(
+        &mut self,
+        worker_id: &str,
+        error: &ExecutionError,
+        now: Timestamp,
+    ) -> Result<FailureOutcome, String> {
+        if self.status.is_terminal() {
+            return Err(format!(
+                "only an in-flight task takes a failure report, but it is {}",
+                self.status.phase()
+            ));
+        }
+        if !worker_id.is_empty()
+            && (!self.status.is_running() || self.worker_id.as_deref() != Some(worker_id))
+        {
+            return Err(format!(
+                "it is {} and leased to {:?}, not {worker_id}",
+                self.status.phase(),
+                self.worker_id
+            ));
+        }
+        self.worker_id = None;
+        self.lease_expires_at = None;
+        self.meta.with_update_at(now);
+
+        // The first retrier whose `ErrorEquals` matches decides, and its budget/backoff come only from
+        // its own history (`retrier_attempts[index]`), so two retriers never pollute each other.
+        let matched = self
+            .retry_plan
+            .iter()
+            .enumerate()
+            .find(|(_, policy)| error.matches_error_names(&policy.error_equals));
+        if let Some((index, policy)) = matched {
+            let attempts = self
+                .retry_state
+                .retrier_attempts
+                .get(index)
+                .map(|a| a.attempt_count)
+                .unwrap_or(0);
+            if policy.has_budget_after(attempts) {
+                // Re-queue rather than re-invoke: the same task entity becomes claimable no earlier
+                // than its backoff gate, so the next attempt is a normal re-claim and the wait needs
+                // no timer to wake it.
+                let next_available_at = now
+                    .checked_add(std::time::Duration::from_secs(
+                        policy.backoff_for_attempt(attempts),
+                    ))
+                    .unwrap_or(now);
+                if self.retry_state.retrier_attempts.len() <= index {
+                    self.retry_state
+                        .retrier_attempts
+                        .resize(index + 1, RetrierAttemptState::default());
+                }
+                self.retry_state.retrier_attempts[index] = RetrierAttemptState {
+                    attempt_count: attempts + 1,
+                    last_retry_at: Some(now),
+                };
+                self.retry_state.attempts += 1;
+                self.status = TaskStatus::Pending;
+                self.retry_state.next_available_at = Some(next_available_at);
+                return Ok(FailureOutcome::Retried);
+            }
+            // A matching retrier with no budget left is no longer a retry: the task fails terminally.
+        }
+
+        self.status = TaskStatus::Failed;
+        self.retry_state.next_available_at = None;
+        Ok(FailureOutcome::Terminal)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::error::RuntimeError;
     use crate::types::meta::ObjectName;
 
     fn ts(ms: u64) -> Timestamp {
@@ -453,7 +572,7 @@ mod tests {
         let mut t = at_status(TaskStatus::Running);
         t.claim("w1", ts(1_000), ts(0));
         let before = t.meta.raw_object_ref();
-        t.mark_completed(ts(200))
+        t.mark_completed("w1", ts(200))
             .expect("a Running task has a settle to take");
 
         assert_eq!(t.status, TaskStatus::Completed);
@@ -475,7 +594,7 @@ mod tests {
     fn a_completed_task_is_terminal_and_never_claimable() {
         let mut t = at_status(TaskStatus::Running);
         t.claim("w1", ts(1_000), ts(0));
-        t.mark_completed(ts(200))
+        t.mark_completed("w1", ts(200))
             .expect("a Running task has a settle to take");
 
         assert!(!t.is_claimable_at(ts(200)));
@@ -537,11 +656,32 @@ mod tests {
             let mut t = at_status(status);
             let before = t.clone();
             let reason = t
-                .mark_completed(ts(200))
+                .mark_completed("w1", ts(200))
                 .expect_err("only a Running task has a settle to take");
             assert!(
                 reason.contains(status.phase()),
                 "the refusal names the state the task was found in: {reason}"
+            );
+            assert_eq!(t, before, "a refused settle writes nothing");
+        }
+    }
+
+    /// A settle lands only on the worker the task is *currently* leased to: a foreign worker's report
+    /// (a stolen / expired-then-reclaimed lease) is refused and the row left untouched, so a stale
+    /// handle can never rewrite an outcome that another worker now owns. An empty `worker_id` is
+    /// likewise no lease holder and refused.
+    #[test]
+    fn only_the_leasing_worker_can_settle_the_task() {
+        let mut t = at_status(TaskStatus::Running);
+        t.claim("w1", ts(1_000), ts(0));
+        let before = t.clone();
+        for reporter in ["w2", ""] {
+            let reason = t
+                .mark_completed(reporter, ts(200))
+                .expect_err("a foreign worker holds no lease to settle");
+            assert!(
+                reason.contains("is leased to"),
+                "the refusal names the live lease: {reason}"
             );
             assert_eq!(t, before, "a refused settle writes nothing");
         }
@@ -565,5 +705,156 @@ mod tests {
         let err =
             serde_json::from_value::<Task>(json).expect_err("a task is never owned by a thread");
         assert!(err.to_string().contains("reference kind mismatch"), "{err}");
+    }
+
+    // ── failure reports ──────────────────────────────────────────────────────
+
+    /// A `Running` task leased to `w1`, carrying `plan` — the state a worker's report arrives at.
+    fn leased_to_w1(plan: Vec<RetryPolicy>) -> Task {
+        let mut t = at_status(TaskStatus::Running);
+        t.worker_id = Some("w1".to_string());
+        t.lease_expires_at = Some(ts(10_000));
+        t.retry_plan = plan;
+        t
+    }
+
+    fn retrier(error_equals: &[&str], max_attempts: i64) -> RetryPolicy {
+        RetryPolicy {
+            error_equals: error_equals.iter().map(|s| s.to_string()).collect(),
+            interval_seconds: 2,
+            max_attempts,
+            backoff_rate: 2.0,
+            max_delay_seconds: None,
+        }
+    }
+
+    /// The error the fixtures report: an ASL `Fail` state's, i.e. one whose `error_name` is the
+    /// `Error` string itself — so a retrier can name it verbatim.
+    fn boom() -> ExecutionError {
+        ExecutionError::Runtime(RuntimeError::StateFailed {
+            state: "T".to_string(),
+            error: "Boom".to_string(),
+            output: Box::new(Value::Null),
+        })
+    }
+
+    /// A matching retrier re-queues the *same* task instead of failing it: the row goes back to
+    /// `Pending`, the lease is released, and the claimability gate is set to the backoff instant —
+    /// `interval × rate^0` = 2s past the report. Nothing is minted and no timer is armed; the next
+    /// attempt is whoever re-claims the row past that gate.
+    #[test]
+    fn a_matching_retrier_requeues_the_task_behind_its_backoff_gate() {
+        let mut t = leased_to_w1(vec![retrier(&["Boom"], 2)]);
+        let outcome = t
+            .handle_failure("w1", &boom(), ts(100))
+            .expect("the lease holder's report is accepted");
+
+        assert_eq!(outcome, FailureOutcome::Retried);
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert_eq!(t.worker_id, None, "the report answers the worker's call");
+        assert_eq!(t.retry_state.attempts, 1);
+        assert_eq!(t.retry_state.retrier_attempts[0].attempt_count, 1);
+        assert_eq!(t.retry_state.next_available_at, Some(ts(2_100)));
+        assert_eq!(t.meta.updated_at, ts(100));
+    }
+
+    /// A retrier whose budget is spent no longer applies, so the same error that re-queued the task
+    /// the first time fails it the second — and the terminal attempt is not counted as a retry.
+    #[test]
+    fn a_retrier_out_of_budget_fails_the_task() {
+        let mut t = leased_to_w1(vec![retrier(&["Boom"], 1)]);
+        assert_eq!(
+            t.handle_failure("w1", &boom(), ts(0))
+                .expect("the first report is accepted"),
+            FailureOutcome::Retried
+        );
+        // The re-queued task is claimed again — the retry's normal re-entry, lease and all.
+        t.claim("w2", ts(10_000), ts(1_000));
+
+        assert_eq!(
+            t.handle_failure("w2", &boom(), ts(2_000))
+                .expect("the second report is accepted"),
+            FailureOutcome::Terminal
+        );
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(
+            t.retry_state.attempts, 1,
+            "the attempt that exhausted the budget is a failure, not a retry"
+        );
+        assert_eq!(t.retry_state.next_available_at, None);
+    }
+
+    /// An error no retrier names fails the task on the first report: matching is by the ASL reserved
+    /// name, so a plan listing a different one is simply not a policy for this failure.
+    #[test]
+    fn an_unmatched_error_fails_the_task_on_the_first_report() {
+        let mut t = leased_to_w1(vec![retrier(&["Some.Other"], 5)]);
+        assert_eq!(
+            t.handle_failure("w1", &boom(), ts(0))
+                .expect("the report is accepted"),
+            FailureOutcome::Terminal
+        );
+        assert_eq!(t.status, TaskStatus::Failed);
+    }
+
+    /// A non-positive `MaxAttempts` grants no retries at all: the definition is meaningless, and
+    /// reading it as a near-infinite ladder would leave a failing execution with no way out.
+    #[test]
+    fn a_non_positive_max_attempts_grants_no_retry() {
+        for max_attempts in [0, -1] {
+            let mut t = leased_to_w1(vec![retrier(&["Boom"], max_attempts)]);
+            assert_eq!(
+                t.handle_failure("w1", &boom(), ts(0))
+                    .expect("the report is accepted"),
+                FailureOutcome::Terminal,
+                "MaxAttempts {max_attempts} is no budget"
+            );
+            assert_eq!(t.status, TaskStatus::Failed);
+        }
+    }
+
+    /// Only the live lease holder's report is applied: a foreign (or stale) one is refused and writes
+    /// nothing, so it can never rewrite an outcome the current holder owns. The *engine's* report is
+    /// not gated that way — a task no worker ever claimed still has a deadline to answer.
+    #[test]
+    fn only_the_live_lease_holder_can_report_a_failure() {
+        let mut t = leased_to_w1(vec![]);
+        let before = t.clone();
+        let reason = t
+            .handle_failure("w2", &boom(), ts(0))
+            .expect_err("a foreign worker holds no lease to report against");
+        assert!(reason.contains("leased to"), "{reason}");
+        assert_eq!(t, before, "a refused report writes nothing");
+
+        let mut unclaimed = at_status(TaskStatus::Pending);
+        assert_eq!(
+            unclaimed
+                .handle_failure("", &boom(), ts(0))
+                .expect("the engine's own backstop may settle an unclaimed task"),
+            FailureOutcome::Terminal
+        );
+    }
+
+    /// A task that already settled takes no second report: the transition is refused and the row is
+    /// left untouched, so a duplicate (or a race between a worker's report and the engine's deadline)
+    /// can never repeat a settlement that already landed.
+    #[test]
+    fn a_terminal_task_refuses_a_failure_report() {
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut t = at_status(status);
+            let before = t.clone();
+            let reason = t
+                .handle_failure("", &boom(), ts(0))
+                .expect_err("a terminal task has no failure to take");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the task was found in: {reason}"
+            );
+            assert_eq!(t, before, "a refused report writes nothing");
+        }
     }
 }
