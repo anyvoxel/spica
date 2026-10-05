@@ -80,7 +80,7 @@ impl ActivityStatus {
 /// - `Wait(WaitActivityState)` — the absolute moment the `Wait` resumes, harvested the same way. A
 ///   `Wait` holds no other runtime data; the instant rides `StateActivated` so every later event of
 ///   the activity carries it, which is what a client asks when it wants "when does this state
-///   resume" without having to find and filter the activity's `WaitResume` timer child.
+///   resume" without having to find and filter the activity's `Seconds` timer child.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ActivityState {
     Parallel(ParallelActivityState),
@@ -100,7 +100,7 @@ pub struct ParallelActivityState {
 
 /// A `Wait` state's activity-level runtime repository — the absolute instant the wait resumes.
 ///
-/// Nothing decides from it: the `WaitResume` timer, armed from this same value at activation, is
+/// Nothing decides from it: the `Seconds` timer, armed from this same value at activation, is
 /// what actually resumes the state (matching [`Execution::deadline`](crate::Execution) and
 /// [`Task::deadline`](crate::Task), where the enforcing timer likewise stays the actor). Resolving
 /// it in the activation step rather than when the timer is armed makes the instant a property of
@@ -224,6 +224,97 @@ impl Activity {
     pub fn retry_count(&self) -> u32 {
         self.retry_state.as_ref().map(|r| r.attempts).unwrap_or(0)
     }
+
+    /// Enter the success finish at `at`, folding in the **raw result** the state's complete step was
+    /// handed: what the state produced is known as soon as its finish begins, and the terminal event
+    /// only carries that value forward. The projected `output` is decided later, at
+    /// [`Self::mark_completed`], once [`crate::ActivityStatus::Completing`]'s children have drained.
+    ///
+    /// Only a `Running` activity has a finish to begin, so one already finishing or terminal is
+    /// **refused** and left untouched — the invariant lives here rather than at each caller, so no call
+    /// site can forget to ask first.
+    ///
+    /// The `Err` is one sentence naming *why* the transition was declined (the object's own state), for
+    /// the caller to fold into its durable rejection reason — the caller alone knows which object and
+    /// which command it is refusing.
+    pub fn mark_completing(&mut self, raw_output: Value, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_running() {
+            return Err(format!(
+                "only a Running activity can begin completing, but it is {}",
+                self.status.phase()
+            ));
+        }
+        self.status = ActivityStatus::Completing;
+        self.raw_output = Some(raw_output);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
+
+    /// Land the success terminal at `at` with the value the complete step's projection produced: the
+    /// finish owned no child or has drained the ones it did, so that value is final and this is the
+    /// only place it is written. `raw_output` keeps the pre-projection view the finish opened with.
+    ///
+    /// Only a `Completing` activity has a terminal to land: one still `Running` has not begun its
+    /// finish (its output is undecided), and one already terminal has landed — both are **refused**, so
+    /// the terminal can never be jumped to from a phase that skipped the finish.
+    pub fn mark_completed(&mut self, output: Value, at: Timestamp) -> Result<(), String> {
+        if !self.status.is_completing() {
+            return Err(format!(
+                "only a Completing activity can complete, but it is {}",
+                self.status.phase()
+            ));
+        }
+        self.status = ActivityStatus::Completed;
+        self.output = Some(output);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
+
+    /// Begin the abnormal finish at `at`: the activity is `Terminating(reason)`, waiting on its owned
+    /// children. The reason is fixed **here** rather than at the terminal — what an activity terminates
+    /// with is decided when its teardown begins, and the terminal only carries that value forward.
+    ///
+    /// An activity can begin terminating from **either** live phase: a `Running` activity a terminate
+    /// command reaches, or a `Completing` one whose own state's complete step turns into a failure (a
+    /// `Fail`). One already `Terminating` (mid-sweep) or terminal has no teardown to begin — both are
+    /// **refused** and left untouched, so no call site can start two teardowns or rewrite a landed one.
+    pub fn mark_terminating(
+        &mut self,
+        reason: TerminationReason,
+        at: Timestamp,
+    ) -> Result<(), String> {
+        if self.status.is_terminating() || self.status.is_terminal() {
+            return Err(format!(
+                "only a Running or Completing activity can begin terminating, but it is {}",
+                self.status.phase()
+            ));
+        }
+        self.status = ActivityStatus::Terminating(reason);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
+
+    /// Land the abnormal terminal at `at`, once no child is left to drain. The reason is **not** taken
+    /// here: the teardown already fixed it, and callers advance the very value that teardown produced,
+    /// so the terminal can never re-decide — or drop — what the activity terminated with.
+    ///
+    /// Only a `Terminating` activity has a terminal to land: one still `Running`/`Completing` has not
+    /// begun its teardown (its reason is undecided), and one already terminal has landed — both are
+    /// **refused**, so the terminal can never be jumped to from a phase that skipped the teardown.
+    pub fn mark_terminated(&mut self, at: Timestamp) -> Result<(), String> {
+        let reason = match &self.status {
+            ActivityStatus::Terminating(reason) => reason.clone(),
+            other => {
+                return Err(format!(
+                    "only a Terminating activity can terminate, but it is {}",
+                    other.phase()
+                ));
+            }
+        };
+        self.status = ActivityStatus::Terminated(reason);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +350,234 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("admits only Thread"), "{msg}");
+    }
+
+    /// A still-`Running` activity with no raw result yet, eligible for a success finish.
+    fn running_activity() -> Activity {
+        Activity {
+            meta: ObjectMeta::<ActivityKind>::builder(ulid::Ulid::from(7u128))
+                .name(ObjectName::from_parsed("execution-0").expect("a valid object name"))
+                .at(Timestamp::from_millis(0))
+                .with_owner(ObjectRef::<ThreadKind>::new(
+                    ObjectName::from_parsed("execution-0").expect("a valid object name"),
+                    ulid::Ulid::nil(),
+                )),
+            execution: ObjectRef::new(
+                ObjectName::from_parsed("execution-0").expect("a valid object name"),
+                ulid::Ulid::nil(),
+            ),
+            state_path: StatePath::from(jsonptr::PointerBuf::new()),
+            status: ActivityStatus::Running,
+            raw_input: Value::Null,
+            input: None,
+            raw_output: None,
+            activity_state: None,
+            retry_state: None,
+            output: None,
+        }
+    }
+
+    /// Opening the finish folds the raw result in, moves the status and the transition stamp, and
+    /// touches nothing else — the identity, input and pre-decision fields all survive so the deferred
+    /// drain can read the result back off the row to project with.
+    #[test]
+    fn completing_moves_only_the_status_input_and_stamp() {
+        let mut activity = running_activity();
+        activity
+            .mark_completing(
+                serde_json::json!({ "worker": "a" }),
+                Timestamp::from_millis(200),
+            )
+            .expect("a Running activity opens its finish");
+        assert_eq!(activity.status, ActivityStatus::Completing);
+        assert_eq!(
+            activity.raw_output,
+            Some(serde_json::json!({ "worker": "a" }))
+        );
+        assert_eq!(activity.meta.created_at, Timestamp::from_millis(0));
+        assert_eq!(activity.meta.updated_at, Timestamp::from_millis(200));
+        assert!(
+            activity.output.is_none(),
+            "output is decided at the terminal, not the finish"
+        );
+    }
+
+    /// Landing the success terminal writes only the projected output and the stamp — and only from
+    /// `Completing`, so the terminal can never be jumped to from a phase that skipped the finish.
+    #[test]
+    fn completed_writes_the_output_and_the_stamp() {
+        let mut activity = running_activity();
+        activity
+            .mark_completing(
+                serde_json::json!({ "raw": true }),
+                Timestamp::from_millis(100),
+            )
+            .expect("a Running activity opens its finish");
+        activity
+            .mark_completed(
+                serde_json::json!({ "done": true }),
+                Timestamp::from_millis(120),
+            )
+            .expect("a Completing activity lands its terminal");
+        assert_eq!(activity.status, ActivityStatus::Completed);
+        assert_eq!(activity.output, Some(serde_json::json!({ "done": true })));
+        assert_eq!(
+            activity.raw_output,
+            Some(serde_json::json!({ "raw": true })),
+            "the raw result the finish opened with survives the projection"
+        );
+        assert_eq!(activity.meta.updated_at, Timestamp::from_millis(120));
+    }
+
+    /// An activity past `Running` refuses the finish and stays exactly as it was — a cancel or an
+    /// earlier finish racing the command never gets overwritten by the one it lost to.
+    #[test]
+    fn a_non_running_activity_refuses_to_complete_and_stays_untouched() {
+        for (status, reject) in [
+            (ActivityStatus::Completing, "only a Running activity"),
+            (ActivityStatus::Completed, "only a Running activity"),
+            (
+                ActivityStatus::Terminating(TerminationReason::Cancelled),
+                "only a Running activity",
+            ),
+        ] {
+            let mut activity = running_activity();
+            activity.status = status;
+            let before = activity.clone();
+            let reason = activity
+                .mark_completing(serde_json::json!({}), Timestamp::from_millis(300))
+                .expect_err("only a Running activity opens its finish");
+            assert!(
+                reason.contains(reject),
+                "reason names the refusal: {reason}"
+            );
+            assert_eq!(activity, before, "a refused finish writes nothing");
+        }
+    }
+
+    /// The success terminal can only land from `Completing`: a still-`Running` activity has not begun
+    /// its finish (its output is undecided), and one already terminal has landed — both are refused
+    /// so the terminal can never be jumped to from a phase that skipped the finish.
+    #[test]
+    fn only_a_completing_activity_lands_the_terminal() {
+        for status in [ActivityStatus::Running, ActivityStatus::Completed] {
+            let mut activity = running_activity();
+            activity.status = status;
+            let before = activity.clone();
+            let reason = activity
+                .mark_completed(serde_json::json!({}), Timestamp::from_millis(400))
+                .expect_err("only a Completing activity lands its terminal");
+            assert!(
+                reason.contains("only a Completing activity can complete"),
+                "reason names the refusal: {reason}"
+            );
+            assert_eq!(activity, before, "a refused terminal writes nothing");
+        }
+    }
+
+    /// Beginning the teardown fixes the reason and moves the stamp — from a live phase (`Running`, or
+    /// the `Completing` a `Fail`'s complete step opens), and touching nothing else.
+    #[test]
+    fn terminating_fixes_the_reason_and_the_stamp() {
+        for status in [ActivityStatus::Running, ActivityStatus::Completing] {
+            let mut activity = running_activity();
+            activity.status = status;
+            activity
+                .mark_terminating(
+                    TerminationReason::Failed {
+                        error: crate::types::error::ExecutionError::Runtime(
+                            crate::types::error::RuntimeError::StateFailed {
+                                state: "P".to_string(),
+                                error: "States.Fail".to_string(),
+                                output: Box::new(Value::Null),
+                            },
+                        ),
+                    },
+                    Timestamp::from_millis(300),
+                )
+                .expect("a live activity begins its teardown");
+            assert!(
+                activity.status.is_terminating(),
+                "the activity is mid-teardown: {:?}",
+                activity.status
+            );
+            assert_eq!(activity.meta.updated_at, Timestamp::from_millis(300));
+            assert!(
+                activity.output.is_none(),
+                "output is only set by a successful complete"
+            );
+        }
+    }
+
+    /// Landing the abnormal terminal carries the reason the teardown fixed, never one re-decided here,
+    /// and moves only the status and the stamp.
+    #[test]
+    fn terminated_carries_the_teardowns_reason() {
+        let mut activity = running_activity();
+        let reason = TerminationReason::Failed {
+            error: crate::types::error::ExecutionError::Runtime(
+                crate::types::error::RuntimeError::StateFailed {
+                    state: "P".to_string(),
+                    error: "States.Fail".to_string(),
+                    output: Box::new(Value::Null),
+                },
+            ),
+        };
+        activity
+            .mark_terminating(reason.clone(), Timestamp::from_millis(100))
+            .expect("a Running activity begins its teardown");
+        activity
+            .mark_terminated(Timestamp::from_millis(120))
+            .expect("a Terminating activity lands its terminal");
+        assert_eq!(activity.status, ActivityStatus::Terminated(reason));
+        assert_eq!(activity.meta.updated_at, Timestamp::from_millis(120));
+    }
+
+    /// An activity already winding down (`Terminating`) or landed (`Terminated`/`Completed`) refuses a
+    /// second teardown and stays untouched — one teardown is already in flight, and starting another
+    /// would rewrite the reason the first fixed.
+    #[test]
+    fn a_winding_down_activity_refuses_a_second_teardown_and_stays_untouched() {
+        for status in [
+            ActivityStatus::Terminating(TerminationReason::Cancelled),
+            ActivityStatus::Terminated(TerminationReason::Cancelled),
+            ActivityStatus::Completed,
+        ] {
+            let mut activity = running_activity();
+            activity.status = status;
+            let before = activity.clone();
+            let reason = activity
+                .mark_terminating(TerminationReason::Cancelled, Timestamp::from_millis(400))
+                .expect_err("only a live activity begins its teardown");
+            assert!(
+                reason.contains("only a Running or Completing activity"),
+                "reason names the refusal: {reason}"
+            );
+            assert_eq!(activity, before, "a refused teardown writes nothing");
+        }
+    }
+
+    /// The abnormal terminal can only land from `Terminating`: a still-`Running`/`Completing` activity
+    /// has not begun its teardown (its reason is undecided), and one already terminal has landed — both
+    /// are refused so the terminal can never be jumped to from a phase that skipped the teardown.
+    #[test]
+    fn only_a_terminating_activity_lands_the_terminal() {
+        for status in [
+            ActivityStatus::Running,
+            ActivityStatus::Completing,
+            ActivityStatus::Completed,
+        ] {
+            let mut activity = running_activity();
+            activity.status = status;
+            let before = activity.clone();
+            let reason = activity
+                .mark_terminated(Timestamp::from_millis(500))
+                .expect_err("only a Terminating activity lands its terminal");
+            assert!(
+                reason.contains("only a Terminating activity can terminate"),
+                "reason names the refusal: {reason}"
+            );
+            assert_eq!(activity, before, "a refused terminal writes nothing");
+        }
     }
 }

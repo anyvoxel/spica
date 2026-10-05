@@ -2,7 +2,16 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{State, SucceedState};
 
+use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use crate::eval_env::EvalEnv;
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::command::{Command, TerminateState, TerminationReason};
+use crate::types::context::States;
+use crate::types::error::ExecutionError;
+use crate::types::event::Event;
+use crate::types::meta::HasRawObjectRef;
+use crate::{Activity, RejectionType, Variables};
 
 pub struct SucceedStateHandlerFactory;
 
@@ -28,17 +37,112 @@ struct SucceedStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for SucceedStateHandler<'_> {
-    // Succeed is terminal: it finishes itself with its evaluated output, then completes the whole
-    // execution with the same output. Per the ASL spec it carries only an optional `Output` (no
-    // `Assign`), so it runs the base's default `finish` and supplies just its output and the terminal
-    // routing.
-    fn output(&self) -> Option<&Value> {
-        self.state.output.as_ref()
+    /// (3.4) A `Succeed` is terminal and owns no child, so its whole complete path — project `Output`,
+    /// open the activity, then hand the completed settle to its owning thread's container, which
+    /// completes the thread — runs here in one go, mirroring `Pass`/`Choice`/`Fail`. A projection
+    /// failure is turned into a terminate here rather than returned: the activity is already
+    /// `Completing`, so there is no later hop to report it from.
+    async fn after_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let output = match self
+            .process_succeed(ctx.env, activity_value, variables)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_value.meta.object_ref(),
+                    reason: TerminationReason::Failed { error },
+                }));
+                return Ok(());
+            }
+        };
+        // Resolve the owning thread's container *before* emitting the terminal, so an entitled settle
+        // is answered while the activity is still intact (see `FailStateHandler::after_completing`).
+        let owner = activity_value.meta.owner.clone();
+        let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!(
+                    "succeed_state: activity {} has no owning thread; completion refused",
+                    activity_value.meta.object_ref()
+                ),
+            ));
+        };
+        let mut completed = activity_value.clone();
+        debug_assert!(
+            completed.mark_completed(output, out.now()).is_ok(),
+            "the complete step that dispatched this after_completing opened the activity as Completing"
+        );
+        let activity_ref = completed.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateCompleted {
+            activity: completed,
+        })
+        .await;
+        // The threaded scope's own completion follows from the terminal's settle (see
+        // `ThreadContainer::after_child_completed`): `Succeed` carries no `Next`, so completing the
+        // thread with the projected output is the state's one and only route.
+        thread_container
+            .after_child_completed(ctx, out, &activity_ref)
+            .await;
+        Ok(())
     }
 
-    // TODO：终态的路由不应该走 `emit_transition` 的通用分支，而应像 Fail 一样直接完成执行。
-    fn end(&self) -> Option<bool> {
-        Some(true)
+    // A `Succeed` owns no children, so its terminate closes inline: mark `Terminated`, emit the
+    // terminal, and relay the settle up to the owning thread.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+        );
+        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        Ok(())
+    }
+}
+
+impl SucceedStateHandler<'_> {
+    /// The `Succeed` complete step: build `$states` and project `Output` (defaulting to the raw
+    /// result), mirroring `Pass`'s `process_pass`. `Succeed` carries no `Assign` (per ASL), so nothing
+    /// is emitted here — no `VariablesAssigned` — and the finish is always the owner's terminal
+    /// completion.
+    async fn process_succeed(
+        &self,
+        env: &mut EvalEnv,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<Value, ExecutionError> {
+        let result = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| activity_value.raw_input.clone());
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        self.project_output(env, self.state.output.as_ref(), &states, variables, result)
+            .await
     }
 }
 

@@ -1,16 +1,16 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State};
+use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State, StatePath};
 
-use super::super::emit_state_completed;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::eval_env::{EvalEnv, extract_jsonata};
-use crate::handler::Collector;
-use crate::types::command::{ActivateState, Command};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
+use crate::types::meta::HasRawObjectRef;
 use crate::types::variables::Variables;
 
 pub struct ChoiceStateHandlerFactory;
@@ -33,6 +33,14 @@ impl StateHandlerFactory for ChoiceStateHandlerFactory {
 
 struct ChoiceStateHandler<'a> {
     state: &'a ChoiceState,
+}
+
+/// What the rule scan decided: the branch to hop to, and the payload that hop carries.
+struct ChoiceBranch {
+    /// The resolved successor's path — the matched rule's `Next`, or the state `Default`.
+    next: StatePath,
+    /// The branch's projected output, i.e. what the successor is activated with.
+    output: Value,
 }
 
 impl ChoiceStateHandler<'_> {
@@ -86,21 +94,21 @@ impl ChoiceStateHandler<'_> {
             },
         }
     }
-}
 
-#[async_trait]
-impl StateHandler for ChoiceStateHandler<'_> {
-    /// Routes the Choice: resolve the matching rule in the finish step, project the `Assign`/`Output`
-    /// of the chosen rule (overriding the state level), and emit the transition. `$states` carries no
-    /// `.result` — a Choice produces no raw result of its own. No match and no `Default` is a
-    /// `NoChoiceMatched` failure, propagated for the base's terminate.
-    async fn finish(
+    /// The `Choice` decision itself: scan the rules against `$states`, apply the winning branch's
+    /// `Assign` onto the scope (emitting `VariablesAssigned`), project that branch's `Output`, and hand
+    /// back the hop to take. It emits nothing about the activity — the terminal and the hop belong to
+    /// [`StateHandler::after_completing`], which turns the returned branch into the success chain and an
+    /// `Err` here into a terminate. `$states` carries no `.result`: a Choice produces no raw result of
+    /// its own, so the pass-through fallback is the processed input. No match and no `Default` is a
+    /// `NoChoiceMatched` failure.
+    async fn process_choice(
         &self,
         env: &mut EvalEnv,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         variables: &Variables,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<ChoiceBranch, ExecutionError> {
         let state_name = activity_value.state_path.state_name();
 
         // `$states` for the rule scan: `assign_ctx = Some` (matching Pass/Succeed/Fail) — however late
@@ -120,13 +128,12 @@ impl StateHandler for ChoiceStateHandler<'_> {
         let assign = rule_assign.as_ref().or(self.state.assign.as_ref());
         let output_src = rule_output.as_ref().or(self.state.output.as_ref());
 
-        // Projection reuses the scan's `$states` — a Choice produces no raw result of its own, so the
-        // pass-through fallback is the processed input.
+        // Projection reuses the scan's `$states`.
         let mut local_scope = variables.clone();
         let owner = activity_value.meta.owner.clone();
         self.apply_assign(out, env, &owner, assign, &states, &mut local_scope)
             .await?;
-        let output_value = self
+        let output = self
             .project_output(
                 env,
                 output_src,
@@ -135,22 +142,92 @@ impl StateHandler for ChoiceStateHandler<'_> {
                 activity_value.raw_input.clone(),
             )
             .await?;
-        emit_state_completed(out, activity_value, &output_value).await;
+        Ok(ChoiceBranch {
+            next: activity_value.state_path.sibling(&rule_next),
+            output,
+        })
+    }
+}
+
+#[async_trait]
+impl StateHandler for ChoiceStateHandler<'_> {
+    /// (3.4) A `Choice` owns no child at all, so there is nothing to wait on: the whole complete path —
+    /// decide the branch, then emit its terminal and its hop — runs here in one go, with no child
+    /// count. Nothing reaches this state through the deferred drain either (see
+    /// `crate::handlers::continue_`): that hop exists to advance a state whose children settled, and
+    /// this one has none to settle.
+    ///
+    /// A decision failure is turned into a terminate here rather than returned: the activity is
+    /// already `Completing`, so there is no later hop to report it from.
+    async fn after_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let branch = match self
+            .process_choice(ctx.env, out, activity_value, variables)
+            .await
+        {
+            Ok(branch) => branch,
+            Err(error) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_value.meta.object_ref(),
+                    reason: TerminationReason::Failed { error },
+                }));
+                return Ok(());
+            }
+        };
+        let mut completed = activity_value.clone();
+        debug_assert!(
+            completed
+                .mark_completed(branch.output.clone(), out.now())
+                .is_ok(),
+            "the complete step that dispatched this after_completing opened the activity as Completing"
+        );
+        out.append_event(Event::StateCompleted {
+            activity: completed,
+        })
+        .await;
 
         // Choice's `next` is mandatory, so the transition is always a sibling hop — the general
         // `emit_transition` (which also handles the `end`/`NoTerminal` cases) is bypassed.
-        let next_path = activity_value.state_path.sibling(&rule_next);
         out.append_event(Event::StateTransitioned(StateTransitioned {
             activity: activity_value.meta.object_ref(),
-            next: next_path.as_ptr().to_owned(),
+            next: branch.next.as_ptr().to_owned(),
         }))
         .await;
         out.append_command(Command::ActivateState(ActivateState {
             execution: activity_value.execution.clone(),
-            owner,
-            state_path: next_path,
-            input: output_value,
+            owner: activity_value.meta.owner.clone(),
+            state_path: branch.next,
+            input: branch.output,
         }));
+        Ok(())
+    }
+
+    // A `Choice` owns no children, so its terminate closes inline: mark `Terminated`, emit the
+    // terminal, and relay the settle up to the owning thread.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+        );
+        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
         Ok(())
     }
 }

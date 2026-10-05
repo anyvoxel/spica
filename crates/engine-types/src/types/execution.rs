@@ -108,10 +108,11 @@ pub struct Execution {
     pub flow_version: ObjectRef<FlowVersionKind>,
     pub status: ExecutionStatus,
     /// The absolute moment the state machine's `TimeoutSeconds` expires, `Some` iff the definition
-    /// sets one. Nothing decides from it — the run is terminated by the `ExecutionTimeout` timer whose
-    /// `deadline` is the *same* instant (both written from one computation at creation) — so this is
-    /// the run's own answer to "when is it due", where a client would otherwise have to find and filter
-    /// the timer child. It is the run-level counterpart of a state's [`Task::deadline`](crate::Task).
+    /// sets one. The run is terminated by the timer armed from this *same* instant (both written from
+    /// one computation at creation), so this is the run's own answer to "when is it due", where a
+    /// client would otherwise have to find and filter the timer child — and the `TimedOut` the timer's
+    /// fire terminates the run with. The run-level counterpart of a state's
+    /// [`Task::deadline`](crate::Task).
     #[serde(default)]
     pub deadline: Option<Timestamp>,
     /// The original execution input.
@@ -165,6 +166,51 @@ impl Execution {
             ));
         }
         self.status = ExecutionStatus::Completed;
+        self.meta.with_update_at(at);
+        Ok(())
+    }
+
+    /// Begin the abnormal finish at `at`: the run is `Terminating(reason)`, waiting on its owned
+    /// children. The reason is fixed **here** rather than at the terminal — what a run terminates with
+    /// is decided when its teardown begins, and the terminal only carries that value forward.
+    ///
+    /// Only a `Running` run has a teardown to begin, so one already finishing or terminal is
+    /// **refused** and left untouched, exactly as [`Self::mark_completing`] — the invariant lives here
+    /// rather than at each caller, so no call site can forget to ask first.
+    pub fn mark_terminating(
+        &mut self,
+        reason: TerminationReason,
+        at: Timestamp,
+    ) -> Result<(), String> {
+        if !self.status.is_running() {
+            return Err(format!(
+                "only a Running execution can begin terminating, but it is {}",
+                self.status.phase()
+            ));
+        }
+        self.status = ExecutionStatus::Terminating(reason);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
+
+    /// Land the abnormal terminal at `at`, once no child is left to drain. The reason is **not** taken
+    /// here: the teardown already fixed it, and callers advance the very value that teardown produced,
+    /// so the terminal can never re-decide — or drop — what the run terminated with.
+    ///
+    /// Only a `Terminating` run has a terminal to land: a run still `Running` has not begun its
+    /// teardown (its reason is undecided), and one already terminal has landed — both are **refused**,
+    /// so the terminal can never be jumped to from a phase that skipped the teardown.
+    pub fn mark_terminated(&mut self, at: Timestamp) -> Result<(), String> {
+        let reason = match &self.status {
+            ExecutionStatus::Terminating(reason) => reason.clone(),
+            other => {
+                return Err(format!(
+                    "only a Terminating execution can be terminated, but it is {}",
+                    other.phase()
+                ));
+            }
+        };
+        self.status = ExecutionStatus::Terminated(reason);
         self.meta.with_update_at(at);
         Ok(())
     }
@@ -282,6 +328,92 @@ mod tests {
             let reason = exec
                 .mark_completed(ts(900))
                 .expect_err("only a Completing run has a terminal to land");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the run was found in: {reason}"
+            );
+            assert_eq!(exec, before, "a refused terminal writes nothing");
+        }
+    }
+
+    /// The teardown fixes the reason where it begins: `Terminating` already carries the value the
+    /// terminal will hand forward, and only the transition stamp moves — `created_at` rides unchanged.
+    #[test]
+    fn beginning_the_teardown_fixes_the_reason_before_the_terminal() {
+        let mut exec = running_execution();
+        exec.mark_terminating(TerminationReason::Cancelled, ts(500))
+            .expect("a Running execution has a teardown to begin");
+
+        assert_eq!(
+            exec.status,
+            ExecutionStatus::Terminating(TerminationReason::Cancelled)
+        );
+        assert_eq!(exec.meta.created_at, ts(0));
+        assert_eq!(exec.meta.updated_at, ts(500));
+    }
+
+    /// Landing the abnormal terminal advances the status onto the reason the teardown already fixed —
+    /// it is read off the run's own status, never passed in — and stamps the moment the terminal
+    /// lands, not the one the teardown began.
+    #[test]
+    fn the_abnormal_terminal_lands_on_the_reason_the_teardown_fixed() {
+        let mut exec = running_execution();
+        exec.mark_terminating(TerminationReason::TimedOut, ts(500))
+            .expect("a Running execution has a teardown to begin");
+        exec.mark_terminated(ts(900))
+            .expect("a Terminating execution has a terminal to land");
+
+        assert_eq!(
+            exec.status,
+            ExecutionStatus::Terminated(TerminationReason::TimedOut)
+        );
+        assert_eq!(exec.meta.created_at, ts(0));
+        assert_eq!(exec.meta.updated_at, ts(900));
+        assert!(exec.is_terminal());
+    }
+
+    /// A teardown only begins from `Running`: a run already finishing or terminal has none to begin, and
+    /// is refused and left untouched — so no call site can restart a teardown, or re-decide the reason
+    /// one already fixed.
+    #[test]
+    fn only_a_running_execution_begins_a_teardown() {
+        for status in [
+            ExecutionStatus::Completing,
+            ExecutionStatus::Terminating(TerminationReason::Cancelled),
+            ExecutionStatus::Completed,
+            ExecutionStatus::Terminated(TerminationReason::Cancelled),
+        ] {
+            let mut exec = running_execution();
+            exec.status = status.clone();
+            let before = exec.clone();
+            let reason = exec
+                .mark_terminating(TerminationReason::TimedOut, ts(500))
+                .expect_err("a run past Running has no teardown to begin");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the run was found in: {reason}"
+            );
+            assert_eq!(exec, before, "a refused teardown writes nothing");
+        }
+    }
+
+    /// The abnormal terminal only lands from `Terminating`: a run still `Running` has not begun its
+    /// teardown (its reason is undecided), and one already terminal has landed — both refused, so the
+    /// terminal can never be jumped to from a phase that skipped the teardown.
+    #[test]
+    fn only_a_terminating_execution_lands_the_abnormal_terminal() {
+        for status in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Completing,
+            ExecutionStatus::Completed,
+            ExecutionStatus::Terminated(TerminationReason::Cancelled),
+        ] {
+            let mut exec = running_execution();
+            exec.status = status.clone();
+            let before = exec.clone();
+            let reason = exec
+                .mark_terminated(ts(900))
+                .expect_err("only a Terminating run has a terminal to land");
             assert!(
                 reason.contains(status.phase()),
                 "the refusal names the state the run was found in: {reason}"

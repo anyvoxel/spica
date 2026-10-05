@@ -6,6 +6,7 @@ use crate::types::command::TerminationReason;
 use crate::types::execution::ExecutionKind;
 use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef, ThreadOwner};
 use spica_asl::StatePath;
+use spica_machinery::Timestamp;
 
 /// Lifecycle status of a [`Thread`] — the scoped sub-state-machine run a `Parallel` branch or a
 /// `Map` item executes.
@@ -148,6 +149,34 @@ impl Thread {
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
     }
+
+    /// Begin the abnormal finish at `at`: the thread is `Terminating(reason)`, waiting on its owned
+    /// children. The reason is fixed **here** rather than at the terminal — what a thread terminates
+    /// with is decided when its teardown begins, and the terminal only carries that value forward.
+    /// Mirrors [`Execution::mark_terminating`](crate::Execution::mark_terminating).
+    ///
+    /// Only a `Running` thread has a teardown to begin, so one already finishing or terminal is
+    /// **refused** and left untouched — the invariant lives here rather than at each caller, so no
+    /// call site can forget to ask first.
+    ///
+    /// The `Err` is one sentence naming *why* the transition was declined (the object's own state),
+    /// for the caller to fold into its durable rejection reason — the caller alone knows which object
+    /// and which command it is refusing.
+    pub fn mark_terminating(
+        &mut self,
+        reason: TerminationReason,
+        at: Timestamp,
+    ) -> Result<(), String> {
+        if !self.status.is_running() {
+            return Err(format!(
+                "only a Running thread can begin terminating, but it is {}",
+                self.status.phase()
+            ));
+        }
+        self.status = ThreadStatus::Terminating(reason);
+        self.meta.with_update_at(at);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +184,6 @@ mod tests {
     use super::*;
     use crate::types::meta::{ObjectName, ObjectRef};
     use crate::types::thread::ThreadKind;
-    use spica_machinery::Timestamp;
 
     /// A thread's owner slot is the union of the two scopes it can hang off, and only those two: a
     /// root thread reads back under its `Execution`, a fan-out thread under its container `Activity`,
@@ -198,5 +226,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("reference kind mismatch"), "{msg}");
         assert!(msg.contains("ThreadOwner"), "{msg}");
+    }
+
+    /// A running fan-out thread born at `ts(0)` — each case drives the transition it is about.
+    fn running_thread() -> Thread {
+        let ts = |ms| Timestamp::from_millis(ms);
+        Thread {
+            meta: ObjectMeta::builder(ulid::Ulid::new())
+                .timestamps(ts(0), ts(0))
+                .with_owner(ThreadOwner::Activity(ObjectRef::new(
+                    ObjectName::plain("parallel").expect("a container name is a valid object name"),
+                    ulid::Ulid::new(),
+                ))),
+            execution: ObjectRef::new(
+                ObjectName::plain("execution").expect("an execution name is a valid object name"),
+                ulid::Ulid::new(),
+            ),
+            state_path: StatePath::root(),
+            start_at: "S".to_string(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: Value::Null,
+            output: None,
+        }
+    }
+
+    /// The teardown fixes the reason where it begins: `Terminating` already carries the value the
+    /// terminal will hand forward, and only the transition stamp moves — `created_at` rides unchanged.
+    #[test]
+    fn beginning_the_teardown_fixes_the_reason_before_the_terminal() {
+        let mut thread = running_thread();
+        thread
+            .mark_terminating(TerminationReason::Cancelled, Timestamp::from_millis(500))
+            .expect("a Running thread has a teardown to begin");
+
+        assert_eq!(
+            thread.status,
+            ThreadStatus::Terminating(TerminationReason::Cancelled)
+        );
+        assert_eq!(thread.meta.created_at, Timestamp::from_millis(0));
+        assert_eq!(thread.meta.updated_at, Timestamp::from_millis(500));
+    }
+
+    /// A teardown only begins from `Running`: a thread already finishing or terminal has none to
+    /// begin, and is refused and left untouched — so no call site can restart a teardown, or re-decide
+    /// the reason one already fixed.
+    #[test]
+    fn only_a_running_thread_begins_a_teardown() {
+        for status in [
+            ThreadStatus::Completing,
+            ThreadStatus::Terminating(TerminationReason::Cancelled),
+            ThreadStatus::Completed,
+            ThreadStatus::Terminated(TerminationReason::Cancelled),
+        ] {
+            let mut thread = running_thread();
+            thread.status = status.clone();
+            let before = thread.clone();
+            let reason = thread
+                .mark_terminating(TerminationReason::TimedOut, Timestamp::from_millis(500))
+                .expect_err("a thread past Running has no teardown to begin");
+            assert!(
+                reason.contains(status.phase()),
+                "the refusal names the state the thread was found in: {reason}"
+            );
+            assert_eq!(thread, before, "a refused teardown writes nothing");
+        }
     }
 }

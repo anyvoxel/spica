@@ -7,15 +7,18 @@
 //! the child hands its settle to its owner's [`Container`] and the owner decides.
 //!
 //! The owner's own kind picks the impl at the call site, so one container exists per kind that owns
-//! children: [`ActivityContainer`] (a state's in-flight task or timer) and [`ExecutionContainer`] (a
-//! run's own scope children). The remaining owners still settle via
+//! children: [`ActivityContainer`] (a state's in-flight task or timer), [`ThreadContainer`] (the
+//! state activities that run in one scope) and [`ExecutionContainer`] (a run's own scope children).
+//! The remaining owners still settle via
 //! [`child_settled`](super::child_completed::child_settled).
 
 mod activity;
 mod execution;
+mod thread;
 
 pub(crate) use activity::ActivityContainer;
 pub(crate) use execution::ExecutionContainer;
+pub(crate) use thread::ThreadContainer;
 
 use crate::StorageError;
 use crate::handler::{Collector, HandlerContext};
@@ -63,8 +66,10 @@ pub(crate) trait Container {
     );
 
     /// An owned `child` reached an **abnormal** terminal (cancelled, terminated, timed out). The
-    /// reason is deliberately not carried: the container that is finishing already holds its own
-    /// `Terminating(reason)` on its row — the single source of truth for why *it* is going down.
+    /// reason is deliberately not carried: a container that is *finishing* already holds its own
+    /// `Terminating(reason)` on its row — the single source of truth for why *it* is going down —
+    /// and one still `Running` reads it off the settled child's row, the same place the success hook
+    /// reads that child's output.
     async fn after_child_terminated(
         &self,
         ctx: &mut HandlerContext<'_>,

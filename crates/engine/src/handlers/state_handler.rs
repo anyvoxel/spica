@@ -4,7 +4,6 @@ use spica_asl::{AssignObject, State};
 use std::collections::HashMap;
 use std::mem::Discriminant;
 
-use super::{emit_state_completed, emit_transition};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::storage::{ActivityRecord, ThreadRecord};
@@ -15,9 +14,9 @@ use crate::types::command::{
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
-use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef};
+use crate::types::meta::{ObjectMeta, ObjectRef, OwnerScope, RawObjectRef};
 use crate::types::thread::ThreadKind;
-use crate::{Activity, ActivityStatus, Timestamp, Variables};
+use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
 /// (via [`Self::state`], the single source of truth for the dispatch-table key) and builds a
@@ -92,18 +91,16 @@ impl StateHandlerRegistry {
     }
 }
 
-/// The state's answer to "may the success finish run now?", returned by
-/// [`StateHandler::on_completing`] once it has dealt with its own unfinished children. A named value
-/// rather than a `bool` because `Waiting` also carries *how many* children are still live, which the
-/// base reports in its deferral log.
-pub enum FinishReadiness {
-    /// Proceed into the finish: no child of this state outlives the decision.
-    Ready,
-    /// Defer: `pending` children are still live. The activity is already `Completing`, so the last
-    /// one's settle drives the drain (see `crate::handlers::continue_`) — nothing re-drives `complete`.
-    Waiting { pending: usize },
-    /// The activity's row is gone or unreadable: there is no finish to run.
-    Gone,
+/// The state's answer to "is this failure mine to route?", returned by
+/// [`StateHandler::on_failed`]. A named value rather than a `bool` because the two answers differ in
+/// what the *caller* does next: a caught failure has already been routed, so the teardown that asked
+/// must stop; an uncaught one stands and the teardown proceeds.
+pub enum FailureRouting {
+    /// The state's error policy took the failure — it has already routed the activity along the
+    /// catcher's `Next`, so the activity is completing rather than terminating.
+    Caught,
+    /// No policy of this state matches: the failure stands and the teardown proceeds.
+    Uncaught,
 }
 
 /// A short-lived handler bound to one resolved [`State`] definition. Owned for a single lifecycle
@@ -111,15 +108,15 @@ pub enum FinishReadiness {
 /// holds a typed definition reference (e.g. `&TaskState`), so the per-variant hooks read it directly
 /// instead of receiving `&State` and re-matching.
 ///
-/// Both lifecycle operations are Template Methods owned by the base. [`activate`](Self::activate)
-/// constructs the activity, runs the four activate hooks (`initialize` / `process_input` /
-/// `after_activated` / `complete_directly`) in a fixed order, and hands into `CompleteState`, so
-/// synchronous states (Pass/Succeed/Fail/Choice) share one code path instead of each re-emitting
-/// `StateActivated` + `CompleteState`. [`complete`](Self::complete) runs the shared complete-step
-/// orchestration (load, guards, `StateCompleting`, the [`on_completing`](Self::on_completing) child
-/// gate, scope resolution) and then the single per-state [`finish`](Self::finish). The activate causal
-/// chain is `StateActivating → StateActivated → (CompleteState | side effect)`; the complete chain is
-/// `StateCompleting → (StateCompleted | failure ed) → transition`.
+/// Both lifecycle operations are Template Methods owned by the base, each ending in a single per-state
+/// call. [`activate`](Self::activate) constructs the activity, runs the four activate hooks
+/// (`initialize` / `process_input` / `after_activated` / `complete_directly`) in a fixed order, and
+/// hands into `CompleteState`, so synchronous states (Pass/Succeed/Fail/Choice) share one code path
+/// instead of each re-emitting `StateActivated` + `CompleteState`. [`complete`](Self::complete) is the
+/// drawer alone — fold the raw result in, open the activity with `StateCompleting` — and hands the rest
+/// to [`after_completing`](Self::after_completing), so a state's whole complete path lives in one
+/// method of its own. The activate causal chain is `StateActivating → StateActivated → (CompleteState |
+/// side effect)`; the complete chain is `StateCompleting → (StateCompleted | failure ed) → transition`.
 #[async_trait]
 pub trait StateHandler: Send + Sync {
     // ── activate hooks — the only per-state variation ────────────────────────
@@ -188,124 +185,33 @@ pub trait StateHandler: Send + Sync {
 
     // ── complete hooks — the only per-state variation of the complete step ──
 
-    /// (3.4) Deal with this state's unfinished children as the finish opens, reporting whether the
-    /// base may continue into [`finish`](Self::finish). The state is the only code that knows *what*
-    /// its children are, so the disposition belongs here: it cleans up whatever must not outlive its
-    /// own decision (a `Task` cancels the deadline/lease timers that merely bounded it), then reports a
-    /// wait for whatever is left. The default waits on the generic child set — a state owning no
-    /// children is trivially `Ready`, and a state whose child *is* its completion trigger (`Wait`'s
-    /// resume timer, a container's fan-out) needs no cleanup of its own.
-    ///
-    /// The activity's reference is derived from the value rather than passed beside it: the row was
-    /// read by that very reference, so `meta` is its source of truth and the two cannot disagree.
-    async fn on_completing(
+    /// (3.4) The state's own complete step, run by the base [`complete`](Self::complete) once the
+    /// activity has been opened with `StateCompleting`. This is the *single* per-state entry for the
+    /// complete path — every state writes its own, so no state's completion is inherited by accident:
+    /// a state disposes of whatever must not outlive its own decision here and then runs the finish.
+    async fn after_completing(
         &self,
         ctx: &mut HandlerContext<'_>,
-        _out: &mut Collector<'_>,
-        activity_value: &Activity,
-    ) -> FinishReadiness {
-        let activity = activity_value.meta.object_ref();
-        match self.live_children(ctx, &activity).await {
-            Some(0) => FinishReadiness::Ready,
-            Some(pending) => FinishReadiness::Waiting { pending },
-            None => FinishReadiness::Gone,
-        }
-    }
-
-    /// How many children the activity still has, re-read from storage. Re-read rather than trusting
-    /// the complete step's opening snapshot: an [`on_completing`](Self::on_completing) override folds
-    /// child edges away (a cancelled timer) before asking, and those folds must be visible to the
-    /// count. `None` when the row is gone or unreadable.
-    async fn live_children(
-        &self,
-        ctx: &HandlerContext<'_>,
-        activity: &ObjectRef<ActivityKind>,
-    ) -> Option<usize> {
-        match ctx.storage.get_activity(activity).await {
-            Ok(Some(a)) => Some(a.active_children.len()),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// The state's `Assign` delta, applied to the completing scope by the default
-    /// [`finish`](Self::finish). These sources live on the typed definition, which a trait default
-    /// method cannot reach, so a state on the canonical success path (`Pass`/`Succeed`/`Wait`/`Task`)
-    /// exposes them here instead of re-implementing the finish. A state that overrides `finish`
-    /// (`Fail`, `Choice`, a container) projects its own sources inside that override.
-    fn assign(&self) -> Option<&AssignObject> {
-        None
-    }
-
-    /// The state's `Output` projection over its raw result; absent means the result passes through.
-    fn output(&self) -> Option<&Value> {
-        None
-    }
-
-    /// The successor this state routes to — a sibling hop in the same `States` table. `None` has no
-    /// successor, which [`end`](Self::end) turns into an owner-terminal completion.
-    fn next(&self) -> Option<&str> {
-        None
-    }
-
-    /// Whether this state is terminal (`End`), routing to its owner's completion instead of a sibling.
-    fn end(&self) -> Option<bool> {
-        None
-    }
-
-    /// (3.5) The per-state finish, run by the base [`complete`](Self::complete) once the activity has
-    /// been loaded, guarded, opened with `StateCompleting` and cleared for the finish by
-    /// [`on_completing`](Self::on_completing). The default is the canonical
-    /// ASL success projection — `Assign` (a delta on the scope, emitted as `VariablesAssigned`) then
-    /// `Output` (defaulting to the state's raw result) — followed by `StateCompleted` and the state's
-    /// transition, so every state on that path (`Pass`/`Succeed`/`Wait`/`Task`) shares one
-    /// implementation instead of four copies. `Fail` overrides it to terminate instead, `Choice` to
-    /// route by its resolved rule, and a container to its own defensive finish. An error is turned
-    /// into a terminate by the base. The activity's reference is derived from `activity_value` here for
-    /// the same reason as in [`on_completing`](Self::on_completing).
-    async fn finish(
-        &self,
-        env: &mut EvalEnv,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         variables: &Variables,
-    ) -> Result<(), ExecutionError> {
-        // `$states.result` is the state's raw result — for a `Task` the worker payload, for
-        // synchronous states and `Wait` the processed input (see `CompleteState`'s docs). It is also
-        // the fallback the projection passes through when the state declares no `Output`.
-        let result = activity_value
-            .raw_output
-            .clone()
-            .unwrap_or_else(|| activity_value.raw_input.clone());
-        let states = States::new(
-            &activity_value.raw_input,
-            &activity_value.state_path.state_name(),
-            activity_value.retry_count(),
-        )
-        .with_result(Some(&result))
-        .with_assign_ctx(Some(&activity_value.raw_input))
-        .build();
-        let mut local_scope = variables.clone();
-        let owner = activity_value.meta.owner.clone();
-        self.apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
-            .await?;
-        let output_value = self
-            .project_output(env, self.output(), &states, &local_scope, result)
-            .await?;
+    ) -> Result<(), ProcessingError>;
 
-        emit_state_completed(out, activity_value, &output_value).await;
-        emit_transition(
-            out,
-            activity_value.execution.clone(),
-            owner.clone(),
-            activity_value.meta.object_ref(),
-            &activity_value.state_path,
-            &output_value,
-            self.next(),
-            self.end(),
-        )
-        .await;
-        Ok(())
-    }
+    /// The state's own terminate step, run by the base [`terminate`](Self::terminate) once the
+    /// activity has been opened with `StateTerminating` and the scope notified. This is the *single*
+    /// per-state entry for the terminate path — the failure mirror of
+    /// [`after_completing`](Self::after_completing): each state disposes of whatever must not outlive
+    /// its own close and then emits `StateTerminated` and relays the settle. A state that still owns
+    /// live children (a `Wait`'s deadline, a `Task`'s call, a `Parallel`/`Map`'s fan-out) sweeps them
+    /// and defers — the last settle drains via the generic `Terminating` path — while a childless
+    /// state closes inline.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ProcessingError>;
 
     /// Apply a state's `Assign` delta (when present) onto the scope variables in place, emitting
     /// `VariablesAssigned` for the owning scope when the eval yields a non-empty object — the
@@ -362,6 +268,30 @@ pub trait StateHandler: Send + Sync {
             Some(output) => env.eval_json(output, states, scope),
             None => Ok(fallback),
         }
+    }
+
+    // ── failure hook ────────────────────────────────────────────────────────
+
+    /// This state's own failure has reached its teardown — take it if this state has a policy for it.
+    /// The default declines (the failure stands and the teardown proceeds); a state whose definition
+    /// carries an ASL `Catch` (a `Task`) overrides it to route the activity to the catcher's `Next`.
+    ///
+    /// The decision belongs to the state because the policy *is* a field of its definition, and it
+    /// arrives through this hook rather than a `match` at the terminate site for the same reason every
+    /// other per-state behaviour does: [`StateHandlerFactory`] is the one place the [`State`] enum is
+    /// matched, so no lifespan site ever downcasts a definition.
+    ///
+    /// The caller asks only for a failure the activity **itself** produced. A swept activity — one an
+    /// ancestor's teardown reached — is never asked, which is what keeps a sibling from being routed
+    /// by a policy that was never about it.
+    async fn on_failed(
+        &self,
+        _ctx: &mut HandlerContext<'_>,
+        _out: &mut Collector<'_>,
+        _activity_value: &Activity,
+        _error: &ExecutionError,
+    ) -> FailureRouting {
+        FailureRouting::Uncaught
     }
 
     // ── lifecycle operations ────────────────────────────────────────────────
@@ -499,12 +429,11 @@ pub trait StateHandler: Send + Sync {
     /// The `Command::CompleteState` flow, owned by the base — the mirror of [`Self::activate`]. The
     /// typed [`CompleteState`] payload supplies the activity and the raw result; `act` and `thread`
     /// are the rows the dispatcher already read for them, screened for liveness before it admitted the
-    /// command, so the base re-reads nothing and what remains is domain work identical across states:
-    /// open the finish with `StateCompleting` (folding the command's raw result in), hand the
-    /// unfinished children to [`on_completing`](Self::on_completing) and defer if it says to wait, and
-    /// hand into the per-state [`finish`](Self::finish) with the scope's variables. The `Err` half of
-    /// the return type is the same contract as `activate`'s: kept for a precondition landing back in
-    /// this layer, with no arm returning one today.
+    /// command, so the base re-reads nothing. What remains is the *drawer* — fold the command's raw
+    /// result in and open the activity with `StateCompleting` — and then the state's own
+    /// [`after_completing`](Self::after_completing), so the base holds no per-state decision at all.
+    /// The `Err` half of the return type is the same contract as `activate`'s: kept for a precondition
+    /// landing back in this layer, with no arm returning one today.
     async fn complete(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -513,58 +442,102 @@ pub trait StateHandler: Send + Sync {
         act: &ActivityRecord,
         thread: &ThreadRecord,
     ) -> Result<(), ProcessingError> {
-        let CompleteState { activity, output } = cmd;
+        let CompleteState { output, .. } = cmd;
 
         // (3.1) Open the finish now that this command has won the activity. Emitting here — before the
-        // children below are dealt with — is what makes the decision durable rather than provisional:
-        // a step that defers on a live child leaves the activity `Completing` (not `Running`), so the
-        // child's eventual settle drives the drain through the generic `Completing` path instead of
-        // depending on the state to re-issue a command. The command's raw result is folded in first
-        // (`CompleteState` always carries the state's raw result, so this overwrites rather than
-        // defaults) so a deferred drain can read it back off the row to project with.
+        // state's children below are dealt with — is what makes the decision durable rather than
+        // provisional: a state that defers on a live child leaves the activity `Completing` (not
+        // `Running`), so the child's eventual settle drives the drain through the generic `Completing`
+        // path instead of depending on the state to re-issue a command. The command's raw result is
+        // folded in first (`CompleteState` always carries the state's raw result, so this overwrites
+        // rather than defaults) so a deferred drain can read it back off the row to project with.
         let mut activity_value = act.value();
-        activity_value.raw_output = Some(output.clone());
-        activity_value.meta.with_update_at(ctx.now());
-        activity_value.status = ActivityStatus::Completing;
+        // The transition owns its own precondition even though the dispatcher screened for `Running`
+        // before admitting the command: a `Completing`/terminal target means a competing finish or a
+        // cancel already won, and refusing here is the one followup entry this command owes. The
+        // refusal is the only record that explains why it applied nothing (mirrors
+        // `complete_execution`'s treatment of the same transition).
+        if let Err(reason) = activity_value.mark_completing(output.clone(), ctx.now()) {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "complete_state: activity {} cannot begin completing: {reason}",
+                    activity_value.meta.object_ref()
+                ),
+            ));
+        }
         out.append_event(Event::StateCompleting {
             activity: activity_value.clone(),
         })
         .await;
 
-        // (3.2) Hand the disposition of this state's unfinished children to the state itself (see
-        // `on_completing`): it cleans up whatever must not outlive its own decision, and reports
-        // whether the finish may run now. A wait leaves the activity `Completing`, so the last child's
-        // settle drives the drain (see `continue_`) and nothing re-drives `complete` — which is why the
-        // decision had to be durable before this point (3.1).
-        match self.on_completing(ctx, out, &activity_value).await {
-            FinishReadiness::Ready => {}
-            FinishReadiness::Waiting { pending } => {
-                tracing::debug!(
-                    activity = %activity,
-                    children = pending,
-                    "state is Completing but its children have not all drained; finish deferred"
-                );
-                return Ok(());
-            }
-            FinishReadiness::Gone => return Ok(()),
-        }
+        // (3.4) The state's own complete step. The scope's variables come off the row the dispatcher
+        // already read (an activity is always owned by a `Thread`), so nothing here re-derives them.
+        self.after_completing(ctx, out, &activity_value, &thread.variables)
+            .await
+    }
 
-        // (3.3) The scope's variables as of the transition, and the per-state finish — the projection
-        // (`$states.result` / `Assign` / `Output`) plus the `Next`/`End` routing. The row arrives as the
-        // activity's owner (an activity is always owned by a `Thread`), read by the dispatcher, so
-        // nothing here re-derives it; `activity_value` is the value (3.1) already opened the finish
-        // with, so its `Completing` status and folded raw result carry forward into whichever lifecycle
-        // the finish emits.
-        let variables = thread.variables.clone();
-        if let Err(e) = self.finish(ctx.env, out, &activity_value, &variables).await {
-            out.append_command(Command::TerminateState(TerminateState {
-                activity: activity.clone(),
-                reason: TerminationReason::Failed { error: e },
-            }));
+    /// The `Command::TerminateState` flow, owned by the base — the failure mirror of
+    /// [`Self::complete`]. `act` and `thread` are the rows the dispatcher already read for them
+    /// (screened for liveness before it admitted the command), so nothing here re-reads. Unlike a
+    /// completion, the terminate's scope notification and drawer are uniform, so the base owns them:
+    /// ask the state's failure policy first (an uncaught failure then stands as a teardown, a caught
+    /// one has already been routed and leaves nothing to tear down), tell the owner scope when it is
+    /// still `Running`, open the activity with `StateTerminating`, and hand the per-state disposal +
+    /// terminal to [`Self::after_terminating`].
+    async fn terminate(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        cmd: &TerminateState,
+        act: &ActivityRecord,
+        thread: &ThreadRecord,
+    ) -> Result<(), ProcessingError> {
+        let TerminateState { reason, .. } = cmd;
+        // The policy gets its say only for a failure the activity **itself** produced: a swept
+        // activity carries `Cancelled`, which is what keeps one state's failure from being routed by
+        // another's policy.
+        if let TerminationReason::Failed { error } = reason
+            && matches!(
+                self.on_failed(ctx, out, &act.value, error).await,
+                FailureRouting::Caught
+            )
+        {
             return Ok(());
         }
+        // The failure reaches the scope the activity runs in, but only when it is still `Running`: a
+        // scope already completing or terminating was reached by an ancestor's sweep, which is tearing
+        // this activity down on the way, and a second termination for it would only be refused.
+        if thread.value.status.is_running() {
+            super::emit_scope_termination(
+                out,
+                &OwnerScope::Thread(act.value.meta.owner.clone()),
+                reason.clone(),
+            );
+        }
+        // The drawer opens the failure now that the policy let it stand, mirroring `complete`'s
+        // `StateCompleting`: a terminate that defers on a live child leaves the activity `Terminating`
+        // (not `Running`), so the child's eventual settle drives the drain through the generic
+        // `Terminating` path instead of depending on the state to re-issue a command.
+        let mut activity_value = act.value();
+        if let Err(e) = activity_value.mark_terminating(reason.clone(), ctx.now()) {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "terminate_state: activity {} cannot begin terminating: {e}",
+                    activity_value.meta.object_ref()
+                ),
+            ));
+        }
+        out.append_event(Event::StateTerminating {
+            activity: activity_value.clone(),
+        })
+        .await;
 
-        Ok(())
+        // The state's own terminate step; the scope's variables come off the row the dispatcher
+        // already read.
+        self.after_terminating(ctx, out, &activity_value, &thread.variables)
+            .await
     }
 }
 #[cfg(test)]

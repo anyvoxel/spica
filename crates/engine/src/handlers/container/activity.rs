@@ -2,7 +2,7 @@ use super::Container;
 use crate::handler::{Collector, HandlerContext};
 use crate::storage::{ActivityRecord, ReadonlyStorageTxn};
 use crate::types::activity::ActivityKind;
-use crate::types::command::{Command, CompleteState};
+use crate::types::command::Command;
 use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
 use crate::{ActivityStatus, StorageError};
 
@@ -74,59 +74,33 @@ impl Container for ActivityContainer {
             return; // terminal, or finishing with children still attached: not this settle's move.
         }
 
-        // TODO(Wait/Parallel/Map): this arm completes the activity unconditionally, which holds only
-        // for the states whose completion trigger *is* the settled child — a `Task`'s in-flight task,
-        // a `Wait`'s resume timer. A fan-out container settling one branch of many must instead
-        // replenish an open slot or aggregate its result, so the decision has to be split before
-        // those states can route their settles through here.
-        out.append_command(Command::CompleteState(CompleteState {
-            activity: self.activity.clone(),
-            // The `Task`'s raw result is the worker's payload, folded onto the activity as
-            // `raw_output` by the `TaskCompleted` applier within this same batch (emitted events fold
-            // into the overlay eagerly at `append_event`). The base `complete` step's `$states.result`
-            // reads that very field, so taking it from the row keeps one source of truth while the
-            // command still carries the result itself, keeping the log self-describing.
-            output: act
-                .value
-                .raw_output
-                .clone()
-                .unwrap_or(serde_json::Value::Null),
-        }));
-        tracing::debug!(
-            activity = %self.activity,
-            child = %child,
-            "child completed; completing the owning activity"
-        );
+        // What a settled child *means* is the state's own affair — a leaf whose child is its
+        // completion trigger finishes, a fan-out replenishes an open slot or converges — so the
+        // container carries no state semantics of its own: it hands the settle to the activity's
+        // `StateHandler::child_completed`, the single place that per-state distinction lives. This is
+        // why the container must be told *which* state it fronts, and why that lives one layer down.
+        super::super::child_completed::dispatch_child_completed(
+            ctx,
+            out,
+            self.activity.clone(),
+            &act,
+            child.clone(),
+        )
+        .await;
     }
 
+    /// The activity's reaction is the completed hook **verbatim**: how a child settled is not what
+    /// decides an activity's next move, only *that* it settled. A terminated child is exactly how a
+    /// `Map`/`Parallel` learns one of its items/branches went down (`child_completed` reads the child's
+    /// own terminal status to tell a finished item from a failed one), so routing the two outcomes to
+    /// different arms would leave a fan-out waiting forever on a settle it was never shown.
     async fn after_child_terminated(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         child: &RawObjectRef,
     ) {
-        let Some(act) = ctx
-            .storage
-            .get_activity(&self.activity)
-            .await
-            .ok()
-            .flatten()
-        else {
-            return; // gone already — nothing to advance.
-        };
-        if self.advance_if_drained(out, &act) {
-            return;
-        }
-        if act.value.status.is_running() {
-            // An activity still Running while a child terminates is the anomalous case (a termination
-            // is driven by the activity's own teardown sweep), and it asks for no reaction: whatever
-            // finishes this activity still owns the next move.
-            tracing::debug!(
-                activity = %self.activity,
-                child = %child,
-                "child terminated under a Running activity; no reaction"
-            );
-        }
+        self.after_child_completed(ctx, out, child).await;
     }
 }
 
@@ -149,7 +123,7 @@ mod tests {
     use crate::handlers::fixtures::{at, object_ref};
     use crate::storage::{ActivityRecord, Storage};
     use crate::types::activity::ActivityKind;
-    use crate::types::command::{Command, CompleteState, TerminationReason};
+    use crate::types::command::{Command, TerminationReason};
     use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
     use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef};
@@ -290,41 +264,22 @@ mod tests {
         );
     }
 
-    /// A settled `Task` under a `Running` activity completes that activity, carrying the payload the
-    /// applier folded onto its `raw_output` — the `CompleteState` the task handler used to emit itself,
-    /// now emitted by the owner that the settle actually concerns.
+    /// A settled child under a still-`Running` activity is **the state's** to interpret — a leaf whose
+    /// child is its completion trigger finishes, a fan-out replenishes or converges — so the container
+    /// emits nothing itself: it hands the settle to the activity's `StateHandler::child_completed`
+    /// (covered per state under `states::task`/`states::parallel`). The state's machine is left
+    /// unresolvable here, pinning that the container carries no `CompleteState` of its own to fall
+    /// back on — the decision that used to live in this arm is gone.
     #[tokio::test]
-    async fn a_settled_child_completes_a_running_activity() {
-        let payload = json!({ "answer": 42 });
+    async fn a_settled_child_under_a_running_activity_is_left_to_the_state() {
         let chain = settle(
-            seeded_activity(ActivityStatus::Running, Some(payload.clone()), 0),
+            seeded_activity(ActivityStatus::Running, Some(json!({ "answer": 42 })), 0),
             false,
         )
         .await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::CompleteState(
-                CompleteState {
-                    activity: activity_ref(),
-                    output: payload,
-                }
-            ))]
-        );
-    }
-
-    /// A `Running` activity that has no folded payload still completes on a settled child, with a null
-    /// result — the state's `Output`/`$states.result` fallback owns what that means.
-    #[tokio::test]
-    async fn a_settled_child_without_a_payload_completes_with_null() {
-        let chain = settle(seeded_activity(ActivityStatus::Running, None, 0), false).await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::CompleteState(
-                CompleteState {
-                    activity: activity_ref(),
-                    output: Value::Null,
-                }
-            ))]
+        assert!(
+            chain.is_empty(),
+            "the container must not decide a Running activity's settle itself: {chain:?}"
         );
     }
 
@@ -373,14 +328,16 @@ mod tests {
         );
     }
 
-    /// A terminated child under a still-`Running` activity asks for no reaction: whatever finishes that
-    /// activity owns the next move.
+    /// A *terminated* child under a still-`Running` activity is just as much the state's to interpret
+    /// as a completed one — it is how a `Map`/`Parallel` learns an item/branch failed — so the container
+    /// routes both outcomes through the same hook and decides nothing itself. The state's machine is
+    /// unresolvable here, pinning that no `CompleteState` is invented as a fallback.
     #[tokio::test]
-    async fn a_terminated_child_leaves_a_running_activity_alone() {
+    async fn a_terminated_child_under_a_running_activity_is_left_to_the_state() {
         let chain = settle(seeded_activity(ActivityStatus::Running, None, 0), true).await;
         assert!(
             chain.is_empty(),
-            "a Running activity must not react: {chain:?}"
+            "the container must not decide a Running activity's settle itself: {chain:?}"
         );
     }
 }

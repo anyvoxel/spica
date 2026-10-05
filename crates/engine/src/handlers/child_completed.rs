@@ -150,7 +150,11 @@ async fn activity_child_settled(
 /// its scope's variables to the state's `StateHandler::child_completed` so the state itself decides
 /// the next move (for a Map: refill a `MaxConcurrency` slot or converge/fail; for a Parallel:
 /// aggregate and complete or fail).
-async fn dispatch_child_completed(
+///
+/// This is the one place a settling child is handed to a state to decide, shared by the generic
+/// [`child_settled`] relay and [`ActivityContainer`](crate::handlers::container::ActivityContainer),
+/// so both reach the same per-state decision rather than the container re-deriving it.
+pub(crate) async fn dispatch_child_completed(
     ctx: &mut HandlerContext<'_>,
     out: &mut Collector<'_>,
     activity: ObjectRef<ActivityKind>,

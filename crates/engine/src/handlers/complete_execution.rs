@@ -84,8 +84,8 @@ impl CompleteExecutionHandler {
             return Ok(());
         }
 
-        // Something is still attached. A success finish cancels the deadlines it owns — an
-        // `ExecutionTimeout` must not fire into a finished run — and waits for them to drain. It never
+        // Something is still attached. A success finish cancels the deadlines it owns — a
+        // `TimeoutSeconds` must not fire into a finished run — and waits for them to drain. It never
         // *terminates* a live child, because a run whose work is done has none: any other kind here is
         // the row's `active_children` disagreeing with the lifecycle rather than a child to wait on.
         // Refused rather than swept or ignored — sweeping turns a success into a failure cascade, and
@@ -240,7 +240,7 @@ mod tests {
         );
     }
 
-    /// A run still owning its deadline cancels it and **waits**: the `ExecutionTimeout` must not fire
+    /// A run still owning its deadline cancels it and **waits**: the deadline must not fire
     /// into a finished run, and no terminal may land before it drains.
     #[tokio::test]
     async fn a_run_waits_for_the_deadlines_it_cancels() {

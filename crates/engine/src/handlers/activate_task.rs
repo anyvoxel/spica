@@ -15,7 +15,7 @@ use crate::types::event::Event;
 ///
 /// The task is simply made claimable (`Pending`): a worker that serves `resource` will pull it via
 /// `TaskApi::poll_tasks`; an unserved task stays queued (Zeebe semantics) and, if the state sets
-/// `TimeoutSeconds`, is eventually failed by the `TaskTimeout` backstop. No worker-presence
+/// `TimeoutSeconds`, the deadline eventually terminates the state that armed it. No worker-presence
 /// prediction happens here — a worker may appear at any time and claim the task.
 #[derive(Default)]
 pub struct ActivateTaskHandler;
@@ -45,7 +45,7 @@ impl ActivateTaskHandler {
                 arguments: arguments.clone(),
                 status: TaskStatus::Pending,
                 // The state's `TimeoutSeconds` instant, decided once by the state handler; the
-                // `TaskTimeout` timer armed from the same value is what enforces it.
+                // `TimeoutSeconds` timer armed from the same value is what enforces it.
                 deadline: *deadline,
                 worker_id: None,
                 lease_expires_at: None,

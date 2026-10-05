@@ -1,17 +1,21 @@
 use super::Container;
 use crate::handler::{Collector, HandlerContext};
 use crate::storage::{ExecutionRecord, ReadonlyStorageTxn};
-use crate::types::command::Command;
+use crate::types::command::{Command, CompleteExecution, TerminateExecution, TerminationReason};
+use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::execution::ExecutionKind;
-use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
+use crate::types::thread::ThreadKind;
 use crate::{ExecutionStatus, StorageError};
 
 /// The container for an `Execution`'s children.
 ///
-/// A run owns one kind of child: its `ExecutionTimeout` timer (see `create_execution`). There is no
-/// state-specific half — a run has no container state to replenish — so both hooks route to the same
-/// scope drain, and the outcome of the settled child is deliberately *not* what the run reacts to:
-/// whether it converges is its own `Completing`/`Terminating` to decide.
+/// A run owns two kinds of child: its **root thread** (the run's own top-level scope) and its own
+/// `TimeoutSeconds` timer (see `create_execution`). There is no state-specific half — a run has no
+/// container state to replenish — so the hooks only decide what an individual settle *means* to a
+/// still-`Running` run: its scope going down abnormally starts the run's teardown, and its scope
+/// finishing successfully closes it. A run already winding down instead converges through its own
+/// `Completing`/`Terminating` to decide.
 pub(crate) struct ExecutionContainer {
     execution: ObjectRef<ExecutionKind>,
 }
@@ -37,7 +41,11 @@ impl ExecutionContainer {
         }
     }
 
-    /// The reaction both hooks share, since neither the child's kind nor its outcome decides it.
+    /// The abnormal-terminal reaction. A run's only termination-triggering child is its **root
+    /// thread**: that thread *is* the run's own top-level scope, so its abnormal terminal is the
+    /// run's, and a run still `Running` has no teardown of its own to advance — this settle is what
+    /// must start one. A run already finishing and drained advances instead, as in `settled`'s
+    /// caller.
     async fn settled(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -56,15 +64,43 @@ impl ExecutionContainer {
         if self.advance_if_drained(out, &exec) {
             return;
         }
-        if exec.status.is_running() {
-            // TODO(Map/Parallel): a run's own `Running` child settle has no replenish hook — the
-            // container states live under a `Thread`, so an Execution has nothing to refill yet.
+        if !exec.status.is_running() {
+            return; // finishing with children still attached, or terminal: not this settle's move.
+        }
+        // The run's other child is its own `TimeoutSeconds` timer, whose cancellation under a `Running`
+        // run is the anomaly — a teardown sweeps it, it never starts one — so it asks for no reaction.
+        if child.kind != ObjectKind::Thread {
             tracing::debug!(
                 execution = %self.execution,
                 child = %child,
-                "child settled under a Running execution; no reaction"
+                "child terminated under a Running execution; no reaction"
             );
+            return;
         }
+        // The reason is read off the settled thread's own status, exactly as the run's *output* is
+        // read off it on the success path: the teardown the run begins then carries the reason its own
+        // top-level scope went down with, rather than one the container would have to invent.
+        let reason = match ctx
+            .storage
+            .get_thread(&child.clone().typed::<ThreadKind>())
+            .await
+        {
+            Ok(Some(thread)) => thread.value.status.termination_reason().cloned(),
+            _ => None,
+        };
+        let Some(reason) = reason else {
+            tracing::debug!(
+                execution = %self.execution,
+                child = %child,
+                "settled thread carries no termination reason; no reaction"
+            );
+            return;
+        };
+        out.append_command(Command::TerminateExecution(TerminateExecution {
+            name: self.execution.name().clone(),
+            uid: Some(self.execution.uid()),
+            reason,
+        }));
     }
 }
 
@@ -88,7 +124,73 @@ impl Container for ExecutionContainer {
         out: &mut Collector<'_>,
         child: &RawObjectRef,
     ) {
-        self.settled(ctx, out, child).await;
+        let Some(exec) = ctx
+            .storage
+            .get_execution(&self.execution)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return; // gone already — nothing to advance.
+        };
+        if self.advance_if_drained(out, &exec) {
+            return;
+        }
+        if !exec.status.is_running() {
+            return; // finishing or terminal: not this settle's move.
+        }
+        // A run has two kinds of child, and *which* kind settled decides what its success means to a
+        // still-`Running` run.
+        //
+        // A `TimeoutSeconds` **timer** settling is the run's deadline elapsing — recorded as the
+        // timer's own `Completed` terminal, since a timer has no failure to reach — so the run goes down
+        // `TimedOut` rather than closing. Only a *fire* reaches this hook: a cancelled timer takes
+        // `after_child_terminated`, where the run's own teardown is the only thing that cancels one.
+        if child.kind == ObjectKind::Timer {
+            out.append_command(Command::TerminateExecution(TerminateExecution {
+                name: self.execution.name().clone(),
+                uid: Some(self.execution.uid()),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                        // The run's own row carries the instant the definition's `TimeoutSeconds`
+                        // resolved to — the same one its timer was armed from, so the reason names the
+                        // deadline without a second read of the timer the fire has just detached.
+                        message: format!(
+                            "execution ran past its TimeoutSeconds deadline ({})",
+                            exec.value.deadline.map(|d| d.as_millis()).unwrap_or(0)
+                        ),
+                    }),
+                },
+            }));
+            return;
+        }
+        // A **root thread** settling is the run's own top-level scope finishing, so the run closes on it.
+        if child.kind != ObjectKind::Thread {
+            tracing::debug!(
+                execution = %self.execution,
+                child = %child,
+                "child completed under a Running execution; no reaction"
+            );
+            return;
+        }
+        // The finished thread's output — folded onto its row by the `ThreadCompleted` applier in this
+        // same batch — becomes the run's own output.
+        let output = match ctx
+            .storage
+            .get_thread(&child.clone().typed::<ThreadKind>())
+            .await
+        {
+            Ok(Some(thread)) => thread
+                .value
+                .output
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::Null,
+        };
+        out.append_command(Command::CompleteExecution(CompleteExecution {
+            execution: self.execution.clone(),
+            output,
+        }));
     }
 
     async fn after_child_terminated(
@@ -127,7 +229,7 @@ mod tests {
     use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
 
-    /// The run whose own children settle — its `ExecutionTimeout` deadline.
+    /// The run whose own children settle — its `TimeoutSeconds` deadline.
     fn execution_ref() -> ObjectRef<ExecutionKind> {
         object_ref("execution", 70)
     }

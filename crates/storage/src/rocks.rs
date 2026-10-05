@@ -745,7 +745,7 @@ mod tests {
     use serde_json::Value;
     use spica_engine_types::{
         Execution, ExecutionKind, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName,
-        RetryState, Task, TaskStatus, Timer, TimerOwner, TimerPurpose, TimerStatus, Timestamp,
+        RetryState, Task, TaskStatus, Timer, TimerOwner, TimerStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
@@ -913,7 +913,6 @@ mod tests {
             );
             let t = TimerRecord::from_value(Timer {
                 execution: id.clone(),
-                purpose: TimerPurpose::WaitResume,
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
                 meta: spica_engine_types::ObjectMeta::builder(uid)

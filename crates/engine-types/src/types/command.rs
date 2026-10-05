@@ -28,7 +28,14 @@ pub enum TerminationReason {
     Failed { error: ExecutionError },
     /// The state-machine `TimeoutSeconds` timer fired before the execution completed.
     TimedOut,
-    /// An external request aborted the execution.
+    /// An external request aborted the execution — **or** the entity is being swept: a teardown
+    /// reached it because an ancestor is going down, not because it did anything itself.
+    ///
+    /// The two share a reason because they are the same fact from the swept entity's side: nothing it
+    /// did caused this. That is also the invariant every *downward* sweep edge relies on — a parent
+    /// passing its own `Failed` reason to a child would put the failure on a bystander's row and, for
+    /// a state carrying a `Catch`, let it route an error that was never its own. So a failure
+    /// propagates *up* (each scope reporting why it died) and only `Cancelled` propagates *down*.
     Cancelled,
 }
 
@@ -199,8 +206,8 @@ pub struct ActivateTask {
     pub arguments: Value,
     pub retry_plan: Vec<RetryPolicy>,
     /// The state's resolved `TimeoutSeconds` instant, if it sets one — carried on the command so the
-    /// born task records it (`Task::deadline`). The `TaskTimeout` timer that enforces it is armed from
-    /// the same computation, so the field and the timer can never name different moments.
+    /// born task records it (`Task::deadline`). The timer that bounds the state is armed from the same
+    /// computation, so the field and the timer can never name different moments.
     #[serde(default)]
     pub deadline: Option<Timestamp>,
 }
@@ -268,8 +275,8 @@ pub enum Command {
     /// Begin executing a state machine. `flow_version` is the [`RawObjectRef`] of the immutable
     /// flow version the execution binds to (its definition); the machine is resolved from Storage at
     /// dispatch time, never carried in the command. Produces `ExecutionCreated` +
-    /// `ActivateState`(start state) + (if `TimeoutSeconds` is set) a `TimerActivated`
-    /// (`ExecutionTimeout`, emitted inline).
+    /// `ActivateState`(start state) + (if `TimeoutSeconds` is set) the run's `TimerActivated`,
+    /// emitted inline.
     CreateExecution(CreateExecution),
 
     /// Fan out one branch of a `Parallel` state as a **child execution** (M3). Produces an
@@ -376,9 +383,10 @@ pub enum Command {
     TerminateState(TerminateState),
 
     // ── Timer (fire → cancel) ────────────────────────────────────────────────
-    /// Signal that an armed timer has fired (its deadline passed). Dispatched by a `WaitResume`
-    /// fires the owning state's resume; by an `ExecutionTimeout` triggers `TerminateExecution` with
-    /// `TimedOut`. Idempotent if the owner already moved past.
+    /// Signal that an armed timer has fired (its deadline passed). The owner named by the timer's own
+    /// slot decides what the fire means to it: a `Wait`'s deadline resumes the state that armed it, a
+    /// `Task`'s terminates it `TimedOut`, and a run's terminates the run. Idempotent if the owner
+    /// already moved past.
     TriggerTimer { timer: ObjectRef<TimerKind> },
 
     /// Cancel a pending timer (e.g. the execution's `TimeoutSeconds` once it finishes). Refused with
@@ -483,21 +491,4 @@ impl Command {
             | Command::ContinueTerminate { .. } => None,
         }
     }
-}
-
-/// Why an armed timer exists — its lifecycle role. Drives `TriggerTimer`'s dispatch and is a
-/// placeholder for later per-state `TimeoutSeconds` (M2).
-///
-/// Every variant is a **state-machine semantic** timer: it arises from the ASL definition
-/// (`Seconds`/`TimeoutSeconds`) and drives a state transition when it fires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TimerPurpose {
-    /// The state-machine `TimeoutSeconds` deadline; its firing terminates the execution `TimedOut`.
-    ExecutionTimeout,
-    /// A `Wait` state's `Seconds` delay; its firing completes the owning state.
-    WaitResume,
-    /// A Task state's `TimeoutSeconds` deadline; its firing fails the in-flight task with
-    /// `States.Timeout` (routed back into the owning state's `Retry`/`Catch` policy).
-    TaskTimeout,
-    // M2: StateTimeout
 }

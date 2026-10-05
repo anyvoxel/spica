@@ -2,18 +2,19 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use spica_asl::{FailState, State};
 
+use super::super::container::{Container, ThreadContainer};
 use super::super::eval_string_or_expr;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
-use crate::ActivityStatus;
+use crate::RejectionType;
 use crate::Variables;
 use crate::eval_env::EvalEnv;
-use crate::handler::Collector;
-use crate::types::command::TerminationReason;
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::command::{Command, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::OwnerScope;
+use crate::types::meta::HasRawObjectRef;
 
 pub struct FailStateHandlerFactory;
 
@@ -39,18 +40,115 @@ struct FailStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for FailStateHandler<'_> {
-    // Fail's finish both terminates itself (emitting the activity's failure ed) and, being terminal,
-    // terminates the owning scope. Both are issued from the same step so the state's terminal ed and the
-    // scope's terminating ed are produced in the same causal chain. This mirrors Pass: Pass emits
-    // `StateCompleted` and routes to the successor / a completed owner; Fail replaces that with the
-    // failure ed and the scope termination, so it overrides the base's success `finish` wholesale.
-    async fn finish(
+    /// (3.4) A `Fail` owns no child at all, so there is nothing to wait on: the whole complete path —
+    /// decide the reason, emit the activity's failure ed, then terminate the owning scope — runs here
+    /// in one go, with no child count. Nothing reaches this state through the deferred drain either
+    /// (see `crate::handlers::continue_`): that hop exists to advance a state whose children settled,
+    /// and this one has none to settle.
+    ///
+    /// A decision failure is turned into a terminate here rather than returned: the activity is
+    /// already `Completing`, so there is no later hop to report it from.
+    async fn after_completing(
         &self,
-        env: &mut EvalEnv,
+        ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         variables: &Variables,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), ProcessingError> {
+        let reason = match self.process_fail(ctx.env, activity_value, variables).await {
+            Ok(reason) => reason,
+            Err(error) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_value.meta.object_ref(),
+                    reason: TerminationReason::Failed { error },
+                }));
+                return Ok(());
+            }
+        };
+
+        // Resolve the owning scope's container *before* any terminal event, so an entitled settle is
+        // answered while the activity is still intact. An activity's owner slot admits only a
+        // `Thread`, so the container is read directly.
+        let owner = activity_value.meta.owner.clone();
+        let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!(
+                    "fail_state: activity {} has no owning thread; termination refused",
+                    activity_value.meta.object_ref()
+                ),
+            ));
+        };
+
+        // Emit the activity's failure ed. `StateTerminating` + `StateTerminated` replace the
+        // `StateCompleted` a successful complete would emit. Each status is advanced in place on the
+        // same value so the terminator carries forward the progressing state.
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated
+                .mark_terminating(reason.clone(), out.now())
+                .is_ok(),
+            "the complete that dispatched this after_completing opened the activity as Completing"
+        );
+        out.append_event(Event::StateTerminating {
+            activity: terminated.clone(),
+        })
+        .await;
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the activity this after_completing just began terminating is Terminating"
+        );
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+
+        // Hand the settled activity to its owning thread's container; the scope's own termination
+        // follows from the state's failure (see `ThreadContainer::after_child_terminated`).
+        thread_container
+            .after_child_terminated(ctx, out, &activity_ref)
+            .await;
+        Ok(())
+    }
+
+    // A `Fail` owns no children, so its terminate closes inline: mark `Terminated`, emit the
+    // terminal, and relay the settle up to the owning thread.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+        );
+        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        Ok(())
+    }
+}
+
+impl FailStateHandler<'_> {
+    /// The `Fail` decision itself: build `$states` and evaluate `Error`/`Cause` (when present) into
+    /// the termination reason — the mirror of `Choice`'s `process_choice`, returning the decided
+    /// value for `after_completing` to turn into the failure ed, and an `Err` for it to terminate on.
+    /// The evaluation error propagates as `Err` for the same reason a `Choice` rule miss does: no
+    /// failure can be named until both fields are resolved.
+    async fn process_fail(
+        &self,
+        env: &mut EvalEnv,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<TerminationReason, ExecutionError> {
         // `$states` for the failure projection: `assign_ctx = Some` (matching Pass/Succeed) — however
         // late an `Assign` is applied, derived values read consistently with the scope already folded.
         let states = States::new(
@@ -60,41 +158,10 @@ impl StateHandler for FailStateHandler<'_> {
         )
         .with_assign_ctx(Some(&activity_value.raw_input))
         .build();
-        let reason = self
-            .fail_reason(env, activity_value, &states, variables)
-            .await?;
-
-        // Emit the activity's failure ed. `StateTerminating` + `StateTerminated` replace the
-        // `StateCompleted` a successful complete would emit. Each status is advanced in place on the
-        // same value so the terminator carries forward the progressing state.
-        let mut terminated = activity_value.clone();
-        terminated.meta.with_update_at(out.now());
-        terminated.status = ActivityStatus::Terminating(reason.clone());
-        out.append_event(Event::StateTerminating {
-            activity: terminated.clone(),
-        })
-        .await;
-        terminated.meta.with_update_at(out.now());
-        terminated.status = ActivityStatus::Terminated(reason.clone());
-        out.append_event(Event::StateTerminated {
-            activity: terminated.clone(),
-        })
-        .await;
-
-        // Route the terminal failure to the *owning scope*. An activity is always owned by a
-        // `Thread`: the root Thread for a top-level run — whose own termination then relays up to the
-        // `Execution` — or the branch/item Thread of a `Parallel`/`Map`, which lives in *thread*
-        // storage and is only reachable via the reference-addressed `TerminateThread`.
-        super::super::emit_scope_termination(
-            out,
-            &OwnerScope::Thread(terminated.meta.owner.clone()),
-            reason,
-        );
-        Ok(())
+        self.fail_reason(env, activity_value, &states, variables)
+            .await
     }
-}
 
-impl FailStateHandler<'_> {
     /// Evaluate `Error`/`Cause` (when present) and package them as the `Fail` complete step's
     /// termination reason. An eval failure propagates as `Err`, which the base turns into the same
     /// terminate + return the inline block used to produce.

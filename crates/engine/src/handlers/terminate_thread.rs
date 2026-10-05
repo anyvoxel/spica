@@ -1,21 +1,21 @@
 use crate::RejectionType;
 use crate::ThreadStatus;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::container::{ActivityContainer, Container, ExecutionContainer};
 use crate::types::activity::ActivityKind;
-use crate::types::command::{Command, TerminateExecution, TerminateState, TerminateThread};
+use crate::types::command::{Command, TerminateState, TerminateThread, TerminationReason};
 use crate::types::event::Event;
-use crate::types::meta::{HasRawObjectRef, ObjectKind, ThreadOwner};
-use crate::types::thread::ThreadKind;
-use crate::types::timer::TimerKind;
+use crate::types::meta::{ObjectKind, ThreadOwner};
 
 /// Handles `TerminateThread`: begins the abnormal finish of a fan-out `Thread` with `reason`.
 /// Mirrors [`TerminateExecutionHandler`](super::terminate_execution::TerminateExecutionHandler) but
 /// resolved against **thread** storage: a `Thread` is only terminated internally by its owning
 /// container Activity (a `Parallel`/`Map` sweep tearing down a branch/item), never by the external
-/// name-addressed root terminate. Emits `ThreadTerminating`, sweeps owned children (timers, child
-/// activities, and nested child threads — each recursively terminating its own subtree), and —
-/// once drained — emits `ThreadTerminated{reason}` plus the inline child-settled reaction so the
-/// owning container converges on its settle.
+/// name-addressed root terminate. Emits `ThreadTerminating`; a thread with nothing left to sweep lands
+/// `ThreadTerminated` in this same batch and hands the settle to its owner's `Container`, while one
+/// whose child is still live sweeps it and finishes when that child settles back. A thread's only child
+/// kind is `Activity`, so a nested fan-out is unwound one layer down — by the `TerminateState` that
+/// child receives — rather than by a thread sweeping a thread.
 #[derive(Default)]
 pub struct TerminateThreadHandler;
 
@@ -40,112 +40,126 @@ impl TerminateThreadHandler {
             ));
         };
         let thread_ref = thread_row.meta.raw_object_ref();
-        // A thread that is already finishing or terminal: the sweep's intent is already satisfied, and
-        // the duplicate is *expected* — one branch thread is reachable from its container's own sweep
-        // and from the run-level cascade, so two of them can tear the same branch down. Refused rather
-        // than dropped, so the durable log records that this sweep was a duplicate rather than leaving
-        // a bogus one indistinguishable from an absorbed one.
-        if !thread_row.value.status.is_running() {
-            let phase = thread_row.value.status.phase();
+        // The whole precondition — only a `Running` thread has a teardown to begin — lives in the
+        // transition (`mark_terminating`), so no call site can honor part of it and forget the rest.
+        //
+        // A thread that is already finishing or terminal is *expected* to be swept twice — one branch
+        // thread is reachable from its container's own sweep and from the run-level cascade, so two of
+        // them can tear the same branch down. Refused rather than dropped, so the durable log records
+        // that this sweep was a duplicate rather than leaving a bogus one indistinguishable from an
+        // absorbed one.
+        let mut terminating_thread = thread_row.value();
+        if let Err(why) = terminating_thread.mark_terminating(reason.clone(), ctx.now()) {
             tracing::warn!(
                 thread = %thread_ref,
                 status = ?thread_row.value.status,
                 reason = ?reason,
-                "termination arrived for a thread that is already past Running; refused"
+                "termination arrived for a thread that is already past Running; refused: {why}"
             );
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
-                format!(
-                    "terminate_thread: thread {thread_ref} is already {phase}; termination refused"
-                ),
+                format!("terminate_thread: thread {thread_ref} cannot be terminated: {why}"),
             ));
         }
-
-        let mut terminating_thread = thread_row.value();
-        terminating_thread.status = ThreadStatus::Terminating(reason.clone());
-        // Advance the domain `updated_at` at event construction (not Entry metadata); `created_at`
-        // carries forward.
-        terminating_thread.meta.with_update_at(ctx.now());
         out.append_event(Event::ThreadTerminating {
             thread: terminating_thread,
         })
         .await;
 
-        // A root thread (owner = the Execution) stands in for the whole run: starting its abnormal
-        // finish must also start the execution's, or an internal top-level failure would leave the
-        // execution Running forever. Only relay while the execution is still Running — if it already
-        // went Terminating (an external cancel that swept us here), that terminal already wins.
-        if let ThreadOwner::Execution(execution) = &thread_row.value.meta.owner
-            && let Ok(Some(exec)) = ctx.storage.get_execution(execution).await
-            && exec.status.is_running()
-        {
-            out.append_command(Command::TerminateExecution(TerminateExecution {
-                name: execution.name().clone(),
-                uid: Some(execution.uid()),
-                reason: reason.clone(),
-            }));
-        }
-
+        // A thread's abnormal finish reaches its owner only **once the thread itself has cleaned up**
+        // — an empty child set below, or the last sweep settle later — never at the moment its own
+        // teardown opens. Reaching earlier (as the run-level relay here once did) starts a parent's
+        // teardown while this thread still holds children, so the parent sweeps a subtree that is
+        // already unwinding and every command it issues lands against a row past `Running`.
         let children = thread_row.active_children.clone();
-        let mut pending = 0usize;
-        for child in children {
-            match child.kind {
-                ObjectKind::Timer => {
-                    out.append_command(Command::CancelTimer {
-                        timer: child.typed::<TimerKind>(),
-                    });
-                    pending += 1;
-                }
-                ObjectKind::Activity => {
-                    out.append_command(Command::TerminateState(TerminateState {
-                        activity: child.typed::<ActivityKind>(),
-                        reason: reason.clone(),
-                    }));
-                    pending += 1;
-                }
-                // A nested container within this thread (a `Parallel`/`Map` branch that itself
-                // fans out) owns child threads which must themselves be torn down recursively.
-                ObjectKind::Thread => {
-                    out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.typed::<ThreadKind>(),
-                        reason: reason.clone(),
-                    }));
-                    pending += 1;
-                }
-                // A thread never directly owns an `Execution` child (its container runs threads,
-                // not top-level executions), so nothing to sweep here.
-                ObjectKind::Execution => {}
-                // A `Task` is owned by an activity, not by the thread directly; the `TerminateState`
-                // sweep above cancels each activity's tasks. Nothing to do here.
-                ObjectKind::Task => {}
-                // A thread owns no Flow/FlowVersion child either.
-                _ => {}
-            }
-        }
-        if pending == 0 {
+        if children.is_empty() {
             let mut terminated_thread = thread_row.value();
             terminated_thread.status = ThreadStatus::Terminated(reason.clone());
             terminated_thread.meta.with_update_at(ctx.now());
-            out.append_event(Event::ThreadTerminated {
-                thread: terminated_thread,
-            })
-            .await;
-            // Run the inline child-settled reaction so the owning container converges (mirrors the
-            // `Execution` termination reaction).
-            super::child_completed::child_settled(
-                ctx,
-                out,
-                thread_row.value.meta.owner.clone().into_raw_object_ref(),
-                thread_ref.clone(),
-            )
-            .await;
-        } else {
-            tracing::debug!(
-                thread = %thread_ref,
-                pending,
-                "thread terminating deferred: waiting on owned children"
-            );
+
+            // Which parent the settled thread reports to is decided by the *type* of its owner — a
+            // `ThreadOwner` sum, so each variant names its own container — never by comparing a runtime
+            // kind. The container is resolved *before* `ThreadTerminated`: an ownerless settle is
+            // refused while it can still be answered, rather than discovered as a no-op once the
+            // terminal event is already on the log. What the settle *means* is the owner's business: a
+            // root thread landing here is what starts its run's own teardown.
+            match thread_row.value.meta.owner.clone() {
+                ThreadOwner::Execution(execution) => {
+                    let Some(container) =
+                        ExecutionContainer::open(ctx.storage, execution.clone()).await?
+                    else {
+                        return Err(ProcessingError::Rejected(
+                            RejectionType::InvalidState,
+                            format!(
+                                "terminate_thread: thread {thread_ref} has no live execution owner \
+                                 {execution}; termination refused"
+                            ),
+                        ));
+                    };
+                    out.append_event(Event::ThreadTerminated {
+                        thread: terminated_thread,
+                    })
+                    .await;
+                    container
+                        .after_child_terminated(ctx, out, &thread_ref)
+                        .await;
+                }
+                // A fan-out thread is owned by its container Activity; the hook runs the settle so the
+                // `Parallel`/`Map` converges through the state's own decision.
+                ThreadOwner::Activity(activity) => {
+                    let Some(container) =
+                        ActivityContainer::open(ctx.storage, activity.clone()).await?
+                    else {
+                        return Err(ProcessingError::Rejected(
+                            RejectionType::InvalidState,
+                            format!(
+                                "terminate_thread: thread {thread_ref} has no live activity owner \
+                                 {activity}; termination refused"
+                            ),
+                        ));
+                    };
+                    out.append_event(Event::ThreadTerminated {
+                        thread: terminated_thread,
+                    })
+                    .await;
+                    container
+                        .after_child_terminated(ctx, out, &thread_ref)
+                        .await;
+                }
+            }
+            return Ok(());
         }
+
+        // A thread's only child kind is `Activity`: `ActivityKind::OwnedBy` is `ObjectRef<ThreadKind>`
+        // and so is the one edge that can parent an object to a thread, while `ThreadOwner` and
+        // `TimerOwner` admit no thread at all and an `Execution`/`Task` is never owned by one. A nested
+        // fan-out therefore reaches its teardown through the `TerminateState` below — that activity's
+        // own sweep reaps its child threads, timers and tasks — never thread-sweeping-thread.
+        //
+        // Any other kind in `active_children` is thus an engine invariant broken — a corrupt projection
+        // or a forged child edge. Refuse to guess and fail loud, rather than leave the teardown
+        // deferred on a child no sweep can reap.
+        for child in children.iter().cloned() {
+            match child.kind {
+                ObjectKind::Activity => {
+                    out.append_command(Command::TerminateState(TerminateState {
+                        activity: child.typed::<ActivityKind>(),
+                        // Swept, not failing: this thread is going down, and its children are being
+                        // taken with it — so they carry `Cancelled` rather than this thread's own
+                        // `reason`. Passing the reason down would put the original error on a
+                        // bystander's row and, for a state with a `Catch`, let it route a failure that
+                        // was never its own.
+                        reason: TerminationReason::Cancelled,
+                    }));
+                }
+                other => panic!("engine regression: a Thread owns no {other:?} child"),
+            }
+        }
+        tracing::debug!(
+            thread = %thread_ref,
+            children = children.len(),
+            "thread terminating deferred: waiting on owned children"
+        );
 
         Ok(())
     }

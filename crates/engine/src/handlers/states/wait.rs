@@ -1,15 +1,23 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::{AssignObject, IntOrExpr, State, WaitState, WaitTimestamp};
+use spica_asl::{IntOrExpr, State, StatePath, WaitState, WaitTimestamp};
 
+use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use super::super::{emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
-use crate::handler::Collector;
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
-use crate::types::command::TimerPurpose;
+use crate::types::activity::ActivityKind;
+use crate::types::command::{
+    ActivateState, Command, CompleteState, CompleteThread, TerminateState, TerminationReason,
+};
+use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::{Activity, ActivityState, Variables, WaitActivityState};
+use crate::types::event::{Event, StateTransitioned};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
+use crate::types::timer::TimerKind;
+use crate::{Activity, ActivityState, RejectionType, Variables, WaitActivityState};
 
 /// The inclusive upper bound of a `Wait` `Seconds` value, per the ASL spec.
 const MAX_WAIT_SECONDS: i64 = 99_999_999;
@@ -36,8 +44,182 @@ struct WaitStateHandler<'a> {
     state: &'a WaitState,
 }
 
+/// What the complete step's projection routed to, handed back for `after_completing` to turn into the
+/// terminal and the transition — the mirror of `Pass`'s `PassFinish`. A `Wait` declares exactly one of
+/// `Next`/`End` (per ASL), so the two are an enum, never both present.
+enum WaitFinish {
+    /// Hop to the resolved sibling successor, activating it with the projected output.
+    Next { next: StatePath, output: Value },
+    /// `End`: no successor — complete the owner thread with the projected output.
+    End { output: Value },
+    /// Neither `Next` nor `End` is declared: the definition is malformed, so the activity unwinds
+    /// with `States.NoTerminal` and its scope is taken down.
+    NoTerminal,
+}
+
 #[async_trait]
 impl StateHandler for WaitStateHandler<'_> {
+    /// (3.4) A `Wait` reaches its complete step only through its resume timer's settle — the timer's
+    /// fire is what issues the `CompleteState`, and its settle has already drained the child edge in
+    /// the same batch (see `WaitStateHandler::child_completed`), so the state is always childless
+    /// here. Its whole complete path — project, then hand the finish's settle to the owning thread's
+    /// container or the successor — runs in one go, mirroring `Pass`/`Choice`. A projection failure
+    /// is turned into a terminate here rather than returned: the activity is already `Completing`, so
+    /// there is no later hop to report it from.
+    async fn after_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let finish = match self
+            .process_wait(ctx.env, out, activity_value, variables)
+            .await
+        {
+            Ok(finish) => finish,
+            Err(error) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_value.meta.object_ref(),
+                    reason: TerminationReason::Failed { error },
+                }));
+                return Ok(());
+            }
+        };
+        match finish {
+            WaitFinish::Next { next, output } => {
+                let mut completed = activity_value.clone();
+                debug_assert!(
+                    completed.mark_completed(output.clone(), out.now()).is_ok(),
+                    "the complete step that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateCompleted {
+                    activity: completed,
+                })
+                .await;
+                out.append_event(Event::StateTransitioned(StateTransitioned {
+                    activity: activity_value.meta.object_ref(),
+                    next: next.as_ptr().to_owned(),
+                }))
+                .await;
+                out.append_command(Command::ActivateState(ActivateState {
+                    execution: activity_value.execution.clone(),
+                    owner: activity_value.meta.owner.clone(),
+                    state_path: next,
+                    input: output,
+                }));
+            }
+            WaitFinish::End { output } => {
+                let mut completed = activity_value.clone();
+                debug_assert!(
+                    completed.mark_completed(output.clone(), out.now()).is_ok(),
+                    "the complete step that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateCompleted {
+                    activity: completed,
+                })
+                .await;
+                // `End` routes to the owner thread's completion rather than a sibling hop, so it
+                // carries no `StateTransitioned` marker.
+                out.append_command(Command::CompleteThread(CompleteThread {
+                    thread: activity_value.meta.owner.clone(),
+                    output,
+                }));
+            }
+            // No route at all: the definition is malformed, so unwind the finishing activity and let
+            // its owner thread's container carry the scope down with the failure.
+            WaitFinish::NoTerminal => {
+                let reason = TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::NoTerminal),
+                };
+                let owner = activity_value.meta.owner.clone();
+                let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await?
+                else {
+                    return Err(ProcessingError::Rejected(
+                        RejectionType::NotFound,
+                        format!(
+                            "wait_state: activity {} has no owning thread; termination refused",
+                            activity_value.meta.object_ref()
+                        ),
+                    ));
+                };
+                let mut terminated = activity_value.clone();
+                debug_assert!(
+                    terminated
+                        .mark_terminating(reason.clone(), out.now())
+                        .is_ok(),
+                    "the complete that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateTerminating {
+                    activity: terminated.clone(),
+                })
+                .await;
+                debug_assert!(
+                    terminated.mark_terminated(out.now()).is_ok(),
+                    "the activity this after_completing just began terminating is Terminating"
+                );
+                let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+                out.append_event(Event::StateTerminated {
+                    activity: terminated,
+                })
+                .await;
+                thread_container
+                    .after_child_terminated(ctx, out, &activity_ref)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    // A `Wait`'s only child is its resume deadline, swept because the activity is going down: a
+    // still-armed timer must not outlive the state it bounds. Cancelling it defers the terminal to the
+    // timer's settle; the base already opened `StateTerminating`, so a `Wait` with no timer left closes
+    // inline.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let mut pending = 0;
+        if let Ok(children) = ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await
+        {
+            for child in children {
+                if child.kind == ObjectKind::Timer {
+                    out.append_command(Command::CancelTimer {
+                        timer: child.typed::<TimerKind>(),
+                    });
+                    pending += 1;
+                }
+            }
+        }
+        if pending == 0 {
+            let mut terminated = activity_value.clone();
+            debug_assert!(
+                terminated.mark_terminated(out.now()).is_ok(),
+                "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+            );
+            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+            let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+            out.append_event(Event::StateTerminated {
+                activity: terminated,
+            })
+            .await;
+            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        } else {
+            tracing::debug!(
+                activity = %activity_value.meta.object_ref(),
+                pending,
+                "wait state terminating deferred: waiting on the deadline"
+            );
+        }
+        Ok(())
+    }
+
     // Wait's processed input is its raw input; the activate work is resolving the resume instant,
     // which is the activity's activation product.
     async fn process_input(
@@ -50,7 +232,7 @@ impl StateHandler for WaitStateHandler<'_> {
     ) -> Result<Value, ExecutionError> {
         // Resolve the deadline here rather than when the timer is armed, so the instant is a property
         // of the entering activity (carried by `StateActivated` and every later event) and *one*
-        // computation feeds both carriers: this repository field and the `WaitResume` timer
+        // computation feeds both carriers: this repository field and the `Seconds` timer
         // `after_activated` arms from it.
         let resume_at = self.resolve_wait_deadline(env, variables, states, now)?;
         activity.activity_state = Some(ActivityState::Wait(WaitActivityState { resume_at }));
@@ -77,7 +259,6 @@ impl StateHandler for WaitStateHandler<'_> {
             // `{execution.name}-{suffix}` generated name, so a branch Wait still names its root run.
             activity_value.execution.clone(),
             activity_value,
-            TimerPurpose::WaitResume,
             wait.resume_at,
         )
         .await;
@@ -88,27 +269,86 @@ impl StateHandler for WaitStateHandler<'_> {
         false
     }
 
-    // A `Wait` owns no result of its own: the timer that resumes it carries the raw result as the
-    // `CompleteState` output, so the base's default `finish` (raw result = `raw_output`, falling back
-    // to the processed input) is exactly this state's projection — only the routing is its own.
-    fn assign(&self) -> Option<&AssignObject> {
-        self.state.assign.as_ref()
-    }
-
-    fn output(&self) -> Option<&Value> {
-        self.state.output.as_ref()
-    }
-
-    fn next(&self) -> Option<&str> {
-        self.state.next.as_deref()
-    }
-
-    fn end(&self) -> Option<bool> {
-        self.state.end
+    /// A `Wait`'s only child is its resume timer, and that timer's settle *is* its completion trigger:
+    /// the state resumes and finishes. The raw result is the activity's processed input — a `Wait`
+    /// produces no distinct raw output — carried as the `CompleteState` output, keeping the command
+    /// self-describing.
+    async fn child_completed(
+        &self,
+        _ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity: ObjectRef<ActivityKind>,
+        activity_value: &Activity,
+        _variables: &Variables,
+        _child: RawObjectRef,
+    ) {
+        out.append_command(Command::CompleteState(CompleteState {
+            activity,
+            output: activity_value
+                .input
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+        }));
     }
 }
 
 impl WaitStateHandler<'_> {
+    /// The `Wait` complete step: build `$states`, apply `Assign` (emitting `VariablesAssigned` on the
+    /// owner scope), project `Output` (defaulting to the raw result), and decide the routing — the
+    /// canonical success finish, mirroring `Pass`'s `process_pass`. It emits nothing about the
+    /// activity itself; the terminal and the transition belong to `after_completing`.
+    async fn process_wait(
+        &self,
+        env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<WaitFinish, ExecutionError> {
+        let result = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| activity_value.raw_input.clone());
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+        let owner = activity_value.meta.owner.clone();
+        self.apply_assign(
+            out,
+            env,
+            &owner,
+            self.state.assign.as_ref(),
+            &states,
+            &mut local_scope,
+        )
+        .await?;
+        let output = self
+            .project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                result,
+            )
+            .await?;
+        let next = self.state.next.as_deref();
+        if self.state.end == Some(true) {
+            Ok(WaitFinish::End { output })
+        } else if let Some(next) = next {
+            Ok(WaitFinish::Next {
+                next: activity_value.state_path.sibling(next),
+                output,
+            })
+        } else {
+            Ok(WaitFinish::NoTerminal)
+        }
+    }
+
     /// Compute the absolute deadline the Wait holds until. `Seconds` is relative — normalized to an
     /// absolute moment at activation **against the caller's `now`** (the injected clock's reading, so
     /// the expiry is as controllable as the definition); `Timestamp` is already absolute (parsed from
@@ -211,10 +451,13 @@ impl WaitStateHandler<'_> {
 #[cfg(test)]
 mod tests {
     use spica_asl::WaitState;
+    use spica_storage::InMemoryStorage;
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
+    use crate::types::command::{
+        ActivateState, Command, CompleteState, CompleteThread, TerminateState, TerminationReason,
+    };
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::{HasRawObjectRef, ObjectMeta};
     use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
@@ -254,7 +497,6 @@ mod tests {
     fn resume_timer(resume_at: Timestamp) -> Timer {
         Timer {
             execution: execution_ref(),
-            purpose: TimerPurpose::WaitResume,
             status: TimerStatus::Active,
             deadline: resume_at,
             meta: ObjectMeta::builder(uid(2))
@@ -292,8 +534,8 @@ mod tests {
             ]
         );
 
-        // The timer is folded as the waiting activity's child — the edge the complete step reads to
-        // decide whether the state may finish yet.
+        // The timer is folded as the waiting activity's child — the edge its settle detaches when it
+        // fires, which is what lets the state finish.
         let timer = resume_timer(resume_at).meta.raw_object_ref();
         assert!(
             activated
@@ -304,46 +546,7 @@ mod tests {
         );
     }
 
-    /// A `Wait` whose timer is still live must not finish: the complete step opens the finish —
-    /// `StateCompleting` is emitted, so the decision is durable — and then defers, leaving the
-    /// activity `Completing` for the timer's settle to drain.
-    #[tokio::test]
-    async fn complete_defers_the_finish_while_the_resume_timer_lives() {
-        let resume_at = deadline(30);
-        let state = wait_state(Some(30), Some("P2"));
-        let activated = activate(
-            &state,
-            &activate_cmd(path("/States/P"), seeded_input()),
-            seeded_scope(ThreadStatus::Running),
-        )
-        .await;
-        let Dispatch { store, .. } = activated;
-
-        let completed = complete(&state, store, &complete_cmd(seeded_input())).await;
-
-        let mut completing = activated_activity(resume_at);
-        completing.raw_output = Some(seeded_input());
-        completing.status = ActivityStatus::Completing;
-        assert_eq!(
-            completed.chain(),
-            vec![EntryPayload::Event(Event::StateCompleting {
-                activity: completing
-            })],
-            "only the durable `ing` lands while the resume timer lives"
-        );
-        assert_eq!(
-            completed
-                .activity(&minted_activity_ref())
-                .await
-                .expect("the row is still there")
-                .value
-                .status,
-            ActivityStatus::Completing,
-            "a deferred finish leaves the activity Completing, not Running"
-        );
-    }
-
-    /// Once the resume timer has drained (its settle detached it), the same complete step finishes:
+    /// Once the resume timer has drained (its settle detached it), the complete step finishes:
     /// the projection runs and the state routes to its successor. The timer's own settle drives that
     /// drain, so nothing here re-arms or re-issues anything.
     #[tokio::test]
@@ -382,6 +585,51 @@ mod tests {
                     input: seeded_input(),
                 })),
             ]
+        );
+    }
+
+    /// A `Wait` that declares `End` (no successor) routes its finish to the owning thread's
+    /// completion, carrying the projected result — the terminal has no sibling to hop to, so no
+    /// `StateTransitioned` is emitted.
+    #[tokio::test]
+    async fn complete_with_end_completes_the_owner_thread() {
+        let state = State::Wait(WaitState {
+            seconds: Some(spica_asl::IntOrExpr::Int(30)),
+            end: Some(true),
+            ..Default::default()
+        });
+        let completed = complete(
+            &state,
+            complete_store(seeded_input(), []).await,
+            &complete_cmd(seeded_input()),
+        )
+        .await;
+
+        let mut done = minted_activity(path("/States/P"), seeded_input());
+        done.input = Some(seeded_input());
+        done.raw_output = Some(seeded_input());
+        done.status = ActivityStatus::Completed;
+        done.output = Some(seeded_input());
+
+        assert!(
+            matches!(
+                completed.chain().last(),
+                Some(EntryPayload::Command(Command::CompleteThread(
+                    CompleteThread {
+                        thread: t,
+                        output,
+                    }
+                ))) if *t == thread_ref() && *output == seeded_input()
+            ),
+            "an `End` Wait completes its owner thread with the result: {:?}",
+            completed.chain().last()
+        );
+        assert!(
+            !completed
+                .chain()
+                .iter()
+                .any(|p| matches!(p, EntryPayload::Event(Event::StateTransitioned(_)))),
+            "a terminal Wait has no successor to name"
         );
     }
 
@@ -425,6 +673,34 @@ mod tests {
                 .status,
             ActivityStatus::Running,
             "the unwinding terminate is a command, not a fold: the row stays as the birth left it"
+        );
+    }
+
+    /// A `Wait`'s resume timer settling resumes and finishes the state: `child_completed` hands the
+    /// activity a `CompleteState` whose raw result is the Wait's processed input (a Wait produces no
+    /// distinct raw output) — the command the timer handler used to append itself.
+    #[tokio::test]
+    async fn child_completed_of_the_resume_timer_completes_the_activity() {
+        let mut store = InMemoryStorage::new();
+        let row = seeded_activity(seeded_input(), []);
+        seed_container(&mut store, row, []).await;
+
+        let completed = child_completed(
+            &wait_state(Some(30), Some("P2")),
+            store,
+            minted_activity_ref(),
+            resume_timer(deadline(30)).meta.raw_object_ref().clone(),
+        )
+        .await;
+
+        assert_eq!(
+            completed.chain(),
+            vec![EntryPayload::Command(Command::CompleteState(
+                CompleteState {
+                    activity: minted_activity_ref(),
+                    output: seeded_input(),
+                }
+            ))]
         );
     }
 }

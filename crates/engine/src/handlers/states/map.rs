@@ -1,19 +1,22 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::{AssignObject, IntOrExpr, MapItems, MapState, State};
+use spica_asl::{IntOrExpr, MapItems, MapState, State};
 
 use super::super::emit_state_completed;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use super::super::{emit_transition, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
-use crate::types::command::{Command, SpawnThread, TerminateState, TerminationReason};
+use crate::types::command::{
+    Command, CompleteThread, SpawnThread, TerminateExecution, TerminateState, TerminateThread,
+    TerminationReason,
+};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::Event;
-use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
+use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, ActivityStatus, MapActivityState, Variables};
 
@@ -72,6 +75,118 @@ struct MapStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for MapStateHandler<'_> {
+    /// (3.4) A `Map` converges through `child_completed` on its last item settle, so this path is reached
+    /// only by a stray `CompleteState`, and it handles both halves in one place: any item still in flight
+    /// is terminated (a finish never waits on a live child), otherwise the activity is completed with its
+    /// own input as a defensive terminal so the machine does not wedge.
+    async fn after_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let activity = activity_value.meta.object_ref();
+        let live = match ctx.storage.get_activity(&activity).await {
+            Ok(Some(a)) => a.active_children.clone(),
+            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        };
+        if !live.is_empty() {
+            // A live item at finish time is an invariant violation (a `Map` finishes only once every
+            // item settles); stop it rather than leave it running behind a completed state.
+            for child in live {
+                if child.kind == ObjectKind::Thread {
+                    out.append_command(Command::TerminateThread(TerminateThread {
+                        thread: child.typed::<ThreadKind>(),
+                        reason: TerminationReason::Cancelled,
+                    }));
+                }
+            }
+            return Ok(());
+        }
+        // Defensive terminal: with no convergence run, no item outputs were aggregated, so complete
+        // with the activity's own input and route down its terminal branch — a stray `CompleteState`
+        // on the container must not wedge the machine.
+        let mut completed = activity_value.clone();
+        debug_assert!(
+            completed
+                .mark_completed(activity_value.raw_input.clone(), out.now())
+                .is_ok(),
+            "the complete that dispatched this after_completing opened the activity as Completing"
+        );
+        out.append_event(Event::StateCompleted {
+            activity: completed,
+        })
+        .await;
+        out.append_command(Command::CompleteThread(CompleteThread {
+            thread: activity_value.meta.owner.clone(),
+            output: activity_value.raw_input.clone(),
+        }));
+        Ok(())
+    }
+
+    // A `Map`'s terminate sweeps its in-flight fan-out: every item execution and item thread is
+    // cancelled so its own subtree unwinds and relays its settle back. The base already opened
+    // `StateTerminating`; once every item drains (via the generic `Terminating` path) the activity's
+    // terminal is emitted there — a childless container closes inline instead.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let activity = activity_value.meta.object_ref();
+        let live = match ctx.storage.get_activity(&activity).await {
+            Ok(Some(a)) => a.active_children.clone(),
+            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        };
+        let mut pending = 0;
+        for child in live {
+            match child.kind {
+                // An item execution and its spawned thread both unwind on cancellation so the
+                // activity drains (the last settle re-enters the generic `Terminating` path).
+                ObjectKind::Execution => {
+                    out.append_command(Command::TerminateExecution(TerminateExecution {
+                        name: child.name.clone(),
+                        uid: Some(child.uid),
+                        reason: TerminationReason::Cancelled,
+                    }));
+                    pending += 1;
+                }
+                ObjectKind::Thread => {
+                    out.append_command(Command::TerminateThread(TerminateThread {
+                        thread: child.typed::<ThreadKind>(),
+                        reason: TerminationReason::Cancelled,
+                    }));
+                    pending += 1;
+                }
+                _ => {}
+            }
+        }
+        if pending == 0 {
+            let mut terminated = activity_value.clone();
+            debug_assert!(
+                terminated.mark_terminated(out.now()).is_ok(),
+                "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+            );
+            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+            let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+            out.append_event(Event::StateTerminated {
+                activity: terminated,
+            })
+            .await;
+            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        } else {
+            tracing::debug!(
+                activity = %activity,
+                pending,
+                "map state terminating deferred: waiting on items"
+            );
+        }
+        Ok(())
+    }
+
     // Seed the definition-derived scaffold so `StateActivating` carries the same `Some(activity_state)`
     // a Parallel does — the empty item plan is mirrored, not the item-derived items/total/cap, which
     // are input-derived and thus harvested in `process_input` (replacing this default).
@@ -156,51 +271,6 @@ impl StateHandler for MapStateHandler<'_> {
 
     fn complete_directly(&self, _activity: &Activity) -> bool {
         false
-    }
-
-    // Read by this state's own `finish_map`, which projects the aggregated per-item outputs.
-    fn assign(&self) -> Option<&AssignObject> {
-        self.state.assign.as_ref()
-    }
-
-    fn output(&self) -> Option<&Value> {
-        self.state.output.as_ref()
-    }
-
-    // Read by `finish_map`'s transition: the successor declared on the Map itself.
-    fn next(&self) -> Option<&str> {
-        self.state.next.as_deref()
-    }
-
-    fn end(&self) -> Option<bool> {
-        self.state.end
-    }
-
-    // A `Map` never completes through the shared success projection: it finishes only once every item
-    // settles, driven by `child_completed` → `finish_map`, so the base's `finish` is reached only as a
-    // defensive fallback. With no successor to hop to, it completes the activity with its own raw input
-    // and routes `emit_transition` down its terminal branch (`next = None` + `end = Some(true)`), so a
-    // stray `CompleteState` on the container does not wedge the machine — nothing else is projected.
-    async fn finish(
-        &self,
-        _env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity_value: &Activity,
-        _variables: &Variables,
-    ) -> Result<(), ExecutionError> {
-        emit_state_completed(out, activity_value, &activity_value.raw_input).await;
-        emit_transition(
-            out,
-            activity_value.execution.clone(),
-            activity_value.meta.owner.clone(),
-            activity_value.meta.object_ref(),
-            &activity_value.state_path,
-            &activity_value.raw_input,
-            None,
-            Some(true),
-        )
-        .await;
-        Ok(())
     }
 
     /// The per-settle **replenish** hook, dispatched by the inline child-settled reaction's Running
@@ -497,7 +567,14 @@ impl MapStateHandler<'_> {
         .build();
         let mut local_scope = variables.clone();
         if let Err(e) = self
-            .apply_assign(out, env, &owner, self.assign(), &states, &mut local_scope)
+            .apply_assign(
+                out,
+                env,
+                &owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
             .await
         {
             out.append_command(Command::TerminateState(TerminateState {
@@ -507,7 +584,13 @@ impl MapStateHandler<'_> {
             return;
         }
         let output_value = match self
-            .project_output(env, self.output(), &states, &local_scope, aggregated)
+            .project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                aggregated,
+            )
             .await
         {
             Ok(output_value) => output_value,
@@ -540,8 +623,8 @@ impl MapStateHandler<'_> {
             activity_ref,
             &activity.state_path,
             &output_value,
-            self.next(),
-            self.end(),
+            self.state.next.as_deref(),
+            self.state.end,
         )
         .await;
     }

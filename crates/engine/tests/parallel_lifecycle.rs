@@ -18,8 +18,7 @@ use spica_engine::{
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind,
     ParallelActivityState, Reject, RejectionType, RequestId, RuntimeError, SpawnThread,
     StateTransitioned, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
-    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerPurpose, TimerStatus,
-    WaitActivityState,
+    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -714,7 +713,6 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -787,7 +785,6 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     meta: meta_span(uid(10), "lifecycle_execution-6", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 300_000))
                         .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Completed,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -2741,17 +2738,6 @@ async fn parallel_branch_failure_fails_the_run() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -2771,6 +2757,17 @@ async fn parallel_branch_failure_fails_the_run() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "Boom".to_string(),
+                        error: "BranchBoom".to_string(),
+                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,
@@ -3052,7 +3049,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Active,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -3207,13 +3203,9 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
+                // Swept, not failing: the surviving `Slow` branch is torn down because the Parallel is
+                // going down, so it carries `Cancelled` rather than the sibling's error.
+                reason: TerminationReason::Cancelled,
             })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
@@ -3234,26 +3226,11 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
-                name: name("lifecycle_execution"),
-                uid: Some(uid(3)),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
+                // The root thread relays the failure up as its own, but the Parallel it sweeps is a
+                // bystander of the run-level teardown: its own terminate arrives as a sweep.
+                reason: TerminationReason::Cancelled,
             })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
@@ -3263,66 +3240,30 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     state_path: path("/States/P/Branches/1/States"),
                     start_at: "Slow".to_string(),
                     index: 1,
-                    status: ThreadStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
+                    status: ThreadStatus::Terminating(TerminationReason::Cancelled),
                     input: json!({"n": 1}),
                     output: None,
                 },
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
+                reason: TerminationReason::Cancelled,
             })),
-            EntryPayload::Event(Event::ExecutionTerminating {
-                execution: Execution {
-                    deadline: None,
-                    meta: meta_root(uid(3), "lifecycle_execution"),
-                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
-                    status: ExecutionStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason:
+                    "terminate_state: activity activity/lifecycle_execution-1 is terminating; \
+                    termination refused — the drain owns its terminal"
+                        .to_string(),
             }),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P/Branches/1/States/Slow"),
-                    status: ActivityStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
+                    status: ActivityStatus::Terminating(TerminationReason::Cancelled),
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
                     raw_output: None,
@@ -3334,17 +3275,11 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
             EntryPayload::Command(Command::CancelTimer {
                 timer: ref_to::<TimerKind>("lifecycle_execution-6", 10),
             }),
-            EntryPayload::Reject(Reject {
-                request_id: RequestId::nil(),
-                rejection_type: RejectionType::InvalidState,
-                rejection_reason: "terminate_thread: thread thread/lifecycle_execution-0 is already Terminating; termination refused".to_string(),
-            }),
             EntryPayload::Event(Event::TimerCancelled {
                 timer: Timer {
                     meta: meta(uid(10), "lifecycle_execution-6")
                         .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    purpose: TimerPurpose::WaitResume,
                     status: TimerStatus::Cancelled,
                     deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
                 },
@@ -3358,13 +3293,7 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                         .with_owner(thread_owner("lifecycle_execution-3", 7)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/P/Branches/1/States/Slow"),
-                    status: ActivityStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
+                    status: ActivityStatus::Terminated(TerminationReason::Cancelled),
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
                     raw_output: None,
@@ -3384,13 +3313,7 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     state_path: path("/States/P/Branches/1/States"),
                     start_at: "Slow".to_string(),
                     index: 1,
-                    status: ThreadStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
+                    status: ThreadStatus::Terminated(TerminationReason::Cancelled),
                     input: json!({"n": 1}),
                     output: None,
                 },
@@ -3443,8 +3366,32 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+            EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
+                name: name("lifecycle_execution"),
+                uid: Some(uid(3)),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "Boom".to_string(),
+                        error: "BranchBoom".to_string(),
+                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                    }),
+                },
+            })),
+            EntryPayload::Event(Event::ExecutionTerminating {
+                execution: Execution {
+                    deadline: None,
+                    meta: meta_root(uid(3), "lifecycle_execution"),
+                    flow_version: ref_to::<FlowVersionKind>("lifecycle_flow-1", 2),
+                    status: ExecutionStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                            state: "Boom".to_string(),
+                            error: "BranchBoom".to_string(),
+                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                        }),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
             }),
             EntryPayload::Event(Event::ExecutionTerminated {
                 execution: Execution {
@@ -3476,9 +3423,9 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
 }
 
 /// Both branches fail. The first failure's `TerminateState` opens P's close and takes the owning
-/// thread down with it; the second branch's settle fails P again, and that `TerminateState` is still
-/// recorded and drained — but the thread is already terminating, so nothing escalates a second time
-/// and the run terminates once.
+/// thread down with it; the second branch's settle fails P again, but by then P's drain has already
+/// produced its terminal, so that duplicate `TerminateState` is refused (a `Reject`), the thread is
+/// already terminating, nothing escalates a second time, and the run terminates once.
 #[rustfmt::skip]
 #[tokio::test]
 async fn parallel_two_failing_branches_terminate_the_run_once() {
@@ -4000,28 +3947,12 @@ async fn parallel_two_failing_branches_terminate_the_run_once() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::StateTerminated {
-                activity: Activity {
-                    meta: meta(uid(5), "lifecycle_execution-1")
-                        .with_owner(thread_owner("lifecycle_execution-0", 4)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States/P"),
-                    status: ActivityStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
-                    raw_input: json!({"n": 1}),
-                    input: Some(json!({"n": 1})),
-                    raw_output: None,
-                    activity_state: Some(ActivityState::Parallel(ParallelActivityState {
-                        branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
-                    })),
-                    retry_state: None,
-                    output: None,
-                },
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason: "terminate_state: activity activity/lifecycle_execution-1 is \
+                    terminated; termination refused — the drain owns its terminal"
+                    .to_string(),
             }),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
@@ -4032,6 +3963,25 @@ async fn parallel_two_failing_branches_terminate_the_run_once() {
                     start_at: "P".to_string(),
                     index: 0,
                     status: ThreadStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                            state: "Boom".to_string(),
+                            error: "BranchBoom".to_string(),
+                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                        }),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
+            }),
+            EntryPayload::Event(Event::ThreadTerminated {
+                thread: Thread {
+                    meta: meta(uid(4), "lifecycle_execution-0")
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                    state_path: path("/States"),
+                    start_at: "P".to_string(),
+                    index: 0,
+                    status: ThreadStatus::Terminated(TerminationReason::Failed {
                         error: ExecutionError::Runtime(RuntimeError::StateFailed {
                             state: "Boom".to_string(),
                             error: "BranchBoom".to_string(),
@@ -4053,25 +4003,6 @@ async fn parallel_two_failing_branches_terminate_the_run_once() {
                     }),
                 },
             })),
-            EntryPayload::Event(Event::ThreadTerminated {
-                thread: Thread {
-                    meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States"),
-                    start_at: "P".to_string(),
-                    index: 0,
-                    status: ThreadStatus::Terminated(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
-            }),
             EntryPayload::Event(Event::ExecutionTerminating {
                 execution: Execution {
                     deadline: None,

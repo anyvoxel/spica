@@ -95,7 +95,7 @@ mod tests {
     use crate::types::task::TaskKind;
     use crate::{
         Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Task, TaskStatus,
-        ThreadKind, Timestamp,
+        TerminationReason, ThreadKind, Timestamp,
     };
 
     /// The task's owner slot: an activity, the only kind it admits.
@@ -247,9 +247,16 @@ mod tests {
 
         /// A live task under a live owner: the handler's own event, and nothing besides — the cancel
         /// moment stamped, the identity its owner matches the child by preserved.
+        ///
+        /// The owner is seeded `Terminating`, which is the only shape this settle really reaches in:
+        /// the state's own teardown sweep is the single emitter of `CancelTask`, so the owner has
+        /// always begun its finish by the time the cancel lands. That is also what keeps the container
+        /// on its drain arm — it decides nothing itself, and the child still attached (no overlay here
+        /// to detach it) leaves even the drain untaken.
         #[tokio::test]
         async fn a_live_task_emits_its_own_cancel_and_nothing_else() {
-            let (task, activity) = live_world();
+            let (task, mut activity) = live_world();
+            activity.value.status = ActivityStatus::Terminating(TerminationReason::Cancelled);
             let chain = cancel_over(&store_with_owner(Ok(Some(task)), activity))
                 .await
                 .expect("a live task under a live owner is a clean settle");

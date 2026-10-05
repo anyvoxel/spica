@@ -1,8 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use spica_asl::{AssignObject, PassState, State};
+use spica_asl::{PassState, State, StatePath};
 
+use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use crate::eval_env::EvalEnv;
+use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::types::command::{
+    ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
+};
+use crate::types::context::States;
+use crate::types::error::{ExecutionError, RuntimeError};
+use crate::types::event::{Event, StateTransitioned};
+use crate::types::meta::HasRawObjectRef;
+use crate::{Activity, RejectionType, Variables};
 
 pub struct PassStateHandlerFactory;
 
@@ -26,32 +37,218 @@ struct PassStateHandler<'a> {
     state: &'a PassState,
 }
 
+/// What the complete step's projection routed to, handed back for `after_completing` to turn into the
+/// terminal and the transition — the mirror of `Choice`'s `ChoiceBranch`. A `Pass` declares exactly
+/// one of `Next`/`End` (per ASL), so the two are an enum, never both present.
+enum PassFinish {
+    /// Hop to the resolved sibling successor, activating it with the projected output.
+    Next { next: StatePath, output: Value },
+    /// `End`: no successor — complete the owner thread with the projected output.
+    End { output: Value },
+    /// Neither `Next` nor `End` is declared: the definition is malformed, so the activity unwinds
+    /// with `States.NoTerminal` and its scope is taken down.
+    NoTerminal,
+}
+
 #[async_trait]
 impl StateHandler for PassStateHandler<'_> {
-    // Pass's projection — `Assign` (a delta on the owning scope, emitted as `VariablesAssigned`)
-    // then `Output` (defaults to the input) — is the canonical ASL success projection and is exactly
-    // the base's default `finish`: Pass supplies only its own `Assign`/`Output` sources and routing.
-    fn assign(&self) -> Option<&AssignObject> {
-        self.state.assign.as_ref()
+    /// (3.4) The canonical ASL success projection runs here in one go — a `Pass` owns no child to
+    /// wait on, so there is nothing to defer, mirroring `Choice`/`Fail`. A projection failure is
+    /// turned into a terminate here rather than returned: the activity is already `Completing`, so
+    /// there is no later hop to report it from.
+    async fn after_completing(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let finish = match self
+            .process_pass(ctx.env, out, activity_value, variables)
+            .await
+        {
+            Ok(finish) => finish,
+            Err(error) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity_value.meta.object_ref(),
+                    reason: TerminationReason::Failed { error },
+                }));
+                return Ok(());
+            }
+        };
+        match finish {
+            PassFinish::Next { next, output } => {
+                let mut completed = activity_value.clone();
+                debug_assert!(
+                    completed.mark_completed(output.clone(), out.now()).is_ok(),
+                    "the complete step that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateCompleted {
+                    activity: completed,
+                })
+                .await;
+                out.append_event(Event::StateTransitioned(StateTransitioned {
+                    activity: activity_value.meta.object_ref(),
+                    next: next.as_ptr().to_owned(),
+                }))
+                .await;
+                out.append_command(Command::ActivateState(ActivateState {
+                    execution: activity_value.execution.clone(),
+                    owner: activity_value.meta.owner.clone(),
+                    state_path: next,
+                    input: output,
+                }));
+            }
+            PassFinish::End { output } => {
+                let mut completed = activity_value.clone();
+                debug_assert!(
+                    completed.mark_completed(output.clone(), out.now()).is_ok(),
+                    "the complete step that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateCompleted {
+                    activity: completed,
+                })
+                .await;
+                // `End` routes to the owner thread's completion rather than a sibling hop, so it
+                // carries no `StateTransitioned` marker.
+                out.append_command(Command::CompleteThread(CompleteThread {
+                    thread: activity_value.meta.owner.clone(),
+                    output,
+                }));
+            }
+            // No route at all: the definition is malformed, so unwind the finishing activity and let
+            // its owner thread's container carry the scope down with the failure.
+            PassFinish::NoTerminal => {
+                let reason = TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::NoTerminal),
+                };
+                let owner = activity_value.meta.owner.clone();
+                let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await?
+                else {
+                    return Err(ProcessingError::Rejected(
+                        RejectionType::NotFound,
+                        format!(
+                            "pass_state: activity {} has no owning thread; termination refused",
+                            activity_value.meta.object_ref()
+                        ),
+                    ));
+                };
+                let mut terminated = activity_value.clone();
+                debug_assert!(
+                    terminated
+                        .mark_terminating(reason.clone(), out.now())
+                        .is_ok(),
+                    "the complete that dispatched this after_completing opened the activity as Completing"
+                );
+                out.append_event(Event::StateTerminating {
+                    activity: terminated.clone(),
+                })
+                .await;
+                debug_assert!(
+                    terminated.mark_terminated(out.now()).is_ok(),
+                    "the activity this after_completing just began terminating is Terminating"
+                );
+                let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+                out.append_event(Event::StateTerminated {
+                    activity: terminated,
+                })
+                .await;
+                thread_container
+                    .after_child_terminated(ctx, out, &activity_ref)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
-    fn output(&self) -> Option<&Value> {
-        self.state.output.as_ref()
+    // A `Pass` owns no children, so its terminate closes inline: the base already opened with
+    // `StateTerminating`, so this marks `Terminated`, emits the terminal, and relays the settle up to
+    // the owning thread.
+    async fn after_terminating(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        _variables: &Variables,
+    ) -> Result<(), ProcessingError> {
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+        );
+        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        Ok(())
     }
+}
 
-    fn next(&self) -> Option<&str> {
-        self.state.next.as_deref()
-    }
-
-    fn end(&self) -> Option<bool> {
-        self.state.end
+impl PassStateHandler<'_> {
+    /// The `Pass` complete step: build `$states`, apply `Assign` (emitting `VariablesAssigned` on the
+    /// owner scope), project `Output` (defaulting to the input), and decide the routing — the
+    /// canonical success finish, mirroring `Choice`'s `process_choice`. It emits nothing about the
+    /// activity itself; the terminal and the transition belong to `after_completing`.
+    async fn process_pass(
+        &self,
+        env: &mut EvalEnv,
+        out: &mut Collector<'_>,
+        activity_value: &Activity,
+        variables: &Variables,
+    ) -> Result<PassFinish, ExecutionError> {
+        let result = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| activity_value.raw_input.clone());
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+        let owner = activity_value.meta.owner.clone();
+        self.apply_assign(
+            out,
+            env,
+            &owner,
+            self.state.assign.as_ref(),
+            &states,
+            &mut local_scope,
+        )
+        .await?;
+        let output = self
+            .project_output(
+                env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                result,
+            )
+            .await?;
+        let next = self.state.next.as_deref();
+        if self.state.end == Some(true) {
+            Ok(PassFinish::End { output })
+        } else if let Some(next) = next {
+            Ok(PassFinish::Next {
+                next: activity_value.state_path.sibling(next),
+                output,
+            })
+        } else {
+            Ok(PassFinish::NoTerminal)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use spica_asl::PassState;
+    use spica_asl::{AssignObject, PassState};
 
     use super::super::harness::*;
     use super::*;

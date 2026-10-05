@@ -273,20 +273,11 @@ message Timer {
   ObjectMeta meta = 1;
   // The top-level execution this timer belongs to.
   ObjectReference execution = 2;
-  TimerPurpose purpose = 3;
+  // Was a per-timer purpose; who armed the timer and why are both `meta.owner` now.
+  reserved 3;
   TimerStatus status = 4;
   // Absolute wall-clock moment the timer fires, milliseconds since the UNIX epoch.
   int64 deadline_millis = 5;
-}
-enum TimerPurpose {
-  TIMER_PURPOSE_UNSPECIFIED = 0;
-  // The state-machine `TimeoutSeconds` deadline; firing terminates the execution `TimedOut`.
-  TIMER_PURPOSE_EXECUTION_TIMEOUT = 1;
-  // A `Wait` state's `Seconds` delay; firing completes the owning state.
-  TIMER_PURPOSE_WAIT_RESUME = 2;
-  // A Task state's `TimeoutSeconds` deadline; firing fails the in-flight task `States.Timeout`.
-  TIMER_PURPOSE_TASK_TIMEOUT = 3;
-  reserved 4; // was TIMER_PURPOSE_DELIVERY_LEASE (a per-claim lease timer)
 }
 enum TimerStatus {
   TIMER_STATUS_UNSPECIFIED = 0;
