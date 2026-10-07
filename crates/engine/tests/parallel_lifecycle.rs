@@ -376,6 +376,10 @@ async fn parallel_over_branches_aggregates_in_branch_order() {
                     output: Some(json!("b1")),
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!(["b0", "b1"]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -385,7 +389,7 @@ async fn parallel_over_branches_aggregates_in_branch_order() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[
                             (0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)),
@@ -405,7 +409,7 @@ async fn parallel_over_branches_aggregates_in_branch_order() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[
                             (0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)),
@@ -853,6 +857,10 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     output: Some(json!("slow")),
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!(["fast", "slow"]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 300_000))
@@ -862,7 +870,7 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["fast", "slow"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -879,7 +887,7 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["fast", "slow"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -1304,6 +1312,10 @@ async fn parallel_arguments_project_the_input_each_branch_receives() {
                     output: Some(json!({"v": 2.0})),
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!([{"v": 2.0}, {"v": 2.0}]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -1313,7 +1325,7 @@ async fn parallel_arguments_project_the_input_each_branch_receives() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"v": 2.0})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!([{"v": 2.0}, {"v": 2.0}])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -1330,7 +1342,7 @@ async fn parallel_arguments_project_the_input_each_branch_receives() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"v": 2.0})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!([{"v": 2.0}, {"v": 2.0}])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -1755,6 +1767,10 @@ async fn parallel_output_projects_the_branches_result_array() {
                     output: Some(json!("b1")),
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!(["b0", "b1"]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -1764,7 +1780,7 @@ async fn parallel_output_projects_the_branches_result_array() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -1781,7 +1797,7 @@ async fn parallel_output_projects_the_branches_result_array() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -2206,6 +2222,10 @@ async fn parallel_with_a_next_successor_hands_the_array_on() {
                     output: Some(json!("b1")),
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!(["b0", "b1"]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -2215,7 +2235,7 @@ async fn parallel_with_a_next_successor_hands_the_array_on() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -2232,7 +2252,7 @@ async fn parallel_with_a_next_successor_hands_the_array_on() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!(["b0", "b1"])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
                     })),
@@ -2663,16 +2683,6 @@ async fn parallel_branch_failure_fails_the_run() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -2719,6 +2729,16 @@ async fn parallel_branch_failure_fails_the_run() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "Boom".to_string(),
+                        error: "BranchBoom".to_string(),
+                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -3168,16 +3188,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -3209,31 +3219,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
             })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
-                    meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States"),
-                    start_at: "P".to_string(),
-                    index: 0,
-                    status: ThreadStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                            state: "Boom".to_string(),
-                            error: "BranchBoom".to_string(),
-                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                        }),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
-            }),
-            EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
-                // The root thread relays the failure up as its own, but the Parallel it sweeps is a
-                // bystander of the run-level teardown: its own terminate arrives as a sweep.
-                reason: TerminationReason::Cancelled,
-            })),
-            EntryPayload::Event(Event::ThreadTerminating {
-                thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
                         .with_owner(fanout_thread_owner("lifecycle_execution-1", 5)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -3249,14 +3234,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
                 reason: TerminationReason::Cancelled,
             })),
-            EntryPayload::Reject(Reject {
-                request_id: RequestId::nil(),
-                rejection_type: RejectionType::InvalidState,
-                rejection_reason:
-                    "terminate_state: activity activity/lifecycle_execution-1 is terminating; \
-                    termination refused — the drain owns its terminal"
-                        .to_string(),
-            }),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
@@ -3344,8 +3321,34 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "Boom".to_string(),
+                        error: "BranchBoom".to_string(),
+                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                    }),
+                },
+            })),
+            EntryPayload::Event(Event::ThreadTerminating {
+                thread: Thread {
+                    meta: meta(uid(4), "lifecycle_execution-0")
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                    state_path: path("/States"),
+                    start_at: "P".to_string(),
+                    index: 0,
+                    status: ThreadStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                            state: "Boom".to_string(),
+                            error: "BranchBoom".to_string(),
+                            output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                        }),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
@@ -3891,16 +3894,6 @@ async fn parallel_two_failing_branches_terminate_the_run_once() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
-                        state: "Boom".to_string(),
-                        error: "BranchBoom".to_string(),
-                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -3947,6 +3940,16 @@ async fn parallel_two_failing_branches_terminate_the_run_once() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::StateFailed {
+                        state: "Boom".to_string(),
+                        error: "BranchBoom".to_string(),
+                        output: Box::new(json!({"Error": "BranchBoom", "Cause": "nope"})),
+                    }),
+                },
+            })),
             EntryPayload::Reject(Reject {
                 request_id: RequestId::nil(),
                 rejection_type: RejectionType::InvalidState,
@@ -4154,6 +4157,10 @@ async fn parallel_with_no_branches_converges_to_an_empty_array() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::CompleteState(CompleteState {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                output: json!([]),
+            })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -4163,7 +4170,7 @@ async fn parallel_with_no_branches_converges_to_an_empty_array() {
                     status: ActivityStatus::Completing,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!([])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: Default::default(),
                     })),
@@ -4180,7 +4187,7 @@ async fn parallel_with_no_branches_converges_to_an_empty_array() {
                     status: ActivityStatus::Completed,
                     raw_input: json!({"n": 1}),
                     input: Some(json!({"n": 1})),
-                    raw_output: Some(json!({"n": 1})),
+                    raw_output: Some(json!([])),
                     activity_state: Some(ActivityState::Parallel(ParallelActivityState {
                         branches: Default::default(),
                     })),

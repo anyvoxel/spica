@@ -2,7 +2,6 @@ use crate::RejectionType;
 use crate::StatePath;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, CreateExecution};
-use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, ExecutionCreated};
 use crate::types::execution::ExecutionKind;
 use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef};
@@ -122,32 +121,19 @@ impl CreateExecutionHandler {
 
         if let Some(deadline) = deadline {
             // The run's own deadline timer is generated **here** (inline): mint the
-            // timer's durable uid, and derive the timer's name as `{execution.name}-{8-char-suffix}`
-            // (k8s generateName style `PlainName::to_generated`, which mints its own suffix uid
-            // internally) — deterministic and replay-safe, since this `TimerActivated` lands in the
+            // timer's durable uid, and derive the timer's name as `{execution.name}-{counter-suffix}`
+            // (k8s generateName style, `PlainName::generated_from_key`) — deterministic and
+            // replay-safe, since this `TimerActivated` lands in the
             // same atomic batch as the `ExecutionCreated`. The name is decoupled from the timer's own
             // `uid`, and must be carried forward by later timer events, so TimerActivated children
             // stay resolvable (see `TimerTriggered`/`TimerCancelled`, which preserve the row's meta
             // rather than re-deriving the name).
             let uid: ulid::Ulid = ctx.mint();
-            // A generated child's base is the execution's own name, which is user-supplied (`Plain`)
-            // by construction; unwrap it to derive the timer's `{name}-{8-char}` handle. The
-            // `Generated` arm is unreachable for a CreateExecution name but kept explicit so a future
-            // misuse fails loudly instead of silently mis-naming the timer.
-            let base = match id.name().as_plain() {
-                Some(p) => p,
-                None => {
-                    // TODO：这里貌似应该是不可能发生的事情
-                    out.fail_execution(
-                        &id,
-                        ExecutionError::Runtime(RuntimeError::InvalidDefinition(
-                            "cannot derive a child name: execution name is not a plain user name"
-                                .into(),
-                        )),
-                    );
-                    return Ok(());
-                }
-            };
+            // A generated child's base is the execution's own base name. `ObjectName::base` is total —
+            // a `Plain` name is its own base and a `Generated` one carries a plain base by construction
+            // (nested generated names are unrepresentable) — so both flavors derive the timer's
+            // `{base}-{suffix}` handle the same way, as the root thread below already does.
+            let base = id.name().base();
             // The suffix is this partition's local generated-name counter (see `Storage::next_generated_seq`),
             // read via the working overlay so a sibling minted earlier in the same batch is visible; the
             // `TimerActivated` applier bumps the counter past it in the same fold.

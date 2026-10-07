@@ -1007,14 +1007,6 @@ async fn choice_without_a_match_or_default_fails() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
-                        state: "Picker".to_string(),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -1053,6 +1045,14 @@ async fn choice_without_a_match_or_default_fails() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::NoChoiceMatched {
+                        state: "Picker".to_string(),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")
@@ -1271,15 +1271,6 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::Jsonata {
-                        field: "{% $states.input.v + 1 %}".to_string(),
-                        message: "Condition must evaluate to a boolean".to_string(),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -1320,6 +1311,15 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::Jsonata {
+                        field: "{% $states.input.v + 1 %}".to_string(),
+                        message: "Condition must evaluate to a boolean".to_string(),
+                    }),
+                },
+            })),
             EntryPayload::Event(Event::ThreadTerminating {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")

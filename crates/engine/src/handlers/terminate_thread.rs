@@ -85,46 +85,27 @@ impl TerminateThreadHandler {
             // root thread landing here is what starts its run's own teardown.
             match thread_row.value.meta.owner.clone() {
                 ThreadOwner::Execution(execution) => {
-                    let Some(container) =
-                        ExecutionContainer::open(ctx.storage, execution.clone()).await?
-                    else {
-                        return Err(ProcessingError::Rejected(
-                            RejectionType::InvalidState,
-                            format!(
-                                "terminate_thread: thread {thread_ref} has no live execution owner \
-                                 {execution}; termination refused"
-                            ),
-                        ));
-                    };
+                    let container =
+                        ExecutionContainer::open(ctx.storage, execution.clone()).await?;
                     out.append_event(Event::ThreadTerminated {
                         thread: terminated_thread,
                     })
                     .await;
                     container
                         .after_child_terminated(ctx, out, &thread_ref)
-                        .await;
+                        .await?;
                 }
                 // A fan-out thread is owned by its container Activity; the hook runs the settle so the
                 // `Parallel`/`Map` converges through the state's own decision.
                 ThreadOwner::Activity(activity) => {
-                    let Some(container) =
-                        ActivityContainer::open(ctx.storage, activity.clone()).await?
-                    else {
-                        return Err(ProcessingError::Rejected(
-                            RejectionType::InvalidState,
-                            format!(
-                                "terminate_thread: thread {thread_ref} has no live activity owner \
-                                 {activity}; termination refused"
-                            ),
-                        ));
-                    };
+                    let container = ActivityContainer::open(ctx.storage, activity.clone()).await?;
                     out.append_event(Event::ThreadTerminated {
                         thread: terminated_thread,
                     })
                     .await;
                     container
                         .after_child_terminated(ctx, out, &thread_ref)
-                        .await;
+                        .await?;
                 }
             }
             return Ok(());

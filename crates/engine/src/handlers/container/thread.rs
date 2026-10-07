@@ -1,47 +1,17 @@
 use serde_json::Value;
 
 use super::Container;
-use crate::handler::{Collector, HandlerContext};
+use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{Command, CompleteThread, TerminateThread};
 use crate::types::meta::{HasRawObjectRef, ObjectRef, RawObjectRef};
 use crate::types::thread::{ThreadKind, ThreadStatus};
-use crate::{ActivityStatus, StorageError};
+use crate::{ActivityStatus, RejectionType};
 
 /// The container for a `Thread`'s children — the activity states that run inside one scope.
 pub(crate) struct ThreadContainer {
     thread: ObjectRef<ThreadKind>,
-}
-
-impl ThreadContainer {
-    /// The half both outcomes share: a thread that is already finishing and has just drained its last
-    /// child advances its own finish. Returns `true` when it emitted the Continue command, so the
-    /// caller knows the outcome-specific arm has nothing left to do.
-    fn advance_if_drained(
-        &self,
-        out: &mut Collector<'_>,
-        thread: &crate::storage::ThreadRecord,
-    ) -> bool {
-        if !thread.active_children.is_empty() {
-            return false; // more children in flight — the last one to settle advances the finish.
-        }
-        match &thread.value.status {
-            ThreadStatus::Completing => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.thread.as_raw_object_ref().clone(),
-                });
-                true
-            }
-            ThreadStatus::Terminating(_) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.thread.as_raw_object_ref().clone(),
-                });
-                true
-            }
-            _ => false,
-        }
-    }
 }
 
 impl Container for ThreadContainer {
@@ -50,95 +20,162 @@ impl Container for ThreadContainer {
     async fn open(
         storage: &dyn ReadonlyStorageTxn,
         owner: ObjectRef<Self::Owner>,
-    ) -> Result<Option<Self>, StorageError> {
-        // See `ActivityContainer::open`: the call site's owner kind is this impl's own parameter type.
+    ) -> Result<Self, ProcessingError> {
+        // The thread is the seam's own existence check (see `Container::open`): a thread that is gone is
+        // refused here, uniformly for every caller whose settle would have nothing to land on.
         if storage.get_thread(&owner).await?.is_none() {
-            return Ok(None);
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("thread_container: thread {owner} is gone"),
+            ));
         }
-        Ok(Some(Self { thread: owner }))
+        Ok(Self { thread: owner })
     }
+
+    // Both hooks decide on one pair: *how the child settled* (which hook) and *where the thread
+    // stands* (its status). A thread's child is always an `Activity` (see `TerminateThreadHandler`), so
+    // the child's kind adds no choice — the table is the same in both hooks, only the `Running` arm
+    // differs, since a thread still running has to be told what the settle *means* while one already
+    // finishing only has to be advanced. Whether the thread has *drained* is not checked here: a
+    // `Continue*` cell names the thread this settle advances, and that command's own handler takes down
+    // anything still attached and stops short of advancing, so the settle that drains the thread last is
+    // the one that advances it.
 
     async fn after_child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         child: &RawObjectRef,
-    ) {
-        let Some(thread) = ctx.storage.get_thread(&self.thread).await.ok().flatten() else {
-            return; // gone already — nothing to advance.
+    ) -> Result<(), ProcessingError> {
+        // The thread was resolved *before* the settle's own terminal event was written, and this re-read
+        // runs in that same batch — so a row that is gone here is the lifecycle disagreeing with the log
+        // rather than a settle to ignore. Refused, never no-op'ed: the terminal is already on this batch,
+        // and a silent success would leave it unexplained. A fault is the leader's to retry.
+        let Some(thread) = ctx.storage.get_thread(&self.thread).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "thread_container: thread {} is gone from under its settled child",
+                    self.thread
+                ),
+            ));
         };
-        if self.advance_if_drained(out, &thread) {
-            return;
+        match &thread.value.status {
+            // The scope's own success: a `Succeed` is a thread's only natural end, so the thread
+            // completes on the settled child's output — read off that child's own row, the single source
+            // of truth, rather than carried on the call. A terminal that projects no value folds as no
+            // `output` at all, hence the `Null` fallback: a null-returning terminal still completes its
+            // thread, where a none-event would strand it.
+            ThreadStatus::Running => {
+                let output = ctx
+                    .storage
+                    .get_activity(&child.clone().typed::<ActivityKind>())
+                    .await?
+                    .map(|act| act.value.output.clone().unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null);
+                out.append_command(Command::CompleteThread(CompleteThread {
+                    thread: self.thread.clone(),
+                    output,
+                }));
+                Ok(())
+            }
+            // Already finishing: this settle advances the thread, whether it was a `Completing`
+            // thread's bystander landing or a `Terminating` one's swept child.
+            ThreadStatus::Completing => {
+                out.append_command(Command::ContinueComplete {
+                    owner: self.thread.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            ThreadStatus::Terminating(_) => {
+                out.append_command(Command::ContinueTerminate {
+                    owner: self.thread.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            // A terminal thread has no child left to settle: the row and the lifecycle disagree, and the
+            // batch is refused rather than advanced.
+            status => Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "thread_container: thread {} settled a completed child {child} while {status:?}",
+                    self.thread
+                ),
+            )),
         }
-        if !thread.value.status.is_running() {
-            return; // finishing with children still attached: some other settle owns the drain.
-        }
-        // A terminal state (`Succeed`) is a thread's only natural end: its `Completed` settle completes
-        // the thread, the output read off the settled child's own row — the single source of truth —
-        // rather than carried on the call. A thread already past `Running` is mid-sweep by its own
-        // chain and needs no second completion.
-        let Some(act) = ctx
-            .storage
-            .get_activity(&child.clone().typed::<ActivityKind>())
-            .await
-            .ok()
-            .flatten()
-        else {
-            return; // the settled child is already gone — nothing to read an output from.
-        };
-        let ActivityStatus::Completed = act.value.status else {
-            return; // not a success terminal (e.g. a `Terminated` child): nothing to complete with.
-        };
-        // A `Completed` child under a running thread is the scope's success, so it completes the
-        // thread with the child's output. A terminal `Succeed` that projects no value carries a
-        // `Null` result, which storage folds as no `output` at all — hence the `Null` fallback, so a
-        // null-returning terminal still completes its thread (a none-event would strand it).
-        let output = act.value.output.clone().unwrap_or(Value::Null);
-        out.append_command(Command::CompleteThread(CompleteThread {
-            thread: self.thread.clone(),
-            output,
-        }));
     }
 
-    /// A state activity under this thread reached an abnormal terminal (a leaf `Fail`). The thread is
-    /// the scope that activity ran in, so it is taken down with the same reason the state failed
-    /// with — read off the settled child's own row, the single source of truth, rather than carried
-    /// on the call. A thread already past `Running` is mid-sweep by its own chain and needs no second
-    /// termination.
+    /// A state activity under this thread reached an abnormal terminal (a leaf `Fail`, or a teardown's
+    /// `Cancelled` sweep) — the same table as the success hook, so the thread is taken down with the
+    /// reason its child failed with while it is still `Running`, and advanced when it is already
+    /// finishing.
     async fn after_child_terminated(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         child: &RawObjectRef,
-    ) {
-        let Some(thread) = ctx.storage.get_thread(&self.thread).await.ok().flatten() else {
-            return; // gone already — nothing to terminate.
+    ) -> Result<(), ProcessingError> {
+        let Some(thread) = ctx.storage.get_thread(&self.thread).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "thread_container: thread {} is gone from under its settled child",
+                    self.thread
+                ),
+            ));
         };
-        if self.advance_if_drained(out, &thread) {
-            return;
+        match &thread.value.status {
+            // The thread is the scope the failed state ran in, so it goes down with the same reason —
+            // read off the settled child's own row, the single source of truth, rather than carried on
+            // the call. An abnormal hook whose child is not in an abnormal terminal, or whose row is
+            // already gone, has no reason to propagate: a running thread is left alone rather than taken
+            // down with a reason this container would have to invent.
+            ThreadStatus::Running => {
+                let reason = match ctx
+                    .storage
+                    .get_activity(&child.clone().typed::<ActivityKind>())
+                    .await?
+                {
+                    Some(act) => match &act.value.status {
+                        ActivityStatus::Terminated(reason) => Some(reason.clone()),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let Some(reason) = reason else {
+                    tracing::debug!(
+                        thread = %self.thread,
+                        child = %child,
+                        "settled child carries no termination reason; no reaction"
+                    );
+                    return Ok(());
+                };
+                out.append_command(Command::TerminateThread(TerminateThread {
+                    thread: self.thread.clone(),
+                    reason,
+                }));
+                Ok(())
+            }
+            ThreadStatus::Completing => {
+                out.append_command(Command::ContinueComplete {
+                    owner: self.thread.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            ThreadStatus::Terminating(_) => {
+                out.append_command(Command::ContinueTerminate {
+                    owner: self.thread.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            status => Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "thread_container: thread {} settled a terminated child {child} while {status:?}",
+                    self.thread
+                ),
+            )),
         }
-        if !thread.value.status.is_running() {
-            return; // finishing with children still attached: some other settle owns the drain.
-        }
-        // A thread's only child kind is `Activity` (see `TerminateThreadHandler`), and only an
-        // *abnormal* terminal — `Terminated` — propagates up as a thread failure; a normal `Completed`
-        // settle is the thread's own advance, not its end.
-        let Some(act) = ctx
-            .storage
-            .get_activity(&child.clone().typed::<ActivityKind>())
-            .await
-            .ok()
-            .flatten()
-        else {
-            return; // the settled child is already gone — nothing to read a reason from.
-        };
-        let ActivityStatus::Terminated(reason) = &act.value.status else {
-            return; // not an abnormal terminal (e.g. a `Completed` child): nothing to propagate.
-        };
-        out.append_command(Command::TerminateThread(TerminateThread {
-            thread: self.thread.clone(),
-            reason: reason.clone(),
-        }));
     }
 }
 
@@ -153,18 +190,19 @@ mod tests {
     use spica_testing::MockReadonlyStorageTxn;
 
     use super::{Container, ThreadContainer};
+    use crate::RejectionType;
     use crate::StatePath;
     use crate::StorageError;
     use crate::eval_env::EvalEnv;
-    use crate::handler::{Collector, HandlerContext, OverlaySink};
+    use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::dispatch::build_state_handlers;
     use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::{ActivityRecord, Storage, ThreadRecord};
+    use crate::storage::{ActivityRecord, ReadonlyStorageTxn, Storage, ThreadRecord};
     use crate::types::activity::{ActivityKind, ActivityStatus};
     use crate::types::command::{Command, CompleteThread, TerminateThread, TerminationReason};
     use crate::types::execution::ExecutionKind;
     use crate::types::id::EntryId;
-    use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, ThreadOwner};
+    use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner};
     use crate::types::thread::{Thread, ThreadKind, ThreadStatus};
     use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
@@ -270,7 +308,6 @@ mod tests {
         let state_handlers = build_state_handlers();
         let container = ThreadContainer::open(&work, thread_ref())
             .await
-            .expect("the store reads cleanly")
             .expect("the seeded thread resolves its container");
         {
             let mut ctx = HandlerContext {
@@ -284,11 +321,13 @@ mod tests {
             if terminated {
                 container
                     .after_child_terminated(&mut ctx, &mut out, &child_ref().into_raw_object_ref())
-                    .await;
+                    .await
+                    .expect("the hook relays the settle");
             } else {
                 container
                     .after_child_completed(&mut ctx, &mut out, &child_ref().into_raw_object_ref())
-                    .await;
+                    .await
+                    .expect("the hook relays the settle");
             }
         }
         out.into_entries()
@@ -297,22 +336,54 @@ mod tests {
             .collect()
     }
 
-    /// A settle with no live owner has no container at all: that `None` is what a handler answers
-    /// *before* it writes the terminal event, and it is why the resolution happens up front.
+    /// Drive the **completed** hook against a mock store answering the one owner read, with the container
+    /// built directly — the shape a vanished owner needs, since `open` refuses that same missing row
+    /// before any hook could be reached.
+    async fn hook_over(
+        store: &dyn ReadonlyStorageTxn,
+        child: &RawObjectRef,
+    ) -> Result<(), ProcessingError> {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
+        let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
+        let mut out = Collector::new(EntryId::new(1), None, clock.clone(), ids.clone());
+        let mut env = EvalEnv::new();
+        let mut definitions = HashMap::new();
+        let state_handlers = build_state_handlers();
+        let container = ThreadContainer {
+            thread: thread_ref(),
+        };
+        let mut ctx = HandlerContext {
+            env: &mut env,
+            storage: store,
+            clock,
+            ids,
+            definitions: &mut definitions,
+            state_handlers: &state_handlers,
+        };
+        container
+            .after_child_completed(&mut ctx, &mut out, child)
+            .await
+    }
+
+    /// A settle with no live owner is refused up front: `open` names the gone owner, so a caller whose
+    /// settle would have nothing to land on answers the absence before it writes its terminal.
     #[tokio::test]
-    async fn an_owner_that_does_not_exist_has_no_container() {
+    async fn a_missing_owner_has_no_container() {
         let store = InMemoryStorage::new();
         let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
+        let Err(ProcessingError::Rejected(ty, reason)) =
+            ThreadContainer::open(&work, thread_ref()).await
+        else {
+            panic!("an open that did not read a missing row");
+        };
+        assert_eq!(ty, RejectionType::NotFound);
         assert!(
-            ThreadContainer::open(&work, thread_ref())
-                .await
-                .expect("the store reads cleanly")
-                .is_none(),
-            "a missing thread row must not yield a container"
+            reason.contains("is gone"),
+            "the refusal names the gone owner: {reason}"
         );
     }
 
-    /// A read that **faults** is `Err`, never `None` (see `ActivityContainer`'s sibling test).
+    /// A read that **faults** stays a fault, never a missing owner (see `ActivityContainer`'s sibling).
     #[tokio::test]
     async fn a_faulted_owner_read_is_not_a_missing_owner() {
         let mut store = MockReadonlyStorageTxn::new();
@@ -321,8 +392,11 @@ mod tests {
             .times(1)
             .return_once(|_| Err(StorageError::Backend("injected storage fault".to_string())));
         assert!(
-            ThreadContainer::open(&store, thread_ref()).await.is_err(),
-            "a fault must surface, not read as a missing row"
+            matches!(
+                ThreadContainer::open(&store, thread_ref()).await,
+                Err(ProcessingError::Unexpected(_))
+            ),
+            "a fault must surface as Unexpected, not read as a missing row"
         );
     }
 
@@ -364,21 +438,41 @@ mod tests {
         );
     }
 
-    /// A thread already finishing is mid-teardown by its own chain — handing it a second termination
-    /// would only be refused, so the container holds back.
+    /// A thread gone from under its settled child refuses the settle instead of no-op'ing it: the
+    /// terminal is already on this attempt's batch, so a silent success would leave the log saying the
+    /// child settled with nothing after it.
     #[tokio::test]
-    async fn a_terminated_child_leaves_a_finishing_thread_alone() {
-        let chain = drive(
-            seeded_thread(ThreadStatus::Terminating(TerminationReason::Cancelled), 1),
-            Some(seeded_child(ActivityStatus::Terminated(
-                TerminationReason::Cancelled,
-            ))),
-            true,
-        )
-        .await;
+    async fn a_vanished_thread_refuses_the_settle() {
+        let mut store = MockReadonlyStorageTxn::new();
+        store.expect_get_thread().times(1).return_once(|_| Ok(None));
+        let result = hook_over(&store, child_ref().as_raw_object_ref()).await;
+        let Err(ProcessingError::Rejected(ty, reason)) = result else {
+            panic!("a vanished thread must refuse the settle: {result:?}");
+        };
+        assert_eq!(ty, RejectionType::InvalidState);
         assert!(
-            chain.is_empty(),
-            "a finishing thread has no second termination to take: {chain:?}"
+            reason.contains("is gone from under its settled child"),
+            "the refusal names what it could not relay to: {reason}"
+        );
+    }
+
+    /// A settled child under a thread that is already terminal has nothing to mean — the row and the
+    /// lifecycle disagree, so the batch is refused rather than advanced.
+    #[tokio::test]
+    async fn a_settled_child_under_a_terminal_thread_is_refused() {
+        let mut store = MockReadonlyStorageTxn::new();
+        store
+            .expect_get_thread()
+            .times(1)
+            .return_once(|_| Ok(Some(seeded_thread(ThreadStatus::Completed, 0))));
+        let result = hook_over(&store, child_ref().as_raw_object_ref()).await;
+        let Err(ProcessingError::Rejected(ty, reason)) = result else {
+            panic!("a settled child under a terminal thread must be refused: {result:?}");
+        };
+        assert_eq!(ty, RejectionType::InvalidState);
+        assert!(
+            reason.contains("while Completed"),
+            "the refusal names the status the thread was found in: {reason}"
         );
     }
 
@@ -433,11 +527,13 @@ mod tests {
         );
     }
 
-    /// A `Completing` thread whose last child just drained advances its own finish.
+    /// A `Completing` thread with a child still in flight still advances: the Continue names the thread
+    /// this settle belongs to, and its own handler takes down whatever is left and stops short of
+    /// advancing — so the settle that drains the thread last is the one that completes it.
     #[tokio::test]
-    async fn a_settled_child_advances_a_drained_completing_thread() {
+    async fn a_settled_child_advances_a_completing_thread_before_the_drain() {
         let chain = drive(
-            seeded_thread(ThreadStatus::Completing, 0),
+            seeded_thread(ThreadStatus::Completing, 1),
             Some(seeded_child(ActivityStatus::Completed)),
             false,
         )
@@ -450,31 +546,36 @@ mod tests {
         );
     }
 
-    /// A `Completing` thread with a child still in flight emits nothing: the last settle to land is
-    /// the one that advances it.
+    /// A terminated child advances a `Terminating` owner into its ContinueTerminate — child still in
+    /// flight or not: the Continue names the thread this settle belongs to, and its own handler takes
+    /// down whatever is left and stops short of advancing, so the settle that drains the thread last is
+    /// the one that terminates it.
     #[tokio::test]
-    async fn a_settled_child_leaves_an_undrained_completing_thread_alone() {
+    async fn a_terminated_child_advances_a_terminating_thread_before_the_drain() {
         let chain = drive(
-            seeded_thread(ThreadStatus::Completing, 1),
-            Some(seeded_child(ActivityStatus::Completed)),
-            false,
-        )
-        .await;
-        assert!(
-            chain.is_empty(),
-            "undrained Completing thread must wait: {chain:?}"
-        );
-    }
-
-    /// A terminated child drains a `Terminating` owner into its ContinueTerminate.
-    #[tokio::test]
-    async fn a_terminated_child_advances_a_drained_terminating_thread() {
-        let chain = drive(
-            seeded_thread(ThreadStatus::Terminating(TerminationReason::Cancelled), 0),
+            seeded_thread(ThreadStatus::Terminating(TerminationReason::Cancelled), 1),
             Some(seeded_child(ActivityStatus::Terminated(
                 TerminationReason::Cancelled,
             ))),
             true,
+        )
+        .await;
+        assert_eq!(
+            chain,
+            vec![EntryPayload::Command(Command::ContinueTerminate {
+                owner: thread_ref().into_raw_object_ref(),
+            })]
+        );
+    }
+
+    /// A *completed* child under a `Terminating` thread advances that teardown just the same: the
+    /// thread's direction was fixed when the teardown began, and a bystander's settle does not reopen it.
+    #[tokio::test]
+    async fn a_completed_child_advances_a_terminating_thread() {
+        let chain = drive(
+            seeded_thread(ThreadStatus::Terminating(TerminationReason::Cancelled), 0),
+            Some(seeded_child(ActivityStatus::Completed)),
+            false,
         )
         .await;
         assert_eq!(

@@ -80,21 +80,14 @@ impl CompleteTaskHandler {
 
         let activity_id = act.meta.owner.clone();
         // The container is resolved *before* anything is emitted: a task's settle has no meaning apart
-        // from the activity it resumes, so an ownerless settle is refused here — while the worker is
-        // still waiting on an answer — rather than discovered as a no-op after `TaskCompleted` is
-        // already on the log, which would strand the owning state with nothing left to resume it.
-        // `InvalidState` as for the guards above: the row the worker holds is no longer the live
-        // incarnation of a settleable task, because its owner is gone. Deliberately neither
-        // `ProcessingError` — which the log reserves for a command that outlived its retry budget —
-        // nor `Unexpected`, whose retry could only repeat this conclusion later: a row is never
-        // removed, so the owning activity cannot come back, and the worker is blocked on the ack.
-        let Some(container) = ActivityContainer::open(ctx.storage, activity_id.clone()).await?
-        else {
-            return Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!("task {task} has no live activity owner {activity_id}; settlement refused"),
-            ));
-        };
+        // from the activity it resumes, so an ownerless settle is refused by the container's own `open`
+        // (`NotFound`, naming the gone owner) — while the worker is still waiting on an answer — rather
+        // than discovered as a no-op after `TaskCompleted` is already on the log, which would strand the
+        // owning state with nothing left to resume it. Deliberately neither `ProcessingError` — which
+        // the log reserves for a command that outlived its retry budget — nor `Unexpected`, whose retry
+        // could only repeat this conclusion later: a row is never removed, so the owning activity cannot
+        // come back, and the worker is blocked on the ack.
+        let container = ActivityContainer::open(ctx.storage, activity_id.clone()).await?;
 
         // Emit the completed task entity (lease cleared, status terminal) — the very value the
         // transition above advanced — and resume the owning Task state's `complete`. The concrete
@@ -117,7 +110,7 @@ impl CompleteTaskHandler {
         // and the owner's container decides.
         container
             .after_child_completed(ctx, out, task.as_raw_object_ref())
-            .await;
+            .await?;
 
         Ok(())
     }

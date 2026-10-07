@@ -8,14 +8,12 @@ use crate::eval_env::EvalEnv;
 use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::log::{Entry, EntryPayload, Timestamp};
 use crate::storage::ReadonlyStorageTxn;
-use crate::types::activity::ActivityKind;
-use crate::types::command::{Command, TerminateState, TerminationReason};
+use crate::types::command::Command;
 use crate::types::error::{ExecutionError, RuntimeError, StorageError};
 use crate::types::event::Event;
-use crate::types::execution::ExecutionKind;
 use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{EntryId, RequestId, StreamId};
-use crate::types::meta::{ObjectRef, OwnerScope};
+use crate::types::meta::ObjectRef;
 use crate::types::reject::{Reject, RejectionType};
 use crate::working::WorkingState;
 
@@ -150,49 +148,6 @@ impl<'a> Collector<'a> {
 
     fn push(&mut self, payload: EntryPayload) {
         self.entries.push(self.build(payload));
-    }
-
-    /// Emit a definitive failure: the two arguments name its victims independently, each optional.
-    /// Handlers own their failures: on an eval/decision error they emit the failure themselves
-    /// (cohesive with the site that produced it), so `handle` always produces an outcome and returns
-    /// `()`. The activity-level [`Command::TerminateState`] runs the state's terminate path
-    /// (StateTerminating + StateTerminated, plus descendant cleanup) rather than marking the activity
-    /// in place.
-    ///
-    /// A failing **state** needs no `scope`: it always has one (an activity is owned by a `Thread`,
-    /// the slot's own type), and that scope's own termination is emitted by
-    /// [`TerminateStateHandler`](crate::handlers::TerminateStateHandler) as part of running the
-    /// command — so the branch-vs-root dialect, and the decision whether the scope still needs
-    /// telling, live in one place instead of at every failing site.
-    ///
-    /// `scope` therefore names a scope *above* the activity's own, which is the one thing a site can
-    /// state about a failure that the activity itself does not: a definition error that ends the whole
-    /// run reaches for an [`OwnerScope::Execution`] and leaves the failing activity to the sweep
-    /// cascade, or names both.
-    ///
-    /// `activity` is `None` at a site with no state context (see
-    /// [`fail_execution`](Self::fail_execution)).
-    pub fn terminate(
-        &mut self,
-        activity: Option<ObjectRef<ActivityKind>>,
-        scope: Option<OwnerScope>,
-        error: ExecutionError,
-    ) {
-        let reason = TerminationReason::Failed { error };
-        if let Some(activity) = activity {
-            self.append_command(Command::TerminateState(TerminateState {
-                activity,
-                reason: reason.clone(),
-            }));
-        }
-        if let Some(scope) = scope {
-            crate::handlers::emit_scope_termination(self, &scope, reason);
-        }
-    }
-
-    /// Convenience for `terminate` at a site where the execution itself failed (no state context).
-    pub fn fail_execution(&mut self, execution: &ObjectRef<ExecutionKind>, error: ExecutionError) {
-        self.terminate(None, Some(OwnerScope::Execution(execution.clone())), error);
     }
 
     /// Consume the collector, returning the collected [`Entry`]s. The
@@ -400,8 +355,9 @@ impl ProcessingError {
 
 // The default arm `?` takes in a handler (or its helpers): an error that escaped the engine's own
 // machinery is the engine's, not the command's, unless the handler says otherwise by constructing a
-// refusal. A domain failure is *not* routed through here — handlers decide those in place
-// (`Collector::terminate`), so `?` never silently turns a state error into an engine fault.
+// refusal. A domain failure is *not* routed through here — handlers decide those in place, emitting
+// the `Command::TerminateState` their own site calls for, so `?` never silently turns a state error
+// into an engine fault.
 impl From<ExecutionError> for ProcessingError {
     fn from(e: ExecutionError) -> Self {
         ProcessingError::Unexpected(e)

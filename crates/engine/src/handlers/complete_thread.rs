@@ -91,42 +91,27 @@ impl CompleteThreadHandler {
             // settle *means* (a run closes; a `Parallel`/`Map` converges).
             match thread_row.value.meta.owner.clone() {
                 ThreadOwner::Execution(execution) => {
-                    let Some(container) =
-                        ExecutionContainer::open(ctx.storage, execution.clone()).await?
-                    else {
-                        return Err(ProcessingError::Rejected(
-                            RejectionType::InvalidState,
-                            format!(
-                                "complete_thread: thread {thread_ref} has no live execution owner \
-                                 {execution}; completion refused"
-                            ),
-                        ));
-                    };
+                    let container =
+                        ExecutionContainer::open(ctx.storage, execution.clone()).await?;
                     out.append_event(Event::ThreadCompleted {
                         thread: completed_thread,
                     })
                     .await;
-                    container.after_child_completed(ctx, out, &thread_ref).await;
+                    container
+                        .after_child_completed(ctx, out, &thread_ref)
+                        .await?;
                 }
                 // A fan-out thread is owned by its container Activity; the hook runs the settle so the
                 // parallel/map converges (or replenishes) through the state's own decision.
                 ThreadOwner::Activity(activity) => {
-                    let Some(container) =
-                        ActivityContainer::open(ctx.storage, activity.clone()).await?
-                    else {
-                        return Err(ProcessingError::Rejected(
-                            RejectionType::InvalidState,
-                            format!(
-                                "complete_thread: thread {thread_ref} has no live activity owner \
-                                 {activity}; completion refused"
-                            ),
-                        ));
-                    };
+                    let container = ActivityContainer::open(ctx.storage, activity.clone()).await?;
                     out.append_event(Event::ThreadCompleted {
                         thread: completed_thread,
                     })
                     .await;
-                    container.after_child_completed(ctx, out, &thread_ref).await;
+                    container
+                        .after_child_completed(ctx, out, &thread_ref)
+                        .await?;
                 }
             }
             return Ok(());

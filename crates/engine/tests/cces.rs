@@ -3576,8 +3576,8 @@ async fn complete_without_a_live_owning_activity_is_refused() {
     );
     assert_eq!(
         rejects[0].rejection_type,
-        RejectionType::InvalidState,
-        "an ownerless settle is the stale-incarnation case the sibling guards refuse, not an engine fault"
+        RejectionType::NotFound,
+        "the container's own `open` names the gone owner it refused"
     );
     assert!(
         !entries

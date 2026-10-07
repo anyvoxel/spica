@@ -402,7 +402,7 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
 
 /// Drive `state`'s [`StateHandler::child_completed`](crate::handlers::state_handler::StateHandler)
 /// once over `store` — the container half of the lifecycle, reached in production through
-/// [`child_settled`](crate::handlers::child_completed::child_settled)'s `Running`-activity arm.
+/// the container's `Running`-activity arm.
 ///
 /// The activity value and the scope variables are read back out of `store` exactly as
 /// `dispatch_child_completed` reads them, so a test seeds the world (see [`seed_container`]) and this

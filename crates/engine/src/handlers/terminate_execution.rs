@@ -110,7 +110,7 @@ impl TerminateExecutionHandler {
                 }
                 // The execution's single root Thread (the top-level owner) is swept here too:
                 // terminating the run must tear down the root thread's whole subtree, after which the
-                // thread relays its settle back (via `child_settled`) letting this execution drain and
+                // thread relays its settle back (via its `ThreadContainer`) letting this execution drain and
                 // emit its own terminal. Swept, not failing — the reason the *run* died already rides
                 // this execution's own `Terminating(reason)`, so the thread carries `Cancelled` rather
                 // than being recorded as the author of the failure.

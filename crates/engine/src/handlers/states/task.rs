@@ -4,7 +4,7 @@ use spica_asl::{State, StatePath, TaskState};
 
 use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{FailureRouting, StateHandler, StateHandlerFactory};
-use super::super::{complete_activity, emit_timer, eval_string_or_expr};
+use super::super::{emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
@@ -15,11 +15,11 @@ use crate::types::command::{
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::{Event, StateTransitioned};
+use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::task::TaskKind;
 use crate::types::timer::{TimerKind, TimerStatus};
-use crate::{Activity, RejectionType, Variables};
+use crate::{Activity, ActivityStatus, Variables};
 
 pub struct TaskStateHandlerFactory;
 
@@ -334,16 +334,7 @@ impl StateHandler for TaskStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await?
-                else {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::NotFound,
-                        format!(
-                            "task_state: activity {} has no owning thread; termination refused",
-                            activity_value.meta.object_ref()
-                        ),
-                    ));
-                };
+                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -366,7 +357,7 @@ impl StateHandler for TaskStateHandler<'_> {
                 .await;
                 thread_container
                     .after_child_terminated(ctx, out, &activity_ref)
-                    .await;
+                    .await?;
             }
         }
         Ok(())
@@ -408,18 +399,21 @@ impl StateHandler for TaskStateHandler<'_> {
             }
         }
         if pending == 0 {
+            let container =
+                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
                 "the terminate step that dispatched this after_terminating opened the activity as Terminating"
             );
-            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
             let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
             out.append_event(Event::StateTerminated {
                 activity: terminated,
             })
             .await;
-            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+            container
+                .after_child_terminated(ctx, out, &activity_ref)
+                .await?;
         } else {
             tracing::debug!(
                 activity = %activity_value.meta.object_ref(),
@@ -437,6 +431,11 @@ impl StateHandler for TaskStateHandler<'_> {
     ///
     /// Retry is deliberately not consulted here — the reused task already decided it, on the failure
     /// path that produced this error.
+    ///
+    /// The routed finish is written out here rather than shared with the normal success tail, because
+    /// the two differ at the one point that matters: this exit never opened `StateCompleting`
+    /// (`terminate` asks the failure policy *before* it touches the row), so the terminal it lands is
+    /// the whole of the finish instead of the end of a complete step.
     async fn on_failed(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -459,23 +458,159 @@ impl StateHandler for TaskStateHandler<'_> {
         let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
             return FailureRouting::Uncaught;
         };
-        // The catcher's finish reuses the canonical success tail, so the routed state is
-        // indistinguishable on the stream from one that succeeded — which is the point of a `Catch`.
+
+        let activity = activity_value.meta.object_ref();
+        // The catcher's projectors read the failure it took: `$states.errorOutput` is the caught
+        // error's output, which is what makes a routed state's projection tell the two apart.
         let error_output = error.error_output().unwrap_or(Value::Null);
-        complete_activity(
-            ctx,
-            out,
-            activity_value.meta.object_ref(),
-            activity_value,
-            &thread.variables,
-            catcher.assign.as_ref(),
-            catcher.output.as_ref(),
-            Some(&catcher.next),
-            None,
+        // A failed attempt produces no distinct raw result — the call that would have set one never
+        // landed — so the projection's `$states.result` falls back to the processed input, exactly as
+        // the success tail's own default does.
+        let raw_result = activity_value
+            .raw_output
+            .as_ref()
+            .unwrap_or(&activity_value.raw_input);
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
             activity_value.retry_count(),
-            Some(&error_output),
         )
+        .with_result(Some(raw_result))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .with_error_output(Some(&error_output))
+        .build();
+        let mut local_scope = thread.variables.clone();
+        if let Some(assign_obj) = catcher.assign.as_ref() {
+            let assign_value = Value::Object(assign_obj.0.clone());
+            let evaluated = match ctx.env.eval_json(&assign_value, &states, &local_scope) {
+                Ok(evaluated) => evaluated,
+                Err(e) => {
+                    out.append_command(Command::TerminateState(TerminateState {
+                        activity: activity.clone(),
+                        reason: TerminationReason::Failed { error: e },
+                    }));
+                    return FailureRouting::Caught;
+                }
+            };
+            match evaluated {
+                Value::Object(map) => {
+                    if !map.is_empty() {
+                        for (k, v) in map {
+                            local_scope.insert(k, v);
+                        }
+                        out.append_event(Event::VariablesAssigned(VariablesAssigned {
+                            scope: owner.clone(),
+                            variables: local_scope.clone(),
+                        }))
+                        .await;
+                    }
+                }
+                _ => {
+                    out.append_command(Command::TerminateState(TerminateState {
+                        activity: activity.clone(),
+                        reason: TerminationReason::Failed {
+                            error: ExecutionError::Runtime(RuntimeError::InvalidDefinition(
+                                "Assign must evaluate to a JSON object".to_string(),
+                            )),
+                        },
+                    }));
+                    return FailureRouting::Caught;
+                }
+            }
+        }
+        let output_value = match catcher.output.as_ref() {
+            Some(o) => match ctx.env.eval_json(o, &states, &local_scope) {
+                Ok(output_value) => output_value,
+                Err(e) => {
+                    out.append_command(Command::TerminateState(TerminateState {
+                        activity: activity.clone(),
+                        reason: TerminationReason::Failed { error: e },
+                    }));
+                    return FailureRouting::Caught;
+                }
+            },
+            None => raw_result.clone(),
+        };
+
+        // A completion disposes of the activity's own deadlines: a `TimeoutSeconds` deadline only
+        // *bounds* the state, so a state that finished early — this very exit — must leave no live
+        // timer child behind. Swept as **events**, so they fold into this batch ahead of the terminal
+        // below rather than arriving as a later log entry.
+        if let Ok(act) = ctx.storage.get_activity(&activity).await {
+            for child in act.map(|a| a.active_children).unwrap_or_default() {
+                if child.kind != ObjectKind::Timer {
+                    continue; // only timer children are swept here; the task child follows its own settle.
+                }
+                let Some(t) = ctx
+                    .storage
+                    .get_timer(&child.clone().typed::<TimerKind>())
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let mut timer_value = t.value;
+                // A fired/cancelled timer is no longer a live child, and the transition declines it —
+                // so no second guard has to be kept in step with that.
+                if timer_value.mark_cancelled(out.now()).is_err() {
+                    continue;
+                }
+                out.append_event(Event::TimerCancelled { timer: timer_value })
+                    .await;
+            }
+        }
+
+        // A catcher takes the failure the attempt produced, so the attempt's in-flight call is
+        // abandoned with it: the task has no state left to report to, and the complete step that would
+        // have swept it (`after_completing`) never opens on this exit. Cancelled as the activity's own
+        // child, exactly as the terminate path sweeps one — the child is a bystander here too, so it
+        // carries no reason.
+        // TODO(fan-out Catch): a `Parallel`/`Map` catching a failure must dispose of its in-flight child
+        // executions/threads the same way; a `Task` is the only kind reachable today.
+        if let Ok(children) = ctx
+            .storage
+            .get_children(activity.as_raw_object_ref().clone())
+            .await
+        {
+            for child in children {
+                if child.kind == ObjectKind::Task {
+                    out.append_command(Command::CancelTask {
+                        task: child.typed::<TaskKind>(),
+                    });
+                }
+            }
+        }
+
+        // The activity lands `Completed`: the catcher's `Next` is what this state routes on, so the
+        // failure is carried by the catcher's activation and nowhere else.
+        let mut completed = activity_value.clone();
+        completed.meta.with_update_at(out.now());
+        completed.status = ActivityStatus::Completed;
+        completed.output = Some(output_value.clone());
+        if completed.raw_output.is_none() {
+            completed.raw_output = Some(completed.raw_input.clone());
+        }
+        out.append_event(Event::StateCompleted {
+            activity: completed,
+        })
         .await;
+
+        // The catcher's `Next` lives as a sibling of this state in the same enclosing `States` table —
+        // that table is this activity's own `state_path` minus its leaf. The marker carries the
+        // resolved target *path*, which is what `ActivateState` routes on.
+        let next_path = activity_value.state_path.sibling(&catcher.next);
+        out.append_event(Event::StateTransitioned(StateTransitioned {
+            activity,
+            next: next_path.as_ptr().to_owned(),
+        }))
+        .await;
+        out.append_command(Command::ActivateState(ActivateState {
+            execution: activity_value.execution.clone(),
+            owner,
+            state_path: next_path,
+            input: output_value,
+        }));
         FailureRouting::Caught
     }
 }
