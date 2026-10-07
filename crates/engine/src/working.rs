@@ -4,7 +4,7 @@
 //! During one `process_command`, the leader opens a single [`StorageTxn`] over committed storage (the
 //! driver opens a fresh txn via `Storage::begin_txn`) and folds each emitted `Event` into it
 //! immediately, at `append_event` time (via the collector's overlay). Handlers read through this type's
-//! [`ReadonlyStorageTxn`] face, which resolves overlay-then-committed — so an inline `child_settled`
+//! [`ReadonlyStorageTxn`] face, which resolves overlay-then-committed — so an inline container relay
 //! sees the just-emitted terminal's effect (its parent's `active_children` drained) and can converge
 //! the whole settled ancestor chain in the same batch.
 //!

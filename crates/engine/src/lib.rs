@@ -99,8 +99,8 @@ pub use types::flow_version::{FlowVersion, FlowVersionKind};
 pub use types::id::{EntryId, FlowName, RequestId, StreamId};
 pub use types::meta::{
     HasRawObjectRef, KindMismatch, MissingOwner, NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta,
-    ObjectMetaBuilder, ObjectName, ObjectRef, OwnerKindMarker, OwnerScope, PlainName, RawObjectRef,
-    ScopeName, ThreadOwner, TimerOwner,
+    ObjectMetaBuilder, ObjectName, ObjectRef, OwnerKindMarker, PlainName, RawObjectRef, ScopeName,
+    ThreadOwner, TimerOwner,
 };
 pub use types::reject::{Reject, RejectionType};
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskKind, TaskStatus};

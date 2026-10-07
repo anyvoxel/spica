@@ -13,7 +13,7 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
 use crate::types::meta::HasRawObjectRef;
-use crate::{Activity, RejectionType, Variables};
+use crate::{Activity, Variables};
 
 pub struct PassStateHandlerFactory;
 
@@ -123,16 +123,7 @@ impl StateHandler for PassStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await?
-                else {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::NotFound,
-                        format!(
-                            "pass_state: activity {} has no owning thread; termination refused",
-                            activity_value.meta.object_ref()
-                        ),
-                    ));
-                };
+                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -155,7 +146,7 @@ impl StateHandler for PassStateHandler<'_> {
                 .await;
                 thread_container
                     .after_child_terminated(ctx, out, &activity_ref)
-                    .await;
+                    .await?;
             }
         }
         Ok(())
@@ -171,18 +162,21 @@ impl StateHandler for PassStateHandler<'_> {
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
+        let container =
+            ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
             "the terminate step that dispatched this after_terminating opened the activity as Terminating"
         );
-        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
         let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
         out.append_event(Event::StateTerminated {
             activity: terminated,
         })
         .await;
-        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        container
+            .after_child_terminated(ctx, out, &activity_ref)
+            .await?;
         Ok(())
     }
 }

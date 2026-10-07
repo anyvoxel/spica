@@ -14,7 +14,7 @@ use crate::types::command::{
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
-use crate::types::meta::{ObjectMeta, ObjectRef, OwnerScope, RawObjectRef};
+use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
@@ -169,9 +169,9 @@ pub trait StateHandler: Send + Sync {
     }
 
     /// A child node of this state reached a terminal state while the state is `Running` — the
-    /// **replenish** half of the child-settled reaction (see `child_completed`'s docs for the
-    /// drain-vs-replenish split). Only a container state (`Parallel`/`Map`) implements this; default
-    /// stays a safe no-op for leaf states.
+    /// **replenish** half of the child-settled reaction, reached from the owning activity's container
+    /// (see `ActivityContainer::settle_running`, which routes a settle to the four states that own
+    /// children). A state that owns no children keeps the default no-op, since no settle can reach it.
     async fn child_completed(
         &self,
         _ctx: &mut HandlerContext<'_>,
@@ -480,11 +480,11 @@ pub trait StateHandler: Send + Sync {
     /// The `Command::TerminateState` flow, owned by the base — the failure mirror of
     /// [`Self::complete`]. `act` and `thread` are the rows the dispatcher already read for them
     /// (screened for liveness before it admitted the command), so nothing here re-reads. Unlike a
-    /// completion, the terminate's scope notification and drawer are uniform, so the base owns them:
-    /// ask the state's failure policy first (an uncaught failure then stands as a teardown, a caught
-    /// one has already been routed and leaves nothing to tear down), tell the owner scope when it is
-    /// still `Running`, open the activity with `StateTerminating`, and hand the per-state disposal +
-    /// terminal to [`Self::after_terminating`].
+    /// completion, the terminate's drawer is uniform, so the base owns it: ask the state's failure
+    /// policy first (an uncaught failure then stands as a teardown, a caught one has already been
+    /// routed and leaves nothing to tear down), open the activity with `StateTerminating`, and hand
+    /// the per-state disposal + terminal to [`Self::after_terminating`] — which relays the terminal
+    /// to the owner's container, so the base tells the owning scope nothing.
     async fn terminate(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -505,16 +505,9 @@ pub trait StateHandler: Send + Sync {
         {
             return Ok(());
         }
-        // The failure reaches the scope the activity runs in, but only when it is still `Running`: a
-        // scope already completing or terminating was reached by an ancestor's sweep, which is tearing
-        // this activity down on the way, and a second termination for it would only be refused.
-        if thread.value.status.is_running() {
-            super::emit_scope_termination(
-                out,
-                &OwnerScope::Thread(act.value.meta.owner.clone()),
-                reason.clone(),
-            );
-        }
+        // Nothing here tells the owning scope: the state's terminal *is* that notification, relayed by
+        // each `after_terminating` to its owner's container — one reaction point that also covers the
+        // drain, where the scope must advance rather than be told again.
         // The drawer opens the failure now that the policy let it stand, mirroring `complete`'s
         // `StateCompleting`: a terminate that defers on a live child leaves the activity `Terminating`
         // (not `Running`), so the child's eventual settle drives the drain through the generic

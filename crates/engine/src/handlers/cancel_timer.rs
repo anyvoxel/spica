@@ -20,10 +20,8 @@ use crate::types::timer::TimerKind;
 /// leave it arriving at a timer that already fired — hence `InvalidState` rather than the `NotFound`
 /// the absent row earns. That judgement is not this handler's to make: it lives on the transition
 /// itself ([`Timer::mark_cancelled`]), and this step only relays the reason it returns. An **owner
-/// that is gone** is refused on the same grounds as the absent row and with the same entry, but as
-/// [`RejectionType::InvalidState`]: the timer itself is live, so this is not a caller naming something
-/// absent — it is the world not being in a state where the cancel applies, and an ownerless cancel has
-/// nothing left to drain.
+/// that is gone** is refused by that container's own `open` with [`RejectionType::NotFound`]: the
+/// timer itself is live, but an ownerless cancel has nothing left to drain into.
 ///
 /// A read that *faults* — the timer's or the owner's — is none of those: it is the engine's own
 /// failure, so it propagates as [`ProcessingError::Unexpected`] for the leader to retry before giving
@@ -61,34 +59,20 @@ impl CancelTimerHandler {
         // refusal, a fault on that read is the engine's (see `Container::open`).
         match timer_value.meta.owner.clone() {
             TimerOwner::Activity(owner) => {
-                let Some(container) = ActivityContainer::open(ctx.storage, owner.clone()).await?
-                else {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::InvalidState,
-                        format!("timer {timer} has no live activity owner {owner}; cancel refused"),
-                    ));
-                };
+                let container = ActivityContainer::open(ctx.storage, owner.clone()).await?;
                 out.append_event(Event::TimerCancelled { timer: timer_value })
                     .await;
                 container
                     .after_child_terminated(ctx, out, timer.as_raw_object_ref())
-                    .await;
+                    .await?;
             }
             TimerOwner::Execution(owner) => {
-                let Some(container) = ExecutionContainer::open(ctx.storage, owner.clone()).await?
-                else {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::InvalidState,
-                        format!(
-                            "timer {timer} has no live execution owner {owner}; cancel refused"
-                        ),
-                    ));
-                };
+                let container = ExecutionContainer::open(ctx.storage, owner.clone()).await?;
                 out.append_event(Event::TimerCancelled { timer: timer_value })
                     .await;
                 container
                     .after_child_terminated(ctx, out, timer.as_raw_object_ref())
-                    .await;
+                    .await?;
             }
         }
 
@@ -107,26 +91,27 @@ mod tests {
     use spica_testing::MockReadonlyStorageTxn;
 
     use super::CancelTimerHandler;
+    use crate::StatePath;
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::dispatch::build_state_handlers;
     use crate::handlers::fixtures::{at, object_ref, path};
-    use crate::storage::{ActivityRecord, ExecutionRecord, Storage, TimerRecord};
+    use crate::storage::{ActivityRecord, ExecutionRecord, Storage, ThreadRecord, TimerRecord};
     use crate::types::command::{Command, TerminationReason};
     use crate::types::event::Event;
     use crate::types::execution::{Execution, ExecutionKind, ExecutionStatus};
     use crate::types::flow_version::FlowVersionKind;
     use crate::types::id::EntryId;
     use crate::types::meta::{
-        HasRawObjectRef, NoOwner, ObjectMeta, ObjectRef, RawObjectRef, TimerOwner,
+        HasRawObjectRef, NoOwner, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner,
     };
     use crate::types::reject::RejectionType;
-    use crate::types::thread::ThreadKind;
+    use crate::types::thread::{Thread, ThreadKind, ThreadStatus};
     use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
     use crate::{
-        Activity, ActivityKind, ActivityStatus, EntryPayload, StorageError, Timer, TimerStatus,
-        Timestamp,
+        Activity, ActivityKind, ActivityStatus, EntryPayload, FlowKind, FlowVersion, StorageError,
+        Timer, TimerStatus, Timestamp,
     };
 
     /// The timer's owner slot filled by an activity — the scope a state's deadline is armed under.
@@ -211,6 +196,71 @@ mod tests {
         row
     }
 
+    /// The version the seeded scope resolves its machine through — the reference the run's own
+    /// `flow_version` names, so the seeded version row has to answer to it.
+    fn version_ref() -> ObjectRef<FlowVersionKind> {
+        object_ref("flow-1", 60)
+    }
+
+    /// The scope a `Running` owner's settle is handed through: the thread the activity is owned by,
+    /// carrying the input its own settle-time variables are read from.
+    fn seeded_scope() -> ThreadRecord {
+        let thread = Thread {
+            meta: ObjectMeta::builder(thread_owner().uid())
+                .name(thread_owner().name().clone())
+                .at(at())
+                .with_owner(ThreadOwner::Execution(execution_ref())),
+            execution: execution_ref(),
+            state_path: StatePath::root(),
+            start_at: "P".to_string(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: json!({ "in": 1 }),
+            output: None,
+        };
+        let mut row = ThreadRecord::from_value(thread, HashSet::new());
+        row.born(at());
+        row
+    }
+
+    /// The run the scope resolves its machine through — the one row between a thread and its
+    /// definition. Its `flow_version` is what [`version_ref`] has to answer to.
+    fn seeded_run() -> ExecutionRecord {
+        let execution = Execution {
+            meta: ObjectMeta::builder(execution_ref().uid())
+                .name(execution_ref().name().clone())
+                .at(at())
+                .with_owner(NoOwner::new()),
+            flow_version: version_ref(),
+            status: ExecutionStatus::Running,
+            deadline: None,
+            input: json!({ "in": 1 }),
+            output: None,
+        };
+        let mut row = ExecutionRecord::from_value(execution, HashSet::new());
+        row.born(at());
+        row
+    }
+
+    /// The definition the seeded run binds to: `P` is a `Task`, so a settle under a `Running` owner is
+    /// handed to a state that owns children. This is what keeps a *cancelled* deadline meaningful —
+    /// the state reads the timer's own row, finds it is no longer a fire, and stops there.
+    fn seeded_deadline_version() -> FlowVersion {
+        FlowVersion {
+            meta: ObjectMeta::builder(version_ref().uid())
+                .name(version_ref().name().clone())
+                .at(at())
+                .with_owner(object_ref::<FlowKind>("deadline_flow", 50)),
+            version: 1,
+            definition: json!({
+                "StartAt": "P",
+                "States": { "P": { "Type": "Task", "Resource": "service-a", "End": true } }
+            })
+            .to_string(),
+            checksum: 0,
+        }
+    }
+
     /// The handler exercised against a **mock** read-only store: no `InMemoryStorage`, no working
     /// overlay, so these pin the handler's *own* decision and nothing else. The store answers exactly
     /// the reads the handler makes and panics on any other, which is itself an assertion about how far
@@ -242,6 +292,10 @@ mod tests {
     /// step emits folds back into the store it is building. That fold is what detaches the timer from
     /// its owner, so the container's own re-read of the owner sees the drained row and reacts to it;
     /// over a mock store the same reaction is unreachable, since nothing ever folds.
+    ///
+    /// The scope rows are seeded too, because resolving *which* reaction that is happens before the arm
+    /// that decides it: an activity owner's settle is relayed to the state its definition puts at its
+    /// own `state_path`, whatever status the activity is in when the settle lands.
     async fn cancel_over_overlay(
         timer: TimerRecord,
         activity: Option<ActivityRecord>,
@@ -253,6 +307,18 @@ mod tests {
                 .put_activity(activity)
                 .await
                 .expect("the in-memory store seeds an activity row");
+            store
+                .put_thread(seeded_scope())
+                .await
+                .expect("the in-memory store seeds a thread row");
+            store
+                .put_execution(seeded_run())
+                .await
+                .expect("the in-memory store seeds an execution row");
+            store
+                .put_flow_version(seeded_deadline_version())
+                .await
+                .expect("the in-memory store seeds a flow version row");
         }
         if let Some(execution) = execution {
             store
@@ -264,7 +330,12 @@ mod tests {
             .put_timer(timer)
             .await
             .expect("the in-memory store seeds a timer row");
+        drive(store).await
+    }
 
+    /// Drive the cancel over an already-seeded store, folding what it emits back in — the leader's
+    /// shape, so the assertion reads the commands the container emitted, not merely an intent.
+    async fn drive(store: InMemoryStorage) -> Vec<EntryPayload> {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
         let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
         let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
@@ -353,13 +424,13 @@ mod tests {
         }
     }
 
-    /// An owner that is gone has nothing to drain the cancel into, so it is refused as a wrong-state
-    /// [`RejectionType::InvalidState`] — the world is not in a state where the cancel applies — rather
-    /// than written against a row nothing converges. The timer itself is live in both cases, so this
-    /// is not a caller naming something absent. The owner is read exactly **once**: resolution finds
-    /// nothing, so the settle never re-reads.
+    /// An owner that is gone has nothing to drain the cancel into, so `Container::open` refuses it
+    /// with [`RejectionType::NotFound`] naming the owner — the resolution the handler used to do
+    /// inline, now the seam's own contract. The timer itself is live in both cases, so this is not a
+    /// caller naming something absent. The owner is read exactly **once**: resolution finds nothing,
+    /// so the settle never re-reads.
     #[tokio::test]
-    async fn a_gone_owner_is_a_wrong_state_refusal() {
+    async fn a_gone_owner_is_refused_by_open() {
         for owner in [
             TimerOwner::Activity(activity_ref()),
             TimerOwner::Execution(execution_ref()),
@@ -393,11 +464,7 @@ mod tests {
             let ProcessingError::Rejected(ty, reason) = err else {
                 panic!("a missing owner is a refusal, not a read fault: {err:?}");
             };
-            assert_eq!(ty, RejectionType::InvalidState);
-            assert!(
-                reason.contains(&timer_ref().to_string()),
-                "the refusal names the timer it could not cancel: {reason}"
-            );
+            assert_eq!(ty, RejectionType::NotFound);
             assert!(
                 reason.contains(&gone),
                 "the refusal names the owner that is gone: {reason}"
@@ -490,8 +557,9 @@ mod tests {
     }
 
     /// A live timer under an owner that is **not** finishing: the handler's own event and nothing
-    /// besides — the owner is still `Running`, so it has no finish to advance, and the container's
-    /// reaction is `container.rs`'s own subject.
+    /// besides — the owner is still `Running`, so it has no finish to advance. The container does hand
+    /// the settle to the state that owns the deadline, but a deadline a sweep *cancelled* is no longer
+    /// a fire: the state reads it, finds it stopped bounding nothing, and stops there too.
     #[tokio::test]
     async fn an_active_timer_emits_its_own_cancel() {
         let chain = cancel_over_overlay(

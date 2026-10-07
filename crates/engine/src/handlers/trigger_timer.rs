@@ -67,28 +67,40 @@ impl TriggerTimerHandler {
         // rather than left indistinguishable from a reaction that did nothing.
         match act.value.meta.owner.clone() {
             TimerOwner::Activity(owner) => {
-                let Some(container) = ActivityContainer::open(ctx.storage, owner).await? else {
-                    tracing::warn!(
-                        timer = %timer,
-                        "fire arrived for a timer whose owning activity is gone; no reaction"
-                    );
-                    return Ok(());
+                let container = match ActivityContainer::open(ctx.storage, owner).await {
+                    Ok(container) => container,
+                    // The fire is the fact, and it stands even for a gone owner: `TimerTriggered` is
+                    // already on this batch, so refusing here would drop it and leave the timer armed.
+                    // Only the reaction is skipped.
+                    Err(ProcessingError::Rejected(..)) => {
+                        tracing::warn!(
+                            timer = %timer,
+                            "fire arrived for a timer whose owning activity is gone; no reaction"
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
                 };
                 container
                     .after_child_completed(ctx, out, timer.as_raw_object_ref())
-                    .await;
+                    .await?;
             }
             TimerOwner::Execution(owner) => {
-                let Some(container) = ExecutionContainer::open(ctx.storage, owner).await? else {
-                    tracing::warn!(
-                        timer = %timer,
-                        "fire arrived for a timer whose owning execution is gone; no reaction"
-                    );
-                    return Ok(());
+                let container = match ExecutionContainer::open(ctx.storage, owner).await {
+                    Ok(container) => container,
+                    // As above: the fire outlives its owner.
+                    Err(ProcessingError::Rejected(..)) => {
+                        tracing::warn!(
+                            timer = %timer,
+                            "fire arrived for a timer whose owning execution is gone; no reaction"
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
                 };
                 container
                     .after_child_completed(ctx, out, timer.as_raw_object_ref())
-                    .await;
+                    .await?;
             }
         }
 

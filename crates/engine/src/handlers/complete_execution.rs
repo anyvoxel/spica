@@ -90,7 +90,7 @@ impl CompleteExecutionHandler {
         // the row's `active_children` disagreeing with the lifecycle rather than a child to wait on.
         // Refused rather than swept or ignored — sweeping turns a success into a failure cascade, and
         // ignoring closes the run with a live child. A refusal strands nothing: the child's own settle
-        // drains the run through `child_settled` → `ContinueComplete`.
+        // drains the run through its `ExecutionContainer` → `ContinueComplete`.
         for child in &children {
             match child.kind {
                 ObjectKind::Timer => out.append_command(Command::CancelTimer {

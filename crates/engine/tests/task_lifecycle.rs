@@ -15,9 +15,9 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
     EntryPayload, Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind,
     ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated,
-    FlowVersionKind, ObjectKind, Reject, RejectionType, RequestId, RetrierAttemptState,
-    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed,
-    TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
+    FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState, RetryPolicy,
+    RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed, TaskKind,
+    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
     TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus,
 };
 
@@ -951,14 +951,6 @@ async fn task_timeout_seconds_fails_the_run() {
                     }),
                 },
             })),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
-                        message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
-                    }),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
@@ -981,27 +973,6 @@ async fn task_timeout_seconds_fails_the_run() {
             EntryPayload::Command(Command::CancelTask {
                 task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
             }),
-            EntryPayload::Event(Event::ThreadTerminating {
-                thread: Thread {
-                    meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
-                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States"),
-                    start_at: "T".to_string(),
-                    index: 0,
-                    status: ThreadStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::TimedOut {
-                            message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
-                        }),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
-            }),
-            EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
-                reason: TerminationReason::Cancelled,
-            })),
             EntryPayload::Event(Event::TaskCancelled {
                 task: Task {
                     meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
@@ -1024,14 +995,6 @@ async fn task_timeout_seconds_fails_the_run() {
             EntryPayload::Command(Command::ContinueTerminate {
                 owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
-            EntryPayload::Reject(Reject {
-                request_id: RequestId::nil(),
-                rejection_type: RejectionType::InvalidState,
-                rejection_reason:
-                    "terminate_state: activity activity/lifecycle_execution-1 is terminating; \
-                    termination refused — the drain owns its terminal"
-                        .to_string(),
-            }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta_span(uid(5), "lifecycle_execution-1", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
@@ -1051,8 +1014,30 @@ async fn task_timeout_seconds_fails_the_run() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                        message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
+                    }),
+                },
+            })),
+            EntryPayload::Event(Event::ThreadTerminating {
+                thread: Thread {
+                    meta: meta_span(uid(4), "lifecycle_execution-0", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                    state_path: path("/States"),
+                    start_at: "T".to_string(),
+                    index: 0,
+                    status: ThreadStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                            message: "task ran past its TimeoutSeconds deadline (1700000030000)".to_string(),
+                        }),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
@@ -2555,12 +2540,6 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     },
                 },
             }),
-            EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
-                },
-            })),
             EntryPayload::Event(Event::StateTerminating {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -2581,28 +2560,6 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
             EntryPayload::Command(Command::CancelTask {
                 task: ref_to::<TaskKind>("lifecycle_execution-2", 6),
             }),
-            EntryPayload::Event(Event::ThreadTerminating {
-                thread: Thread {
-                    meta: meta(uid(4), "lifecycle_execution-0")
-                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    state_path: path("/States"),
-                    start_at: "T".to_string(),
-                    index: 0,
-                    status: ThreadStatus::Terminating(TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
-                    }),
-                    input: json!({"n": 1}),
-                    output: None,
-                },
-            }),
-            // A swept duplicate: the thread's teardown reaches the already-terminating activity, and
-            // it carries `Cancelled` — a sweep takes a child down because its parent is going down,
-            // never because the child is the author of the failure.
-            EntryPayload::Command(Command::TerminateState(TerminateState {
-                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
-                reason: TerminationReason::Cancelled,
-            })),
             EntryPayload::Event(Event::TaskCancelled {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
@@ -2625,14 +2582,6 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
             EntryPayload::Command(Command::ContinueTerminate {
                 owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
-            EntryPayload::Reject(Reject {
-                request_id: RequestId::nil(),
-                rejection_type: RejectionType::InvalidState,
-                rejection_reason:
-                    "terminate_state: activity activity/lifecycle_execution-1 is terminating; \
-                    termination refused — the drain owns its terminal"
-                        .to_string(),
-            }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
                     meta: meta(uid(5), "lifecycle_execution-1")
@@ -2650,9 +2599,30 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+            EntryPayload::Command(Command::TerminateThread(TerminateThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
+                reason: TerminationReason::Failed {
+                    error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
+                },
+            })),
+            EntryPayload::Event(Event::ThreadTerminating {
+                thread: Thread {
+                    meta: meta(uid(4), "lifecycle_execution-0")
+                        .with_owner(root_thread_owner("lifecycle_execution", 3)),
+                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
+                    state_path: path("/States"),
+                    start_at: "T".to_string(),
+                    index: 0,
+                    status: ThreadStatus::Terminating(TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::InvalidDefinition("Task TimeoutSeconds must be a positive integer".to_string())),
+                    }),
+                    input: json!({"n": 1}),
+                    output: None,
+                },
             }),
+            // A swept duplicate: the thread's teardown reaches the already-terminating activity, and
+            // it carries `Cancelled` — a sweep takes a child down because its parent is going down,
+            // never because the child is the author of the failure.,
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
                     meta: meta(uid(4), "lifecycle_execution-0")

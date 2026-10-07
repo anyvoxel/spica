@@ -2,23 +2,23 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{ParallelState, State};
 
-use super::super::emit_state_completed;
-use super::super::emit_transition;
+use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use crate::RejectionType;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    Command, CompleteThread, SpawnThread, TerminateExecution, TerminateState, TerminateThread,
-    TerminationReason,
+    ActivateState, Command, CompleteState, CompleteThread, SpawnThread, TerminateState,
+    TerminateThread, TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
+use crate::types::event::{Event, StateTransitioned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
-use crate::{Activity, ActivityState, ActivityStatus, Variables};
+use crate::{Activity, ActivityState, Variables};
 
 /// The `Parallel` state: runs several branch sub-state-machines concurrently, waits for all of them
 /// to reach a terminal state, then transitions — or fails the whole state if any branch fails.
@@ -27,8 +27,9 @@ use crate::{Activity, ActivityState, ActivityStatus, Variables};
 /// [`SpawnThreadHandler`](super::super::spawn_thread::SpawnThreadHandler)) rooted under this
 /// activity and carrying a [`state_path`](crate::storage::ExecutionRecord), so a branch resolves its
 /// own states within the single shared machine document without copying any definition. The
-/// `Parallel` activity stays `Running` owning those children; it completes only through
-/// `child_completed` once the last branch settles, or terminates on a branch failure.
+/// `Parallel` activity stays `Running` owning those children; it converges — by issuing its own
+/// `CompleteState` — once the last branch settles in `child_completed`, immediately when the
+/// definition declares no branches, or terminates on a branch failure.
 pub struct ParallelStateHandlerFactory;
 
 #[async_trait]
@@ -65,42 +66,95 @@ struct ParallelStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for ParallelStateHandler<'_> {
-    /// (3.4) A `Parallel` converges through `child_completed` on its last branch settle, so this path is
-    /// reached only by a stray `CompleteState`, and it handles both halves in one place: any branch still
-    /// in flight is terminated (a finish never waits on a live child), otherwise the activity is completed
-    /// with its own input as a defensive terminal so the machine does not wedge.
+    /// (3.4) A `Parallel` converges by *issuing* `CompleteState` — from `child_completed` on the last
+    /// branch settle, or from `after_activated` on a branchless definition — so this hook is the finish
+    /// the framework then owns, the same shape a `Map`'s or a `Task`'s settle drives. The command's raw
+    /// result, already folded onto the row by the base, is the aggregated per-branch output array.
     async fn after_completing(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
-        _variables: &Variables,
+        variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let activity = activity_value.meta.object_ref();
-        let live = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a.active_children.clone(),
-            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        // A read fault is the dispatch's; a missing row is a real refusal, since the `CompleteState`
+        // that opened this finish named an activity that existed.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("parallel_state: activity {activity} not found"),
+            ));
         };
-        if !live.is_empty() {
-            // A live branch at finish time is an invariant violation (a `Parallel` finishes only once
-            // every branch settles); stop it rather than leave it running behind a completed state.
-            for child in live {
-                if child.kind == ObjectKind::Thread {
-                    out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.typed::<ThreadKind>(),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                }
-            }
+        // Convergence issues the command only once the last branch settled, so a live child here is an
+        // engine regression rather than a flow error — refused rather than swept, because the array
+        // this finish projects would be missing exactly that branch's output.
+        if !act.active_children.is_empty() {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "parallel_state: activity {activity} is completing with {} live children",
+                    act.active_children.len()
+                ),
+            ));
+        }
+        // `$states.result` is the aggregated array the convergence folded in (empty for a branchless
+        // definition); `Output`, when present, projects over it (so a Parallel can reshape that array).
+        let aggregated = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&aggregated))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+        // A projection failure is turned into a terminate here rather than returned: the activity is
+        // already `Completing`, so there is no later hop to report it from (mirrors `fail.rs`).
+        if let Err(e) = self
+            .apply_assign(
+                out,
+                ctx.env,
+                &activity_value.meta.owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
+            .await
+        {
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
             return Ok(());
         }
-        // Defensive terminal: with no convergence run, no branch outputs were aggregated, so complete
-        // with the activity's own input and route down its terminal branch — a stray `CompleteState`
-        // on the container must not wedge the machine.
+        let output_value = match self
+            .project_output(
+                ctx.env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                aggregated,
+            )
+            .await
+        {
+            Ok(output_value) => output_value,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return Ok(());
+            }
+        };
         let mut completed = activity_value.clone();
         debug_assert!(
             completed
-                .mark_completed(activity_value.raw_input.clone(), out.now())
+                .mark_completed(output_value.clone(), out.now())
                 .is_ok(),
             "the complete that dispatched this after_completing opened the activity as Completing"
         );
@@ -108,17 +162,40 @@ impl StateHandler for ParallelStateHandler<'_> {
             activity: completed,
         })
         .await;
-        out.append_command(Command::CompleteThread(CompleteThread {
-            thread: activity_value.meta.owner.clone(),
-            output: activity_value.raw_input.clone(),
-        }));
+        // The routing owns the owner notification: an `End` completes the owning thread (whose own
+        // container then advances the scope), a `Next` activates the successor state.
+        if self.state.end == Some(true) {
+            out.append_command(Command::CompleteThread(CompleteThread {
+                thread: activity_value.meta.owner.clone(),
+                output: output_value,
+            }));
+        } else if let Some(next) = self.state.next.as_deref() {
+            // The successor lives as a sibling of this state in the same enclosing `States` table —
+            // that table is this activity's `state_path` minus its own leaf.
+            let next_path = activity_value.state_path.sibling(next);
+            out.append_event(Event::StateTransitioned(StateTransitioned {
+                activity: activity_value.meta.object_ref(),
+                next: next_path.as_ptr().to_owned(),
+            }))
+            .await;
+            out.append_command(Command::ActivateState(ActivateState {
+                execution: activity_value.execution.clone(),
+                owner: activity_value.meta.owner.clone(),
+                state_path: next_path,
+                input: output_value,
+            }));
+        } else {
+            // Every state declares `Next` or `End`, so a definition reaching here is malformed and the
+            // flow should have been refused at submission (see `spica_asl::StateMachine::validate`).
+            unreachable!("parallel state {} declares neither Next nor End", activity)
+        }
         Ok(())
     }
 
-    // A `Parallel`'s terminate sweeps its in-flight fan-out: every branch execution and branch thread
-    // is cancelled so its own subtree unwinds and relays its settle back. The base already opened
-    // `StateTerminating`; once every branch drains (via the generic `Terminating` path) the activity's
-    // terminal is emitted there — a childless container closes inline instead.
+    // A `Parallel`'s terminate sweeps its in-flight fan-out: every branch thread is cancelled so its
+    // own subtree unwinds and relays its settle back. The base already opened `StateTerminating`;
+    // once every branch drains (via the generic `Terminating` path) the activity's terminal is
+    // emitted there — a childless container closes inline instead.
     async fn after_terminating(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -127,53 +204,53 @@ impl StateHandler for ParallelStateHandler<'_> {
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let activity = activity_value.meta.object_ref();
-        let live = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a.active_children.clone(),
-            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        // A read fault is the dispatch's; a missing row is a real refusal, since the terminate that
+        // opened this teardown named an activity that existed.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("parallel_state: activity {activity} not found"),
+            ));
         };
-        let mut pending = 0;
-        for child in live {
-            match child.kind {
-                // A branch execution and its spawned thread both unwind on cancellation so the
-                // activity drains (the last settle re-enters the generic `Terminating` path).
-                ObjectKind::Execution => {
-                    out.append_command(Command::TerminateExecution(TerminateExecution {
-                        name: child.name.clone(),
-                        uid: Some(child.uid),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                    pending += 1;
-                }
-                ObjectKind::Thread => {
-                    out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.typed::<ThreadKind>(),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                    pending += 1;
-                }
-                _ => {}
-            }
-        }
-        if pending == 0 {
+        // A childless container has nothing to sweep, so it closes now: the terminal, then the relay to
+        // its owner thread's container, which advances the scope.
+        if act.active_children.is_empty() {
+            let container =
+                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
                 "the terminate step that dispatched this after_terminating opened the activity as Terminating"
             );
-            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
             let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
             out.append_event(Event::StateTerminated {
                 activity: terminated,
             })
             .await;
-            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
-        } else {
-            tracing::debug!(
-                activity = %activity,
-                pending,
-                "parallel state terminating deferred: waiting on branches"
-            );
+            container
+                .after_child_terminated(ctx, out, &activity_ref)
+                .await?;
+            return Ok(());
         }
+
+        // A branch thread unwinds on cancellation so the activity drains (the last settle re-enters
+        // the generic `Terminating` path). A branch is always a thread: the fan-out is `SpawnThread`,
+        // and nothing else can parent an object to this activity.
+        let mut pending = 0;
+        for child in act.active_children {
+            if let ObjectKind::Thread = child.kind {
+                out.append_command(Command::TerminateThread(TerminateThread {
+                    thread: child.typed::<ThreadKind>(),
+                    reason: TerminationReason::Cancelled,
+                }));
+                pending += 1;
+            }
+        }
+        tracing::debug!(
+            activity = %activity,
+            pending,
+            "parallel state terminating deferred: waiting on branches"
+        );
         Ok(())
     }
 
@@ -206,14 +283,26 @@ impl StateHandler for ParallelStateHandler<'_> {
     // branch's `States` table. The activity stays `Running`; it completes only via `child_completed`.
     async fn after_activated(
         &self,
-        env: &mut EvalEnv,
+        _env: &mut EvalEnv,
         out: &mut Collector<'_>,
         activity_value: &Activity,
-        variables: &Variables,
+        _variables: &Variables,
         _states: &Value,
     ) -> Result<(), ExecutionError> {
         let activity = activity_value.meta.object_ref();
         let owner = activity.clone();
+
+        // No branch means no child will ever settle, and the settle is the only thing that drives this
+        // activity's convergence — so converge here instead of wedging on a child that never comes,
+        // the same way a `Map` with no items does.
+        if self.state.branches.is_empty() {
+            out.append_command(Command::CompleteState(CompleteState {
+                activity: activity.clone(),
+                output: Value::Array(Vec::new()),
+            }));
+            return Ok(());
+        }
+
         for (index, branch) in self.state.branches.iter().enumerate() {
             let pointer = activity_value.state_path.branch(index);
             out.append_command(Command::SpawnThread(SpawnThread {
@@ -224,20 +313,6 @@ impl StateHandler for ParallelStateHandler<'_> {
                 start_at: branch.start_at.clone(),
                 input: activity_value.input.clone().unwrap_or_default(),
             }));
-        }
-        // No branch means no child will ever settle, and the settle is the only thing that drives this
-        // activity's convergence — so converge here instead of wedging on a child that never comes,
-        // the same way a `Map` with no items does.
-        if self.state.branches.is_empty() {
-            self.finish_parallel(
-                env,
-                out,
-                activity,
-                activity_value,
-                variables,
-                Value::Array(Vec::new()),
-            )
-            .await;
         }
         Ok(())
     }
@@ -253,15 +328,16 @@ impl StateHandler for ParallelStateHandler<'_> {
     ///   may still be in flight (mirroring `fail.rs`, whose own TerminateState + TerminateExecution
     ///   sweep cancels those surviving sibling branches);
     /// - otherwise, once the last branch has settled and drained this activity's `active_children`,
-    ///   aggregate each branch's output (in `Branches` declaration order) into an array and run the
-    ///   `Parallel`'s success finish with that array as its result.
+    ///   aggregate each branch's output (in `Branches` declaration order) into an array and issue the
+    ///   `CompleteState` that carries it as the state's raw result — the projection and routing then
+    ///   belong to `after_completing`.
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
-        variables: &Variables,
+        _variables: &Variables,
         _child: RawObjectRef,
     ) {
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
@@ -342,24 +418,20 @@ impl StateHandler for ParallelStateHandler<'_> {
             }
         }
 
-        // All branches succeeded: the state's result is the ordered array of branch outputs.
-        let aggregated = Value::Array(outputs);
-        self.finish_parallel(
-            ctx.env,
-            out,
-            activity,
-            activity_value,
-            variables,
-            aggregated,
-        )
-        .await;
+        // All branches succeeded: the state's result is the ordered array of branch outputs, which
+        // becomes the `CompleteState` raw result — the finish itself belongs to `after_completing`, so
+        // projection and routing live in one place for every way a Parallel can converge.
+        out.append_command(Command::CompleteState(CompleteState {
+            activity: activity.clone(),
+            output: Value::Array(outputs),
+        }));
     }
 }
 
 impl ParallelStateHandler<'_> {
-    /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. Emits the
-    /// activity's failure ed; the activity's own terminate is what stops the surviving sibling
-    /// branches, since the sweep it runs takes down the branch threads this activity owns.
+    /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. The
+    /// activity's own terminate is what stops the surviving sibling branches, since the sweep it runs
+    /// takes down the branch threads this activity owns.
     async fn fail_parallel(
         &self,
         out: &mut Collector<'_>,
@@ -376,98 +448,6 @@ impl ParallelStateHandler<'_> {
             reason: reason.clone(),
         }));
     }
-
-    /// The `Parallel`'s success finish: with all branches converged, project the state result —
-    /// `$states` `.result` is the aggregated branch-output array, `Assign` mutates the scope, and
-    /// `Output` defaults to that array — then emit the ed and route via the shared transition helper.
-    ///
-    /// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
-    /// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the
-    /// success finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing
-    /// uniform.
-    async fn finish_parallel(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
-        activity_value: &Activity,
-        variables: &Variables,
-        aggregated: Value,
-    ) {
-        let owner = activity_value.meta.owner.clone();
-        // `$states.result` / the default state result is the aggregated branch-output array; `Output`,
-        // when present, projects over it (so a Parallel can reshape that array).
-        let states = States::new(
-            &activity_value.raw_input,
-            &activity_value.state_path.state_name(),
-            activity_value.retry_count(),
-        )
-        .with_result(Some(&aggregated))
-        .with_assign_ctx(Some(&activity_value.raw_input))
-        .build();
-        let mut local_scope = variables.clone();
-        if let Err(e) = self
-            .apply_assign(
-                out,
-                env,
-                &owner,
-                self.state.assign.as_ref(),
-                &states,
-                &mut local_scope,
-            )
-            .await
-        {
-            out.append_command(Command::TerminateState(TerminateState {
-                activity: activity.clone(),
-                reason: TerminationReason::Failed { error: e },
-            }));
-            return;
-        }
-        let output_value = match self
-            .project_output(
-                env,
-                self.state.output.as_ref(),
-                &states,
-                &local_scope,
-                aggregated,
-            )
-            .await
-        {
-            Ok(output_value) => output_value,
-            Err(e) => {
-                out.append_command(Command::TerminateState(TerminateState {
-                    activity: activity.clone(),
-                    reason: TerminationReason::Failed { error: e },
-                }));
-                return;
-            }
-        };
-
-        // `finish_parallel` only borrows `activity_value`, so it advances a fresh copy in place
-        // through the completing → completed lifecycle moments.
-        let mut finished = activity_value.clone();
-        finished.meta.with_update_at(out.now());
-        finished.status = ActivityStatus::Completing;
-        if finished.raw_output.is_none() {
-            finished.raw_output = Some(finished.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleting {
-            activity: finished.clone(),
-        })
-        .await;
-        emit_state_completed(out, &finished, &output_value).await;
-        emit_transition(
-            out,
-            activity_value.execution.clone(),
-            activity_value.meta.owner.clone(),
-            activity,
-            &activity_value.state_path,
-            &output_value,
-            self.state.next.as_deref(),
-            self.state.end,
-        )
-        .await;
-    }
 }
 
 #[cfg(test)]
@@ -480,18 +460,16 @@ mod tests {
     use super::super::harness::*;
     use super::*;
     use crate::storage::{ActivityRecord, ThreadRecord};
-    use crate::types::command::{ActivateState, CompleteThread};
-    use crate::types::event::StateTransitioned;
+    use crate::types::command::CompleteThread;
     use crate::types::meta::HasRawObjectRef;
-    use crate::{EntryPayload, ParallelActivityState, ThreadStatus};
+    use crate::{ActivityStatus, EntryPayload, ParallelActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
-    // A `Parallel` is a container: it does not complete itself but converges once every branch it
-    // fanned out has settled. Its activation therefore ends in side effects rather than the inline
-    // `CompleteState` a leaf gets — the fan-out, plus a convergence shortcut for the degenerate
-    // definition. The convergence proper is `child_completed`, driven once per branch settle; it
-    // decides between "not yet", "that branch failed" and "aggregate and finish". The base `finish` is
-    // only a defensive fallback a stray `CompleteState` lands on.
+    // A `Parallel` is a container: it does not complete inline but converges once every branch it
+    // fanned out has settled, by issuing a `CompleteState` that the framework finish then projects and
+    // routes. Its activation therefore ends in the fan-out, plus that convergence command for the
+    // degenerate branchless definition. The convergence proper is `child_completed`, driven once per
+    // branch settle; it decides between "not yet", "that branch failed" and "aggregate and converge".
 
     fn branch(start_at: &str) -> Branch {
         Branch {
@@ -577,7 +555,7 @@ mod tests {
 
     /// No branch means no settle will ever arrive — and the settle is the only thing that drives
     /// convergence — so the container converges on the spot rather than wedging on a child that never
-    /// comes. The result is the empty aggregated array.
+    /// comes: it issues its own `CompleteState` carrying the empty aggregated array as the raw result.
     #[tokio::test]
     async fn activate_converges_a_parallel_with_no_branches() {
         let activated = activate(
@@ -586,15 +564,6 @@ mod tests {
             seeded_scope(ThreadStatus::Running),
         )
         .await;
-
-        let mut completing = activated_activity();
-        completing.input = Some(seeded_input());
-        // The finish falls back to the raw input as the raw result when the activity carries none.
-        completing.raw_output = Some(seeded_input());
-        completing.status = ActivityStatus::Completing;
-        let mut done = completing.clone();
-        done.status = ActivityStatus::Completed;
-        done.output = Some(json!([]));
 
         assert_eq!(
             activated.chain(),
@@ -609,22 +578,17 @@ mod tests {
                         processed
                     }
                 }),
-                EntryPayload::Event(Event::StateCompleting {
-                    activity: completing
-                }),
-                EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
+                EntryPayload::Command(Command::CompleteState(CompleteState {
+                    activity: minted_activity_ref(),
                     output: json!([]),
                 })),
             ]
         );
     }
 
-    /// The base `finish` is a defensive fallback: reached only by a stray `CompleteState` on the
-    /// container (a real convergence goes through `finish_parallel`), it ignores the command's raw
-    /// result entirely and completes the activity with its own input, routing down the terminal branch
-    /// so the machine does not wedge.
+    /// The container's finish is the same framework finish a leaf gets: the `CompleteState` the
+    /// convergence issued is folded as the raw result, `Assign`/`Output` project from it, and the
+    /// terminal `End` completes the owning thread.
     #[tokio::test]
     async fn complete_completes_the_container_terminal() {
         let completed = complete(
@@ -636,13 +600,12 @@ mod tests {
 
         let mut completing = minted_activity(path("/States/P"), seeded_input());
         completing.input = Some(seeded_input());
-        // Whatever the command carried is folded as the raw result...
+        // The command's raw result is the aggregated array the finish projects over.
         completing.raw_output = Some(json!({ "ignored": true }));
         completing.status = ActivityStatus::Completing;
         let mut done = completing.clone();
         done.status = ActivityStatus::Completed;
-        // ...but the fallback projects the activity's own input over it.
-        done.output = Some(seeded_input());
+        done.output = Some(json!({ "ignored": true }));
 
         assert_eq!(
             completed.chain(),
@@ -653,7 +616,7 @@ mod tests {
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
                 EntryPayload::Command(Command::CompleteThread(CompleteThread {
                     thread: thread_ref(),
-                    output: seeded_input(),
+                    output: json!({ "ignored": true }),
                 })),
             ]
         );
@@ -698,8 +661,9 @@ mod tests {
     }
 
     /// The last branch's settle converges the container: every branch's output is aggregated in
-    /// *declaration* order (never the order the branches happen to live in the map) and the state runs
-    /// its success finish with that array as the result.
+    /// *declaration* order (never the order the branches happen to live in the map), and the
+    /// convergence then issues the container's own `CompleteState` carrying that array as the raw
+    /// result — the projection and routing belong to the framework finish, not this hook.
     #[tokio::test]
     async fn child_convergence_aggregates_branches_in_declaration_order() {
         let mut store = InMemoryStorage::new();
@@ -713,7 +677,6 @@ mod tests {
         )
         .await;
 
-        let aggregated = json!([{ "i": 0 }, { "i": 1 }]);
         let completed = child_completed(
             &parallel_state(vec![branch("B0"), branch("B1")], Some("P2"), None),
             store,
@@ -722,36 +685,14 @@ mod tests {
         )
         .await;
 
-        let mut finishing = minted_activity(path("/States/P"), seeded_input());
-        finishing.activity_state = Some(ActivityState::Parallel(ParallelActivityState {
-            branches: fan_out(true),
-        }));
-        finishing.input = Some(seeded_input());
-        // A container activity carries no raw result of its own, so the finish falls back to its input.
-        finishing.raw_output = Some(seeded_input());
-        finishing.status = ActivityStatus::Completing;
-        let mut done = finishing.clone();
-        done.status = ActivityStatus::Completed;
-        done.output = Some(aggregated.clone());
-
         assert_eq!(
             completed.chain(),
-            vec![
-                EntryPayload::Event(Event::StateCompleting {
-                    activity: finishing
-                }),
-                EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
+            vec![EntryPayload::Command(Command::CompleteState(
+                CompleteState {
                     activity: minted_activity_ref(),
-                    next: path("/States/P2").as_ptr().to_owned(),
-                })),
-                EntryPayload::Command(Command::ActivateState(ActivateState {
-                    execution: execution_ref(),
-                    owner: thread_ref(),
-                    state_path: path("/States/P2"),
-                    input: aggregated,
-                })),
-            ]
+                    output: json!([{ "i": 0 }, { "i": 1 }]),
+                }
+            ))]
         );
     }
 

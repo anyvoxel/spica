@@ -2,23 +2,24 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{IntOrExpr, MapItems, MapState, State};
 
-use super::super::emit_state_completed;
+use super::super::container::{Container, ThreadContainer};
+use super::super::eval_string_or_expr;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use super::super::{emit_transition, eval_string_or_expr};
+use crate::RejectionType;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    Command, CompleteThread, SpawnThread, TerminateExecution, TerminateState, TerminateThread,
-    TerminationReason,
+    ActivateState, Command, CompleteState, CompleteThread, SpawnThread, TerminateState,
+    TerminateThread, TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::Event;
+use crate::types::event::{Event, StateTransitioned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
-use crate::{Activity, ActivityState, ActivityStatus, MapActivityState, Variables};
+use crate::{Activity, ActivityState, MapActivityState, Variables};
 
 /// The `Map` state: iterates an `Items` array, running the `ItemProcessor` sub-state-machine once
 /// per item as a child execution, with bounded concurrency (`MaxConcurrency`, 0 = unlimited). It
@@ -75,42 +76,95 @@ struct MapStateHandler<'a> {
 
 #[async_trait]
 impl StateHandler for MapStateHandler<'_> {
-    /// (3.4) A `Map` converges through `child_completed` on its last item settle, so this path is reached
-    /// only by a stray `CompleteState`, and it handles both halves in one place: any item still in flight
-    /// is terminated (a finish never waits on a live child), otherwise the activity is completed with its
-    /// own input as a defensive terminal so the machine does not wedge.
+    /// (3.4) A `Map` converges by *issuing* `CompleteState` — from `child_completed` on the last item
+    /// settle, or from `after_activated` on an empty plan — so this hook is the finish the framework
+    /// then owns, the same shape a `Task`'s or a `Wait`'s settle drives. The command's raw result,
+    /// already folded onto the row by the base, is the aggregated per-item output array.
     async fn after_completing(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
-        _variables: &Variables,
+        variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let activity = activity_value.meta.object_ref();
-        let live = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a.active_children.clone(),
-            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        // A read fault is the dispatch's; a missing row is a real refusal, since the `CompleteState`
+        // that opened this finish named an activity that existed.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("map_state: activity {activity} not found"),
+            ));
         };
-        if !live.is_empty() {
-            // A live item at finish time is an invariant violation (a `Map` finishes only once every
-            // item settles); stop it rather than leave it running behind a completed state.
-            for child in live {
-                if child.kind == ObjectKind::Thread {
-                    out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.typed::<ThreadKind>(),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                }
-            }
+        // Convergence issues the command only once the last item settled, so a live child here is an
+        // engine regression rather than a flow error — refused rather than swept, because the array
+        // this finish projects would be missing exactly that item's output.
+        if !act.active_children.is_empty() {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "map_state: activity {activity} is completing with {} live children",
+                    act.active_children.len()
+                ),
+            ));
+        }
+        // `$states.result` is the aggregated array the convergence folded in (empty for an empty
+        // plan); `Output`, when present, projects over it (so a Map can reshape that array).
+        let aggregated = activity_value
+            .raw_output
+            .clone()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let states = States::new(
+            &activity_value.raw_input,
+            &activity_value.state_path.state_name(),
+            activity_value.retry_count(),
+        )
+        .with_result(Some(&aggregated))
+        .with_assign_ctx(Some(&activity_value.raw_input))
+        .build();
+        let mut local_scope = variables.clone();
+        // A projection failure is turned into a terminate here rather than returned: the activity is
+        // already `Completing`, so there is no later hop to report it from (mirrors `fail.rs`).
+        if let Err(e) = self
+            .apply_assign(
+                out,
+                ctx.env,
+                &activity_value.meta.owner,
+                self.state.assign.as_ref(),
+                &states,
+                &mut local_scope,
+            )
+            .await
+        {
+            out.append_command(Command::TerminateState(TerminateState {
+                activity: activity.clone(),
+                reason: TerminationReason::Failed { error: e },
+            }));
             return Ok(());
         }
-        // Defensive terminal: with no convergence run, no item outputs were aggregated, so complete
-        // with the activity's own input and route down its terminal branch — a stray `CompleteState`
-        // on the container must not wedge the machine.
+        let output_value = match self
+            .project_output(
+                ctx.env,
+                self.state.output.as_ref(),
+                &states,
+                &local_scope,
+                aggregated,
+            )
+            .await
+        {
+            Ok(output_value) => output_value,
+            Err(e) => {
+                out.append_command(Command::TerminateState(TerminateState {
+                    activity: activity.clone(),
+                    reason: TerminationReason::Failed { error: e },
+                }));
+                return Ok(());
+            }
+        };
         let mut completed = activity_value.clone();
         debug_assert!(
             completed
-                .mark_completed(activity_value.raw_input.clone(), out.now())
+                .mark_completed(output_value.clone(), out.now())
                 .is_ok(),
             "the complete that dispatched this after_completing opened the activity as Completing"
         );
@@ -118,17 +172,40 @@ impl StateHandler for MapStateHandler<'_> {
             activity: completed,
         })
         .await;
-        out.append_command(Command::CompleteThread(CompleteThread {
-            thread: activity_value.meta.owner.clone(),
-            output: activity_value.raw_input.clone(),
-        }));
+        // The routing owns the owner notification: an `End` completes the owning thread (whose own
+        // container then advances the scope), a `Next` activates the successor state.
+        if self.state.end == Some(true) {
+            out.append_command(Command::CompleteThread(CompleteThread {
+                thread: activity_value.meta.owner.clone(),
+                output: output_value,
+            }));
+        } else if let Some(next) = self.state.next.as_deref() {
+            // The successor lives as a sibling of this state in the same enclosing `States` table —
+            // that table is this activity's `state_path` minus its own leaf.
+            let next_path = activity_value.state_path.sibling(next);
+            out.append_event(Event::StateTransitioned(StateTransitioned {
+                activity: activity_value.meta.object_ref(),
+                next: next_path.as_ptr().to_owned(),
+            }))
+            .await;
+            out.append_command(Command::ActivateState(ActivateState {
+                execution: activity_value.execution.clone(),
+                owner: activity_value.meta.owner.clone(),
+                state_path: next_path,
+                input: output_value,
+            }));
+        } else {
+            // Every state declares `Next` or `End`, so a definition reaching here is malformed and the
+            // flow should have been refused at submission (see `spica_asl::StateMachine::validate`).
+            unreachable!("map state {} declares neither Next nor End", activity)
+        }
         Ok(())
     }
 
-    // A `Map`'s terminate sweeps its in-flight fan-out: every item execution and item thread is
-    // cancelled so its own subtree unwinds and relays its settle back. The base already opened
-    // `StateTerminating`; once every item drains (via the generic `Terminating` path) the activity's
-    // terminal is emitted there — a childless container closes inline instead.
+    // A `Map`'s terminate sweeps its in-flight fan-out: every item thread is cancelled so its own
+    // subtree unwinds and relays its settle back. The base already opened `StateTerminating`; the
+    // drained side of this hook — re-entered by the generic `Terminating` path once the last sweep
+    // settles (see `handlers::continue_terminate`) — emits the activity's terminal.
     async fn after_terminating(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -137,53 +214,50 @@ impl StateHandler for MapStateHandler<'_> {
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let activity = activity_value.meta.object_ref();
-        let live = match ctx.storage.get_activity(&activity).await {
-            Ok(Some(a)) => a.active_children.clone(),
-            Ok(None) | Err(_) => return Ok(()), // gone or unreadable — nothing left to dispose of.
+        // A read fault is the dispatch's; a missing row is a real refusal, since the terminate that
+        // opened this teardown named an activity that existed.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::NotFound,
+                format!("map_state: activity {activity} not found"),
+            ));
         };
-        let mut pending = 0;
-        for child in live {
-            match child.kind {
-                // An item execution and its spawned thread both unwind on cancellation so the
-                // activity drains (the last settle re-enters the generic `Terminating` path).
-                ObjectKind::Execution => {
-                    out.append_command(Command::TerminateExecution(TerminateExecution {
-                        name: child.name.clone(),
-                        uid: Some(child.uid),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                    pending += 1;
-                }
-                ObjectKind::Thread => {
-                    out.append_command(Command::TerminateThread(TerminateThread {
-                        thread: child.typed::<ThreadKind>(),
-                        reason: TerminationReason::Cancelled,
-                    }));
-                    pending += 1;
-                }
-                _ => {}
-            }
-        }
-        if pending == 0 {
+        if act.active_children.is_empty() {
+            // Nothing left to reap: close the activity and hand it to the owning thread's container —
+            // the same reaction point a `Fail`'s terminate uses, which advances a thread already
+            // draining this child and takes down a still-`Running` one from the reason on the row.
+            let container =
+                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
                 "the terminate step that dispatched this after_terminating opened the activity as Terminating"
             );
-            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
             let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
             out.append_event(Event::StateTerminated {
                 activity: terminated,
             })
             .await;
-            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
-        } else {
-            tracing::debug!(
-                activity = %activity,
-                pending,
-                "map state terminating deferred: waiting on items"
-            );
+            container
+                .after_child_terminated(ctx, out, &activity_ref)
+                .await?;
+            return Ok(());
         }
+        // An item thread unwinds on cancellation so the activity drains (the last settle re-enters
+        // this hook with no children left). An item is always a thread: the fan-out is `SpawnThread`,
+        // and nothing else can parent an object to this activity.
+        for child in act.active_children {
+            if let ObjectKind::Thread = child.kind {
+                out.append_command(Command::TerminateThread(TerminateThread {
+                    thread: child.typed::<ThreadKind>(),
+                    reason: TerminationReason::Cancelled,
+                }));
+            }
+        }
+        tracing::debug!(
+            activity = %activity,
+            "map state terminating deferred: waiting on items"
+        );
         Ok(())
     }
 
@@ -220,15 +294,18 @@ impl StateHandler for MapStateHandler<'_> {
     // item when the cap is 0 (unlimited). Further items arrive via replenish in `child_completed`.
     async fn after_activated(
         &self,
-        env: &mut EvalEnv,
+        _env: &mut EvalEnv,
         out: &mut Collector<'_>,
         activity_value: &Activity,
-        variables: &Variables,
+        _variables: &Variables,
         _states: &Value,
     ) -> Result<(), ExecutionError> {
         let Some(ActivityState::Map(progress)) = activity_value.activity_state.as_ref() else {
+            // TODO：不应该出现这种情况，直接 panic 即可
             return Ok(()); // plan not built — nothing to fan out.
         };
+        // TODO：先处理 total == 0 的情况
+
         let initial_batch = if progress.max_concurrency == 0 {
             progress.total // unlimited — can fill every remaining slot
         } else {
@@ -253,18 +330,13 @@ impl StateHandler for MapStateHandler<'_> {
                 input: progress.items.get(index).cloned().unwrap_or(Value::Null),
             }));
         }
-        // Empty items spawn no children, so no `child_completed` will ever drive this Map; converge
-        // immediately to an empty array (otherwise the side wedges waiting on a settle that never
-        // comes).
+        // Empty items spawn no children, so no `child_completed` will ever drive this Map; complete
+        // with an empty aggregate (otherwise the side wedges waiting on a settle that never comes).
         if progress.total == 0 {
-            self.finish_map(
-                env,
-                out,
-                activity_value,
-                variables,
-                Value::Array(Vec::new()),
-            )
-            .await;
+            out.append_command(Command::CompleteState(CompleteState {
+                activity: activity.clone(),
+                output: Value::Array(Vec::new()),
+            }));
         }
         Ok(())
     }
@@ -283,14 +355,15 @@ impl StateHandler for MapStateHandler<'_> {
     ///    terminal event, applied before this hook runs, is the source of truth);
     /// 2. on any failure, fails the whole `Map` (default tolerance 0) — mirroring `fail.rs`;
     /// 3. otherwise refills up to `MaxConcurrency` free slots from the never-spawned tail of the
-    ///    items array, then converges (`finish_map`) once `completed == total`.
+    ///    items array, then converges (a `CompleteState` that projects the ordered outputs) once
+    ///    `completed == total`.
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
-        variables: &Variables,
+        _variables: &Variables,
         child: RawObjectRef,
     ) {
         let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
@@ -367,7 +440,9 @@ impl StateHandler for MapStateHandler<'_> {
             }
         }
         // All items have settled successfully — the last settle drained the final slot, so
-        // `completed_now == total` implies no in-flight children remain.
+        // `completed_now == total` implies no in-flight children remain. The aggregated array becomes
+        // the `CompleteState` raw result: the finish itself belongs to `after_completing`, so the
+        // projection and routing live in one place for every way a Map can converge.
         if completed_now == progress.total {
             // Aggregate the per-item outputs in item-index order (mirroring a `Parallel`'s
             // branch-order aggregation). Every child is `Completed` by now.
@@ -390,14 +465,10 @@ impl StateHandler for MapStateHandler<'_> {
                     .unwrap_or(Value::Null);
                 outputs.push(output);
             }
-            self.finish_map(
-                ctx.env,
-                out,
-                activity_value,
-                variables,
-                Value::Array(outputs),
-            )
-            .await;
+            out.append_command(Command::CompleteState(CompleteState {
+                activity: activity.clone(),
+                output: Value::Array(outputs),
+            }));
             return;
         }
 
@@ -536,98 +607,6 @@ impl MapStateHandler<'_> {
             reason: reason.clone(),
         }));
     }
-
-    /// The `Map`'s success finish: with all items converged, project the state result — `$states.result`
-    /// is the ordered `aggregated` array of per-item outputs, `Assign` mutates the scope, and `Output`
-    /// defaults to that array — then emit the ed and route via the shared transition helper. Mirrors
-    /// `finish_parallel` (the aggregation work already happened in the async caller).
-    ///
-    /// Unlike most states, this is **not** reached through the `CompleteStateHandler` framework (which
-    /// emits `StateCompleting`), so `StateCompleting` is emitted here — the `ing` that opens the success
-    /// finish — before the projection, keeping the `StateCompleting → StateCompleted` pairing uniform.
-    async fn finish_map(
-        &self,
-        env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity: &Activity,
-        variables: &Variables,
-        aggregated: Value,
-    ) {
-        let activity_ref = activity.meta.object_ref();
-        let owner = activity.meta.owner.clone();
-        // `$states.result` / the default state result is the aggregated per-item output array;
-        // `Output`, when present, projects over it (so a Map can reshape that array).
-        let states = States::new(
-            &activity.raw_input,
-            &activity.state_path.state_name(),
-            activity.retry_count(),
-        )
-        .with_result(Some(&aggregated))
-        .with_assign_ctx(Some(&activity.raw_input))
-        .build();
-        let mut local_scope = variables.clone();
-        if let Err(e) = self
-            .apply_assign(
-                out,
-                env,
-                &owner,
-                self.state.assign.as_ref(),
-                &states,
-                &mut local_scope,
-            )
-            .await
-        {
-            out.append_command(Command::TerminateState(TerminateState {
-                activity: activity_ref.clone(),
-                reason: TerminationReason::Failed { error: e },
-            }));
-            return;
-        }
-        let output_value = match self
-            .project_output(
-                env,
-                self.state.output.as_ref(),
-                &states,
-                &local_scope,
-                aggregated,
-            )
-            .await
-        {
-            Ok(output_value) => output_value,
-            Err(e) => {
-                out.append_command(Command::TerminateState(TerminateState {
-                    activity: activity_ref.clone(),
-                    reason: TerminationReason::Failed { error: e },
-                }));
-                return;
-            }
-        };
-
-        // `finish_map` only borrows `activity`, so it advances a fresh copy in place through the
-        // completing → completed lifecycle moments.
-        let mut activity_value = activity.clone();
-        activity_value.meta.with_update_at(out.now());
-        activity_value.status = ActivityStatus::Completing;
-        if activity_value.raw_output.is_none() {
-            activity_value.raw_output = Some(activity_value.raw_input.clone());
-        }
-        out.append_event(Event::StateCompleting {
-            activity: activity_value.clone(),
-        })
-        .await;
-        emit_state_completed(out, &activity_value, &output_value).await;
-        emit_transition(
-            out,
-            activity.execution.clone(),
-            activity.meta.owner.clone(),
-            activity_ref,
-            &activity.state_path,
-            &output_value,
-            self.state.next.as_deref(),
-            self.state.end,
-        )
-        .await;
-    }
 }
 
 #[cfg(test)]
@@ -641,7 +620,7 @@ mod tests {
     use super::*;
     use crate::storage::{ActivityRecord, ThreadRecord};
     use crate::types::command::CompleteThread;
-    use crate::{EntryPayload, MapActivityState, ThreadStatus};
+    use crate::{ActivityStatus, EntryPayload, MapActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
     // A `Map` is a container like `Parallel`, but its fan-out is *input-derived*: the iteration plan
@@ -649,8 +628,8 @@ mod tests {
     // `after_activated` fans out only the first `min(total, cap)` items — the rest arrive by
     // replenish. These tests pin the plan, the first batch, and the two degenerate outcomes; the
     // per-settle half (`child_completed`) is driven once per item settle and decides between
-    // "refill a freed slot", "not my child", "that item failed" and "aggregate and finish". The base
-    // `finish` is only a defensive fallback a stray `CompleteState` lands on.
+    // "refill a freed slot", "not my child", "that item failed" and "aggregate and converge". The
+    // convergence issues a `CompleteState` whose framework finish does the projection and routing.
 
     fn map_state(
         items: Option<MapItems>,
@@ -808,8 +787,10 @@ mod tests {
         );
     }
 
-    /// An empty `Items` spawns no children, so no settle will ever drive convergence — the container
-    /// converges on the spot to the empty aggregated array rather than wedging.
+    /// An empty `Items` spawns no children, so no settle will ever drive convergence — activation
+    /// finishes on the spot by issuing `CompleteState` with the empty aggregate (otherwise the side
+    /// wedges waiting on a settle that never comes). The finish itself is the framework's, driven by
+    /// that command — see [`complete_projects_the_aggregated_result`].
     #[tokio::test]
     async fn activate_converges_a_map_with_no_items() {
         let activated = activate(
@@ -818,14 +799,6 @@ mod tests {
             seeded_scope(ThreadStatus::Running),
         )
         .await;
-
-        let mut completing = activated_activity(planned(vec![], 2));
-        // The finish falls back to the raw input as the raw result when the activity carries none.
-        completing.raw_output = Some(seeded_input());
-        completing.status = ActivityStatus::Completing;
-        let mut done = completing.clone();
-        done.status = ActivityStatus::Completed;
-        done.output = Some(json!([]));
 
         assert_eq!(
             activated.chain(),
@@ -841,37 +814,38 @@ mod tests {
                 EntryPayload::Event(Event::StateActivated {
                     activity: activated_activity(planned(vec![], 2))
                 }),
-                EntryPayload::Event(Event::StateCompleting {
-                    activity: completing
-                }),
-                EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
+                EntryPayload::Command(Command::CompleteState(CompleteState {
+                    activity: minted_activity_ref(),
                     output: json!([]),
                 })),
             ]
         );
     }
 
-    /// The base `finish` is a defensive fallback: reached only by a stray `CompleteState` on the
-    /// container (a real convergence goes through `finish_map`), it ignores the command's raw result
-    /// and completes the activity with its own input, routing down the terminal branch.
+    /// The finish a convergence issues, driven by the base `complete`: the command's raw result (the
+    /// aggregated per-item array) becomes `$states.result`, and with no `Output`/`Assign` it *is* the
+    /// activity's output — which then routes down the terminal branch.
     #[tokio::test]
-    async fn complete_completes_the_container_terminal() {
+    async fn complete_projects_the_aggregated_result() {
+        let aggregated = json!([{ "i": 0 }, { "i": 1 }]);
         let completed = complete(
-            &map_state(Some(MapItems::Array(vec![])), Some(2), Some(true)),
+            &map_state(
+                Some(MapItems::Array(vec![json!(1), json!(2)])),
+                Some(2),
+                Some(true),
+            ),
             complete_store(seeded_input(), []).await,
-            &complete_cmd(json!({ "ignored": true })),
+            &complete_cmd(aggregated.clone()),
         )
         .await;
 
         let mut completing = minted_activity(path("/States/P"), seeded_input());
         completing.input = Some(seeded_input());
-        completing.raw_output = Some(json!({ "ignored": true }));
+        completing.raw_output = Some(aggregated.clone());
         completing.status = ActivityStatus::Completing;
         let mut done = completing.clone();
         done.status = ActivityStatus::Completed;
-        done.output = Some(seeded_input());
+        done.output = Some(aggregated.clone());
 
         assert_eq!(
             completed.chain(),
@@ -882,7 +856,7 @@ mod tests {
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
                 EntryPayload::Command(Command::CompleteThread(CompleteThread {
                     thread: thread_ref(),
-                    output: seeded_input(),
+                    output: aggregated,
                 })),
             ]
         );
@@ -926,8 +900,9 @@ mod tests {
         )
     }
 
-    /// The last item's settle converges: every item's output aggregated in *item* order (not the order
-    /// the children happen to live in the map), then the state's success finish with that array.
+    /// The last item's settle converges: every item's output is aggregated in *item* order (not the
+    /// order the children happen to live in the map) into the `CompleteState` raw result the finish
+    /// then projects.
     #[tokio::test]
     async fn child_convergence_aggregates_items_in_index_order() {
         let items = vec![json!(1), json!(2)];
@@ -951,33 +926,14 @@ mod tests {
         )
         .await;
 
-        let mut finishing = minted_activity(path("/States/P"), seeded_input());
-        finishing.input = Some(seeded_input());
-        finishing.activity_state = Some(ActivityState::Map(MapActivityState {
-            items: vec![json!(1), json!(2)],
-            total: 2,
-            max_concurrency: 0,
-            children: item_children(&[0, 1]),
-        }));
-        // A container activity carries no raw result of its own, so the finish falls back to its input.
-        finishing.raw_output = Some(seeded_input());
-        finishing.status = ActivityStatus::Completing;
-        let mut done = finishing.clone();
-        done.status = ActivityStatus::Completed;
-        done.output = Some(aggregated.clone());
-
         assert_eq!(
             completed.chain(),
-            vec![
-                EntryPayload::Event(Event::StateCompleting {
-                    activity: finishing
-                }),
-                EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
+            vec![EntryPayload::Command(Command::CompleteState(
+                CompleteState {
+                    activity: minted_activity_ref(),
                     output: aggregated,
-                })),
-            ]
+                }
+            ))]
         );
     }
 

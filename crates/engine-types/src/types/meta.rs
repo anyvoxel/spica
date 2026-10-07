@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use crate::types::activity::ActivityKind;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::execution::ExecutionKind;
-use crate::types::thread::ThreadKind;
 use spica_machinery::Timestamp;
 
 pub use spica_machinery::name::{ObjectName, PlainName, ScopeName};
@@ -459,38 +458,6 @@ declare_owner! {
     TimerOwner {
         Execution => ExecutionKind,
         Activity => ActivityKind,
-    }
-}
-
-/// A terminal-failure scope: the two kinds a run's teardown can be directed at.
-///
-/// Not an owner slot — no object declares it as its [`ObjectKindMarker::OwnedBy`]; it names the two
-/// roles whose addressing differs, so a caller holding "the scope above me" cannot reach for the
-/// wrong verb. A `Thread` (the branch/item that must be stopped) terminates by reference via
-/// `TerminateThread`, while an `Execution` is addressed by name+uid and is reached only for the run
-/// itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnerScope {
-    Execution(ObjectRef<ExecutionKind>),
-    Thread(ObjectRef<ThreadKind>),
-}
-
-impl OwnerScope {
-    /// Recover the scope a flat reference names: the one seam where an address the engine carries
-    /// *flat* (a command's `execution`, an activity's `execution` anchor or owner) becomes a scope
-    /// type again. Those anchors are minted by the engine itself, so a reference that names no scope
-    /// is an anomaly, not a decision: it yields `None` — the caller records the failure without a
-    /// scope and the log names the address — rather than panicking the processor on a corrupt payload.
-    pub fn of_raw_object_ref(reference: &RawObjectRef) -> Option<Self> {
-        match reference.kind {
-            ObjectKind::Execution => ObjectRef::<ExecutionKind>::try_from(reference.clone())
-                .ok()
-                .map(OwnerScope::Execution),
-            ObjectKind::Thread => ObjectRef::<ThreadKind>::try_from(reference.clone())
-                .ok()
-                .map(OwnerScope::Thread),
-            _ => None,
-        }
     }
 }
 
@@ -1150,42 +1117,6 @@ mod tests {
         );
         let owner = ObjectRef::<TestKind>::try_from(matching).expect("the kind matches");
         assert_eq!(owner.as_raw_object_ref().kind, ObjectKind::Execution);
-    }
-
-    /// Every flat anchor a failure site holds (a command's `execution`, an activity's owner) reads
-    /// back as the scope it names, and one that names no scope answers `None` — the disposition the
-    /// fail paths give a leaf address, which must never be a panic: a corrupt payload cannot be
-    /// allowed to wedge the processor into a retry loop.
-    #[test]
-    fn a_flat_reference_is_read_back_as_the_scope_it_names() {
-        let run = RawObjectRef::new(
-            ObjectKind::Execution,
-            ObjectName::plain("execution").unwrap(),
-            ulid::Ulid::new(),
-        );
-        assert_eq!(
-            OwnerScope::of_raw_object_ref(&run),
-            Some(OwnerScope::Execution(ObjectRef::new(
-                run.name.clone(),
-                run.uid
-            )))
-        );
-
-        let thread = RawObjectRef::new(
-            ObjectKind::Thread,
-            ObjectName::plain("parallel").unwrap(),
-            ulid::Ulid::new(),
-        );
-        assert_eq!(
-            OwnerScope::of_raw_object_ref(&thread),
-            Some(OwnerScope::Thread(ObjectRef::new(
-                thread.name.clone(),
-                thread.uid
-            )))
-        );
-
-        // A nil reference is a `FlowVersion` placeholder: no scope, so no scope termination.
-        assert_eq!(OwnerScope::of_raw_object_ref(&RawObjectRef::nil()), None);
     }
 
     /// A thread's owner slot admits exactly the two scopes a thread can hang off, and the union adds

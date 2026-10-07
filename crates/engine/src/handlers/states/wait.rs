@@ -8,16 +8,15 @@ use super::super::{emit_timer, eval_string_or_expr};
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
-use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    ActivateState, Command, CompleteState, CompleteThread, TerminateState, TerminationReason,
+    ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
+use crate::types::meta::{HasRawObjectRef, ObjectKind};
 use crate::types::timer::TimerKind;
-use crate::{Activity, ActivityState, RejectionType, Variables, WaitActivityState};
+use crate::{Activity, ActivityState, Variables, WaitActivityState};
 
 /// The inclusive upper bound of a `Wait` `Seconds` value, per the ASL spec.
 const MAX_WAIT_SECONDS: i64 = 99_999_999;
@@ -133,16 +132,7 @@ impl StateHandler for WaitStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let Some(thread_container) = ThreadContainer::open(ctx.storage, owner).await?
-                else {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::NotFound,
-                        format!(
-                            "wait_state: activity {} has no owning thread; termination refused",
-                            activity_value.meta.object_ref()
-                        ),
-                    ));
-                };
+                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -165,7 +155,7 @@ impl StateHandler for WaitStateHandler<'_> {
                 .await;
                 thread_container
                     .after_child_terminated(ctx, out, &activity_ref)
-                    .await;
+                    .await?;
             }
         }
         Ok(())
@@ -198,18 +188,21 @@ impl StateHandler for WaitStateHandler<'_> {
             }
         }
         if pending == 0 {
+            let container =
+                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
                 "the terminate step that dispatched this after_terminating opened the activity as Terminating"
             );
-            let owner = activity_value.meta.owner.clone().into_raw_object_ref();
             let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
             out.append_event(Event::StateTerminated {
                 activity: terminated,
             })
             .await;
-            super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+            container
+                .after_child_terminated(ctx, out, &activity_ref)
+                .await?;
         } else {
             tracing::debug!(
                 activity = %activity_value.meta.object_ref(),
@@ -267,28 +260,6 @@ impl StateHandler for WaitStateHandler<'_> {
 
     fn complete_directly(&self, _activity: &Activity) -> bool {
         false
-    }
-
-    /// A `Wait`'s only child is its resume timer, and that timer's settle *is* its completion trigger:
-    /// the state resumes and finishes. The raw result is the activity's processed input — a `Wait`
-    /// produces no distinct raw output — carried as the `CompleteState` output, keeping the command
-    /// self-describing.
-    async fn child_completed(
-        &self,
-        _ctx: &mut HandlerContext<'_>,
-        out: &mut Collector<'_>,
-        activity: ObjectRef<ActivityKind>,
-        activity_value: &Activity,
-        _variables: &Variables,
-        _child: RawObjectRef,
-    ) {
-        out.append_command(Command::CompleteState(CompleteState {
-            activity,
-            output: activity_value
-                .input
-                .clone()
-                .unwrap_or(serde_json::Value::Null),
-        }));
     }
 }
 
@@ -451,12 +422,11 @@ impl WaitStateHandler<'_> {
 #[cfg(test)]
 mod tests {
     use spica_asl::WaitState;
-    use spica_storage::InMemoryStorage;
 
     use super::super::harness::*;
     use super::*;
     use crate::types::command::{
-        ActivateState, Command, CompleteState, CompleteThread, TerminateState, TerminationReason,
+        ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
     };
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::{HasRawObjectRef, ObjectMeta};
@@ -673,34 +643,6 @@ mod tests {
                 .status,
             ActivityStatus::Running,
             "the unwinding terminate is a command, not a fold: the row stays as the birth left it"
-        );
-    }
-
-    /// A `Wait`'s resume timer settling resumes and finishes the state: `child_completed` hands the
-    /// activity a `CompleteState` whose raw result is the Wait's processed input (a Wait produces no
-    /// distinct raw output) — the command the timer handler used to append itself.
-    #[tokio::test]
-    async fn child_completed_of_the_resume_timer_completes_the_activity() {
-        let mut store = InMemoryStorage::new();
-        let row = seeded_activity(seeded_input(), []);
-        seed_container(&mut store, row, []).await;
-
-        let completed = child_completed(
-            &wait_state(Some(30), Some("P2")),
-            store,
-            minted_activity_ref(),
-            resume_timer(deadline(30)).meta.raw_object_ref().clone(),
-        )
-        .await;
-
-        assert_eq!(
-            completed.chain(),
-            vec![EntryPayload::Command(Command::CompleteState(
-                CompleteState {
-                    activity: minted_activity_ref(),
-                    output: seeded_input(),
-                }
-            ))]
         );
     }
 }

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State, StatePath};
 
+use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::eval_env::{EvalEnv, extract_jsonata};
@@ -154,8 +155,8 @@ impl StateHandler for ChoiceStateHandler<'_> {
     /// (3.4) A `Choice` owns no child at all, so there is nothing to wait on: the whole complete path —
     /// decide the branch, then emit its terminal and its hop — runs here in one go, with no child
     /// count. Nothing reaches this state through the deferred drain either (see
-    /// `crate::handlers::continue_`): that hop exists to advance a state whose children settled, and
-    /// this one has none to settle.
+    /// `crate::handlers::continue_complete`): that hop exists to advance a state whose children settled,
+    /// and this one has none to settle.
     ///
     /// A decision failure is turned into a terminate here rather than returned: the activity is
     /// already `Completing`, so there is no later hop to report it from.
@@ -216,18 +217,21 @@ impl StateHandler for ChoiceStateHandler<'_> {
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
+        let container =
+            ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
             "the terminate step that dispatched this after_terminating opened the activity as Terminating"
         );
-        let owner = activity_value.meta.owner.clone().into_raw_object_ref();
         let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
         out.append_event(Event::StateTerminated {
             activity: terminated,
         })
         .await;
-        super::super::child_completed::child_settled(ctx, out, owner, activity_ref).await;
+        container
+            .after_child_terminated(ctx, out, &activity_ref)
+            .await?;
         Ok(())
     }
 }
