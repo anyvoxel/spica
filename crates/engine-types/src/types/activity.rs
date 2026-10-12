@@ -115,7 +115,7 @@ pub struct WaitActivityState {
 
 /// The `Map` state's activity-level runtime repository — the **static activation plan** projected
 /// from the `Map` activation product on `Event::StateActivated`. It drives the bounded-concurrency
-/// replenish loop in `MapStateHandler`:
+/// replenish loop in `MapStateElementBehavior`:
 ///
 /// - `items` is the iterable array the `Map` was entered with; `total` is its length (an empty Map
 ///   converges immediately to an empty array).

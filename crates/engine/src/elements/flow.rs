@@ -1,40 +1,38 @@
-//! `CreateFlow` command handler: creates a **brand-new flow** with its first version.
+//! The `Flow` element — a workflow **definition**: the name executions address, and the immutable
+//! versions that carry its ASL. Only its birth lives here; a version is never mutated afterwards.
 
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::CreateFlow;
 use crate::types::event::{Event, FlowCreated, FlowVersionCreated};
 use crate::types::flow::Flow;
-use crate::types::flow::FlowStatus;
 use crate::types::flow_version::FlowVersion;
 
-/// Handles the creation of a new flow **definition** (a new [`FlowName`] with its first immutable
-/// version).
-///
-/// This is the CCES analogue of Zeebe's Deployment processing: the single place a full definition
-/// enters the system for a **new** name. The handler assigns the durable identity — minting a fresh
-/// version reference (its `{flow_name}-{version}` object name plus a never-reused `uid`, the
-/// identity executions bind to, at the first `version` ordinal (`1`)) — then emits both
-/// [`Event::FlowCreated`] (the flow aggregate's birth) and [`Event::FlowVersionCreated`]
-/// (this first version) in one atomic command batch. From then on, executions reference only a
-/// version reference and the machine is resolved from Storage by it, never carried in a command again.
-///
-/// `CreateFlow` is **only** for a new name: the [`Engine::create_flow`](crate::Engine::create_flow)
-/// boundary pre-checks (and rejects) an existing name before appending, and the handler re-checks
-/// defensively below so a command forged straight into the log can never alias a second creation
-/// onto a live flow. Creating an *additional* version of an existing flow is a distinct future
-/// operation that emits only [`Event::FlowVersionCreated`] — for which that event is split out.
-///
-/// The definition travels as its **raw ASL string** (the `definition` field). The boundary
-/// validates it before anything is written, but the handler re-parses defensively so a command
-/// forged straight into the log can never fold a non-parseable definition into Storage — the
-/// invariant `FlowVersion.definition` always parses.
-#[derive(Default)]
-pub struct CreateFlowHandler;
+pub(crate) struct FlowElementBehavior;
 
-impl CreateFlowHandler {
-    pub(crate) async fn handle(
-        &self,
+impl FlowElementBehavior {
+    /// Create a **new** flow definition — a new name with its first immutable version — and hand back
+    /// the two rows it births.
+    ///
+    /// This is the CCES analogue of Zeebe's Deployment processing: the single place a full definition
+    /// enters the system for a **new** name. This element assigns the durable identity — minting a fresh
+    /// version reference (its `{flow_name}-{version}` object name plus a never-reused `uid`, the
+    /// identity executions bind to, at the first `version` ordinal (`1`)) — then emits both
+    /// [`Event::FlowCreated`] (the flow aggregate's birth) and [`Event::FlowVersionCreated`]
+    /// (this first version) in one atomic command batch. From then on, executions reference only a
+    /// version reference and the machine is resolved from Storage by it, never carried in a command again.
+    ///
+    /// `CreateFlow` is **only** for a new name: the [`Engine::create_flow`](crate::Engine::create_flow)
+    /// boundary pre-checks (and rejects) an existing name before appending, and this re-checks
+    /// defensively below so a command forged straight into the log can never alias a second creation
+    /// onto a live flow. Creating an *additional* version of an existing flow is a distinct future
+    /// operation that emits only [`Event::FlowVersionCreated`] — for which that event is split out.
+    ///
+    /// The definition travels as its **raw ASL string** (the `definition` field). The boundary
+    /// validates it before anything is written, but this re-parses defensively so a command
+    /// forged straight into the log can never fold a non-parseable definition into Storage — the
+    /// invariant `FlowVersion.definition` always parses.
+    pub(crate) async fn create(
         p: &CreateFlow,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
@@ -89,53 +87,33 @@ impl CreateFlowHandler {
         let flow_version = FlowVersion::version_name(name, 1);
         let flow_version_uid = ctx.mint();
         let created_at = ctx.now();
+        // The owner reference both rows are minted against: the flow's plain name plus its fresh uid,
+        // bundled once so the flow's own meta and its first version's owner cannot disagree on it.
+        let flow_ref = crate::types::meta::ObjectRef::new(
+            crate::types::meta::ObjectName::plain(name.as_str())
+                .expect("a valid FlowName is a valid user object name"),
+            flow_uid,
+        );
         tracing::info!(name = %name, uid = %flow_uid, version = %flow_version, "flow with first version created");
 
         // Emit the flow's birth and its first version in one atomic batch (same cause/stream). The
         // StreamProcessor routes the caller's ack on `FlowVersionCreated` (see `Event::FlowVersionCreated`).
         out.append_event(Event::FlowCreated(FlowCreated {
             request_id: *request_id,
-            // TODO：是不是提供一个 new 函数比较好？
-            flow: Flow {
-                // The flow carries its real, user-supplied name (the primary key) plus a fresh
-                // `meta.uid` — every object has an independent incarnation id.
-                meta: crate::types::meta::ObjectMeta::builder(flow_uid)
-                    .name(
-                        crate::types::meta::ObjectName::plain(name.as_str())
-                            .expect("a valid FlowName is a valid user object name"),
-                    )
-                    .at(created_at)
-                    // A flow is a root of its own tree: its owner slot is `NoOwner` by type.
-                    .with_owner(crate::types::meta::NoOwner::new()),
-                status: FlowStatus::Active,
-                // A flow is born with its first version (ordinal 1); the version applier advances
-                // this counter on later publishes.
-                latest_version: 1,
-            },
+            flow: Flow::new(flow_uid, name, created_at),
         }))
         .await;
         // The CreateFlow caller awaits the request echoed on this `FlowVersionCreated` (the version's
         // birth); an injected `Hook` observer wakes it as soon as the engine reports this event applied.
         let version_event = Event::FlowVersionCreated(FlowVersionCreated {
             request_id: *request_id,
-            flow_version: FlowVersion {
-                // A flow version is owned by its flow: the meta carries an owner reference to the
-                // owning `Flow` (same scope, inherited) bundling the flow's own name and uid. The
-                // slot's type names the kind, so only the name/uid parts are passed.
-                meta: crate::types::meta::ObjectMeta::builder(flow_version_uid)
-                    .name(flow_version)
-                    .at(created_at)
-                    .with_owner(crate::types::meta::ObjectRef::new(
-                        crate::types::meta::ObjectName::plain(name.as_str())
-                            .expect("a valid FlowName is a valid user object name"),
-                        flow_uid,
-                    )),
-                version: 1,
-                definition: definition.clone(),
-                // Fingerprint the raw definition once at the single mint point; it rides the event
-                // to storage unchanged (a version's content is immutable once created).
-                checksum: FlowVersion::definition_checksum(definition),
-            },
+            flow_version: FlowVersion::new(
+                flow_version_uid,
+                &flow_ref,
+                1,
+                definition.clone(),
+                created_at,
+            ),
         });
         out.append_event(version_event).await;
 

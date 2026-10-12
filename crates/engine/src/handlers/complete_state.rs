@@ -5,7 +5,7 @@ use crate::types::error::ExecutionError;
 
 /// Handles `Command::CompleteState`: the success finish of the running activity bound to it.
 /// Dispatches to the matching
-/// [`StateHandler::complete`](crate::handlers::state_handler::StateHandler::complete),
+/// [`StateHandler::complete`](crate::elements::state_handler::StateHandler::complete),
 /// which emits the projection
 /// (`StateCompleting` + `StateCompleted`) and the transition. If the activity owns children (M2
 /// states only), the ed is deferred until they finish — only M1 synchronous/timed states reach here

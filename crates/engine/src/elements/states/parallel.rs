@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{ParallelState, State};
 
-use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::RejectionType;
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
@@ -24,7 +25,7 @@ use crate::{Activity, ActivityState, Variables};
 /// to reach a terminal state, then transitions — or fails the whole state if any branch fails.
 ///
 /// Fan-out is **flat, not recursive**: each branch runs as a *child execution* (see
-/// [`SpawnThreadHandler`](super::super::spawn_thread::SpawnThreadHandler)) rooted under this
+/// [`ThreadElementBehavior::spawn`](crate::elements::ThreadElementBehavior::spawn)) rooted under this
 /// activity and carrying a [`state_path`](crate::storage::ExecutionRecord), so a branch resolves its
 /// own states within the single shared machine document without copying any definition. The
 /// `Parallel` activity stays `Running` owning those children; it converges — by issuing its own
@@ -56,16 +57,16 @@ impl StateHandlerFactory for ParallelStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(ParallelStateHandler { state: s })
+        Box::new(ParallelStateElementBehavior { state: s })
     }
 }
 
-struct ParallelStateHandler<'a> {
+struct ParallelStateElementBehavior<'a> {
     state: &'a ParallelState,
 }
 
 #[async_trait]
-impl StateHandler for ParallelStateHandler<'_> {
+impl StateHandler for ParallelStateElementBehavior<'_> {
     /// (3.4) A `Parallel` converges by *issuing* `CompleteState` — from `child_completed` on the last
     /// branch settle, or from `after_activated` on a branchless definition — so this hook is the finish
     /// the framework then owns, the same shape a `Map`'s or a `Task`'s settle drives. The command's raw
@@ -216,7 +217,7 @@ impl StateHandler for ParallelStateHandler<'_> {
         // its owner thread's container, which advances the scope.
         if act.active_children.is_empty() {
             let container =
-                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -428,7 +429,7 @@ impl StateHandler for ParallelStateHandler<'_> {
     }
 }
 
-impl ParallelStateHandler<'_> {
+impl ParallelStateElementBehavior<'_> {
     /// Fail the `Parallel` activity — the ASL "any branch fails ⇒ whole Parallel fails" rule. The
     /// activity's own terminate is what stops the surviving sibling branches, since the sweep it runs
     /// takes down the branch threads this activity owns.

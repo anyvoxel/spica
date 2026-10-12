@@ -1,15 +1,16 @@
-use super::state_handler::StateHandlerRegistry;
-use super::states::{
+use super::{
+    ActivateStateHandler, CompleteStateHandler, ContinueCompleteHandler, ContinueTerminateHandler,
+    TerminateStateHandler,
+};
+use crate::elements::state_handler::StateHandlerRegistry;
+use crate::elements::states::{
     ChoiceStateHandlerFactory, FailStateHandlerFactory, MapStateHandlerFactory,
     ParallelStateHandlerFactory, PassStateHandlerFactory, SucceedStateHandlerFactory,
     TaskStateHandlerFactory, WaitStateHandlerFactory,
 };
-use super::{
-    ActivateStateHandler, ActivateTaskHandler, CancelTaskHandler, CancelTimerHandler,
-    ClaimTasksHandler, CompleteExecutionHandler, CompleteStateHandler, CompleteTaskHandler,
-    CompleteThreadHandler, ContinueCompleteHandler, ContinueTerminateHandler,
-    CreateExecutionHandler, CreateFlowHandler, FailTaskHandler, SpawnThreadHandler,
-    TerminateExecutionHandler, TerminateStateHandler, TerminateThreadHandler, TriggerTimerHandler,
+use crate::elements::{
+    ExecutionElementBehavior, FlowElementBehavior, TaskElementBehavior, ThreadElementBehavior,
+    TimerElementBehavior,
 };
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::Command;
@@ -66,23 +67,23 @@ pub(crate) async fn dispatch_command(
     out: &mut Collector<'_>,
 ) -> Result<(), ProcessingError> {
     match command {
-        Command::CreateFlow(p) => CreateFlowHandler.handle(p, ctx, out).await,
-        Command::CreateExecution(p) => CreateExecutionHandler.handle(p, ctx, out).await,
-        Command::SpawnThread(p) => SpawnThreadHandler.handle(p, ctx, out).await,
-        Command::CompleteExecution(p) => CompleteExecutionHandler.handle(p, ctx, out).await,
-        Command::CompleteThread(p) => CompleteThreadHandler.handle(p, ctx, out).await,
-        Command::TerminateExecution(p) => TerminateExecutionHandler.handle(p, ctx, out).await,
-        Command::TerminateThread(p) => TerminateThreadHandler.handle(p, ctx, out).await,
+        Command::CreateFlow(p) => FlowElementBehavior::create(p, ctx, out).await,
+        Command::CreateExecution(p) => ExecutionElementBehavior::create(p, ctx, out).await,
+        Command::SpawnThread(p) => ThreadElementBehavior::spawn(p, ctx, out).await,
+        Command::CompleteExecution(p) => ExecutionElementBehavior::complete(p, ctx, out).await,
+        Command::CompleteThread(p) => ThreadElementBehavior::complete(p, ctx, out).await,
+        Command::TerminateExecution(p) => ExecutionElementBehavior::terminate(p, ctx, out).await,
+        Command::TerminateThread(p) => ThreadElementBehavior::terminate(p, ctx, out).await,
         Command::ActivateState(p) => ActivateStateHandler.handle(p, ctx, out).await,
         Command::CompleteState(p) => CompleteStateHandler.handle(p, ctx, out).await,
         Command::TerminateState(p) => TerminateStateHandler.handle(p, ctx, out).await,
-        Command::ActivateTask(p) => ActivateTaskHandler.handle(p, ctx, out).await,
-        Command::ClaimTasks(p) => ClaimTasksHandler.handle(p, ctx, out).await,
-        Command::CompleteTask(p) => CompleteTaskHandler.handle(p, ctx, out).await,
-        Command::FailTask(p) => FailTaskHandler.handle(p, ctx, out).await,
-        Command::TriggerTimer { timer } => TriggerTimerHandler.handle(timer, ctx, out).await,
-        Command::CancelTimer { timer } => CancelTimerHandler.handle(timer, ctx, out).await,
-        Command::CancelTask { task } => CancelTaskHandler.handle(task, ctx, out).await,
+        Command::ActivateTask(p) => TaskElementBehavior::activate(p, ctx, out).await,
+        Command::ClaimTasks(p) => TaskElementBehavior::claim(p, ctx, out).await,
+        Command::CompleteTask(p) => TaskElementBehavior::complete(p, ctx, out).await,
+        Command::FailTask(p) => TaskElementBehavior::fail(p, ctx, out).await,
+        Command::TriggerTimer { timer } => TimerElementBehavior::trigger(timer, ctx, out).await,
+        Command::CancelTimer { timer } => TimerElementBehavior::cancel(timer, ctx, out).await,
+        Command::CancelTask { task } => TaskElementBehavior::cancel(task, ctx, out).await,
         Command::ContinueComplete { owner } => {
             ContinueCompleteHandler.handle(owner, ctx, out).await
         }

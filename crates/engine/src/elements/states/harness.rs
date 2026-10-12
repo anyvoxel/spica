@@ -25,7 +25,7 @@ use spica_storage::InMemoryStorage;
 use crate::StatePath;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink};
-use crate::handlers::dispatch::build_state_handlers;
+use crate::handlers::build_state_handlers;
 use crate::storage::ReadonlyStorageTxn;
 use crate::storage::{ActivityRecord, Storage, ThreadRecord};
 use crate::types::command::{ActivateState, CompleteState};
@@ -300,7 +300,7 @@ impl Dispatch {
     }
 }
 
-/// Drive `state`'s inherited [`StateHandler::activate`](crate::handlers::state_handler::StateHandler)
+/// Drive `state`'s inherited [`StateHandler::activate`](crate::elements::state_handler::StateHandler)
 /// once over a working overlay — the leader's shape, so the emitted `StateActivating`/`StateActivated`
 /// (and any timer a state arms) fold into the transaction and a later read sees them. `scope` is the
 /// row the leader would already have read and screened for it, seeded here so the fold has an owner to
@@ -351,7 +351,7 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: ThreadRecord) -
     Dispatch { entries, store }
 }
 
-/// Drive `state`'s inherited [`StateHandler::complete`](crate::handlers::state_handler::StateHandler)
+/// Drive `state`'s inherited [`StateHandler::complete`](crate::elements::state_handler::StateHandler)
 /// once over `store` — the mirror of [`activate`], seeded either from a preceding activation's store or
 /// from [`complete_store`]. The two rows the dispatcher would have read and screened are read back out
 /// of the overlay here, exactly as `dispatch_command`'s `CompleteState` path reads them.
@@ -400,7 +400,7 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
     Dispatch { entries, store }
 }
 
-/// Drive `state`'s [`StateHandler::child_completed`](crate::handlers::state_handler::StateHandler)
+/// Drive `state`'s [`StateHandler::child_completed`](crate::elements::state_handler::StateHandler)
 /// once over `store` — the container half of the lifecycle, reached in production through
 /// the container's `Running`-activity arm.
 ///

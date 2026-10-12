@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta};
+use crate::Timestamp;
+use crate::types::id::FlowName;
+use crate::types::meta::{NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName};
 
 /// The lifecycle status of a [`Flow`]. Deletion is a `TODO` (M1/M2): a flow is created `Active`
 /// and may become `Deleted` once a delete (cascade) operation lands — currently nothing transitions
@@ -56,4 +58,40 @@ pub struct Flow {
     /// publishing a new version increments it (see the `FlowVersionCreated` applier). Kept as an
     /// O(1) counter so "latest version" resolves without a scan; the initial version is `1`.
     pub latest_version: u32,
+}
+
+impl Flow {
+    /// Birth a flow at `name`, at identity `uid` and birth time `created_at`. A flow is born the
+    /// only way it can exist at birth — `Active`, holding version ordinal `1`, and a tenant-level
+    /// root with no owner — so the caller supplies the minted `uid` and the moment, and no
+    /// combination of fields an unborn flow cannot have is expressible.
+    pub fn new(uid: ulid::Ulid, name: &FlowName, created_at: Timestamp) -> Self {
+        Self {
+            meta: ObjectMeta::builder(uid)
+                .name(ObjectName::plain(name.as_str()).expect("a FlowName is a valid object name"))
+                .at(created_at)
+                .with_owner(NoOwner::new()),
+            status: FlowStatus::Active,
+            latest_version: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flow is born only one way — `Active`, at ordinal `1`, ownerless — so the constructor fixes
+    /// that state rather than accepting it, and names the flow after its own (plain) user name.
+    #[test]
+    fn new_births_an_active_ownerless_flow_at_version_one() {
+        let at = Timestamp::from_millis(1_000);
+        let flow = Flow::new(ulid::Ulid::new(), &FlowName::new("order").unwrap(), at);
+        assert_eq!(flow.meta.name.as_str(), "order");
+        assert_eq!(flow.meta.created_at, at);
+        assert_eq!(flow.status, FlowStatus::Active);
+        assert_eq!(flow.latest_version, 1);
+        // A tenant-level root's owner slot is `NoOwner` by type — see `FlowKind::OwnedBy`.
+        assert_eq!(flow.meta.owner, NoOwner::new());
+    }
 }

@@ -24,9 +24,9 @@ use spica_machinery::{Clock, IdGenerator};
 use tracing::{debug, warn};
 
 use crate::applier::{ApplierContext, dispatch_event};
+use crate::elements::state_handler::StateHandlerRegistry;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
-use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::handlers::{build_state_handlers, dispatch_command};
 use crate::log::{Entry, EntryPayload, Timestamp};
 use crate::processing::{CommandProcessed, ProcessingHandles};
@@ -176,10 +176,10 @@ impl Leader {
     /// the command's own state, so re-dispatching could only repeat it — it is refused immediately.
     ///
     /// Either way a refusal is recorded as the command's **single** response entry, so the engine's
-    /// *every command has a subsequent entry* invariant holds even for a dispatch that produced
-    /// nothing: the awaiting caller is woken by [`Collector::reject`]'s record rather than left
-    /// hanging on a silent return. The failed attempt's own batch is dropped unappended (its working
-    /// txn was never committed), so the refusal is recorded on a fresh batch.
+    /// *every command has a subsequent entry* invariant holds on this path too: the awaiting caller is
+    /// woken by [`Collector::reject`]'s record rather than left hanging on a silent return. The failed
+    /// attempt's own batch is dropped unappended (its working txn was never committed), so the refusal
+    /// is recorded on a fresh batch.
     ///
     /// Kept off the caller's stack: the driver's `?` sees only the unexpected failures of the
     /// *engine* (a store that cannot even open the refusal's transaction), which are not the command's.
@@ -250,6 +250,17 @@ impl Leader {
         // nothing in `last_applied` — survives an attempt that produced no outcome.
         dispatch_command(command, &mut ctx, &mut out).await?;
         let entries = out.into_parts();
+        // Every command answers with an entry — an `Event` (applied), a follow-up `Command`, or an
+        // in-band `Reject` — so a handler that returns `Ok` having emitted nothing is a broken
+        // handler, not a quiet no-op. Asserted rather than refused: a refusal here would mint a
+        // `Reject` that names the wrong culprit (the command is fine; the handler is not), and the
+        // caller could not tell it from a legitimate refusal. An "already advanced past it" command
+        // answers by *refusing*, not by staying silent — see `ThreadElementBehavior::complete`.
+        assert!(
+            !entries.is_empty(),
+            "dispatch of {command:?} produced no entry; every command answers with an event, a \
+             follow-up command or a reject"
+        );
         // Record the produced Events for the driver's `after_commit` once this batch is durable
         // (the Zeebe post-commit report). Set here rather than in `apply_batch` (which no longer
         // exists on the live path): the fold happened eagerly at `append_event` time.

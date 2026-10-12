@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{IntOrExpr, MapItems, MapState, State};
 
-use super::super::container::{Container, ThreadContainer};
-use super::super::eval_string_or_expr;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::RejectionType;
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
@@ -29,7 +30,7 @@ use crate::{Activity, ActivityState, MapActivityState, Variables};
 /// leeway is a deferred TODO; the current behavior equals the ASL default of tolerating 0 failures).
 ///
 /// Each item runs through the exact same `SpawnThread` fan-out a `Parallel` branch uses (see
-/// [`crate::handlers::spawn_thread::SpawnThreadHandler`]): a child execution rooted under this
+/// [`ThreadElementBehavior::spawn`](crate::elements::ThreadElementBehavior::spawn)): a child execution rooted under this
 /// activity and carrying a [`state_path`](crate::storage::ExecutionRecord) of
 /// `/States/<map>/ItemProcessor/States` (the processor's own `States` table in the single shared
 /// machine document — the same shape of pointer a root thread carries). The Map activity stays
@@ -66,16 +67,16 @@ impl StateHandlerFactory for MapStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(MapStateHandler { state: s })
+        Box::new(MapStateElementBehavior { state: s })
     }
 }
 
-struct MapStateHandler<'a> {
+struct MapStateElementBehavior<'a> {
     state: &'a MapState,
 }
 
 #[async_trait]
-impl StateHandler for MapStateHandler<'_> {
+impl StateHandler for MapStateElementBehavior<'_> {
     /// (3.4) A `Map` converges by *issuing* `CompleteState` — from `child_completed` on the last item
     /// settle, or from `after_activated` on an empty plan — so this hook is the finish the framework
     /// then owns, the same shape a `Task`'s or a `Wait`'s settle drives. The command's raw result,
@@ -227,7 +228,7 @@ impl StateHandler for MapStateHandler<'_> {
             // the same reaction point a `Fail`'s terminate uses, which advances a thread already
             // draining this child and takes down a still-`Running` one from the reason on the row.
             let container =
-                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -514,7 +515,7 @@ impl StateHandler for MapStateHandler<'_> {
     }
 }
 
-impl MapStateHandler<'_> {
+impl MapStateElementBehavior<'_> {
     /// Resolve the items array the Map iterates. `Items` is either a literal array or a JSONata
     /// string that must evaluate to an array; when absent it defaults to the state's input when that
     /// is an array. `ItemSelector` (which transforms each element) is a deferred TODO.

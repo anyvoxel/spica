@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{AssignObject, ChoiceCondition, ChoiceState, State, StatePath};
 
-use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::{EvalEnv, extract_jsonata};
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
@@ -28,11 +29,11 @@ impl StateHandlerFactory for ChoiceStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(ChoiceStateHandler { state: s })
+        Box::new(ChoiceStateElementBehavior { state: s })
     }
 }
 
-struct ChoiceStateHandler<'a> {
+struct ChoiceStateElementBehavior<'a> {
     state: &'a ChoiceState,
 }
 
@@ -44,7 +45,7 @@ struct ChoiceBranch {
     output: Value,
 }
 
-impl ChoiceStateHandler<'_> {
+impl ChoiceStateElementBehavior<'_> {
     /// Resolve the chosen branch: the first rule whose condition evaluates true, or the state
     /// `Default` when none matches. Returns that branch's `Assign` + `Output` + `next`; a rule with
     /// no condition never matches, and a state with neither a match nor a `Default` yields
@@ -151,7 +152,7 @@ impl ChoiceStateHandler<'_> {
 }
 
 #[async_trait]
-impl StateHandler for ChoiceStateHandler<'_> {
+impl StateHandler for ChoiceStateElementBehavior<'_> {
     /// (3.4) A `Choice` owns no child at all, so there is nothing to wait on: the whole complete path —
     /// decide the branch, then emit its terminal and its hop — runs here in one go, with no child
     /// count. Nothing reaches this state through the deferred drain either (see
@@ -218,7 +219,7 @@ impl StateHandler for ChoiceStateHandler<'_> {
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let container =
-            ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),

@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use spica_asl::{FailState, State};
 
-use super::super::container::{Container, ThreadContainer};
-use super::super::eval_string_or_expr;
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::Variables;
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::eval_string_or_expr;
 use crate::types::command::{Command, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
@@ -29,16 +30,16 @@ impl StateHandlerFactory for FailStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(FailStateHandler { state: s })
+        Box::new(FailStateElementBehavior { state: s })
     }
 }
 
-struct FailStateHandler<'a> {
+struct FailStateElementBehavior<'a> {
     state: &'a FailState,
 }
 
 #[async_trait]
-impl StateHandler for FailStateHandler<'_> {
+impl StateHandler for FailStateElementBehavior<'_> {
     /// (3.4) A `Fail` owns no child at all, so there is nothing to wait on: the whole complete path —
     /// decide the reason, emit the activity's failure ed, then terminate the owning scope — runs here
     /// in one go, with no child count. Nothing reaches this state through the deferred drain either
@@ -69,7 +70,7 @@ impl StateHandler for FailStateHandler<'_> {
         // answered while the activity is still intact. An activity's owner slot admits only a
         // `Thread`, so the container is read directly.
         let owner = activity_value.meta.owner.clone();
-        let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
+        let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
 
         // Emit the activity's failure ed. `StateTerminating` + `StateTerminated` replace the
         // `StateCompleted` a successful complete would emit. Each status is advanced in place on the
@@ -96,7 +97,7 @@ impl StateHandler for FailStateHandler<'_> {
         .await;
 
         // Hand the settled activity to its owning thread's container; the scope's own termination
-        // follows from the state's failure (see `ThreadContainer::after_child_terminated`).
+        // follows from the state's failure (see `ThreadElementBehavior::after_child_terminated`).
         thread_container
             .after_child_terminated(ctx, out, &activity_ref)
             .await?;
@@ -113,7 +114,7 @@ impl StateHandler for FailStateHandler<'_> {
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let container =
-            ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
@@ -131,7 +132,7 @@ impl StateHandler for FailStateHandler<'_> {
     }
 }
 
-impl FailStateHandler<'_> {
+impl FailStateElementBehavior<'_> {
     /// The `Fail` decision itself: build `$states` and evaluate `Error`/`Cause` (when present) into
     /// the termination reason — the mirror of `Choice`'s `process_choice`, returning the decided
     /// value for `after_completing` to turn into the failure ed, and an `Err` for it to terminate on.

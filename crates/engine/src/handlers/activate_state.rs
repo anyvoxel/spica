@@ -4,11 +4,11 @@ use crate::types::command::ActivateState;
 use crate::types::error::ExecutionError;
 
 /// Dispatches `Command::ActivateState` to the matching
-/// [`StateHandlerRegistry::create`](crate::handlers::state_handler::StateHandlerRegistry::create)
+/// [`StateHandlerRegistry::create`](crate::elements::state_handler::StateHandlerRegistry::create)
 /// bound handler. It is deliberately thin: it reads the owning thread once — resolving the state
 /// definition from that same row and screening its liveness — then hands the command, the resolved
 /// definition and the row it read to the base
-/// [`StateHandler::activate`](crate::handlers::state_handler::StateHandler::activate),
+/// [`StateHandler::activate`](crate::elements::state_handler::StateHandler::activate),
 /// which owns the whole orchestration (constructing the activity, emitting
 /// `StateActivating`/`StateActivated`, and running the state's activate hooks). Every precondition
 /// lives here because this is the one place the scope is read.

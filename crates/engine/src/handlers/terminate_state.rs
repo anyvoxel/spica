@@ -8,10 +8,10 @@ use crate::types::error::ExecutionError;
 /// Handles `Command::TerminateState`: the abnormal finish of the activity bound to it. Resolves the
 /// owning thread + its machine/state definition just far enough to pick the right handler and screen
 /// the rows it read, then delegates to the base
-/// [`StateHandler::terminate`](crate::handlers::state_handler::StateHandler::terminate), which owns
+/// [`StateHandler::terminate`](crate::elements::state_handler::StateHandler::terminate), which owns
 /// the terminate orchestration — mirroring how
 /// [`CompleteStateHandler`](crate::handlers::CompleteStateHandler) dispatches to
-/// [`StateHandler::complete`](crate::handlers::state_handler::StateHandler::complete).
+/// [`StateHandler::complete`](crate::elements::state_handler::StateHandler::complete).
 ///
 /// It is also the one place a failing state's **scope** is taken down: an activity is always owned by
 /// a [`Thread`](crate::Thread) (the slot's own type — a top-level run's derived root thread, or a
@@ -77,7 +77,7 @@ impl TerminateStateHandler {
     }
 
     /// Resolve the owning thread + its machine/state definition to reach the per-state
-    /// [`StateHandler::terminate`](crate::handlers::state_handler::StateHandler::terminate), mirroring
+    /// [`StateHandler::terminate`](crate::elements::state_handler::StateHandler::terminate), mirroring
     /// `CompleteStateHandler` exactly: each of these rows is a hard precondition of this command, so a
     /// read that comes up short (a forged/corrupt projection) is refused rather than answered with a
     /// generic sweep — a terminate whose state cannot be named would guess at the state's own teardown

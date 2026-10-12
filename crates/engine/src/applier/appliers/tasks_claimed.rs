@@ -20,7 +20,7 @@ impl TasksClaimedApplier {
             tasks,
         } = event;
         // Fold each claim **only while the task is still claimable** — the conditional exactly-once
-        // stake. The batch was decided at discovery time (see `ClaimTasksHandler`), so a racing pull
+        // stake. The batch was decided at discovery time (see `TaskElementBehavior::claim`), so a racing pull
         // can learn of a task it no longer legitimately owns, or a stale/replayed `TasksClaimed` can
         // arrive after a cancel or a settlement; overwriting in those cases would wrongly hand the
         // task to a worker who doesn't own it. Skipping one entry leaves the task with whoever does
