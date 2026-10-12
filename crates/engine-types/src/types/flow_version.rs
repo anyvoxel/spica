@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
+use crate::Timestamp;
 use crate::types::flow::FlowKind;
 use crate::types::id::FlowName;
 use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectName, ObjectRef};
@@ -63,6 +64,36 @@ pub struct FlowVersion {
 }
 
 impl FlowVersion {
+    /// Mint version `version` of the flow `flow` points at, at identity `uid` and birth time
+    /// `created_at`. The two fields that must never drift from their source — the generated
+    /// `{flow}-{version}` addressing key and the definition fingerprint — are derived here, so a
+    /// caller supplies only inputs and cannot hand-build a version whose name or `checksum`
+    /// disagrees with its content. The owner is `flow` itself: a version *is* its flow's snapshot,
+    /// and reading the flow's name off that reference is the same direction [`Self::flow_name`] uses.
+    pub fn new(
+        uid: ulid::Ulid,
+        flow: &ObjectRef<FlowKind>,
+        version: u32,
+        definition: impl Into<String>,
+        created_at: Timestamp,
+    ) -> Self {
+        let flow_name = flow
+            .name()
+            .as_plain()
+            .expect("a Flow's name is a user plain name, never a generated one");
+        let definition = definition.into();
+        let checksum = Self::definition_checksum(&definition);
+        Self {
+            meta: ObjectMeta::builder(uid)
+                .name(Self::version_name(flow_name, version))
+                .at(created_at)
+                .with_owner(flow.clone()),
+            version,
+            definition,
+            checksum,
+        }
+    }
+
     /// The addressing `ObjectName` of version `version` under flow `name`: `{name}-{version}` with a
     /// plain **decimal** ordinal (e.g. `order-1`, `order-10`). Versions of one flow do **not** order
     /// by name — decimal lexicographic order diverges from numeric (`order-10` sorts before
@@ -107,6 +138,31 @@ mod tests {
     use crate::types::flow::Flow;
     use crate::types::meta::{ObjectName, ObjectRef};
     use spica_machinery::Timestamp;
+
+    /// The constructor mints the two fields that must track their source — the `{flow}-{version}`
+    /// addressing key and the definition fingerprint — rather than accepting them, so a version
+    /// always names itself after its flow/ordinal and always checksums what it stores.
+    #[test]
+    fn new_derives_name_owner_and_checksum_from_its_inputs() {
+        let flow = FlowName::new("order").unwrap();
+        let flow_uid = ulid::Ulid::new();
+        let owner = ObjectRef::new(ObjectName::plain("order").unwrap(), flow_uid);
+        let version = FlowVersion::new(
+            ulid::Ulid::new(),
+            &owner,
+            7,
+            "{\"StartAt\":\"A\"}",
+            Timestamp::from_millis(0),
+        );
+        assert_eq!(version.meta.name.as_str(), "order-7");
+        assert_eq!(version.version, 7);
+        assert_eq!(version.flow_owner(), &owner);
+        assert_eq!(version.flow_name(), flow);
+        assert_eq!(
+            version.checksum,
+            FlowVersion::definition_checksum("{\"StartAt\":\"A\"}")
+        );
+    }
 
     #[test]
     fn version_name_encodes_flow_and_decimal_ordinal() {

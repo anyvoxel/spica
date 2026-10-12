@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{PassState, State, StatePath};
 
-use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{
@@ -29,11 +30,11 @@ impl StateHandlerFactory for PassStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(PassStateHandler { state: s })
+        Box::new(PassStateElementBehavior { state: s })
     }
 }
 
-struct PassStateHandler<'a> {
+struct PassStateElementBehavior<'a> {
     state: &'a PassState,
 }
 
@@ -51,7 +52,7 @@ enum PassFinish {
 }
 
 #[async_trait]
-impl StateHandler for PassStateHandler<'_> {
+impl StateHandler for PassStateElementBehavior<'_> {
     /// (3.4) The canonical ASL success projection runs here in one go — a `Pass` owns no child to
     /// wait on, so there is nothing to defer, mirroring `Choice`/`Fail`. A projection failure is
     /// turned into a terminate here rather than returned: the activity is already `Completing`, so
@@ -123,7 +124,7 @@ impl StateHandler for PassStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
+                let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -163,7 +164,7 @@ impl StateHandler for PassStateHandler<'_> {
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
         let container =
-            ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
@@ -181,7 +182,7 @@ impl StateHandler for PassStateHandler<'_> {
     }
 }
 
-impl PassStateHandler<'_> {
+impl PassStateElementBehavior<'_> {
     /// The `Pass` complete step: build `$states`, apply `Assign` (emitting `VariablesAssigned` on the
     /// owner scope), project `Output` (defaulting to the input), and decide the routing — the
     /// canonical success finish, mirroring `Choice`'s `process_choice`. It emits nothing about the

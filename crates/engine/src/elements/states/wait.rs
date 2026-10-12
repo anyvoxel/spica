@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{IntOrExpr, State, StatePath, WaitState, WaitTimestamp};
 
-use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use super::super::{emit_timer, eval_string_or_expr};
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::{emit_timer, eval_string_or_expr};
 use crate::log::Timestamp;
 use crate::types::command::{
     ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
@@ -35,11 +36,11 @@ impl StateHandlerFactory for WaitStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(WaitStateHandler { state: s })
+        Box::new(WaitStateElementBehavior { state: s })
     }
 }
 
-struct WaitStateHandler<'a> {
+struct WaitStateElementBehavior<'a> {
     state: &'a WaitState,
 }
 
@@ -57,10 +58,10 @@ enum WaitFinish {
 }
 
 #[async_trait]
-impl StateHandler for WaitStateHandler<'_> {
+impl StateHandler for WaitStateElementBehavior<'_> {
     /// (3.4) A `Wait` reaches its complete step only through its resume timer's settle — the timer's
     /// fire is what issues the `CompleteState`, and its settle has already drained the child edge in
-    /// the same batch (see `WaitStateHandler::child_completed`), so the state is always childless
+    /// the same batch (see `WaitStateElementBehavior::child_completed`), so the state is always childless
     /// here. Its whole complete path — project, then hand the finish's settle to the owning thread's
     /// container or the successor — runs in one go, mirroring `Pass`/`Choice`. A projection failure
     /// is turned into a terminate here rather than returned: the activity is already `Completing`, so
@@ -132,7 +133,7 @@ impl StateHandler for WaitStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
+                let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -189,7 +190,7 @@ impl StateHandler for WaitStateHandler<'_> {
         }
         if pending == 0 {
             let container =
-                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -263,7 +264,7 @@ impl StateHandler for WaitStateHandler<'_> {
     }
 }
 
-impl WaitStateHandler<'_> {
+impl WaitStateElementBehavior<'_> {
     /// The `Wait` complete step: build `$states`, apply `Assign` (emitting `VariablesAssigned` on the
     /// owner scope), project `Output` (defaulting to the raw result), and decide the routing — the
     /// canonical success finish, mirroring `Pass`'s `process_pass`. It emits nothing about the

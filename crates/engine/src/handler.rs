@@ -4,8 +4,8 @@ use std::sync::Arc;
 use spica_asl::StateMachine;
 use spica_machinery::{Clock, IdGenerator};
 
+use crate::elements::state_handler::StateHandlerRegistry;
 use crate::eval_env::EvalEnv;
-use crate::handlers::state_handler::StateHandlerRegistry;
 use crate::log::{Entry, EntryPayload, Timestamp};
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::command::Command;
@@ -175,10 +175,9 @@ impl<'a> Collector<'a> {
     /// awakes the awaiter directly as it reads the record (see the `EntryPayload::Reject` arm in
     /// `processor.rs`) — no projection is folded for a refusal.
     ///
-    /// Only **client-originated awaiting** commands (`request_id` present) reject; an internal
-    /// follow-up no-op (a replayed terminal command whose state already advanced past it) stays
-    /// silent — there is no one to respond to. A command whose refusal has no awaiting caller still
-    /// emits the `Reject` record for the durable audit trail.
+    /// So a command with no awaiting caller still emits its `Reject` record for the durable audit
+    /// trail — silence is never an answer. A duplicated or already-advanced-past command is refused
+    /// like any other, which is what lets the dispatcher assert that every command produced an entry.
     ///
     /// - `request_id` — the command's correlating [`RequestId`] (the same id that would have echoed
     ///   on its success `Event`).

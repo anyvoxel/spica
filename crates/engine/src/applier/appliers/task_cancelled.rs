@@ -15,7 +15,7 @@ impl TaskCancelledApplier {
         task: &Task,
     ) -> Result<(), ExecutionError> {
         // Mark the task Cancelled and drain it from its owning activity. The physical call is left
-        // running; a later `CompleteTask` for this task is swallowed by the `CompleteTaskHandler`'s
+        // running; a later `CompleteTask` for this task is swallowed by the `TaskElementBehavior::complete`'s
         // non-`Running` guard.
         if let Some(mut t) = ctx.storage.get_task(&task.meta.object_ref()).await? {
             let parent = t

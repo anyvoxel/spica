@@ -1,22 +1,35 @@
-//! The **container side** of a child settling: what an owner does when one of its owned nodes reaches
-//! a terminal state.
+//! Per-object **element** behavior — every piece of one kind of workflow object's lifecycle logic in
+//! one place.
 //!
-//! A settling node names only its owner. What that settle *means* is the owner's business, so the
-//! reaction lives here rather than in the settling node's own handler — a `Task`'s handler used to
-//! know that its parent was an `Activity` and that the parent therefore needed a `CompleteState`. Now
-//! the child hands its settle to its owner's [`Container`] and the owner decides.
+//! The object graph is made of *elements*: the definitions a run is built from (`Flow`, with its
+//! immutable `FlowVersion`s), the run itself (`Execution`), its `Thread`s, their `Activity` states,
+//! and the leaf work each activity hands out (`Task`, `Timer`) — plus, one layer down, the
+//! state-type behaviors. Historically one element's rules were scattered across the command handler
+//! that opened it, the `Container` impl that reacted to its children settling, and the `Continue*`
+//! hop that advanced it, so they had to be reconstructed from four or five files. This module
+//! gathers them: one `*ElementBehavior` per kind, named for the element it governs. An element's
+//! **birth** belongs here too — the same aggregation, one step earlier in its life.
 //!
-//! The owner's own kind picks the impl at the call site, so one container exists per kind that owns
-//! children: [`ActivityContainer`] (a state's in-flight task or timer), [`ThreadContainer`] (the
-//! state activities that run in one scope) and [`ExecutionContainer`] (a run's own scope children).
+//! Aggregation is only the first step: the shared skeleton (how an already-finishing node advances,
+//! how a node's children are swept by kind, how a settled node relays to its owner) is still spelled
+//! out per element here, and lifting it onto a shared trait is the next one — to be introduced only
+//! once that skeleton's real signature is known, rather than guessed at.
 
 mod activity;
 mod execution;
+mod flow;
+pub(crate) mod state_handler;
+pub(crate) mod states;
+mod task;
 mod thread;
+mod timer;
 
-pub(crate) use activity::ActivityContainer;
-pub(crate) use execution::ExecutionContainer;
-pub(crate) use thread::ThreadContainer;
+pub(crate) use activity::ActivityElementBehavior;
+pub(crate) use execution::ExecutionElementBehavior;
+pub(crate) use flow::FlowElementBehavior;
+pub(crate) use task::TaskElementBehavior;
+pub(crate) use thread::ThreadElementBehavior;
+pub(crate) use timer::TimerElementBehavior;
 
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::storage::ReadonlyStorageTxn;

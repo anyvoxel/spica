@@ -251,10 +251,10 @@ impl StreamProcessor {
 
     /// The **leader** driver loop: write path + own read-back. Tails the log and for each entry:
     ///
-    /// - **Command** — dispatch it; if it produced a non-empty batch, append `batch ++ [Noop]`
-    ///   atomically, then commit the work transaction the dispatch already eager-folded into (with
-    ///   the batch-end watermark), replay its deferred timer side effects, and (post-commit) drain the
-    ///   correlated acks. Grants and rejections are answered right after the append.
+    /// - **Command** — dispatch it; append `batch ++ [Noop]` atomically, then commit the work
+    ///   transaction the dispatch already eager-folded into (with the batch-end watermark), replay its
+    ///   deferred timer side effects, and (post-commit) drain the correlated acks. Grants and
+    ///   rejections are answered right after the append.
     /// - **Event** — always skipped: `recover_leader` folded any crash residue at startup, and the
     ///   work transaction eagerly applied this batch, so the Event is at/below the watermark.
     ///   The leader never folds Events in its live loop (`is_already_applied` is only a debug guard).
@@ -299,10 +299,11 @@ impl StreamProcessor {
                             debug!(entries = produced.entries.len(), "command produced entries");
 
                             // Append the produced batch atomically, terminated by a `Noop` commit
-                            // marker (one atomic append = one causal batch). Empty batches (a pure
-                            // query / grant-only command that produced nothing) append nothing: there
-                            // is nothing to fold, so no terminator is needed and re-running them is a
-                            // harmless no-op.
+                            // marker (one atomic append = one causal batch). The batch is never
+                            // empty — `dispatch_once` asserts every command answered with an entry —
+                            // so the guard is belt-and-braces: a hypothetical empty batch has
+                            // nothing to fold, needs no terminator, and re-running it is a harmless
+                            // no-op.
                             if !produced.entries.is_empty() {
                                 let mut to_append: Vec<Entry> = produced.entries.clone();
                                 to_append.push(noop(&*leader.clock(), StreamId::nil(), entry_id));

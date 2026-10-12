@@ -51,6 +51,7 @@
 //! JSONata (e.g. `5`) round-trips as `5.0`. Comparisons inside JSONata are unaffected.
 
 mod applier;
+mod elements;
 mod engine;
 mod eval_env;
 mod follower;

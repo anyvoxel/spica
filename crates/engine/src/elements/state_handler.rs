@@ -170,7 +170,7 @@ pub trait StateHandler: Send + Sync {
 
     /// A child node of this state reached a terminal state while the state is `Running` — the
     /// **replenish** half of the child-settled reaction, reached from the owning activity's container
-    /// (see `ActivityContainer::settle_running`, which routes a settle to the four states that own
+    /// (see `ActivityElementBehavior::settle_running`, which routes a settle to the four states that own
     /// children). A state that owns no children keeps the default no-op, since no settle can reach it.
     async fn child_completed(
         &self,
@@ -537,8 +537,8 @@ pub trait StateHandler: Send + Sync {
 mod tests {
     use serde_json::Value;
 
-    use super::super::dispatch::build_state_handlers;
     use crate::StatePath;
+    use crate::handlers::build_state_handlers;
     use crate::{Activity, ActivityStatus, ExecutionKind};
 
     /// A minimal empty `Activity` sufficient to dispatch an object-safe lifecycle hook — the create

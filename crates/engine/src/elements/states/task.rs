@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use spica_asl::{State, StatePath, TaskState};
 
-use super::super::container::{Container, ThreadContainer};
 use super::super::state_handler::{FailureRouting, StateHandler, StateHandlerFactory};
-use super::super::{emit_timer, eval_string_or_expr};
+use crate::elements::Container;
+use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
+use crate::handlers::{emit_timer, eval_string_or_expr};
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
@@ -35,11 +36,11 @@ impl StateHandlerFactory for TaskStateHandlerFactory {
                 "create dispatch guarantees the factory receives its own variant; got {state:?}"
             );
         };
-        Box::new(TaskStateHandler { state: s })
+        Box::new(TaskStateElementBehavior { state: s })
     }
 }
 
-struct TaskStateHandler<'a> {
+struct TaskStateElementBehavior<'a> {
     state: &'a TaskState,
 }
 
@@ -57,7 +58,7 @@ enum TaskFinish {
 }
 
 #[async_trait]
-impl StateHandler for TaskStateHandler<'_> {
+impl StateHandler for TaskStateElementBehavior<'_> {
     // A Task's processed input is its projected `Arguments` (defaults to the state's input), which
     // is what the external call receives.
     async fn process_input(
@@ -176,7 +177,7 @@ impl StateHandler for TaskStateHandler<'_> {
     /// sweep when a catcher takes the failure). Two guards keep that reading honest, both of which the
     /// fire itself would otherwise get wrong:
     ///
-    /// - Only a *fire* counts. A cancel reaches this hook too — `ActivityContainer` routes both
+    /// - Only a *fire* counts. A cancel reaches this hook too — `ActivityElementBehavior` routes both
     ///   outcomes through `child_completed`, so a `Parallel`/`Map` sees a failed branch — so the timer's
     ///   own recorded status is the discriminator, and a swept deadline fails nothing.
     /// - Only while the attempt is still in flight. The scheduler's fire is decoupled from the dispatch
@@ -334,7 +335,7 @@ impl StateHandler for TaskStateHandler<'_> {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
                 let owner = activity_value.meta.owner.clone();
-                let thread_container = ThreadContainer::open(ctx.storage, owner).await?;
+                let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -400,7 +401,7 @@ impl StateHandler for TaskStateHandler<'_> {
         }
         if pending == 0 {
             let container =
-                ThreadContainer::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -615,7 +616,7 @@ impl StateHandler for TaskStateHandler<'_> {
     }
 }
 
-impl TaskStateHandler<'_> {
+impl TaskStateElementBehavior<'_> {
     /// The `Task` complete step: the settled task's payload is the raw result, so build `$states`,
     /// apply the state's `Assign` (emitting `VariablesAssigned` on the owner scope), project `Output`
     /// (defaulting to the payload), and decide the routing — the canonical success finish, mirroring
@@ -1039,7 +1040,7 @@ mod tests {
         );
     }
 
-    /// A *cancelled* deadline reaches this hook too — `ActivityContainer` routes both outcomes through
+    /// A *cancelled* deadline reaches this hook too — `ActivityElementBehavior` routes both outcomes through
     /// `child_completed` — so the timer's own recorded status is the discriminator: a swept deadline
     /// fails nothing, since the sweep is the complete step retiring a bound that has stopped applying.
     #[tokio::test]
