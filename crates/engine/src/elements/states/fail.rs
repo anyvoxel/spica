@@ -305,9 +305,9 @@ mod tests {
             .await
             .expect("the failure ed folds the activity row");
         assert!(
-            row.value.status.is_terminal(),
+            row.status.is_terminal(),
             "the activity is left terminal, not Running: {:?}",
-            row.value.status
+            row.status
         );
     }
 
@@ -354,7 +354,6 @@ mod tests {
                 .activity(&minted_activity_ref())
                 .await
                 .expect("the failure ed folds the activity row")
-                .value
                 .activity_state,
             None::<ActivityState>
         );

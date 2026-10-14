@@ -34,8 +34,7 @@ impl TaskFailedApplier {
             let parent = t.meta.owner.clone();
             // Fold the entity verbatim (status, cleared worker/lease, + the retry bookkeeping the
             // handler stamped: `attempts`, `retrier_attempts`, `next_available_at`).
-            t.value = task.clone();
-            t.with_update_at(ctx.timestamp);
+            t = task.clone();
             ctx.storage.put_task(t).await?;
             if retryable {
                 // The reused task stays a child (claimable again after `next_available_at` lapses).
@@ -43,7 +42,9 @@ impl TaskFailedApplier {
                 // the shared projection / Catch path sees the accumulated retries.
                 if let Some(mut act) = ctx.storage.get_activity(&parent).await? {
                     act.retry_state.get_or_insert_default().attempts = task.retry_state.attempts;
-                    act.with_update_at(ctx.timestamp);
+                    // The event carries no activity value, so this fold's own write is stamped from
+                    // the entry's frozen moment — deterministic on replay, never a local clock.
+                    act.meta.with_update_at(ctx.timestamp);
                     ctx.storage.put_activity(act).await?;
                 }
             } else {

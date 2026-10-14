@@ -17,12 +17,11 @@ impl VariablesAssignedApplier {
         // Thread — the run's derived root thread for a top-level state, a branch Thread for a
         // `Parallel`/`Map` branch (see `ActivityKind::OwnedBy`). Assignment is a projection concern:
         // lifecycle events stay focused on identity/status, while the scope's mutable variables are
-        // folded here as a full snapshot for later JSONata evaluation and replay.
-        if let Some(mut thread) = ctx.storage.get_thread(scope).await? {
-            thread.variables = variables.clone();
-            thread.with_update_at(ctx.timestamp);
-            ctx.storage.put_thread(thread).await?;
-        }
+        // folded here as a full snapshot for later JSONata evaluation and replay. Because the payload
+        // *is* that snapshot, the fold is a pure overwrite of the scope's own cell — it reads neither
+        // the scope cell nor the thread row, so no read-modify-write can interleave and the row's
+        // lifecycle writes stay untouched.
+        ctx.storage.put_variables(scope, variables.clone()).await?;
         Ok(())
     }
 }

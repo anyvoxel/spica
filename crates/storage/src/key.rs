@@ -38,6 +38,8 @@
 //! | `task` | `/<t>/<ns>/task/<name>` | Task row (name is the primary key) |
 //! | `flow` | `/<t>/<ns>/flow/<flow_name>` | Flow row (name is the primary key) |
 //! | `flowversion` | `/<t>/<ns>/flowversion/<flow_name>-<ver>` | FlowVersion row |
+//! | `_index` | `/<t>/<ns>/_index/children/<p_kind>/<p_name>/<c_kind>/<c_name>` | ownership edge (value: child ref) |
+//! | `_index` | `/<t>/<ns>/_index/variables/<thread_name>` | a thread's variable scope (`Variables` map) |
 //! | `_global` | `/<t>/<ns>/_global/last_processed_position` | resume watermark (`i64`) |
 //!
 //! A flow version's key embeds its own `ObjectName` `{flow_name}-{version}` (a plain **decimal**
@@ -45,10 +47,18 @@
 //! lexicographically (`order-10` sorts before `order-2`), so a range scan over the
 //! `/<t>/<ns>/flowversion/{flow_name}-` prefix enumerates a flow's versions and callers order them
 //! by the `version` field, never by key order.
+//!
+//! `_index` holds the tables whose content is **derived** from the event stream yet is not part of
+//! an entity's own value — so far the **ownership edge** (one row per `(parent, child)` pair,
+//! enumerating a parent's live children by a prefix scan over the parent) and a thread's **variable
+//! scope**. Both are kept off the entity row for the same reason: an embedded set, or an embedded
+//! scope, would have to be re-attached by every `put_*`, and a writer that forgot would silently
+//! drop the parent's children (leaving a container forever undrained) or wipe the run's variables.
+//! As separate cells they cannot be clobbered by the entity's own writes.
 
 use spica_engine_types::{
-    ActivityKind, ExecutionKind, FlowName, ObjectKind, ObjectName, ObjectRef, ScopeName, TaskKind,
-    ThreadKind, TimerKind,
+    ActivityKind, ExecutionKind, FlowName, ObjectKind, ObjectName, ObjectRef, RawObjectRef,
+    ScopeName, TaskKind, ThreadKind, TimerKind,
 };
 
 /// The two fixed scope segments of every key (tenant + namespace).
@@ -253,6 +263,65 @@ impl KeyBuilder {
         ])
     }
 
+    /// The range-start enumerating **every child of one parent**:
+    /// `/<t>/<ns>/_index/children/<parent_kind>/<parent_name>/`. The trailing `/` binds the scan to
+    /// exactly this parent's edges, so one parent's children are one contiguous range.
+    pub fn child_edge_prefix(&self, parent: &RawObjectRef) -> Vec<u8> {
+        let name = parent.name.as_str();
+        join(&[
+            self.scope.tenant(),
+            self.scope.namespace(),
+            "_index",
+            "children",
+            Kind::from_object(parent.kind).segment(),
+            name.as_str(),
+            "",
+        ])
+    }
+
+    /// One ownership **edge** row — `parent` owns `child`:
+    /// `/<t>/<ns>/_index/children/<parent_kind>/<parent_name>/<child_kind>/<child_name>`, whose value
+    /// is the child's full [`RawObjectRef`] (kind + name + uid). The uniform, kind-independent
+    /// membership test that replaces a set embedded on the parent row.
+    ///
+    /// Both ends spell their **kind** into the key instead of trusting the name alone. Names would in
+    /// fact separate today (generated names share one partition-local counter, and `-` is reserved so
+    /// the user and generated spaces never overlap), but entity rows are keyed `<kind>/<name>`
+    /// *because* a name does not identify a row — this table is not the place to take that back, and
+    /// a future second counter would silently merge two same-named parents' children.
+    pub fn child_edge(&self, parent: &RawObjectRef, child: &RawObjectRef) -> Vec<u8> {
+        let parent_name = parent.name.as_str();
+        let child_name = child.name.as_str();
+        join(&[
+            self.scope.tenant(),
+            self.scope.namespace(),
+            "_index",
+            "children",
+            Kind::from_object(parent.kind).segment(),
+            parent_name.as_str(),
+            Kind::from_object(child.kind).segment(),
+            child_name.as_str(),
+        ])
+    }
+
+    /// A thread's **variable scope**, a derived lookup value under the reserved `_index` namespace:
+    /// `/<t>/<ns>/_index/variables/<thread_name>`. The scope is not part of the thread's
+    /// event-carried value, so it gets its own cell: a whole-row `put_thread` can then never
+    /// clobber it, and an assignment never rewrites the thread row.
+    ///
+    /// No kind segment: a scope belongs to a `Thread` and nothing else, so the name alone addresses
+    /// it (unlike an ownership edge, whose *both* ends are any kind).
+    pub fn variables(&self, thread_name: &ObjectName) -> Vec<u8> {
+        let name = thread_name.as_str();
+        join(&[
+            self.scope.tenant(),
+            self.scope.namespace(),
+            "_index",
+            "variables",
+            name.as_str(),
+        ])
+    }
+
     /// Global (non-entity) progress scalar under the reserved `_global` namespace:
     /// `/<t>/<ns>/_global/last_processed_position`. Holds the StreamProcessor's resume watermark; a single
     /// fixed key per store rather than a per-row address (it is a scalar, not an entity).
@@ -295,7 +364,7 @@ fn join(segments: &[&str]) -> Vec<u8> {
 mod tests {
     use super::*;
     use spica_engine_types::{
-        ActivityKind, ExecutionKind, NoOwner, ObjectMeta, PlainName, TaskKind,
+        ActivityKind, ExecutionKind, HasRawObjectRef, NoOwner, ObjectMeta, PlainName, TaskKind,
     };
     use ulid::Ulid;
 
@@ -431,6 +500,78 @@ mod tests {
         assert_eq!(
             String::from_utf8(kb.flow_version_prefix(&flow)).unwrap(),
             "/acme/prod/flowversion/order-"
+        );
+    }
+
+    #[test]
+    fn child_edges_are_one_range_per_parent() {
+        let kb = KeyBuilder::new(scope("acme", "prod"));
+        let parent = exec_ref(Ulid::new()).into_raw_object_ref();
+        let a = act_ref(Ulid::new()).into_raw_object_ref();
+        let b = act_ref(Ulid::new()).into_raw_object_ref();
+
+        let edge_a = String::from_utf8(kb.child_edge(&parent, &a)).unwrap();
+        // Both ends spell their kind, and the value side is the child's own name — so a raw dump of
+        // the edge table reads as `parent-kind/parent-name/child-kind/child-name`.
+        assert!(
+            edge_a.starts_with("/acme/prod/_index/children/execution/child-"),
+            "{edge_a}"
+        );
+        assert!(edge_a.contains("/activity/child-"), "{edge_a}");
+        // The prefix is exactly this parent's range — a trailing `/` keeps it from covering a parent
+        // whose name merely extends this one.
+        assert!(
+            edge_a.starts_with(&String::from_utf8(kb.child_edge_prefix(&parent)).unwrap()),
+            "{edge_a}"
+        );
+        // Distinct children of one parent never collide.
+        assert_ne!(
+            edge_a,
+            String::from_utf8(kb.child_edge(&parent, &b)).unwrap()
+        );
+
+        // A same-named parent of another kind is a *different* parent with its own set (see
+        // `child_edge`'s note on why the kind is not dropped).
+        let name = PlainName::new("order").unwrap().generated_from_key(7);
+        let exec_parent = RawObjectRef::new(ObjectKind::Execution, name.clone(), Ulid::new());
+        let thread_parent = RawObjectRef::new(ObjectKind::Thread, name.clone(), exec_parent.uid);
+        assert_ne!(
+            kb.child_edge(&exec_parent, &a),
+            kb.child_edge(&thread_parent, &a)
+        );
+        assert_ne!(
+            kb.child_edge_prefix(&exec_parent),
+            kb.child_edge_prefix(&thread_parent)
+        );
+        // An edge never lands inside either end's own entity-row range.
+        assert!(
+            !kb.child_edge(&parent, &a)
+                .starts_with(&kb.kind_prefix(Kind::Execution))
+        );
+        assert!(
+            !kb.child_edge(&parent, &a)
+                .starts_with(&kb.kind_prefix(Kind::Activity))
+        );
+    }
+
+    #[test]
+    fn a_threads_variable_scope_is_an_index_cell_beside_its_row() {
+        let kb = KeyBuilder::new(scope("acme", "prod"));
+        let name = PlainName::new("order").unwrap().generated_from_key(7);
+        let key = String::from_utf8(kb.variables(&name)).unwrap();
+        // The scope is addressed by the thread's name alone — no kind segment, since only a `Thread`
+        // owns a scope.
+        assert_eq!(key, "/acme/prod/_index/variables/order-7");
+        // It never lands in the thread entity-row range, so `put_thread` and an assignment can never
+        // write over one another.
+        assert!(
+            !kb.variables(&name)
+                .starts_with(&kb.kind_prefix(Kind::Thread))
+        );
+        // Distinct threads keep distinct scopes.
+        assert_ne!(
+            kb.variables(&name),
+            kb.variables(&PlainName::new("order").unwrap().generated_from_key(8))
         );
     }
 

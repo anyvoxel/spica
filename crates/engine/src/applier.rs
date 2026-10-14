@@ -71,11 +71,15 @@ pub async fn dispatch_event(
 }
 
 /// Context handed to a single event applier `apply` call: mutable access to the store, plus the
-/// **`timestamp`** of the entry currently being applied — the single deterministic source for the
-/// projection's `created_at`/`updated_at` facts; it is the value frozen in the log record, so every
-/// replica replaying the same entries computes identical times (see `storage::*::created_at`).
-/// Appliers must use this value and **never** call `Timestamp::now()` locally, which would make the
-/// fold non-deterministic across replicas.
+/// **`timestamp`** of the entry currently being applied. It is the value frozen in the log record, so
+/// every replica replaying the same entries computes identical times; appliers must use it and
+/// **never** call `Timestamp::now()` locally, which would make the fold non-deterministic.
+///
+/// A projection row's timing facts are the domain value's own `meta.created_at`/`updated_at`, which
+/// normally come from the event payload (the handler stamped them at construction). This entry
+/// timestamp is the source where the event carries no value for the row being written — a fold-only
+/// bookkeeping mutation — and the basis of time-dependent *decisions* (a claimability check must
+/// re-make the same decision on replay).
 ///
 /// M1→M2 note: there is **no** task service on the context. Applying `TaskActivated` used to invoke
 /// the handler in-process as a side effect; now it only makes the task *claimable* — a worker pulls

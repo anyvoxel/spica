@@ -74,9 +74,7 @@ pub use handler::{Collector, HandlerContext};
 pub use hook::Hook;
 pub use log::{Entry, EntryPayload, InMemoryLogStream, LogStream, RocksLogStream, Timestamp};
 pub use query::{QueryListPage, QueryObject};
-pub use storage::{
-    ActivityRecord, ExecutionRecord, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-};
+pub use storage::{Storage, StorageTxn};
 pub use stream_processor::StreamProcessor;
 pub use task_api::{ActivatedTask, TaskApi};
 pub use types::StatePath;

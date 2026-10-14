@@ -15,6 +15,7 @@ use crate::types::flow_version::FlowVersionKind;
 use crate::types::id::{EntryId, RequestId, StreamId};
 use crate::types::meta::ObjectRef;
 use crate::types::reject::{Reject, RejectionType};
+use crate::types::thread::Thread;
 use crate::working::WorkingState;
 
 /// Collects the [`Entry`]s a handler emits while handling one Command, enveloping each with the
@@ -285,13 +286,13 @@ impl HandlerContext<'_> {
         Ok(machine)
     }
 
-    /// Resolve — and cache — the state machine a [`crate::storage::ThreadRecord`] binds to, then
+    /// Resolve — and cache — the state machine a [`Thread`](crate::Thread) binds to, then
     /// return it. The version is derived from the thread's root `execution` (the whole tree shares one
     /// definition — see [`crate::storage::resolve_thread_flow_version`]). Kept on the context so the
     /// resolve (which reads `Storage`) stays one call at every machine-using site.
     pub async fn machine_for_thread(
         &mut self,
-        thread: &crate::storage::ThreadRecord,
+        thread: &Thread,
     ) -> Result<Arc<StateMachine>, ExecutionError> {
         // The immutable borrow of `storage` for resolving the version ends before the mutable
         // `machine` call below, so there is no aliasing of `self`.

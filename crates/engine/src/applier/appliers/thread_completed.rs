@@ -15,10 +15,10 @@ impl ThreadCompletedApplier {
         if let Some(mut row) = ctx.storage.get_thread(&thread.meta.object_ref()).await? {
             row.status = ThreadStatus::Completed;
             row.output = thread.output.clone();
-            // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
-            row.value.meta.updated_at = thread.meta.updated_at;
-            let parent = row.value.meta.owner.clone();
-            row.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status/output update.
+            row.meta.updated_at = thread.meta.updated_at;
+            let parent = row.meta.owner.clone();
             ctx.storage.put_thread(row).await?;
             ctx.storage
                 .remove_child(parent.into_raw_object_ref(), thread.meta.raw_object_ref())

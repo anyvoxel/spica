@@ -20,10 +20,10 @@
 //!
 //! A fold is backed by a native RocksDB [`Transaction`] (the store is opened as an
 //! [`OptimisticTransactionDB`]). `Transaction::get` resolves **read-your-writes** natively — it
-//! checks the transaction's own pending writes before the committed store — which is what lets the
-//! read-modify-write appliers (`add_child`/`put_execution` on the same row within one fold, e.g.
-//! `StateActivating`) compose correctly on the same base row. This replaces the hand-rolled overlay
-//! we previously kept, taking the same semantics from RocksDB itself.
+//! checks the transaction's own pending writes before the committed store — which is what lets a
+//! fold read a row and then write it back (an applier reconstructing a record from its loaded base)
+//! compose correctly within the same fold. This replaces the hand-rolled overlay we previously kept,
+//! taking the same semantics from RocksDB itself.
 //!
 //! # Key layout
 //!
@@ -43,9 +43,9 @@ use async_trait::async_trait;
 use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 
 use spica_engine_types::{
-    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
-    FlowVersionKind, ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError,
-    StorageTxn, TaskKind, TaskRecord, ThreadKind, ThreadRecord, TimerKind, TimerRecord, Timestamp,
+    Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
+    ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError, StorageTxn, Task,
+    TaskKind, Thread, ThreadKind, Timer, TimerKind, Timestamp, Variables,
 };
 
 use crate::{KeyBuilder, Kind, Scope};
@@ -112,6 +112,15 @@ impl RocksStorage {
             .map_err(|e| StorageError::Backend(format!("rocksdb write: {e}")))?;
         Ok(())
     }
+
+    /// Delete one row at `key` through the same default (WAL, no-fsync) path. An absent key is not an
+    /// error — a delete is idempotent, which is what makes removing an ownership edge twice harmless.
+    fn delete_row(&self, key: Vec<u8>) -> Result<(), StorageError> {
+        self.db
+            .delete(key)
+            .map_err(|e| StorageError::Backend(format!("rocksdb delete: {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -119,35 +128,45 @@ impl Storage for RocksStorage {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         self.get_row(self.keys.thread(reference))
+    }
+
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        // A thread with no `Assign` yet has no row here — an empty scope, not a missing one.
+        Ok(self
+            .get_row(self.keys.variables(reference.name()))?
+            .unwrap_or_default())
     }
 
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         self.get_row(self.keys.task(reference))
     }
 
@@ -156,17 +175,17 @@ impl Storage for RocksStorage {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         // A forward prefix scan over the `task` kind (no per-resource queue index in M1 — see the
         // trait doc). Row values are their JSON encoding, decoded and filtered by resource+status.
         let prefix = self.keys.task_prefix();
-        let mut out: Vec<TaskRecord> = Vec::new();
+        let mut out: Vec<Task> = Vec::new();
         for item in self.db.prefix_iterator(prefix) {
             let (_, value) =
                 item.map_err(|e| StorageError::Backend(format!("rocksdb task scan: {e}")))?;
-            let task: TaskRecord = serde_json::from_slice(&value)
+            let task: Task = serde_json::from_slice(&value)
                 .map_err(|e| StorageError::Codec(format!("rocksdb task decode: {e}")))?;
-            if task.value.resource == resource && task.value.is_claimable_at(now) {
+            if task.resource == resource && task.is_claimable_at(now) {
                 // The cap counts rows already collected, so it is tested *before* the row joins
                 // them: `limit == 0` yields an empty page on every backend.
                 if out.len() >= limit {
@@ -213,131 +232,73 @@ impl Storage for RocksStorage {
         Ok(out)
     }
 
-    /// `active_children` is stored on the parent row, so this reads it back like
-    /// [`InMemoryStorage`](crate::InMemoryStorage) does (a leaf — TimerRecord/TaskRecord — owns nothing).
+    /// Read `id`'s ownership edges: a prefix scan over the `_index/children/<id>/…` range, decoding
+    /// each edge's stored child reference. One contiguous range per parent, whatever kind it is.
     async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError> {
-        Ok(match id.kind {
-            ObjectKind::Execution => self
-                .get_execution(&id.clone().typed::<ExecutionKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Thread => self
-                .get_thread(&id.clone().typed::<ThreadKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Activity => self
-                .get_activity(&id.clone().typed::<ActivityKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            // A timer/task (or a non-node kind) is a leaf; it has no children to sweep.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {
-                HashSet::new()
+        let prefix = self.keys.child_edge_prefix(&id);
+        let mut out = HashSet::new();
+        for item in self.db.prefix_iterator(prefix.clone()) {
+            let (key, value) =
+                item.map_err(|e| StorageError::Backend(format!("rocksdb edge scan: {e}")))?;
+            if !key.starts_with(&prefix) {
+                break;
             }
-        })
+            out.insert(
+                serde_json::from_slice(&value)
+                    .map_err(|e| StorageError::Codec(format!("rocksdb edge decode: {e}")))?,
+            );
+        }
+        Ok(out)
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
         self.put_row(self.keys.execution(&exec.meta.object_ref()), &exec)
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
         self.put_row(self.keys.thread(&thread.meta.object_ref()), &thread)
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+    /// Overwrite the scope row — a single put, with no read of either cell: the event carries the
+    /// full post-assign snapshot.
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError> {
+        self.put_row(self.keys.variables(reference.name()), &variables)
+    }
+
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
         self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
         self.put_row(self.keys.task(&task.meta.object_ref()), &task)
     }
 
-    /// Read-modify-write `parent`'s `active_children` minus `child`, exactly like
-    /// [`InMemoryStorage`](crate::InMemoryStorage), persisted back through the DB.
+    /// Delete the ownership edge `parent` → `child`: one single-row delete, with no read-modify-write
+    /// of the parent (see [`KeyBuilder::child_edge`](crate::KeyBuilder::child_edge)).
     async fn remove_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(mut exec) = self
-                    .get_execution(&parent.clone().typed::<ExecutionKind>())
-                    .await?
-                {
-                    exec.active_children.remove(&child);
-                    self.put_execution(exec).await?;
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(mut thread) = self
-                    .get_thread(&parent.clone().typed::<ThreadKind>())
-                    .await?
-                {
-                    thread.active_children.remove(&child);
-                    self.put_thread(thread).await?;
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(mut act) = self
-                    .get_activity(&parent.clone().typed::<ActivityKind>())
-                    .await?
-                {
-                    act.active_children.remove(&child);
-                    self.put_activity(act).await?;
-                }
-            }
-            // A leaf (or non-node kind) never owns children; nothing to remove.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
-        Ok(())
+        self.delete_row(self.keys.child_edge(&parent, &child))
     }
 
-    /// Read-modify-write `parent`'s `active_children` plus `child`, persisted back through the DB.
+    /// Write the ownership edge `parent` → `child` as its own row. Because the edge is not a column on
+    /// the parent, this cannot clobber a concurrent write of the parent's own row (nor vice versa).
     async fn add_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(mut exec) = self
-                    .get_execution(&parent.clone().typed::<ExecutionKind>())
-                    .await?
-                {
-                    exec.active_children.insert(child);
-                    self.put_execution(exec).await?;
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(mut thread) = self
-                    .get_thread(&parent.clone().typed::<ThreadKind>())
-                    .await?
-                {
-                    thread.active_children.insert(child);
-                    self.put_thread(thread).await?;
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(mut act) = self
-                    .get_activity(&parent.clone().typed::<ActivityKind>())
-                    .await?
-                {
-                    act.active_children.insert(child);
-                    self.put_activity(act).await?;
-                }
-            }
-            // A leaf (or non-node kind) never owns children; nothing to add.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
-        Ok(())
+        self.put_row(self.keys.child_edge(&parent, &child), &child)
     }
 
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {
@@ -441,8 +402,7 @@ struct RocksTxn {
 
 impl RocksTxn {
     /// Read one row through this fold's [`Transaction`]. Read-your-writes (see the type docs) is what
-    /// lets the read-modify-write appliers compose on one base row inside a fold — `add_child` followed
-    /// by `put_execution` of the same ExecutionRecord row, as `StateActivating` does.
+    /// lets a fold that reads a row and writes it back compose on its own earlier write.
     fn get_row<T: serde::de::DeserializeOwned>(
         &self,
         key: Vec<u8>,
@@ -469,6 +429,15 @@ impl RocksTxn {
             .map_err(|e| StorageError::Backend(format!("txn write: {e}")))?;
         Ok(())
     }
+
+    /// Buffer a row delete into this fold's [`Transaction`] (the ownership-edge removal path);
+    /// buffered deletes compose with earlier buffered writes of the same key, last one winning.
+    fn delete_row(&self, key: Vec<u8>) -> Result<(), StorageError> {
+        self.txn
+            .delete(key)
+            .map_err(|e| StorageError::Backend(format!("txn delete: {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -476,35 +445,46 @@ impl StorageTxn for RocksTxn {
     async fn get_execution(
         &mut self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         self.get_row(self.keys.execution(reference))
     }
 
     async fn get_thread(
         &mut self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         self.get_row(self.keys.thread(reference))
+    }
+
+    /// Read the scope inside this fold (read-your-writes: a put buffered earlier in the same fold is
+    /// visible, since the RocksDB `Transaction` reads through its own batch).
+    async fn get_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        Ok(self
+            .get_row(self.keys.variables(reference.name()))?
+            .unwrap_or_default())
     }
 
     async fn get_activity(
         &mut self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         self.get_row(self.keys.activity(reference))
     }
 
     async fn get_timer(
         &mut self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         self.get_row(self.keys.timer(reference))
     }
 
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         self.get_row(self.keys.task(reference))
     }
 
@@ -513,7 +493,7 @@ impl StorageTxn for RocksTxn {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         // A forward prefix scan through the transaction iterator, which applies the pending
         // WriteBatch over the committed store (read-your-writes): a task folded earlier in this
         // batch is seen, with its buffered status winning. No per-resource queue index in M1.
@@ -521,16 +501,16 @@ impl StorageTxn for RocksTxn {
         let iter = self
             .txn
             .iterator(IteratorMode::From(&prefix, Direction::Forward));
-        let mut out: Vec<TaskRecord> = Vec::new();
+        let mut out: Vec<Task> = Vec::new();
         for item in iter {
             let (key, value) =
                 item.map_err(|e| StorageError::Backend(format!("rocksdb txn task scan: {e}")))?;
             if !key.starts_with(&prefix) {
                 break;
             }
-            let task: TaskRecord = serde_json::from_slice(&value)
+            let task: Task = serde_json::from_slice(&value)
                 .map_err(|e| StorageError::Codec(format!("rocksdb txn task decode: {e}")))?;
-            if task.value.resource == resource && task.value.is_claimable_at(now) {
+            if task.resource == resource && task.is_claimable_at(now) {
                 // Same cap-before-collect ordering as the committed-store scan above.
                 if out.len() >= limit {
                     break;
@@ -541,133 +521,78 @@ impl StorageTxn for RocksTxn {
         Ok(out)
     }
 
+    /// Read `id`'s ownership edges through this fold's [`Transaction`] iterator, which applies the
+    /// pending batch over the committed store (read-your-writes): an edge added earlier in this fold
+    /// is seen, and one removed earlier is gone.
     async fn get_children(
         &mut self,
         id: RawObjectRef,
     ) -> Result<HashSet<RawObjectRef>, StorageError> {
-        Ok(match id.kind {
-            ObjectKind::Execution => self
-                .get_execution(&id.clone().typed::<ExecutionKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Thread => self
-                .get_thread(&id.clone().typed::<ThreadKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Activity => self
-                .get_activity(&id.clone().typed::<ActivityKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            // A timer/task (or a non-node kind) is a leaf; it has no children to sweep.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {
-                HashSet::new()
+        let prefix = self.keys.child_edge_prefix(&id);
+        let iter = self
+            .txn
+            .iterator(IteratorMode::From(&prefix, Direction::Forward));
+        let mut out = HashSet::new();
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| StorageError::Backend(format!("rocksdb txn edge scan: {e}")))?;
+            if !key.starts_with(&prefix) {
+                break;
             }
-        })
+            out.insert(
+                serde_json::from_slice(&value)
+                    .map_err(|e| StorageError::Codec(format!("rocksdb txn edge decode: {e}")))?,
+            );
+        }
+        Ok(out)
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
         self.put_row(self.keys.execution(&exec.meta.object_ref()), &exec)
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
         self.put_row(self.keys.thread(&thread.meta.object_ref()), &thread)
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+    /// Overwrite the scope row — a single put, with no read of either cell: the event carries the
+    /// full post-assign snapshot.
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError> {
+        self.put_row(self.keys.variables(reference.name()), &variables)
+    }
+
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
         self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
         self.put_row(self.keys.task(&task.meta.object_ref()), &task)
     }
 
-    /// Read-modify-write `parent`'s `active_children` minus `child`: read the (read-your-writes)
-    /// row, remove `child`, and buffer the result back into the transaction (atomicity at commit).
+    /// Buffer the deletion of the ownership edge `parent` → `child` into this fold's transaction.
     async fn remove_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(mut exec) = self
-                    .get_execution(&parent.clone().typed::<ExecutionKind>())
-                    .await?
-                {
-                    exec.active_children.remove(&child);
-                    self.put_execution(exec).await?;
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(mut thread) = self
-                    .get_thread(&parent.clone().typed::<ThreadKind>())
-                    .await?
-                {
-                    thread.active_children.remove(&child);
-                    self.put_thread(thread).await?;
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(mut act) = self
-                    .get_activity(&parent.clone().typed::<ActivityKind>())
-                    .await?
-                {
-                    act.active_children.remove(&child);
-                    self.put_activity(act).await?;
-                }
-            }
-            // A leaf (or non-node kind) never owns children; nothing to remove.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
-        Ok(())
+        self.delete_row(self.keys.child_edge(&parent, &child))
     }
 
-    /// Read-modify-write `parent`'s `active_children` plus `child`: read the (read-your-writes) row,
-    /// insert `child`, and buffer the result back into the transaction (atomicity at commit).
+    /// Buffer the ownership edge `parent` → `child` into this fold's transaction as its own row.
     async fn add_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(mut exec) = self
-                    .get_execution(&parent.clone().typed::<ExecutionKind>())
-                    .await?
-                {
-                    exec.active_children.insert(child);
-                    self.put_execution(exec).await?;
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(mut thread) = self
-                    .get_thread(&parent.clone().typed::<ThreadKind>())
-                    .await?
-                {
-                    thread.active_children.insert(child);
-                    self.put_thread(thread).await?;
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(mut act) = self
-                    .get_activity(&parent.clone().typed::<ActivityKind>())
-                    .await?
-                {
-                    act.active_children.insert(child);
-                    self.put_activity(act).await?;
-                }
-            }
-            // A leaf (or non-node kind) never owns children; nothing to add.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
-        Ok(())
+        self.put_row(self.keys.child_edge(&parent, &child), &child)
     }
 
     async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError> {
@@ -742,10 +667,11 @@ impl StorageTxn for RocksTxn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use spica_engine_types::{
         Execution, ExecutionKind, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName,
-        RetryState, Task, TaskStatus, Timer, TimerOwner, TimerStatus, Timestamp,
+        RetryState, StatePath, Task, TaskStatus, ThreadOwner, ThreadStatus, Timer, TimerOwner,
+        TimerStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
@@ -757,6 +683,35 @@ mod tests {
                 .generated_from_key(uid.0 as u64),
             uid,
         )
+    }
+
+    /// A distinct thread reference (`child-<uid>`), matching a `meta.raw_object_ref()`.
+    fn thread_ref() -> ObjectRef<ThreadKind> {
+        let uid = ulid::Ulid::new();
+        ObjectRef::new(
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
+            uid,
+        )
+    }
+
+    /// A minimal running thread row. Only its own identity/lifecycle facts matter here; the variable
+    /// scope sits in the sibling cell under test.
+    fn sample_thread(id: ObjectRef<ThreadKind>) -> Thread {
+        Thread {
+            meta: spica_engine_types::ObjectMeta::builder(id.uid())
+                .name(id.name().clone())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Execution(test_exec_ref())),
+            execution: test_exec_ref(),
+            state_path: StatePath::root(),
+            start_at: "S".into(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: json!({}),
+            output: None,
+        }
     }
 
     /// A distinct timer reference (`child-<uid>`), matching a `meta.raw_object_ref()`.
@@ -776,24 +731,19 @@ mod tests {
     }
 
     /// A minimal running execution row for exercising the store.
-    fn sample_execution(id: ObjectRef<ExecutionKind>) -> ExecutionRecord {
-        ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version: ObjectRef::new(
-                    PlainName::new("flow").unwrap().generated_from_key(1),
-                    ulid::Ulid::nil(),
-                ),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine_types::ObjectMeta::builder(id.uid())
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(spica_engine_types::NoOwner::new()),
-            },
-            active_children: HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+    fn sample_execution(id: ObjectRef<ExecutionKind>) -> Execution {
+        Execution {
+            deadline: None,
+            flow_version: ObjectRef::new(
+                PlainName::new("flow").unwrap().generated_from_key(1),
+                ulid::Ulid::nil(),
+            ),
+            status: ExecutionStatus::Running,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine_types::ObjectMeta::builder(id.uid())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(spica_engine_types::NoOwner::new()),
         }
     }
 
@@ -829,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_and_remove_child_tracks_active_children() {
+    async fn add_and_remove_child_tracks_ownership_edges() {
         let path = temp_path("children");
         let id = test_exec_ref();
         let child = timer_ref();
@@ -851,7 +801,7 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
-            // add, then reflect in the persisted row
+            // add, then reflect in the edge table
             store
                 .add_child(
                     parent.clone().into_raw_object_ref(),
@@ -866,14 +816,6 @@ mod tests {
                     .unwrap(),
                 HashSet::from([child.clone().into_raw_object_ref()])
             );
-            // a leaf parent (TimerRecord) owns nothing and never grows
-            assert!(
-                store
-                    .get_children(timer_ref().into_raw_object_ref())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
             // remove, then reflect
             store
                 .remove_child(
@@ -884,12 +826,186 @@ mod tests {
                 .unwrap();
             assert!(
                 store
-                    .get_children(parent.into_raw_object_ref())
+                    .get_children(parent.clone().into_raw_object_ref())
                     .await
                     .unwrap()
                     .is_empty()
             );
+            // Removing an absent edge is idempotent, not an error (its row simply is not there).
+            store
+                .remove_child(
+                    parent.into_raw_object_ref(),
+                    child.clone().into_raw_object_ref(),
+                )
+                .await
+                .unwrap();
         }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The edge table is keyed by `(parent_kind, parent_name)`, so two parents that merely *share a
+    /// name* across kinds hold different child sets — the property `child_edge`'s kind-in-key note
+    /// pins. A leaf kind is also a legal parent now: nothing about the edge space is node-specific,
+    /// which is what lets a Task own its timeout timer.
+    #[tokio::test]
+    async fn edge_sets_are_per_parent_kind_and_admit_any_parent() {
+        let path = temp_path("edges-kinds");
+        let name = PlainName::new("order").unwrap().generated_from_key(7);
+        let exec = ObjectRef::<ExecutionKind>::new(name.clone(), ulid::Ulid::new());
+        let thread = ObjectRef::<ThreadKind>::new(name, exec.uid());
+        let timer = timer_ref();
+        {
+            let mut store = RocksStorage::open(&path).unwrap();
+            store
+                .put_execution(sample_execution(exec.clone()))
+                .await
+                .unwrap();
+
+            let child = timer.clone().into_raw_object_ref();
+            store
+                .add_child(exec.clone().into_raw_object_ref(), child.clone())
+                .await
+                .unwrap();
+            // The same-named thread does not inherit the execution's child...
+            assert!(
+                store
+                    .get_children(thread.clone().into_raw_object_ref())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // ...and giving the thread its own edge leaves the execution's set untouched.
+            store
+                .add_child(thread.clone().into_raw_object_ref(), child.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_children(thread.into_raw_object_ref())
+                    .await
+                    .unwrap(),
+                HashSet::from([child.clone()])
+            );
+            assert_eq!(
+                store
+                    .get_children(exec.into_raw_object_ref())
+                    .await
+                    .unwrap(),
+                HashSet::from([child.clone()])
+            );
+            // A leaf kind is a legal parent too — the edge space is not node-specific, which is what
+            // lets a Task own its timeout timer.
+            store
+                .add_child(timer.clone().into_raw_object_ref(), child.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_children(timer.into_raw_object_ref())
+                    .await
+                    .unwrap(),
+                HashSet::from([child])
+            );
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The edge and the parent row are independent cells: writing the parent row (a status change)
+    /// leaves its children intact, and adding a child leaves the row intact — neither write has to
+    /// re-attach the other, so a status transition can never drop a child it did not mean to touch.
+    #[tokio::test]
+    async fn a_parent_write_and_its_edges_do_not_clobber_each_other() {
+        let path = temp_path("edges-clobber");
+        let id = test_exec_ref();
+        let child = timer_ref();
+        {
+            let mut store = RocksStorage::open(&path).unwrap();
+            let mut row = sample_execution(id.clone());
+            store.put_execution(row.clone()).await.unwrap();
+            store
+                .add_child(
+                    id.clone().into_raw_object_ref(),
+                    child.clone().into_raw_object_ref(),
+                )
+                .await
+                .unwrap();
+
+            // A row write straight from a domain value (no re-attached child set) keeps the edge.
+            row.meta.with_update_at(Timestamp::from_millis(42));
+            store.put_execution(row).await.unwrap();
+            assert_eq!(
+                store
+                    .get_children(id.clone().into_raw_object_ref())
+                    .await
+                    .unwrap(),
+                HashSet::from([child.clone().into_raw_object_ref()])
+            );
+
+            // And the reverse: a child edge write leaves the row's own facts alone.
+            store
+                .add_child(
+                    id.clone().into_raw_object_ref(),
+                    timer_ref().into_raw_object_ref(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_execution(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .meta
+                    .updated_at,
+                Timestamp::from_millis(42)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The persisted twin of the in-memory scope test: the variable scope is its own cell, so a
+    /// whole-row `put_thread` cannot clobber it, a fold's snapshot overwrites it wholesale, and it
+    /// survives a drop/reopen.
+    #[tokio::test]
+    async fn variables_are_independent_of_the_thread_row_and_persist() {
+        let path = temp_path("variables");
+        let id = thread_ref();
+        {
+            let mut store = RocksStorage::open(&path).unwrap();
+            store.put_thread(sample_thread(id.clone())).await.unwrap();
+            // No scope yet: a thread reads as an empty map rather than "missing".
+            assert!(store.get_variables(&id).await.unwrap().is_empty());
+
+            store
+                .put_variables(&id, Variables::from([("g".to_string(), json!("hi"))]))
+                .await
+                .unwrap();
+            // Rewriting the whole thread row (a lifecycle update carrying no scope) keeps the scope.
+            let mut row = sample_thread(id.clone());
+            row.meta.with_update_at(Timestamp::from_millis(42));
+            store.put_thread(row).await.unwrap();
+            assert_eq!(
+                store.get_variables(&id).await.unwrap().get("g"),
+                Some(&json!("hi"))
+            );
+
+            // Inside one fold a write is visible to a read of that same fold (read-your-writes).
+            let mut txn = store.begin_txn().unwrap();
+            txn.put_variables(&id, Variables::from([("x".to_string(), json!(1))]))
+                .await
+                .unwrap();
+            assert_eq!(
+                txn.get_variables(&id).await.unwrap().get("x"),
+                Some(&json!(1))
+            );
+            txn.commit(None).unwrap();
+        }
+        // Reopen: the scope outlives the store instance (durability via the RocksDB WAL), and the
+        // fold's snapshot replaced the committed one wholesale.
+        let store = RocksStorage::open(&path).unwrap();
+        let scope = store.get_variables(&id).await.unwrap();
+        assert_eq!(scope.get("x"), Some(&json!(1)));
+        assert_eq!(scope.get("g"), None);
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -911,14 +1027,14 @@ mod tests {
                     .generated_from_key(uid.0 as u64),
                 uid,
             );
-            let t = TimerRecord::from_value(Timer {
+            let t = Timer {
                 execution: id.clone(),
                 status: TimerStatus::Active,
                 deadline: Timestamp::from_millis(0),
                 meta: spica_engine_types::ObjectMeta::builder(uid)
                     .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
                     .with_owner(TimerOwner::Execution(id.clone())),
-            });
+            };
             store.put_timer(t.clone()).await.unwrap();
             assert_eq!(
                 store
@@ -954,31 +1070,27 @@ mod tests {
         worker_id: Option<&str>,
         lease_expires_at: Option<Timestamp>,
         next_available_at: Option<Timestamp>,
-    ) -> TaskRecord {
-        TaskRecord {
-            value: Task {
-                execution: ObjectRef::nil(),
-                resource: resource.to_string(),
-                arguments: Value::Null,
-                status,
-                deadline: None,
-                worker_id: worker_id.map(str::to_string),
-                lease_expires_at,
-                retry_plan: vec![],
-                retry_state: RetryState {
-                    attempts: 0,
-                    retrier_attempts: vec![],
-                    next_available_at,
-                },
-                meta: spica_engine_types::ObjectMeta::builder(id)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(ObjectRef::new(
-                        PlainName::new("invoke").unwrap().generated_from_key(1),
-                        ulid::Ulid::nil(),
-                    )),
+    ) -> Task {
+        Task {
+            execution: ObjectRef::nil(),
+            resource: resource.to_string(),
+            arguments: Value::Null,
+            status,
+            deadline: None,
+            worker_id: worker_id.map(str::to_string),
+            lease_expires_at,
+            retry_plan: vec![],
+            retry_state: RetryState {
+                attempts: 0,
+                retrier_attempts: vec![],
+                next_available_at,
             },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+            meta: spica_engine_types::ObjectMeta::builder(id)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ObjectRef::new(
+                    PlainName::new("invoke").unwrap().generated_from_key(1),
+                    ulid::Ulid::nil(),
+                )),
         }
     }
 
@@ -1042,7 +1154,7 @@ mod tests {
 
             let found = store.activatable_tasks("r", now, 10).await.unwrap();
             assert_eq!(
-                found.iter().map(|t| t.value.meta.uid).collect::<Vec<_>>(),
+                found.iter().map(|t| t.meta.uid).collect::<Vec<_>>(),
                 vec![expired],
                 "only the lapsed lease is claimable at `now`"
             );
@@ -1067,7 +1179,7 @@ mod tests {
                 .activatable_tasks("r", Timestamp::from_millis(1_000_001), 10)
                 .await
                 .unwrap();
-            let mut uids: Vec<_> = later.iter().map(|t| t.value.meta.uid).collect();
+            let mut uids: Vec<_> = later.iter().map(|t| t.meta.uid).collect();
             uids.sort();
             let mut expected = vec![expired, live, gated];
             expected.sort();

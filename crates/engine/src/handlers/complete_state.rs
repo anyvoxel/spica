@@ -49,7 +49,7 @@ impl CompleteStateHandler {
         };
         // An activity's owner slot admits only a `Thread`, so the row is read directly — no `kind`
         // guard.
-        let owner = act.value.meta.owner.clone();
+        let owner = act.meta.owner.clone();
         let Some(thread) = ctx.storage.get_thread(&owner).await? else {
             // The same judgement as the miss above, one hop out: rows are never removed, so an
             // activity that exists without the thread its owner slot names is a corrupt projection or
@@ -79,14 +79,14 @@ impl CompleteStateHandler {
         // definition inside the machine the owning thread binds to (a branch/item activity carries
         // the deeper path, a top-level one `/States/<name>`). Activation resolved the same path
         // against the same machine, so a miss is the projection's, not the flow's.
-        let state_def = match sm.state_at(&act.value.state_path) {
+        let state_def = match sm.state_at(&act.state_path) {
             Ok(def) => def,
             Err(e) => {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
                         "complete_state: activity {activity} names state {:?} which its machine does not define: {e}",
-                        act.value.state_path
+                        act.state_path
                     ),
                 ));
             }
@@ -99,12 +99,12 @@ impl CompleteStateHandler {
         // step's job: the child whose settle stranded it drives that drain (see
         // `crate::handlers::trigger_timer`), so emitting `StateTerminated` from here would duplicate a
         // terminal event the settle path already owns.
-        if !act.value.status.is_running() {
+        if !act.status.is_running() {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "activity {activity} is {}, not Running; cannot complete",
-                    act.value.status.phase()
+                    act.status.phase()
                 ),
             ));
         }
@@ -112,9 +112,9 @@ impl CompleteStateHandler {
         // (completing, or swept by an ancestor's termination), so the finish it would route into has no
         // owner left to accept it. Refused on the activity's footing above rather than swallowed — a
         // silent skip would leave this command with neither of the two entries it owes.
-        if !thread.value.status.is_running() {
-            let phase = thread.value.status.phase();
-            tracing::warn!(thread = %owner, status = ?thread.value.status,
+        if !thread.status.is_running() {
+            let phase = thread.status.phase();
+            tracing::warn!(thread = %owner, status = ?thread.status,
                 "completion arrived for a thread that is not Running; refused");
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,

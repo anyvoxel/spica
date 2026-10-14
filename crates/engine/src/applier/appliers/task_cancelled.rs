@@ -22,12 +22,12 @@ impl TaskCancelledApplier {
                 .meta
                 .owner
                 .clone()
-                // The slot is an `ObjectRef<ActivityKind>` and `active_children` speaks flat addresses.
+                // The slot is an `ObjectRef<ActivityKind>` and an ownership edge speaks flat addresses.
                 .into_raw_object_ref();
             t.status = TaskStatus::Cancelled;
-            // Sync the domain value's transition stamp from the event (see task_completed.rs).
-            t.value.meta.with_update_at(task.meta.updated_at);
-            t.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status update.
+            t.meta.with_update_at(task.meta.updated_at);
             ctx.storage.put_task(t).await?;
             ctx.storage
                 .remove_child(parent, task.meta.raw_object_ref())

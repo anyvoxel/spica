@@ -748,7 +748,6 @@ mod tests {
     use crate::engine::NoopHook;
     use crate::leader::MAX_COMMAND_ATTEMPTS;
     use crate::log::{InMemoryLogStream, Timestamp};
-    use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord, TimerRecord};
     use crate::types::command::{CompleteTask, CreateFlow, TerminateExecution};
     use crate::types::error::StorageError;
     use crate::types::flow::Flow;
@@ -756,7 +755,11 @@ mod tests {
     use crate::types::id::{FlowName, RequestId};
     use crate::types::meta::{ObjectMeta, ObjectName, ObjectRef, PlainName, RawObjectRef};
     use crate::types::reject::RejectionType;
-    use crate::{ActivityKind, ExecutionKind, TaskKind, ThreadKind, TimerKind};
+    use crate::types::thread::Thread;
+    use crate::{
+        Activity, ActivityKind, Execution, ExecutionKind, Task, TaskKind, ThreadKind, Timer,
+        TimerKind, Variables,
+    };
 
     use super::*;
 
@@ -1035,31 +1038,37 @@ mod tests {
         async fn get_execution(
             &self,
             reference: &ObjectRef<ExecutionKind>,
-        ) -> Result<Option<ExecutionRecord>, StorageError> {
+        ) -> Result<Option<Execution>, StorageError> {
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &self,
             reference: &ObjectRef<ThreadKind>,
-        ) -> Result<Option<ThreadRecord>, StorageError> {
+        ) -> Result<Option<Thread>, StorageError> {
             self.inner.get_thread(reference).await
+        }
+        async fn get_variables(
+            &self,
+            reference: &ObjectRef<ThreadKind>,
+        ) -> Result<Variables, StorageError> {
+            self.inner.get_variables(reference).await
         }
         async fn get_activity(
             &self,
             reference: &ObjectRef<ActivityKind>,
-        ) -> Result<Option<ActivityRecord>, StorageError> {
+        ) -> Result<Option<Activity>, StorageError> {
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &self,
             reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<TimerRecord>, StorageError> {
+        ) -> Result<Option<Timer>, StorageError> {
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &self,
             reference: &ObjectRef<TaskKind>,
-        ) -> Result<Option<TaskRecord>, StorageError> {
+        ) -> Result<Option<Task>, StorageError> {
             self.inner.get_task(reference).await
         }
         async fn get_children(
@@ -1073,22 +1082,29 @@ mod tests {
             resource: &str,
             now: Timestamp,
             limit: usize,
-        ) -> Result<Vec<TaskRecord>, StorageError> {
+        ) -> Result<Vec<Task>, StorageError> {
             self.inner.activatable_tasks(resource, now, limit).await
         }
-        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+        async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
             self.inner.put_execution(exec).await
         }
-        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+        async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
             self.inner.put_thread(thread).await
         }
-        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+        async fn put_variables(
+            &mut self,
+            reference: &ObjectRef<ThreadKind>,
+            variables: Variables,
+        ) -> Result<(), StorageError> {
+            self.inner.put_variables(reference, variables).await
+        }
+        async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
         }
-        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+        async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
             self.inner.put_timer(timer).await
         }
-        async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+        async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
             self.inner.put_task(task).await
         }
         async fn remove_child(
@@ -1172,35 +1188,42 @@ mod tests {
         async fn get_execution(
             &mut self,
             reference: &ObjectRef<ExecutionKind>,
-        ) -> Result<Option<ExecutionRecord>, StorageError> {
+        ) -> Result<Option<Execution>, StorageError> {
             self.read()?;
             self.inner.get_execution(reference).await
         }
         async fn get_thread(
             &mut self,
             reference: &ObjectRef<ThreadKind>,
-        ) -> Result<Option<ThreadRecord>, StorageError> {
+        ) -> Result<Option<Thread>, StorageError> {
             self.read()?;
             self.inner.get_thread(reference).await
+        }
+        async fn get_variables(
+            &mut self,
+            reference: &ObjectRef<ThreadKind>,
+        ) -> Result<Variables, StorageError> {
+            self.read()?;
+            self.inner.get_variables(reference).await
         }
         async fn get_activity(
             &mut self,
             reference: &ObjectRef<ActivityKind>,
-        ) -> Result<Option<ActivityRecord>, StorageError> {
+        ) -> Result<Option<Activity>, StorageError> {
             self.read()?;
             self.inner.get_activity(reference).await
         }
         async fn get_timer(
             &mut self,
             reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<TimerRecord>, StorageError> {
+        ) -> Result<Option<Timer>, StorageError> {
             self.read()?;
             self.inner.get_timer(reference).await
         }
         async fn get_task(
             &mut self,
             reference: &ObjectRef<TaskKind>,
-        ) -> Result<Option<TaskRecord>, StorageError> {
+        ) -> Result<Option<Task>, StorageError> {
             self.read()?;
             self.inner.get_task(reference).await
         }
@@ -1216,7 +1239,7 @@ mod tests {
             resource: &str,
             now: Timestamp,
             limit: usize,
-        ) -> Result<Vec<TaskRecord>, StorageError> {
+        ) -> Result<Vec<Task>, StorageError> {
             self.read()?;
             self.inner.activatable_tasks(resource, now, limit).await
         }
@@ -1239,19 +1262,26 @@ mod tests {
             self.read()?;
             self.inner.flow_version_of(name, version).await
         }
-        async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+        async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
             self.inner.put_execution(exec).await
         }
-        async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+        async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
             self.inner.put_thread(thread).await
         }
-        async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+        async fn put_variables(
+            &mut self,
+            reference: &ObjectRef<ThreadKind>,
+            variables: Variables,
+        ) -> Result<(), StorageError> {
+            self.inner.put_variables(reference, variables).await
+        }
+        async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
         }
-        async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+        async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
             self.inner.put_timer(timer).await
         }
-        async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+        async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
             self.inner.put_task(task).await
         }
         async fn remove_child(

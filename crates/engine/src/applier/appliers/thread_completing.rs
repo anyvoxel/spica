@@ -14,9 +14,9 @@ impl ThreadCompletingApplier {
         if let Some(mut row) = ctx.storage.get_thread(&thread.meta.object_ref()).await? {
             row.status = ThreadStatus::Completing;
             row.output = thread.output.clone();
-            // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
-            row.value.meta.updated_at = thread.meta.updated_at;
-            row.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status/output update.
+            row.meta.updated_at = thread.meta.updated_at;
             ctx.storage.put_thread(row).await?;
         }
         Ok(())

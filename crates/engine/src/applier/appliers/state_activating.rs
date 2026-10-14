@@ -3,7 +3,6 @@
 use crate::types::error::ExecutionError;
 use crate::{Activity, ApplierContext};
 
-use crate::storage::ActivityRecord;
 use crate::types::meta::HasRawObjectRef;
 
 #[derive(Default)]
@@ -15,13 +14,8 @@ impl StateActivatingApplier {
         activity: &Activity,
     ) -> Result<(), ExecutionError> {
         // `StateActivating` is the creation moment of the projection row: the event already carries
-        // the canonical domain entity, and storage only adds its projection-only `active_children`
-        // bookkeeping alongside it.
-        let mut row =
-            ActivityRecord::from_value(activity.clone(), std::collections::HashSet::new());
-        // Birth: `created_at`/`updated_at` stamped with the `StateActivating` entry's moment.
-        row.born(ctx.timestamp);
-        ctx.storage.put_activity(row).await?;
+        // the canonical domain entity, so the row is that value verbatim.
+        ctx.storage.put_activity(activity.clone()).await?;
         super::bump_generated_seq(ctx.storage, &activity.meta.raw_object_ref().name).await?;
         ctx.storage
             .add_child(

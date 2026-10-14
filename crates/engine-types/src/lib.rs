@@ -15,9 +15,7 @@ pub mod types;
 // so a consumer (or a storage implementation) names one path regardless of which crate it is
 // talking to. The two modules stay public for callers that prefer the explicit split.
 pub use spica_machinery::Timestamp;
-pub use storage::{
-    ActivityRecord, ExecutionRecord, Storage, StorageTxn, TaskRecord, ThreadRecord, TimerRecord,
-};
+pub use storage::{Storage, StorageTxn};
 pub use types::StatePath;
 pub use types::activity::{
     Activity, ActivityKind, ActivityState, ActivityStatus, MapActivityState, ParallelActivityState,

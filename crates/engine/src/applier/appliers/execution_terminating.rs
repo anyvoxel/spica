@@ -19,8 +19,7 @@ impl ExecutionTerminatingApplier {
             .await?
         {
             exec.status = execution.status.clone();
-            exec.value.meta.updated_at = execution.meta.updated_at;
-            exec.with_update_at(ctx.timestamp);
+            exec.meta.updated_at = execution.meta.updated_at;
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

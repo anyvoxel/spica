@@ -309,8 +309,9 @@ mod tests {
             .activity(&activity)
             .await
             .expect("StateActivating folds the activity row");
-        assert_eq!(row.value.status, ActivityStatus::Running);
-        assert_eq!(row.created_at, at());
+        assert_eq!(row.status, ActivityStatus::Running);
+        assert_eq!(row.meta.created_at, at());
+        assert_eq!(row.meta.updated_at, at());
         assert!(
             activated
                 .children(thread_ref().as_raw_object_ref())

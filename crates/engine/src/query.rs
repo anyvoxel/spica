@@ -6,24 +6,32 @@
 //! server maps each onto its wire mirror (the `spica_proto` Query service). Keying and paging live
 //! here (kind + addressing name; storage-key order), so the wire never leaks storage layout.
 
-use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord, TimerRecord};
+use crate::types::activity::Activity;
 use crate::types::error::ExecutionError;
+use crate::types::execution::Execution;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
 use crate::types::meta::{ObjectKind, ObjectName, ObjectRef};
+use crate::types::task::Task;
+use crate::types::thread::Thread;
+use crate::types::timer::Timer;
 
 /// The persisted projection of one object of any kind, in its typed record form — the value behind a
 /// `GetObject`/`ListObjects` read. Each variant names the entity kind it mirrors, so `kind()` is a
 /// match, not a scan.
+///
+/// The arms keep their domain values inline: this is the server's cold read facade, one value at a
+/// time, so the size spread between kinds costs nothing a box would recover — only indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryObject {
     Flow(Flow),
     FlowVersion(FlowVersion),
-    Execution(ExecutionRecord),
-    Thread(ThreadRecord),
-    Activity(ActivityRecord),
-    Timer(TimerRecord),
-    Task(TaskRecord),
+    Execution(Execution),
+    Thread(Thread),
+    Activity(Activity),
+    Timer(Timer),
+    Task(Task),
 }
 
 impl QueryObject {
@@ -44,11 +52,11 @@ impl QueryObject {
         match self {
             QueryObject::Flow(f) => &f.meta.name,
             QueryObject::FlowVersion(v) => &v.meta.name,
-            QueryObject::Execution(e) => &e.value.meta.name,
-            QueryObject::Thread(t) => &t.value.meta.name,
-            QueryObject::Activity(a) => &a.value.meta.name,
-            QueryObject::Timer(t) => &t.value.meta.name,
-            QueryObject::Task(t) => &t.value.meta.name,
+            QueryObject::Execution(e) => &e.meta.name,
+            QueryObject::Thread(t) => &t.meta.name,
+            QueryObject::Activity(a) => &a.meta.name,
+            QueryObject::Timer(t) => &t.meta.name,
+            QueryObject::Task(t) => &t.meta.name,
         }
     }
 }
@@ -130,19 +138,19 @@ fn decode(kind: ObjectKind, name: ObjectName, bytes: &[u8]) -> Result<QueryObjec
         ObjectKind::FlowVersion => serde_json::from_slice::<FlowVersion>(bytes)
             .map(QueryObject::FlowVersion)
             .map_err(|_| bad()),
-        ObjectKind::Execution => serde_json::from_slice::<ExecutionRecord>(bytes)
+        ObjectKind::Execution => serde_json::from_slice::<Execution>(bytes)
             .map(QueryObject::Execution)
             .map_err(|_| bad()),
-        ObjectKind::Thread => serde_json::from_slice::<ThreadRecord>(bytes)
+        ObjectKind::Thread => serde_json::from_slice::<Thread>(bytes)
             .map(QueryObject::Thread)
             .map_err(|_| bad()),
-        ObjectKind::Activity => serde_json::from_slice::<ActivityRecord>(bytes)
+        ObjectKind::Activity => serde_json::from_slice::<Activity>(bytes)
             .map(QueryObject::Activity)
             .map_err(|_| bad()),
-        ObjectKind::Timer => serde_json::from_slice::<TimerRecord>(bytes)
+        ObjectKind::Timer => serde_json::from_slice::<Timer>(bytes)
             .map(QueryObject::Timer)
             .map_err(|_| bad()),
-        ObjectKind::Task => serde_json::from_slice::<TaskRecord>(bytes)
+        ObjectKind::Task => serde_json::from_slice::<Task>(bytes)
             .map(QueryObject::Task)
             .map_err(|_| bad()),
     }

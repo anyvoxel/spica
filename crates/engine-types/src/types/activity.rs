@@ -152,8 +152,10 @@ impl ObjectKindMarker for ActivityKind {
 /// The event-carried domain value of an Activity.
 ///
 /// This is the entity-shaped payload Activity lifecycle events carry. It intentionally excludes
-/// projection-only bookkeeping such as `active_children`; those remain on `storage::ActivityRecord`, the
-/// storage projection row, so event payloads stay focused on the Activity's own domain state.
+/// projection-only bookkeeping — above all the ownership edges its children ride on, which live in
+/// storage's `_index` edge table rather than on the activity's own row. A follower therefore
+/// rebuilds the same domain state from the event stream alone, while storage keeps that fold-only
+/// metadata alongside it.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Activity {

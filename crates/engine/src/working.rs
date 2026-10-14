@@ -5,7 +5,7 @@
 //! driver opens a fresh txn via `Storage::begin_txn`) and folds each emitted `Event` into it
 //! immediately, at `append_event` time (via the collector's overlay). Handlers read through this type's
 //! [`ReadonlyStorageTxn`] face, which resolves overlay-then-committed — so an inline container relay
-//! sees the just-emitted terminal's effect (its parent's `active_children` drained) and can converge
+//! sees the just-emitted terminal's effect (its parent's children drained) and can converge
 //! the whole settled ancestor chain in the same batch.
 //!
 //! The working txn is now the **single authoritative fold** of a produced batch: the driver commits
@@ -25,16 +25,19 @@ use async_trait::async_trait;
 
 use crate::applier::{ApplierContext, dispatch_event};
 use crate::log::Timestamp;
-use crate::storage::{
-    ActivityRecord, ExecutionRecord, ReadonlyStorageTxn, StorageTxn, TaskRecord, ThreadRecord,
-    TimerRecord,
-};
+use crate::storage::{ReadonlyStorageTxn, StorageTxn};
+use crate::types::activity::Activity;
 use crate::types::error::{ExecutionError, StorageError};
 use crate::types::event::Event;
+use crate::types::execution::Execution;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
 use crate::types::id::FlowName;
 use crate::types::meta::{ObjectRef, RawObjectRef};
+use crate::types::task::Task;
+use crate::types::thread::Thread;
+use crate::types::timer::Timer;
+use crate::types::variables::Variables;
 use crate::{ActivityKind, ExecutionKind, FlowVersionKind, TaskKind, ThreadKind, TimerKind};
 
 /// The ephemeral overlay backing one handled command. Shared between the handler's read face and the
@@ -113,7 +116,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_execution(reference).await
@@ -121,15 +124,23 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_thread(reference).await
     }
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        let mut txn = self.txn.lock().await;
+        let storage = txn.as_mut().expect("working txn alive during dispatch");
+        storage.get_variables(reference).await
+    }
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_activity(reference).await
@@ -137,7 +148,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_timer(reference).await
@@ -145,7 +156,7 @@ impl ReadonlyStorageTxn for WorkingState {
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_task(reference).await
@@ -163,7 +174,7 @@ impl ReadonlyStorageTxn for WorkingState {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.activatable_tasks(resource, now, limit).await

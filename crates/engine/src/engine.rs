@@ -22,6 +22,7 @@ use crate::types::id::{EntryId, FlowName, RequestId, StreamId};
 use crate::types::meta::{ObjectKind, ObjectName, ObjectRef};
 use crate::types::task::Task;
 use crate::types::task::TaskKind;
+use crate::types::variables::Variables;
 
 /// Executes ASL state machines via the CCES architecture (Causal Command Event Sourcing).
 ///
@@ -403,8 +404,8 @@ impl EngineInner {
             drop(storage);
             // Hand back the whole terminal snapshot; `is_terminal` covers both `Completed` and
             // `Terminated(_)`, so success and failure both resolve here and the caller reads the status.
-            if record.value.is_terminal() {
-                return Ok(record.value);
+            if record.is_terminal() {
+                return Ok(record);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -491,6 +492,14 @@ impl EngineInner {
         }
     }
 
+    /// Read a thread's **variable scope** by its addressing name. The scope is derived state kept
+    /// beside the thread row (see [`Storage::get_variables`]), so it is a read of its own rather than
+    /// part of the `get_object` row — a caller that wants the full wire mirror joins the two.
+    pub async fn get_variables(&self, name: &ObjectName) -> Result<Variables, ExecutionError> {
+        let storage = self.storage.lock().await;
+        Ok(storage.get_variables(&ref_for::<_>(name)).await?)
+    }
+
     /// List one kind's persisted objects in storage-key order — the engine side of the k8s-style
     /// `Query.ListObjects` RPC. `limit` caps the page (the server may substitute a default), and
     /// `continue_token` (the previous page's last addressing name, opaque on the wire) resumes the
@@ -518,12 +527,7 @@ impl EngineInner {
         limit: usize,
     ) -> Result<Vec<Task>, ExecutionError> {
         let storage = self.storage.lock().await;
-        Ok(storage
-            .activatable_tasks(resource, now, limit)
-            .await?
-            .into_iter()
-            .map(|r| r.value)
-            .collect())
+        Ok(storage.activatable_tasks(resource, now, limit).await?)
     }
 
     /// Validate + pre-check + append a `CreateFlow` for a new flow version. Append-and-return (no ack

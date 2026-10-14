@@ -1,41 +1,37 @@
 //! The CCES storage **contract**: the [`Storage`] trait plus the projection row types it names.
 //!
-//! This module owns the *interface* (and the four projection row wrappers [`ExecutionRecord`],
-//! [`ActivityRecord`], [`TaskRecord`], [`TimerRecord`]). The concrete implementations — the durable
-//! `RocksStorage`, the in-memory `InMemoryStorage`, and their byte-level `KeyBuilder` encoding — live
+//! This module owns the *interface*. A projection row is the canonical domain value itself —
+//! `Execution`, `Thread`, `Activity`, `Task`, `Timer` — keyed by `meta.name`. A thread's variable
+//! scope is **derived** state the event-carried `Thread` does not hold, so it is not a row field
+//! but its own cell in the storage's `_index` namespace (see [`Storage::get_variables`]). The
+//! concrete implementations — the durable `RocksStorage`, the in-memory
+//! `InMemoryStorage`, and their byte-level `KeyBuilder` encoding — live
 //! in `spica-storage`, which **depends on** this crate to implement the trait. Both sides therefore
 //! meet on one trait type: the engine's consumers and the storage backends each name the same
 //! [`Storage`], so an implementation satisfies the engine's bounds wherever it is compiled.
 
-mod activity;
-mod execution;
-mod task;
 mod thread;
-mod timer;
 
 use std::collections::HashSet;
 
 use async_trait::async_trait;
 
-use crate::types::activity::ActivityKind;
+use crate::types::activity::{Activity, ActivityKind};
 use crate::types::error::StorageError;
-use crate::types::execution::ExecutionKind;
+use crate::types::execution::{Execution, ExecutionKind};
 use crate::types::flow::Flow;
 use crate::types::flow_version::{FlowVersion, FlowVersionKind};
 use crate::types::id::FlowName;
 use crate::types::meta::{ObjectKind, ObjectName, ObjectRef, RawObjectRef};
-use crate::types::task::TaskKind;
-use crate::types::thread::ThreadKind;
-use crate::types::timer::TimerKind;
+use crate::types::task::{Task, TaskKind};
+use crate::types::thread::{Thread, ThreadKind};
+use crate::types::timer::{Timer, TimerKind};
+use crate::types::variables::Variables;
 use spica_machinery::Timestamp;
 
-pub use activity::ActivityRecord;
-pub use execution::ExecutionRecord;
-pub use task::TaskRecord;
 // Every state's owner is a `Thread`, so resolving the machine a state binds to is a read off that
 // thread's tree — its version derived from the thread's root `execution`.
-pub use thread::{ThreadRecord, resolve_thread_flow_version};
-pub use timer::TimerRecord;
+pub use thread::resolve_thread_flow_version;
 
 /// Persistent projection of the execution tree, rebuilt by applying the
 /// [`Event`](crate::types::event::Event) stream.
@@ -54,23 +50,36 @@ pub trait Storage: Send + Sync {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError>;
+    ) -> Result<Option<Execution>, StorageError>;
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError>;
+    ) -> Result<Option<Thread>, StorageError>;
+    /// The scope's current variables — the accumulated snapshot of the `Assign`s folded onto
+    /// `reference`. Derived state the event-carried `Thread` deliberately does not hold, so it lives
+    /// in its own `_index` cell rather than on the thread row: an assignment then never rewrites the
+    /// row, and a whole-row `put_thread` can never wipe the scope. A thread with no `Assign` yet has
+    /// an empty scope, not a missing one.
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError>;
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError>;
+    ) -> Result<Option<Activity>, StorageError>;
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError>;
-    async fn get_task(
-        &self,
-        reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError>;
+    ) -> Result<Option<Timer>, StorageError>;
+    async fn get_task(&self, reference: &ObjectRef<TaskKind>)
+    -> Result<Option<Task>, StorageError>;
+    /// Every node `id` still **owns** — its in-flight children (active activities / timers / child
+    /// threads). An ownership edge is its own row in the storage's `_index` side table (keys are
+    /// `/<scope>/_index/children/<parent-kind>/<parent-name>/<child-kind>/<child-name>`), not a set
+    /// embedded on the parent's row — so a parent's own writes and its child set are independent
+    /// cells and cannot clobber each other. Completing or terminating waits for this to drain before
+    /// the terminal `ed` is emitted.
     async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError>;
 
     /// Scan up to `limit` tasks of `resource` that a worker may claim **at** `now` — the discovery
@@ -91,7 +100,7 @@ pub trait Storage: Send + Sync {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError>;
+    ) -> Result<Vec<Task>, StorageError>;
 
     /// Enumerate `kind`'s rows in storage-key order (k8s-style LIST over one kind), returning each
     /// row's canonical addressing [`ObjectName`] + its raw serialized (serde JSON) value bytes —
@@ -113,23 +122,32 @@ pub trait Storage: Send + Sync {
         )))
     }
 
-    /// Upsert an `ExecutionRecord` record (read-modify-write by an event applier).
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError>;
-    /// Upsert a `ThreadRecord` record (a scoped sub-run's projection row).
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError>;
-    /// Upsert an `ActivityRecord` record.
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError>;
-    /// Upsert a `TimerRecord` record.
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError>;
-    /// Upsert a `TaskRecord` record.
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError>;
-    /// Remove `child` from `parent`'s `active_children` (a terminal child draining its owner).
+    /// Upsert an `Execution` row (read-modify-write by an event applier).
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError>;
+    /// Upsert a `Thread` row (a scoped sub-run's projection row).
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError>;
+    /// Overwrite the scope at `reference` with `variables` — what the `VariablesAssigned` applier
+    /// folds (the event carries the full post-assign snapshot, so this is a pure overwrite with no
+    /// read of either cell). See [`Storage::get_variables`].
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError>;
+    /// Upsert an `Activity` row.
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError>;
+    /// Upsert a `Timer` row.
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError>;
+    /// Upsert a `Task` row.
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError>;
+    /// Remove the ownership edge `parent` → `child` (a terminal child draining its owner). A no-op
+    /// when the edge is absent.
     async fn remove_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError>;
-    /// Add `child` to `parent`'s `active_children` (a child appears when its `ing` event lands).
+    /// Record the ownership edge `parent` → `child` (a child appears when its `ing` event lands).
     async fn add_child(
         &mut self,
         parent: RawObjectRef,
@@ -226,23 +244,31 @@ pub trait StorageTxn: Send {
     async fn get_execution(
         &mut self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError>;
+    ) -> Result<Option<Execution>, StorageError>;
     async fn get_thread(
         &mut self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError>;
+    ) -> Result<Option<Thread>, StorageError>;
+    /// The scope's current variables, read through this fold (read-your-writes: an assignment
+    /// folded earlier is seen). See [`Storage::get_variables`].
+    async fn get_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError>;
     async fn get_activity(
         &mut self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError>;
+    ) -> Result<Option<Activity>, StorageError>;
     async fn get_timer(
         &mut self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError>;
+    ) -> Result<Option<Timer>, StorageError>;
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError>;
+    ) -> Result<Option<Task>, StorageError>;
+    /// The in-flight children `id` owns, read through this fold (read-your-writes: an edge added
+    /// earlier in the same fold is seen). See [`Storage::get_children`].
     async fn get_children(
         &mut self,
         id: RawObjectRef,
@@ -257,7 +283,7 @@ pub trait StorageTxn: Send {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError>;
+    ) -> Result<Vec<Task>, StorageError>;
 
     async fn get_flow_by_name(&mut self, name: FlowName) -> Result<Option<Flow>, StorageError>;
     async fn get_flow_version(
@@ -270,23 +296,29 @@ pub trait StorageTxn: Send {
         version: u32,
     ) -> Result<Option<FlowVersion>, StorageError>;
 
-    /// Upsert an `ExecutionRecord` record into this transaction's pending batch.
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError>;
-    /// Upsert a `ThreadRecord` record into this transaction's pending batch.
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError>;
-    /// Upsert an `ActivityRecord` record into this transaction's pending batch.
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError>;
-    /// Upsert a `TimerRecord` record into this transaction's pending batch.
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError>;
-    /// Upsert a `TaskRecord` record into this transaction's pending batch.
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError>;
-    /// Remove `child` from `parent`'s `active_children` (a terminal child draining its owner).
+    /// Upsert an `Execution` row into this transaction's pending batch.
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError>;
+    /// Upsert a `Thread` row into this transaction's pending batch.
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError>;
+    /// Overwrite the scope at `reference` into this transaction's pending batch, read-your-writes.
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError>;
+    /// Upsert an `Activity` row into this transaction's pending batch.
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError>;
+    /// Upsert a `Timer` row into this transaction's pending batch.
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError>;
+    /// Upsert a `Task` row into this transaction's pending batch.
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError>;
+    /// Remove the ownership edge `parent` → `child` from this fold's pending batch.
     async fn remove_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError>;
-    /// Add `child` to `parent`'s `active_children` (a child appears when its `ing` event lands).
+    /// Record the ownership edge `parent` → `child` into this fold's pending batch.
     async fn add_child(
         &mut self,
         parent: RawObjectRef,
@@ -328,30 +360,38 @@ pub trait ReadonlyStorageTxn: Send + Sync {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError>;
+    ) -> Result<Option<Execution>, StorageError>;
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError>;
+    ) -> Result<Option<Thread>, StorageError>;
+    /// The scope's current variables — the accumulated snapshot of the `Assign`s folded onto
+    /// `reference`. Derived state the event-carried `Thread` deliberately does not hold, so it lives
+    /// in its own `_index` cell rather than on the thread row: an assignment then never rewrites the
+    /// row, and a whole-row `put_thread` can never wipe the scope. A thread with no `Assign` yet has
+    /// an empty scope, not a missing one.
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError>;
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError>;
+    ) -> Result<Option<Activity>, StorageError>;
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError>;
-    async fn get_task(
-        &self,
-        reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError>;
+    ) -> Result<Option<Timer>, StorageError>;
+    async fn get_task(&self, reference: &ObjectRef<TaskKind>)
+    -> Result<Option<Task>, StorageError>;
+    /// The in-flight children `id` owns (see [`Storage::get_children`]).
     async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError>;
     async fn activatable_tasks(
         &self,
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError>;
+    ) -> Result<Vec<Task>, StorageError>;
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError>;
     async fn get_flow_version(
         &self,
@@ -373,31 +413,37 @@ impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         <T as Storage>::get_execution(self, reference).await
     }
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         <T as Storage>::get_thread(self, reference).await
+    }
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        <T as Storage>::get_variables(self, reference).await
     }
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         <T as Storage>::get_activity(self, reference).await
     }
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         <T as Storage>::get_timer(self, reference).await
     }
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         <T as Storage>::get_task(self, reference).await
     }
     async fn get_children(&self, id: RawObjectRef) -> Result<HashSet<RawObjectRef>, StorageError> {
@@ -408,7 +454,7 @@ impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         <T as Storage>::activatable_tasks(self, resource, now, limit).await
     }
     async fn get_flow_by_name(&self, name: FlowName) -> Result<Option<Flow>, StorageError> {

@@ -9,9 +9,12 @@
 //!
 //! Sibling to `states::harness`, which owns the same idea for the state handlers' deeper seed graph.
 
+use spica_storage::InMemoryStorage;
+
 use crate::StatePath;
 use crate::Timestamp;
-use crate::types::meta::{ObjectKindMarker, ObjectName, ObjectRef};
+use crate::storage::Storage;
+use crate::types::meta::{ObjectKindMarker, ObjectName, ObjectRef, RawObjectRef};
 
 /// The instant every stamp reads: one `ManualClock` reading serves the seeded rows' meta and the
 /// collector's envelopes alike, so `at()` pins them all at once.
@@ -46,4 +49,44 @@ pub(crate) fn pointer(segments: &str) -> jsonptr::PointerBuf {
 
 pub(crate) fn path(segments: &str) -> StatePath {
     StatePath::from(pointer(segments))
+}
+
+/// A fixture's row bundled with the ownership edges its children ride on. A projection row no longer
+/// carries its children — storage keeps them in its `_index` ownership-edge table — so a fixture hands
+/// the pair to a store seeder instead of the row builder, which lands the row and each edge as two
+/// independent cells exactly as the appliers do.
+pub struct Seeded<R> {
+    pub row: R,
+    pub children: Vec<RawObjectRef>,
+}
+
+impl<R> Seeded<R> {
+    /// A row that owns nothing — the ordinary seed.
+    pub(crate) fn lone(row: R) -> Self {
+        Self {
+            row,
+            children: Vec::new(),
+        }
+    }
+
+    /// A row whose children are still attached: a draining owner's whole precondition.
+    pub(crate) fn owning(row: R, children: impl IntoIterator<Item = RawObjectRef>) -> Self {
+        Self {
+            row,
+            children: children.into_iter().collect(),
+        }
+    }
+}
+
+/// Land `children` as ownership edges of `parent` — the store-side half of a [`Seeded`] row.
+pub(crate) async fn seed_edges(
+    store: &mut InMemoryStorage,
+    parent: RawObjectRef,
+    children: impl IntoIterator<Item = RawObjectRef>,
+) {
+    for child in children {
+        Storage::add_child(store, parent.clone(), child)
+            .await
+            .expect("the in-memory store lands an ownership edge");
+    }
 }

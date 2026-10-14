@@ -20,11 +20,9 @@ impl ExecutionCompletingApplier {
         {
             exec.status = ExecutionStatus::Completing;
             exec.output = execution.output.clone();
-            // Keep the projected domain value's `updated_at` in step with the event's (which the
-            // handler stamped at construction); the record's own `updated_at` is separately touched
-            // from the entry timestamp below.
-            exec.value.meta.updated_at = execution.meta.updated_at;
-            exec.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status/output update.
+            exec.meta.updated_at = execution.meta.updated_at;
             ctx.storage.put_execution(exec).await?;
         }
         Ok(())

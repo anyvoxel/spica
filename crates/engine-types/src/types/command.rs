@@ -128,7 +128,7 @@ pub struct CreateExecution {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpawnThread {
     /// The owning node — the `Parallel`/`Map` activity's reference (kind `Activity`) whose
-    /// `active_children` must drain before the container can finish.
+    /// children must drain before the container can finish.
     pub owner: ObjectRef<ActivityKind>,
     /// The reference of the top-level run this branch belongs to (the child inherits it as
     /// its `execution` anchor, carried verbatim through every nesting level).
@@ -446,7 +446,7 @@ pub enum Command {
     CancelTask { task: ObjectRef<TaskKind> },
 
     /// Continue a drained-and-finishing `owner`'s **success** drain on a later round. Issued by the
-    /// one-hop child-settled reactor (see `handlers::child_completed`) the moment it observes the
+    /// one-hop child-settled reactor (see `Container::after_child_completed`) the moment it observes the
     /// `owner` is `Completing` with no remaining children; the `ContinueCompleteHandler` emits the
     /// owner's terminal next round and issues a follow-up Continue for *its* owner. Replaces the old
     /// inline recursive cascade with one hop per round (Zeebe's `COMPLETE_ELEMENT` decoupling), so
