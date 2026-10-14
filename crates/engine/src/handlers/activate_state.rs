@@ -57,9 +57,9 @@ impl ActivateStateHandler {
         // ancestor's termination), so a fresh activation on it names the wrong incarnation rather than
         // duplicating anything — refused like the sibling handlers' non-Running guards. Checked before
         // the definition lookup below: the scope's own status is the cheaper and more fundamental gate.
-        if !thread.value.status.is_running() {
-            let phase = thread.value.status.phase();
-            tracing::warn!(thread = %owner, status = ?thread.value.status,
+        if !thread.status.is_running() {
+            let phase = thread.status.phase();
+            tracing::warn!(thread = %owner, status = ?thread.status,
                 "activation arrived for a thread that is not Running; refused");
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,

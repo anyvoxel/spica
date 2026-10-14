@@ -78,7 +78,7 @@ pub struct TaskFailed {
 /// consumed (input / scheduling info, kept on the `ing` event) and what it produced (output /
 /// outcome, on the `ed` event). For synchronous states both events land in one batch; for a node
 /// that owns children the `ed` is **deferred** until the children have drained (each child
-/// terminates, the projection removes it from the parent's `active_children`, and the shared
+/// terminates, the projection removes it from the parent's ownership edges, and the shared
 /// cascade in the lifecycle handlers emits the ed). `ExecutionCreated` is the single creation
 /// record (its ed form would carry nothing).
 ///
@@ -146,7 +146,7 @@ pub enum Event {
     /// single creation record for a `Parallel` branch / `Map` item: a scoped sub-run of the shared
     /// machine that behaves like a self-contained sub-execution but is a distinct [`Thread`] entity
     /// (carrying the top-level `root_execution` anchor and its branch `state_path`). A thread is
-    /// always owned by its container Activity, so it is wired into that activity's `active_children`.
+    /// always owned by its container Activity, so it is wired into that activity's ownership edges.
     ///
     /// A thread is spawned by a container (fan-out), never by a client request, so this variant
     /// carries no `request_id` — it is never a request acknowledgement.
@@ -169,7 +169,8 @@ pub enum Event {
     /// the full event-carried [`Activity`] for that moment.
     ///
     /// The value is the Activity's domain entity shape, intentionally excluding projection-only
-    /// bookkeeping such as `active_children`. A follower / recovered leader can therefore rebuild the
+    /// bookkeeping such as the ownership edges to its children. A follower / recovered leader can
+    /// therefore rebuild the
     /// same activity domain state from the event stream alone, while storage remains free to keep its
     /// own fold-only metadata alongside it.
     StateActivating { activity: Activity },

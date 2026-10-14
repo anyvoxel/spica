@@ -20,9 +20,9 @@ impl ExecutionCompletedApplier {
         {
             exec.status = ExecutionStatus::Completed;
             exec.output = execution.output.clone();
-            // Keep the projected domain `updated_at` in step with the event's (handler-stamped).
-            exec.value.meta.updated_at = execution.meta.updated_at;
-            exec.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status/output update.
+            exec.meta.updated_at = execution.meta.updated_at;
             // No parent edge to detach: a run has no owner (its slot is `NoOwner`).
             ctx.storage.put_execution(exec).await?;
         }

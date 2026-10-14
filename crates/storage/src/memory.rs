@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use spica_engine_types::{
-    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
-    FlowVersionKind, ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError,
-    StorageTxn, TaskKind, TaskRecord, ThreadKind, ThreadRecord, TimerKind, TimerRecord, Timestamp,
+    Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
+    ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError, StorageTxn, Task,
+    TaskKind, Thread, ThreadKind, Timer, TimerKind, Timestamp, Variables,
 };
 
 /// The in-memory projection state, kept behind a shared interior (see [`InMemoryStorage`]). The
@@ -20,12 +20,17 @@ use spica_engine_types::{
 struct InMemoryDb {
     // Execution rows, keyed by the addressing `name` (the primary key, per scope); the `uid` is a
     // secondary attribute, matching the persisted `KeyBuilder::execution`.
-    executions: HashMap<ObjectName, ExecutionRecord>,
+    executions: HashMap<ObjectName, Execution>,
     // Thread rows (fan-out sub-runs), keyed by the addressing `name`, matching `KeyBuilder::thread`.
-    threads: HashMap<ObjectName, ThreadRecord>,
-    activities: HashMap<ObjectName, ActivityRecord>,
-    timers: HashMap<ObjectName, TimerRecord>,
-    tasks: HashMap<ObjectName, TaskRecord>,
+    threads: HashMap<ObjectName, Thread>,
+    /// Thread variable scopes (`Storage::get_variables`), keyed by the owning thread's addressing
+    /// name — the map-level twin of the `_index/variables/…` key. A separate map rather than a field
+    /// on the thread row, so an `Assign` never rewrites the row and a whole-row `put_thread` can
+    /// never wipe the scope.
+    variables: HashMap<ObjectName, Variables>,
+    activities: HashMap<ObjectName, Activity>,
+    timers: HashMap<ObjectName, Timer>,
+    tasks: HashMap<ObjectName, Task>,
     /// Flow rows, addressed by the immutable name (the primary key).
     flows: HashMap<FlowName, Flow>,
     /// Persisted flow versions, keyed by the version's own addressing `ObjectName` (`{flow}-{version}`,
@@ -38,6 +43,10 @@ struct InMemoryDb {
     /// Partition-local generated-name counter (see [`Storage::next_generated_seq`]), the next suffix
     /// a generated object name may take. `0` = none minted yet.
     next_generated_seq: i64,
+    /// Ownership edges (`Storage::get_children`), keyed by the `(parent, child)` pair — the map-level
+    /// twin of the `_index/children/…` key range. Pair-keyed rather than a per-parent child set so an
+    /// add/remove is one insert/remove with no read-modify-write of the parent.
+    children: HashSet<(RawObjectRef, RawObjectRef)>,
 }
 
 /// In-process, in-memory [`Storage`] used as the M1 synchronous/test default.
@@ -74,73 +83,13 @@ impl InMemoryStorage {
 }
 
 impl InMemoryDb {
-    fn children(&self, id: &RawObjectRef) -> HashSet<RawObjectRef> {
-        match id.kind {
-            ObjectKind::Execution => self
-                .executions
-                .get(&id.name)
-                .map(|x| x.active_children.clone())
-                .unwrap_or_default(),
-            // A thread is a self-contained sub-run: it owns (and can drain) its own children.
-            ObjectKind::Thread => self
-                .threads
-                .get(&id.name)
-                .map(|x| x.active_children.clone())
-                .unwrap_or_default(),
-            ObjectKind::Activity => self
-                .activities
-                .get(&id.name)
-                .map(|x| x.active_children.clone())
-                .unwrap_or_default(),
-            // A timer/task (or a non-node kind) is a leaf; it has no children to sweep.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {
-                HashSet::new()
-            }
-        }
-    }
-
-    fn remove_child(&mut self, parent: &RawObjectRef, child: &RawObjectRef) {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(exec) = self.executions.get_mut(&parent.name) {
-                    exec.active_children.remove(child);
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(thread) = self.threads.get_mut(&parent.name) {
-                    thread.active_children.remove(child);
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(act) = self.activities.get_mut(&parent.name) {
-                    act.active_children.remove(child);
-                }
-            }
-            // A timer/task/flow never owns children; nothing to remove.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
-    }
-
-    fn add_child(&mut self, parent: &RawObjectRef, child: RawObjectRef) {
-        match parent.kind {
-            ObjectKind::Execution => {
-                if let Some(exec) = self.executions.get_mut(&parent.name) {
-                    exec.active_children.insert(child);
-                }
-            }
-            ObjectKind::Thread => {
-                if let Some(thread) = self.threads.get_mut(&parent.name) {
-                    thread.active_children.insert(child);
-                }
-            }
-            ObjectKind::Activity => {
-                if let Some(act) = self.activities.get_mut(&parent.name) {
-                    act.active_children.insert(child);
-                }
-            }
-            // A timer/task/flow never owns children; nothing to add.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
+    /// The children `parent` currently owns, read off the edge set.
+    fn children(&self, parent: &RawObjectRef) -> HashSet<RawObjectRef> {
+        self.children
+            .iter()
+            .filter(|(p, _)| p == parent)
+            .map(|(_, c)| c.clone())
+            .collect()
     }
 }
 
@@ -149,35 +98,47 @@ impl Storage for InMemoryStorage {
     async fn get_execution(
         &self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         Ok(self.db().executions.get(reference.name()).cloned())
     }
 
     async fn get_thread(
         &self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         Ok(self.db().threads.get(reference.name()).cloned())
+    }
+
+    async fn get_variables(
+        &self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        Ok(self
+            .db()
+            .variables
+            .get(reference.name())
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn get_activity(
         &self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         Ok(self.db().activities.get(reference.name()).cloned())
     }
 
     async fn get_timer(
         &self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         Ok(self.db().timers.get(reference.name()).cloned())
     }
 
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         Ok(self.db().tasks.get(reference.name()).cloned())
     }
 
@@ -186,13 +147,13 @@ impl Storage for InMemoryStorage {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         // A linear scan of the task map — no per-resource queue index in M1 (see the trait doc).
         let db = self.db();
         Ok(db
             .tasks
             .values()
-            .filter(|t| t.value.resource == resource && t.value.is_claimable_at(now))
+            .filter(|t| t.resource == resource && t.is_claimable_at(now))
             .take(limit)
             .cloned()
             .collect())
@@ -246,27 +207,38 @@ impl Storage for InMemoryStorage {
             .collect())
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
         self.db().executions.insert(exec.meta.name.clone(), exec);
         Ok(())
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
         self.db().threads.insert(thread.meta.name.clone(), thread);
         Ok(())
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError> {
+        self.db()
+            .variables
+            .insert(reference.name().clone(), variables);
+        Ok(())
+    }
+
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.db().activities.insert(act.meta.name.clone(), act);
         Ok(())
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
         self.db().timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
         self.db().tasks.insert(task.meta.name.clone(), task);
         Ok(())
     }
@@ -276,7 +248,7 @@ impl Storage for InMemoryStorage {
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        self.db().remove_child(&parent, &child);
+        self.db().children.remove(&(parent, child));
         Ok(())
     }
 
@@ -285,7 +257,7 @@ impl Storage for InMemoryStorage {
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        self.db().add_child(&parent, child);
+        self.db().children.insert((parent, child));
         Ok(())
     }
 
@@ -363,17 +335,45 @@ impl Storage for InMemoryStorage {
 struct InMemoryBatch {
     // Execution rows, keyed by the addressing `name` (the primary key, per scope); the `uid` is a
     // secondary attribute, matching the persisted `KeyBuilder::execution`.
-    executions: HashMap<ObjectName, ExecutionRecord>,
+    executions: HashMap<ObjectName, Execution>,
     // Thread rows (fan-out sub-runs), keyed by the addressing `name`, matching `KeyBuilder::thread`.
-    threads: HashMap<ObjectName, ThreadRecord>,
-    activities: HashMap<ObjectName, ActivityRecord>,
-    timers: HashMap<ObjectName, TimerRecord>,
-    tasks: HashMap<ObjectName, TaskRecord>,
+    threads: HashMap<ObjectName, Thread>,
+    /// Thread variable scopes (`Storage::get_variables`), keyed by the owning thread's addressing
+    /// name — the map-level twin of the `_index/variables/…` key. A separate map rather than a field
+    /// on the thread row, so an `Assign` never rewrites the row and a whole-row `put_thread` can
+    /// never wipe the scope.
+    variables: HashMap<ObjectName, Variables>,
+    activities: HashMap<ObjectName, Activity>,
+    timers: HashMap<ObjectName, Timer>,
+    tasks: HashMap<ObjectName, Task>,
     flows: HashMap<FlowName, Flow>,
     // Version rows, keyed by the version's own `{flow}-{version}` name (see `InMemoryDb`).
     flow_versions: HashMap<ObjectName, FlowVersion>,
     // Pending bump of the partition-local generated-name counter (`None` = no bump in this fold).
     next_generated_seq: Option<i64>,
+    /// Pending ownership-edge decisions, keyed by the `(parent, child)` pair with the *final*
+    /// decision for that edge as the value — so add-then-remove (or the reverse) within one fold
+    /// resolves to whatever the fold decided last, without a tombstone concept. Landed at commit.
+    children: HashMap<(RawObjectRef, RawObjectRef), bool>,
+}
+
+impl InMemoryBatch {
+    /// The edge set for `parent` as this fold sees it: the committed edges overlaid with this fold's
+    /// pending decisions. Mirrors what the `RocksTxn` iterator gets for free from its pending batch.
+    fn children(&self, db: &InMemoryDb, parent: &RawObjectRef) -> HashSet<RawObjectRef> {
+        let mut out = db.children(parent);
+        for ((p, c), present) in &self.children {
+            if p != parent {
+                continue;
+            }
+            if *present {
+                out.insert(c.clone());
+            } else {
+                out.remove(c);
+            }
+        }
+        out
+    }
 }
 
 /// Atomic projection transaction for [`InMemoryStorage`]. Owns a clone of the shared
@@ -391,7 +391,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_execution(
         &mut self,
         reference: &ObjectRef<ExecutionKind>,
-    ) -> Result<Option<ExecutionRecord>, StorageError> {
+    ) -> Result<Option<Execution>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
         if let Some(exec) = self.batch.executions.get(reference.name()) {
             return Ok(Some(exec.clone()));
@@ -408,7 +408,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_thread(
         &mut self,
         reference: &ObjectRef<ThreadKind>,
-    ) -> Result<Option<ThreadRecord>, StorageError> {
+    ) -> Result<Option<Thread>, StorageError> {
         // Read-your-writes: resolve from the fold's buffered batch first, then committed state.
         if let Some(thread) = self.batch.threads.get(reference.name()) {
             return Ok(Some(thread.clone()));
@@ -422,10 +422,28 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
+    async fn get_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+    ) -> Result<Variables, StorageError> {
+        // Read-your-writes: an assignment folded earlier in this batch is seen by a later read.
+        if let Some(variables) = self.batch.variables.get(reference.name()) {
+            return Ok(variables.clone());
+        }
+        Ok(self
+            .inner
+            .lock()
+            .expect("in-memory storage lock poisoned")
+            .variables
+            .get(reference.name())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn get_activity(
         &mut self,
         reference: &ObjectRef<ActivityKind>,
-    ) -> Result<Option<ActivityRecord>, StorageError> {
+    ) -> Result<Option<Activity>, StorageError> {
         if let Some(act) = self.batch.activities.get(reference.name()) {
             return Ok(Some(act.clone()));
         }
@@ -441,7 +459,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_timer(
         &mut self,
         reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<TimerRecord>, StorageError> {
+    ) -> Result<Option<Timer>, StorageError> {
         if let Some(timer) = self.batch.timers.get(reference.name()) {
             return Ok(Some(timer.clone()));
         }
@@ -457,7 +475,7 @@ impl StorageTxn for InMemoryTxn {
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
-    ) -> Result<Option<TaskRecord>, StorageError> {
+    ) -> Result<Option<Task>, StorageError> {
         if let Some(task) = self.batch.tasks.get(reference.name()) {
             return Ok(Some(task.clone()));
         }
@@ -475,10 +493,10 @@ impl StorageTxn for InMemoryTxn {
         resource: &str,
         now: Timestamp,
         limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    ) -> Result<Vec<Task>, StorageError> {
         // read-your-writes: the committed rows, with the pending batch winning by name — so a task
         // folded earlier in this batch is seen (and its replacement status supersedes the committed one).
-        let mut tasks: HashMap<ObjectName, TaskRecord> = self
+        let mut tasks: HashMap<ObjectName, Task> = self
             .inner
             .lock()
             .expect("in-memory storage lock poisoned")
@@ -489,7 +507,7 @@ impl StorageTxn for InMemoryTxn {
         }
         Ok(tasks
             .values()
-            .filter(|t| t.value.resource == resource && t.value.is_claimable_at(now))
+            .filter(|t| t.resource == resource && t.is_claimable_at(now))
             .take(limit)
             .cloned()
             .collect())
@@ -499,73 +517,64 @@ impl StorageTxn for InMemoryTxn {
         &mut self,
         id: RawObjectRef,
     ) -> Result<HashSet<RawObjectRef>, StorageError> {
-        Ok(match id.kind {
-            ObjectKind::Execution => self
-                .get_execution(&id.clone().typed::<ExecutionKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Thread => self
-                .get_thread(&id.clone().typed::<ThreadKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            ObjectKind::Activity => self
-                .get_activity(&id.clone().typed::<ActivityKind>())
-                .await?
-                .map(|x| x.active_children)
-                .unwrap_or_default(),
-            // A timer/task (or a non-node kind) is a leaf; it has no children to sweep.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {
-                HashSet::new()
-            }
-        })
+        let db = self.inner.lock().expect("in-memory storage lock poisoned");
+        Ok(self.batch.children(&db, &id))
     }
 
-    async fn put_execution(&mut self, exec: ExecutionRecord) -> Result<(), StorageError> {
+    async fn put_execution(&mut self, exec: Execution) -> Result<(), StorageError> {
         self.batch.executions.insert(exec.meta.name.clone(), exec);
         Ok(())
     }
 
-    async fn put_thread(&mut self, thread: ThreadRecord) -> Result<(), StorageError> {
+    async fn put_thread(&mut self, thread: Thread) -> Result<(), StorageError> {
         self.batch.threads.insert(thread.meta.name.clone(), thread);
         Ok(())
     }
 
-    async fn put_activity(&mut self, act: ActivityRecord) -> Result<(), StorageError> {
+    async fn put_variables(
+        &mut self,
+        reference: &ObjectRef<ThreadKind>,
+        variables: Variables,
+    ) -> Result<(), StorageError> {
+        self.batch
+            .variables
+            .insert(reference.name().clone(), variables);
+        Ok(())
+    }
+
+    async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.batch.activities.insert(act.meta.name.clone(), act);
         Ok(())
     }
 
-    async fn put_timer(&mut self, timer: TimerRecord) -> Result<(), StorageError> {
+    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
         self.batch.timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
-    async fn put_task(&mut self, task: TaskRecord) -> Result<(), StorageError> {
+    async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
         self.batch.tasks.insert(task.meta.name.clone(), task);
         Ok(())
     }
 
-    /// Remove `child` from `parent`'s `active_children`: read the (batch-first) row, mutate a clone,
-    /// and buffer the result into this fold's batch (atomicity at commit).
+    /// Record the removal of the `parent` → `child` edge into this fold's batch: the pair's final
+    /// decision in this fold is now "absent".
     async fn remove_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        self.buffer_child_mutation(&parent, &child, false);
+        self.batch.children.insert((parent, child), false);
         Ok(())
     }
 
-    /// Add `child` to `parent`'s `active_children`: read the (batch-first) row, mutate a clone, and
-    /// buffer the result into this fold's batch (atomicity at commit).
+    /// Record the `parent` → `child` edge into this fold's batch (last decision for the pair wins).
     async fn add_child(
         &mut self,
         parent: RawObjectRef,
         child: RawObjectRef,
     ) -> Result<(), StorageError> {
-        self.buffer_child_mutation(&parent, &child, true);
+        self.batch.children.insert((parent, child), true);
         Ok(())
     }
 
@@ -658,11 +667,21 @@ impl StorageTxn for InMemoryTxn {
         // Land the whole fold all-or-nothing, then the watermark advance in the same atomic unit.
         db.executions.extend(batch.executions);
         db.threads.extend(batch.threads);
+        db.variables.extend(batch.variables);
         db.activities.extend(batch.activities);
         db.timers.extend(batch.timers);
         db.tasks.extend(batch.tasks);
         db.flows.extend(batch.flows);
         db.flow_versions.extend(batch.flow_versions);
+        // Land this fold's edge decisions: each pair's final decision is either an insert or a
+        // removal, applied straight to the edge set (last-write-wins was already resolved in the map).
+        for (edge, present) in batch.children {
+            if present {
+                db.children.insert(edge);
+            } else {
+                db.children.remove(&edge);
+            }
+        }
         if let Some(seq) = batch.next_generated_seq {
             db.next_generated_seq = db.next_generated_seq.max(seq);
         }
@@ -670,83 +689,6 @@ impl StorageTxn for InMemoryTxn {
             db.last_processed_position = w;
         }
         Ok(())
-    }
-}
-
-impl InMemoryTxn {
-    /// Read the (batch-first) parent row for `parent`, add/remove `child` on a clone, and buffer the
-    /// mutated row into this fold's batch. Reading the batch first (read-your-writes) is what lets a
-    /// read-modify-write compose with an earlier `put_execution`/`add_child` of the same row in the
-    /// same fold without clobbering it.
-    fn buffer_child_mutation(&mut self, parent: &RawObjectRef, child: &RawObjectRef, insert: bool) {
-        match parent.kind {
-            ObjectKind::Execution => {
-                let base = self
-                    .batch
-                    .executions
-                    .get(&parent.name)
-                    .cloned()
-                    .or_else(|| {
-                        self.inner
-                            .lock()
-                            .expect("in-memory storage lock poisoned")
-                            .executions
-                            .get(&parent.name)
-                            .cloned()
-                    });
-                if let Some(mut exec) = base {
-                    if insert {
-                        exec.active_children.insert(child.clone());
-                    } else {
-                        exec.active_children.remove(child);
-                    }
-                    self.batch.executions.insert(parent.name.clone(), exec);
-                }
-            }
-            ObjectKind::Thread => {
-                let base = self.batch.threads.get(&parent.name).cloned().or_else(|| {
-                    self.inner
-                        .lock()
-                        .expect("in-memory storage lock poisoned")
-                        .threads
-                        .get(&parent.name)
-                        .cloned()
-                });
-                if let Some(mut thread) = base {
-                    if insert {
-                        thread.active_children.insert(child.clone());
-                    } else {
-                        thread.active_children.remove(child);
-                    }
-                    self.batch.threads.insert(parent.name.clone(), thread);
-                }
-            }
-            ObjectKind::Activity => {
-                let base = self
-                    .batch
-                    .activities
-                    .get(&parent.name)
-                    .cloned()
-                    .or_else(|| {
-                        self.inner
-                            .lock()
-                            .expect("in-memory storage lock poisoned")
-                            .activities
-                            .get(&parent.name)
-                            .cloned()
-                    });
-                if let Some(mut act) = base {
-                    if insert {
-                        act.active_children.insert(child.clone());
-                    } else {
-                        act.active_children.remove(child);
-                    }
-                    self.batch.activities.insert(parent.name.clone(), act);
-                }
-            }
-            // A leaf (or non-node kind) never owns children; nothing to mutate.
-            ObjectKind::Timer | ObjectKind::Task | ObjectKind::Flow | ObjectKind::FlowVersion => {}
-        }
     }
 }
 
@@ -771,9 +713,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use spica_engine_types::{
-        Execution, ExecutionStatus, ObjectRef, PlainName, RetryState, Task, TaskStatus, Timestamp,
+        Execution, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName, RetryState, StatePath,
+        Task, TaskStatus, ThreadOwner, ThreadStatus, TimerKind, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
@@ -787,25 +730,60 @@ mod tests {
         )
     }
 
+    /// A distinct thread reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
+    fn thread_ref() -> ObjectRef<ThreadKind> {
+        let uid = ulid::Ulid::new();
+        ObjectRef::new(
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
+            uid,
+        )
+    }
+
+    /// A minimal running thread row. Only its own identity/lifecycle facts matter here; the variable
+    /// scope sits in the sibling cell under test.
+    fn sample_thread(id: ObjectRef<ThreadKind>) -> Thread {
+        Thread {
+            meta: spica_engine_types::ObjectMeta::builder(id.uid())
+                .name(id.name().clone())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Execution(test_exec_ref())),
+            execution: test_exec_ref(),
+            state_path: StatePath::root(),
+            start_at: "S".into(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: json!({}),
+            output: None,
+        }
+    }
+
+    /// A distinct timer reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
+    fn timer_ref() -> ObjectRef<TimerKind> {
+        let uid = ulid::Ulid::new();
+        ObjectRef::new(
+            PlainName::new("child")
+                .unwrap()
+                .generated_from_key(uid.0 as u64),
+            uid,
+        )
+    }
+
     /// A minimal running execution row for exercising the in-memory store.
-    fn sample_execution(id: ObjectRef<ExecutionKind>) -> ExecutionRecord {
-        ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version: ObjectRef::new(
-                    PlainName::new("flow").unwrap().generated_from_key(1),
-                    ulid::Ulid::nil(),
-                ),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine_types::ObjectMeta::builder(id.uid())
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(spica_engine_types::NoOwner::new()),
-            },
-            active_children: HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+    fn sample_execution(id: ObjectRef<ExecutionKind>) -> Execution {
+        Execution {
+            deadline: None,
+            flow_version: ObjectRef::new(
+                PlainName::new("flow").unwrap().generated_from_key(1),
+                ulid::Ulid::nil(),
+            ),
+            status: ExecutionStatus::Running,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine_types::ObjectMeta::builder(id.uid())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(spica_engine_types::NoOwner::new()),
         }
     }
 
@@ -830,31 +808,27 @@ mod tests {
         worker_id: Option<&str>,
         lease_expires_at: Option<Timestamp>,
         next_available_at: Option<Timestamp>,
-    ) -> TaskRecord {
-        TaskRecord {
-            value: Task {
-                execution: ObjectRef::nil(),
-                resource: resource.to_string(),
-                arguments: Value::Null,
-                status,
-                deadline: None,
-                worker_id: worker_id.map(str::to_string),
-                lease_expires_at,
-                retry_plan: vec![],
-                retry_state: RetryState {
-                    attempts: 0,
-                    retrier_attempts: vec![],
-                    next_available_at,
-                },
-                meta: spica_engine_types::ObjectMeta::builder(id)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(ObjectRef::new(
-                        PlainName::new("invoke").unwrap().generated_from_key(1),
-                        ulid::Ulid::nil(),
-                    )),
+    ) -> Task {
+        Task {
+            execution: ObjectRef::nil(),
+            resource: resource.to_string(),
+            arguments: Value::Null,
+            status,
+            deadline: None,
+            worker_id: worker_id.map(str::to_string),
+            lease_expires_at,
+            retry_plan: vec![],
+            retry_state: RetryState {
+                attempts: 0,
+                retrier_attempts: vec![],
+                next_available_at,
             },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+            meta: spica_engine_types::ObjectMeta::builder(id)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ObjectRef::new(
+                    PlainName::new("invoke").unwrap().generated_from_key(1),
+                    ulid::Ulid::nil(),
+                )),
         }
     }
 
@@ -916,7 +890,7 @@ mod tests {
 
         let found = store.activatable_tasks("r", now, 10).await.unwrap();
         assert_eq!(
-            found.iter().map(|t| t.value.meta.uid).collect::<Vec<_>>(),
+            found.iter().map(|t| t.meta.uid).collect::<Vec<_>>(),
             vec![expired],
             "only the lapsed lease is claimable at `now`"
         );
@@ -943,7 +917,7 @@ mod tests {
             .activatable_tasks("r", Timestamp::from_millis(1_000_001), 10)
             .await
             .unwrap();
-        let mut uids: Vec<_> = later.iter().map(|t| t.value.meta.uid).collect();
+        let mut uids: Vec<_> = later.iter().map(|t| t.meta.uid).collect();
         uids.sort();
         let mut expected = vec![expired, live, gated];
         expected.sort();
@@ -975,5 +949,111 @@ mod tests {
         }
         assert!(store.get_execution(&other).await.unwrap().is_none());
         assert_eq!(store.last_processed_position().await.unwrap(), 7);
+    }
+
+    /// The in-memory twin of the RocksDB edge tests: edges live off the parent row, so they compose
+    /// with a row write instead of clobbering it, and a fold sees its own pending add/remove.
+    #[tokio::test]
+    async fn edges_are_independent_of_the_parent_row_and_replay_through_a_fold() {
+        let mut store = InMemoryStorage::new();
+        let id = test_exec_ref();
+        let parent = id.clone().into_raw_object_ref();
+        let child = timer_ref().into_raw_object_ref();
+        let other = timer_ref().into_raw_object_ref();
+        store
+            .put_execution(sample_execution(id.clone()))
+            .await
+            .unwrap();
+
+        assert!(store.get_children(parent.clone()).await.unwrap().is_empty());
+        store
+            .add_child(parent.clone(), child.clone())
+            .await
+            .unwrap();
+        // Writing the parent row from a bare domain value (no re-attached child set) keeps the edge.
+        let mut row = sample_execution(id.clone());
+        row.meta.with_update_at(Timestamp::from_millis(42));
+        store.put_execution(row).await.unwrap();
+        assert_eq!(
+            store.get_children(parent.clone()).await.unwrap(),
+            HashSet::from([child.clone()])
+        );
+        assert_eq!(
+            store
+                .get_execution(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .meta
+                .updated_at,
+            Timestamp::from_millis(42)
+        );
+
+        // Inside one fold: add then remove the same edge resolves to the last decision, and an edge
+        // added earlier in the fold is visible to a read of that same fold (read-your-writes).
+        let mut txn = store.begin_txn().unwrap();
+        txn.add_child(parent.clone(), other.clone()).await.unwrap();
+        assert_eq!(
+            txn.get_children(parent.clone()).await.unwrap(),
+            HashSet::from([child.clone(), other.clone()])
+        );
+        txn.remove_child(parent.clone(), other.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            txn.get_children(parent.clone()).await.unwrap(),
+            HashSet::from([child.clone()])
+        );
+        // Nothing landed before commit; after it, the removal holds and the untouched edge survives.
+        assert_eq!(
+            store.get_children(parent.clone()).await.unwrap(),
+            HashSet::from([child.clone()])
+        );
+        txn.commit(None).unwrap();
+        assert_eq!(
+            store.get_children(parent).await.unwrap(),
+            HashSet::from([child])
+        );
+    }
+
+    /// The in-memory twin of the RocksDB scope tests: the variable scope lives off the thread row, so
+    /// a whole-row `put_thread` cannot clobber it, an `Assign` never rewrites the row, and a fold sees
+    /// its own pending write.
+    #[tokio::test]
+    async fn variables_are_independent_of_the_thread_row_and_replay_through_a_fold() {
+        let mut store = InMemoryStorage::new();
+        let id = thread_ref();
+        store.put_thread(sample_thread(id.clone())).await.unwrap();
+        // No scope yet: a thread reads as an empty map rather than "missing".
+        assert!(store.get_variables(&id).await.unwrap().is_empty());
+
+        store
+            .put_variables(&id, Variables::from([("g".to_string(), json!("hi"))]))
+            .await
+            .unwrap();
+        // Rewriting the whole thread row (a lifecycle update carrying no scope) keeps the scope.
+        let mut row = sample_thread(id.clone());
+        row.meta.with_update_at(Timestamp::from_millis(42));
+        store.put_thread(row).await.unwrap();
+        assert_eq!(
+            store.get_variables(&id).await.unwrap().get("g"),
+            Some(&json!("hi"))
+        );
+
+        // Inside one fold a write is visible to a read of that same fold (read-your-writes), and it
+        // lands on commit.
+        let mut txn = store.begin_txn().unwrap();
+        txn.put_variables(&id, Variables::from([("x".to_string(), json!(1))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            txn.get_variables(&id).await.unwrap().get("x"),
+            Some(&json!(1))
+        );
+        // The fold's snapshot replaced the committed one wholesale.
+        txn.commit(None).unwrap();
+        let scope = store.get_variables(&id).await.unwrap();
+        assert_eq!(scope.get("x"), Some(&json!(1)));
+        assert_eq!(scope.get("g"), None);
     }
 }

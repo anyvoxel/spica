@@ -640,7 +640,6 @@ mod tests {
                 .activity(&minted_activity_ref())
                 .await
                 .expect("the birth event folded a row")
-                .value
                 .status,
             ActivityStatus::Running,
             "the unwinding terminate is a command, not a fold: the row stays as the birth left it"

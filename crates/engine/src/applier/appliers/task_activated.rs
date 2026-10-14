@@ -18,18 +18,15 @@ impl TaskActivatedApplier {
         // Fold the invocation as a durable fact: a `Pending` (available) task row owned by the
         // invoking activity. `deadline` is the state's `TimeoutSeconds` instant (carried on the
         // command), and `worker_id`/`lease_expires_at` are `None` until a worker claims it.
-        let mut row = crate::storage::TaskRecord::from_value(task.clone());
-        // Birth: `created_at`/`updated_at` stamped with the `TaskActivated` entry's moment.
-        row.born(ctx.timestamp);
-        ctx.storage.put_task(row).await?;
+        ctx.storage.put_task(task.clone()).await?;
         super::bump_generated_seq(ctx.storage, &task.meta.raw_object_ref().name).await?;
         ctx.storage
             .add_child(
                 task.meta
                     .owner
                     .clone()
-                    // The slot is an `ObjectRef<ActivityKind>`; `active_children` speaks flat addresses,
-                    // so the owner crosses the erasure seam here.
+                    // The slot is an `ObjectRef<ActivityKind>`; an ownership edge speaks flat
+                    // addresses, so the owner crosses the erasure seam here.
                     .into_raw_object_ref(),
                 task.meta.raw_object_ref(),
             )

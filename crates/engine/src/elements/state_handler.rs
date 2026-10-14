@@ -6,7 +6,6 @@ use std::mem::Discriminant;
 
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::storage::{ActivityRecord, ThreadRecord};
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
     ActivateState, Command, CompleteState, TerminateState, TerminationReason,
@@ -15,7 +14,7 @@ use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, VariablesAssigned};
 use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef};
-use crate::types::thread::ThreadKind;
+use crate::types::thread::{Thread, ThreadKind};
 use crate::{Activity, ActivityStatus, RejectionType, Timestamp, Variables};
 
 /// The registered, stateless `State` → factory entry: identifies the [`State`] variant it serves
@@ -311,7 +310,7 @@ pub trait StateHandler: Send + Sync {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &ActivateState,
-        thread: &ThreadRecord,
+        thread: &Thread,
     ) -> Result<(), ProcessingError> {
         let ActivateState {
             execution,
@@ -351,9 +350,10 @@ pub trait StateHandler: Send + Sync {
 
         // The activity's owner is always a `Thread` — the derived root thread for a top-level run, a
         // fan-out thread for a branch/item — which the slot's own type guarantees. The row arrives
-        // already read and screened, and it is exactly what yields the variables the hooks evaluate
+        // already read and screened; the scope's variables are derived state in their own `_index`
+        // cell (see `Storage::get_variables`), read once here as the value every hook evaluates
         // against.
-        let variables = thread.variables.clone();
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
         let state_name = activity_value.state_path.state_name();
 
         self.initialize(&mut activity_value).await;
@@ -439,8 +439,8 @@ pub trait StateHandler: Send + Sync {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &CompleteState,
-        act: &ActivityRecord,
-        thread: &ThreadRecord,
+        act: &Activity,
+        thread: &Thread,
     ) -> Result<(), ProcessingError> {
         let CompleteState { output, .. } = cmd;
 
@@ -451,7 +451,7 @@ pub trait StateHandler: Send + Sync {
         // path instead of depending on the state to re-issue a command. The command's raw result is
         // folded in first (`CompleteState` always carries the state's raw result, so this overwrites
         // rather than defaults) so a deferred drain can read it back off the row to project with.
-        let mut activity_value = act.value();
+        let mut activity_value = act.clone();
         // The transition owns its own precondition even though the dispatcher screened for `Running`
         // before admitting the command: a `Completing`/terminal target means a competing finish or a
         // cancel already won, and refusing here is the one followup entry this command owes. The
@@ -471,9 +471,11 @@ pub trait StateHandler: Send + Sync {
         })
         .await;
 
-        // (3.4) The state's own complete step. The scope's variables come off the row the dispatcher
-        // already read (an activity is always owned by a `Thread`), so nothing here re-derives them.
-        self.after_completing(ctx, out, &activity_value, &thread.variables)
+        // (3.4) The state's own complete step. The scope's variables are derived state in their own
+        // `_index` cell, read off the scope the dispatcher already resolved (an activity is always
+        // owned by a `Thread`).
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
+        self.after_completing(ctx, out, &activity_value, &variables)
             .await
     }
 
@@ -490,8 +492,8 @@ pub trait StateHandler: Send + Sync {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         cmd: &TerminateState,
-        act: &ActivityRecord,
-        thread: &ThreadRecord,
+        act: &Activity,
+        thread: &Thread,
     ) -> Result<(), ProcessingError> {
         let TerminateState { reason, .. } = cmd;
         // The policy gets its say only for a failure the activity **itself** produced: a swept
@@ -499,7 +501,7 @@ pub trait StateHandler: Send + Sync {
         // another's policy.
         if let TerminationReason::Failed { error } = reason
             && matches!(
-                self.on_failed(ctx, out, &act.value, error).await,
+                self.on_failed(ctx, out, act, error).await,
                 FailureRouting::Caught
             )
         {
@@ -512,7 +514,7 @@ pub trait StateHandler: Send + Sync {
         // `StateCompleting`: a terminate that defers on a live child leaves the activity `Terminating`
         // (not `Running`), so the child's eventual settle drives the drain through the generic
         // `Terminating` path instead of depending on the state to re-issue a command.
-        let mut activity_value = act.value();
+        let mut activity_value = act.clone();
         if let Err(e) = activity_value.mark_terminating(reason.clone(), ctx.now()) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
@@ -527,9 +529,10 @@ pub trait StateHandler: Send + Sync {
         })
         .await;
 
-        // The state's own terminate step; the scope's variables come off the row the dispatcher
-        // already read.
-        self.after_terminating(ctx, out, &activity_value, &thread.variables)
+        // The state's own terminate step; the scope's variables are derived state in their own
+        // `_index` cell, read off the scope the dispatcher already resolved.
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
+        self.after_terminating(ctx, out, &activity_value, &variables)
             .await
     }
 }

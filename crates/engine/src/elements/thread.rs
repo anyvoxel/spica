@@ -73,7 +73,7 @@ impl Container for ThreadElementBehavior {
                 ),
             ));
         };
-        match &thread.value.status {
+        match &thread.status {
             // The scope's own success: a `Succeed` is a thread's only natural end, so the thread
             // completes on the settled child's output — read off that child's own row, the single source
             // of truth, rather than carried on the call. A terminal that projects no value folds as no
@@ -84,7 +84,7 @@ impl Container for ThreadElementBehavior {
                     .storage
                     .get_activity(&child.clone().typed::<ActivityKind>())
                     .await?
-                    .map(|act| act.value.output.clone().unwrap_or(Value::Null))
+                    .map(|act| act.output.clone().unwrap_or(Value::Null))
                     .unwrap_or(Value::Null);
                 out.append_command(Command::CompleteThread(CompleteThread {
                     thread: self.thread.clone(),
@@ -137,7 +137,7 @@ impl Container for ThreadElementBehavior {
                 ),
             ));
         };
-        match &thread.value.status {
+        match &thread.status {
             // The thread is the scope the failed state ran in, so it goes down with the same reason —
             // read off the settled child's own row, the single source of truth, rather than carried on
             // the call. An abnormal hook whose child is not in an abnormal terminal, or whose row is
@@ -149,7 +149,7 @@ impl Container for ThreadElementBehavior {
                     .get_activity(&child.clone().typed::<ActivityKind>())
                     .await?
                 {
-                    Some(act) => match &act.value.status {
+                    Some(act) => match &act.status {
                         ActivityStatus::Terminated(reason) => Some(reason.clone()),
                         _ => None,
                     },
@@ -228,11 +228,11 @@ impl ThreadElementBehavior {
         // them can tear the same branch down. Refused rather than dropped, so the durable log records
         // that this sweep was a duplicate rather than leaving a bogus one indistinguishable from an
         // absorbed one.
-        let mut terminating_thread = thread_row.value();
+        let mut terminating_thread = thread_row.clone();
         if let Err(why) = terminating_thread.mark_terminating(reason.clone(), ctx.now()) {
             tracing::warn!(
                 thread = %thread_ref,
-                status = ?thread_row.value.status,
+                status = ?thread_row.status,
                 reason = ?reason,
                 "termination arrived for a thread that is already past Running; refused: {why}"
             );
@@ -251,9 +251,12 @@ impl ThreadElementBehavior {
         // teardown opens. Reaching earlier (as the run-level relay here once did) starts a parent's
         // teardown while this thread still holds children, so the parent sweeps a subtree that is
         // already unwinding and every command it issues lands against a row past `Running`.
-        let children = thread_row.active_children.clone();
+        let children = ctx
+            .storage
+            .get_children(thread_row.meta.object_ref().into_raw_object_ref())
+            .await?;
         if children.is_empty() {
-            let mut terminated_thread = thread_row.value();
+            let mut terminated_thread = thread_row.clone();
             terminated_thread.status = ThreadStatus::Terminated(reason.clone());
             terminated_thread.meta.with_update_at(ctx.now());
 
@@ -263,7 +266,7 @@ impl ThreadElementBehavior {
             // refused while it can still be answered, rather than discovered as a no-op once the
             // terminal event is already on the log. What the settle *means* is the owner's business: a
             // root thread landing here is what starts its run's own teardown.
-            match thread_row.value.meta.owner.clone() {
+            match thread_row.meta.owner.clone() {
                 ThreadOwner::Execution(execution) => {
                     let container =
                         ExecutionElementBehavior::open(ctx.storage, execution.clone()).await?;
@@ -298,7 +301,7 @@ impl ThreadElementBehavior {
         // fan-out therefore reaches its teardown through the `TerminateState` below — that activity's
         // own sweep reaps its child threads, timers and tasks — never thread-sweeping-thread.
         //
-        // Any other kind in `active_children` is thus an engine invariant broken — a corrupt projection
+        // Any other kind in the child set is thus an engine invariant broken — a corrupt projection
         // or a forged child edge. Refuse to guess and fail loud, rather than leave the teardown
         // deferred on a child no sweep can reap.
         for child in children.iter().cloned() {
@@ -359,11 +362,11 @@ impl ThreadElementBehavior {
         // thread, and the leader dispatches in append order, so whichever lands second finds the thread
         // past `Running`. Refused rather than dropped, so the durable log records that this finish was a
         // duplicate rather than leaving it indistinguishable from one that applied.
-        if !thread_row.value.status.is_running() {
-            let phase = thread_row.value.status.phase();
+        if !thread_row.status.is_running() {
+            let phase = thread_row.status.phase();
             tracing::warn!(
                 thread = %thread_ref,
-                status = ?thread_row.value.status,
+                status = ?thread_row.status,
                 "completion arrived for a thread that is already past Running; refused"
             );
             return Err(ProcessingError::Rejected(
@@ -374,7 +377,7 @@ impl ThreadElementBehavior {
             ));
         }
 
-        let mut completing_thread = thread_row.value();
+        let mut completing_thread = thread_row.clone();
         completing_thread.status = ThreadStatus::Completing;
         completing_thread.output = Some(output.clone());
         // A new lifecycle transition — advance the domain `updated_at` (stemmed at event
@@ -389,8 +392,14 @@ impl ThreadElementBehavior {
         // (`TimerOwner` has no `Thread` variant) — and the activity relaying this completion has
         // already drained, so an empty set is the ordinary case: the thread finishes here and hands its
         // result up to its owner.
-        if thread_row.active_children.is_empty() {
-            let mut completed_thread = thread_row.value();
+        // Read from the ownership-edge index rather than off the row, so the set is never a second copy
+        // the status write above could clobber.
+        let children = ctx
+            .storage
+            .get_children(thread_row.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if children.is_empty() {
+            let mut completed_thread = thread_row.clone();
             completed_thread.status = ThreadStatus::Completed;
             completed_thread.output = Some(output.clone());
             completed_thread.meta.with_update_at(ctx.now());
@@ -401,7 +410,7 @@ impl ThreadElementBehavior {
             // is refused while it can still be answered, rather than discovered as a no-op once the
             // terminal event is already on the log. The hook then lets the owner decide what the
             // settle *means* (a run closes; a `Parallel`/`Map` converges).
-            match thread_row.value.meta.owner.clone() {
+            match thread_row.meta.owner.clone() {
                 ThreadOwner::Execution(execution) => {
                     let container =
                         ExecutionElementBehavior::open(ctx.storage, execution.clone()).await?;
@@ -430,7 +439,7 @@ impl ThreadElementBehavior {
             return Ok(());
         }
 
-        // Anything still attached is the row's `active_children` disagreeing with the lifecycle rather
+        // Anything still attached is the row's child set disagreeing with the lifecycle rather
         // than a child to wait on: there is no deadline here to cancel, and an activity a thread could
         // still be waiting on is the very one relaying this completion. Refused rather than closed
         // over, and a refusal strands nothing — the child's own settle drains the thread.
@@ -438,7 +447,7 @@ impl ThreadElementBehavior {
             RejectionType::InvalidState,
             format!(
                 "complete_thread: thread {thread_ref} still owns {} live child(ren); completion refused",
-                thread_row.active_children.len()
+                children.len()
             ),
         ))
     }
@@ -473,12 +482,17 @@ impl ThreadElementBehavior {
                 ),
             ));
         };
-        if !thread.active_children.is_empty() {
+        // Read from the ownership-edge index rather than off the row (see `terminate_thread`).
+        let children = ctx
+            .storage
+            .get_children(thread.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // Unreachable by construction — a Continue is issued only for a drained node. A thread
             // holds `Activity` children and nothing else (`ActivityKind::OwnedBy` is
             // `ObjectRef<ThreadKind>`, and it is the one edge that can parent an object to a thread), so
             // any other kind here is the row disagreeing with the lifecycle rather than a child to reap.
-            for child in &thread.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Activity => {
                         out.append_command(Command::TerminateState(TerminateState {
@@ -494,7 +508,7 @@ impl ThreadElementBehavior {
             }
             return Ok(());
         }
-        let mut terminated_thread = thread.value();
+        let mut terminated_thread = thread.clone();
         terminated_thread.status = ThreadStatus::Terminated(reason.clone());
         terminated_thread.meta.with_update_at(ctx.now());
         out.append_event(Event::ThreadTerminated {
@@ -507,7 +521,7 @@ impl ThreadElementBehavior {
         // that had nothing to wait for does. A kind-routed dispatch would not: it has no arm for
         // a still-`Running` run, which is where that teardown has to come from.
         let child = node.into_raw_object_ref();
-        match thread.value.meta.owner.clone() {
+        match thread.meta.owner.clone() {
             ThreadOwner::Execution(execution) => {
                 match ExecutionElementBehavior::open(ctx.storage, execution).await {
                     Ok(container) => container.after_child_terminated(ctx, out, &child).await?,
@@ -557,11 +571,16 @@ impl ThreadElementBehavior {
                 ),
             ));
         }
-        if !thread.active_children.is_empty() {
+        // Read from the ownership-edge index rather than off the row (see `continue_terminate`).
+        let children = ctx
+            .storage
+            .get_children(thread.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // Unreachable by construction — a Continue is issued only for a drained node. A thread
             // holds `Activity` children and nothing else, so any other kind here is the row disagreeing
             // with the lifecycle rather than a child to take down.
-            for child in &thread.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Activity => {
                         out.append_command(Command::TerminateState(TerminateState {
@@ -578,7 +597,7 @@ impl ThreadElementBehavior {
             return Ok(());
         }
         let output = thread.output.clone().unwrap_or_default();
-        let mut completed_thread = thread.value();
+        let mut completed_thread = thread.clone();
         completed_thread.status = ThreadStatus::Completed;
         completed_thread.output = Some(output);
         completed_thread.meta.with_update_at(ctx.now());
@@ -589,7 +608,7 @@ impl ThreadElementBehavior {
         // The settled thread hands its settle to its owner's `Container` — the owner's *type* names the
         // container, so a root thread closes its run and a fan-out thread converges its activity.
         let child = node.into_raw_object_ref();
-        match thread.value.meta.owner.clone() {
+        match thread.meta.owner.clone() {
             ThreadOwner::Execution(execution) => {
                 match ExecutionElementBehavior::open(ctx.storage, execution).await {
                     Ok(container) => container.after_child_completed(ctx, out, &child).await?,
@@ -614,7 +633,7 @@ impl ThreadElementBehavior {
     /// into a new child **Thread** (a scoped sub-run, distinct from a top-level `Execution`).
     ///
     /// The child is projected by a `ThreadCreated{parent, execution, state_path}` (which wires it
-    /// into its owner's `active_children` via the applier), then entered at its `StartAt` state via
+    /// into its owner's ownership edges via the applier), then entered at its `StartAt` state via
     /// `ActivateState`. From there it runs as a self-contained sub-state-machine — its internal hops
     /// happen entirely within the thread, and its terminal hop runs the inline child-settled reaction
     /// back to `parent`, so the owning `Parallel`/`Map` activity only learns the child settled
@@ -681,7 +700,7 @@ impl ThreadElementBehavior {
         // does **not** re-record `flow_version` (derived via its `execution` later, see `Thread`) —
         // it only inherits the tree's top-level anchor verbatim, so its states resolve against the
         // same shared machine doc.
-        let scope_ref = owner_activity.value.meta.owner.clone();
+        let scope_ref = owner_activity.meta.owner.clone();
         // Resolve the owning thread to inherit the tree's top-level anchor (`execution`): the child
         // Thread shares the owner's tree, so the anchor is taken verbatim while the Thread itself is
         // the child's `owner`. The slot admits only a `Thread`, so the row is read directly.
@@ -698,7 +717,7 @@ impl ThreadElementBehavior {
                 ),
             ));
         };
-        let root_execution = owner_thread.value.execution.clone();
+        let root_execution = owner_thread.execution.clone();
 
         // Mint the child's uid and its stable RawObjectRef up front: the child `Thread` row is
         // keyed by that reference, and the sibling `ActivateState` entry must name the same run
@@ -720,7 +739,7 @@ impl ThreadElementBehavior {
         tracing::debug!(child = ?reference, owner = ?owner, "spawning child thread from fan-out command");
 
         // Root the child in the owning tree: `parent` links it to the Parallel activity (whose
-        // `active_children` the applier populates, so the Parallel drains only once every branch
+        // ownership edges the applier populates, so the Parallel drains only once every branch
         // settles); `execution` inherits the top-level run's id verbatim (the flat query
         // anchor shared by the whole tree); `state_path` lets the child resolve its own branch
         // states without querying its parent or the root — it already names the branch's `States`
@@ -774,7 +793,7 @@ impl ThreadElementBehavior {
 
 #[cfg(test)]
 mod settle_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::{Value, json};
@@ -789,8 +808,8 @@ mod settle_tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::build_state_handlers;
-    use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::{ActivityRecord, ReadonlyStorageTxn, Storage, ThreadRecord};
+    use crate::handlers::fixtures::{Seeded, at, object_ref, seed_edges};
+    use crate::storage::{ReadonlyStorageTxn, Storage};
     use crate::types::activity::{ActivityKind, ActivityStatus};
     use crate::types::command::{Command, CompleteThread, TerminateThread, TerminationReason};
     use crate::types::execution::ExecutionKind;
@@ -823,7 +842,7 @@ mod settle_tests {
 
     /// A seeded thread row with `children` live children still attached (any ref is fine here — the
     /// drain decision reads the set, not the members).
-    fn seeded_thread(status: ThreadStatus, children: usize) -> ThreadRecord {
+    fn seeded_thread(status: ThreadStatus, children: usize) -> Seeded<Thread> {
         let thread = Thread {
             meta: ObjectMeta::builder(thread_ref().uid())
                 .name(thread_ref().name().clone())
@@ -839,16 +858,14 @@ mod settle_tests {
         };
         let live = (0..children)
             .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
-            .collect::<HashSet<_>>();
-        let mut row = ThreadRecord::from_value(thread, live);
-        row.born(at());
-        row
+            .collect::<Vec<_>>();
+        Seeded::owning(thread, live)
     }
 
     /// A settled child activity row owned by [`thread_ref`]-shaped owner slot — the row the
     /// terminated hook reads the failure's reason back off of.
-    fn seeded_child(status: ActivityStatus) -> ActivityRecord {
-        let activity = Activity {
+    fn seeded_child(status: ActivityStatus) -> Activity {
+        Activity {
             meta: ObjectMeta::builder(child_ref().uid())
                 .name(child_ref().name().clone())
                 .at(at())
@@ -862,22 +879,21 @@ mod settle_tests {
             output: None,
             activity_state: None,
             retry_state: None,
-        };
-        let mut row = ActivityRecord::from_value(activity, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// Drive one hook over a working overlay seeded with the thread and (optionally) its settled
     /// child — the leader's shape, so the assertion reads the command the container emitted.
     async fn drive(
-        thread: ThreadRecord,
-        child: Option<ActivityRecord>,
+        thread: Seeded<Thread>,
+        child: Option<Activity>,
         terminated: bool,
     ) -> Vec<EntryPayload> {
         let mut store = InMemoryStorage::new();
+        let owner = thread.row.meta.raw_object_ref();
+        seed_edges(&mut store, owner, thread.children).await;
         store
-            .put_thread(thread)
+            .put_thread(thread.row)
             .await
             .expect("the in-memory store seeds a thread row");
         if let Some(child) = child {
@@ -1057,7 +1073,7 @@ mod settle_tests {
         store
             .expect_get_thread()
             .times(1)
-            .return_once(|_| Ok(Some(seeded_thread(ThreadStatus::Completed, 0))));
+            .return_once(|_| Ok(Some(seeded_thread(ThreadStatus::Completed, 0).row)));
         let result = hook_over(&store, child_ref().as_raw_object_ref()).await;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a settled child under a terminal thread must be refused: {result:?}");
@@ -1085,7 +1101,7 @@ mod settle_tests {
     #[tokio::test]
     async fn a_completed_child_completes_a_running_thread() {
         let mut child = seeded_child(ActivityStatus::Completed);
-        child.value.output = Some(json!({ "done": 1.0 }));
+        child.output = Some(json!({ "done": 1.0 }));
         let chain = drive(seeded_thread(ThreadStatus::Running, 0), Some(child), false).await;
         assert_eq!(
             chain,

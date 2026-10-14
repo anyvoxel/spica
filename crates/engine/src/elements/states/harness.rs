@@ -26,12 +26,13 @@ use crate::StatePath;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink};
 use crate::handlers::build_state_handlers;
-use crate::storage::ReadonlyStorageTxn;
-use crate::storage::{ActivityRecord, Storage, ThreadRecord};
+use crate::storage::{ReadonlyStorageTxn, Storage};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::execution::ExecutionKind;
 use crate::types::id::EntryId;
-use crate::types::meta::{ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner};
+use crate::types::meta::{
+    HasRawObjectRef, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner,
+};
 use crate::types::thread::ThreadKind;
 use crate::working::WorkingState;
 use crate::{
@@ -41,7 +42,7 @@ use crate::{
 
 // ── deterministic inputs ────────────────────────────────────────────────────
 
-pub(crate) use crate::handlers::fixtures::{at, obj_name, path, uid};
+pub(crate) use crate::handlers::fixtures::{Seeded, at, obj_name, path, seed_edges, uid};
 
 /// The input a seeded activity carries — the same value [`seeded_scope`] seeds on the thread, so the
 /// scope's variables and the activity's input agree.
@@ -136,8 +137,8 @@ pub fn complete_cmd(output: Value) -> CompleteState {
 
 /// The scope a state's activity is owned by — the thread `activate` resolves and screens for
 /// liveness before it does anything else, and the owner `complete` loads the scope variables from.
-pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
-    let thread = Thread {
+pub fn seeded_scope(status: ThreadStatus) -> Thread {
+    Thread {
         meta: ObjectMeta::builder(thread_ref().uid())
             .name(thread_ref().name().clone())
             .at(at())
@@ -149,26 +150,15 @@ pub fn seeded_scope(status: ThreadStatus) -> ThreadRecord {
         status,
         input: seeded_input(),
         output: None,
-    };
-    let mut row = ThreadRecord::from_value(thread, HashSet::new());
-    row.born(at());
-    row
+    }
 }
 
 /// A `Running` activity row at `/States/P`, owned by [`thread_ref`] and carrying `input` as both its
-/// raw and processed input — the row a `CompleteState` names. `children` are the child refs still
-/// attached (a `Wait`'s resume timer, a `Task`'s deadline); the state's own `after_completing` is what
-/// disposes of them.
-pub fn seeded_activity(
-    input: Value,
-    children: impl IntoIterator<Item = RawObjectRef>,
-) -> ActivityRecord {
+/// raw and processed input — the row a `CompleteState` names.
+pub fn seeded_activity(input: Value) -> Activity {
     let mut activity = minted_activity(path("/States/P"), input.clone());
     activity.input = Some(input);
-    let mut row =
-        ActivityRecord::from_value(activity, children.into_iter().collect::<HashSet<_>>());
-    row.born(at());
-    row
+    activity
 }
 
 /// The container variant of [`seeded_activity`]: a row the caller shapes fully, so a `Parallel`/`Map`
@@ -181,15 +171,13 @@ pub fn seeded_activity_with(
     activity_state: ActivityState,
     status: ActivityStatus,
     children: impl IntoIterator<Item = RawObjectRef>,
-) -> ActivityRecord {
+) -> Seeded<Activity> {
     let mut activity = minted_activity(state_path, input.clone());
     activity.input = Some(input);
     activity.activity_state = Some(activity_state);
     activity.status = status;
-    let mut row =
-        ActivityRecord::from_value(activity, children.into_iter().collect::<HashSet<_>>());
-    row.born(at());
-    row
+    let row = activity;
+    Seeded::owning(row, children)
 }
 
 /// The reference of the `index`-th fan-out child (a `Parallel` branch / `Map` item). The ids sit far
@@ -206,9 +194,9 @@ pub fn seeded_child_thread(
     index: usize,
     output: Value,
     status: ThreadStatus,
-) -> ThreadRecord {
+) -> Thread {
     let reference = child_ref(index);
-    let thread = Thread {
+    Thread {
         meta: ObjectMeta::builder(reference.uid())
             .name(reference.name().clone())
             .at(at())
@@ -220,14 +208,13 @@ pub fn seeded_child_thread(
         status,
         input: seeded_input(),
         output: Some(output),
-    };
-    let mut row = ThreadRecord::from_value(thread, HashSet::new());
-    row.born(at());
-    row
+    }
 }
 
 /// A store holding just the live scope and a `Running` activity row (see [`seeded_activity`]) — where
-/// a `complete` test starts when it is not continuing a preceding `activate`.
+/// a `complete` test starts when it is not continuing a preceding `activate`. `children` are the child
+/// refs still attached (a `Wait`'s resume timer, a `Task`'s deadline); the state's own
+/// `after_completing` is what disposes of them.
 pub async fn complete_store(
     input: Value,
     children: impl IntoIterator<Item = RawObjectRef>,
@@ -238,9 +225,15 @@ pub async fn complete_store(
         .await
         .expect("the in-memory store seeds a thread row");
     store
-        .put_activity(seeded_activity(input, children))
+        .put_activity(seeded_activity(input))
         .await
         .expect("the in-memory store seeds an activity row");
+    seed_edges(
+        &mut store,
+        minted_activity_ref().into_raw_object_ref(),
+        children,
+    )
+    .await;
     store
 }
 
@@ -250,15 +243,17 @@ pub async fn complete_store(
 /// driven, not something the driver produces.
 pub async fn seed_container(
     store: &mut InMemoryStorage,
-    activity: ActivityRecord,
-    children: impl IntoIterator<Item = ThreadRecord>,
+    activity: Seeded<Activity>,
+    children: impl IntoIterator<Item = Thread>,
 ) {
     store
         .put_thread(seeded_scope(ThreadStatus::Running))
         .await
         .expect("the in-memory store seeds a thread row");
+    let owner = activity.row.meta.raw_object_ref();
+    seed_edges(store, owner, activity.children).await;
     store
-        .put_activity(activity)
+        .put_activity(activity.row)
         .await
         .expect("the in-memory store seeds an activity row");
     for child in children {
@@ -286,7 +281,7 @@ impl Dispatch {
     }
 
     /// The committed activity row at `reference`, or `None` where nothing was folded.
-    pub async fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Option<ActivityRecord> {
+    pub async fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Option<Activity> {
         Storage::get_activity(&self.store, reference)
             .await
             .expect("the in-memory store reads")
@@ -306,7 +301,7 @@ impl Dispatch {
 /// row the leader would already have read and screened for it, seeded here so the fold has an owner to
 /// attach the activity to, and the batch is committed afterwards as the leader's driver does, so the
 /// fold lands on the store's committed face — which is what the assertions read.
-pub async fn activate(state: &State, cmd: &ActivateState, scope: ThreadRecord) -> Dispatch {
+pub async fn activate(state: &State, cmd: &ActivateState, scope: Thread) -> Dispatch {
     let mut store = InMemoryStorage::new();
     store
         .put_thread(scope.clone())
@@ -375,7 +370,7 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
             .expect("the in-memory store reads")
             .expect("the activity row is seeded before a complete is driven");
         let thread = work
-            .get_thread(&act.value.meta.owner)
+            .get_thread(&act.meta.owner)
             .await
             .expect("the in-memory store reads")
             .expect("the owning thread row is seeded before a complete is driven");
@@ -443,15 +438,13 @@ pub async fn child_completed(
             .expect("the in-memory store reads")
             .expect("the container activity row is seeded");
         let scope_ref = activity_value.meta.owner.clone();
-        // The owner is always a `Thread` — read it directly, as `dispatch_child_completed` does; the
-        // driver needs only the scope variables it evaluates against.
-        let thread = ctx
+        // The owner is always a `Thread` — read its scope directly, as `dispatch_child_completed`
+        // does; the driver needs only the scope variables it evaluates against.
+        let variables = ctx
             .storage
-            .get_thread(&scope_ref)
+            .get_variables(&scope_ref)
             .await
-            .expect("the in-memory store reads")
-            .expect("the owning thread is seeded");
-        let variables = thread.variables.clone();
+            .expect("the in-memory store reads");
         state_handlers
             .create(state)
             .expect("every State variant has a registered handler")
@@ -459,7 +452,7 @@ pub async fn child_completed(
                 &mut ctx,
                 &mut out,
                 activity,
-                &activity_value.value(),
+                &activity_value.clone(),
                 &variables,
                 child,
             )

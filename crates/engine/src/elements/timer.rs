@@ -43,12 +43,12 @@ impl TimerElementBehavior {
         // A duplicate fire, or one racing the `CancelTimer` that swept the timer first: the transition
         // refuses a timer past `Active`, leaving it untouched. The fire is recorded rather than
         // swallowed, so the durable log explains why the deadline went unenforced.
-        let mut fired = act.value();
+        let mut fired = act.clone();
         if let Err(why) = fired.mark_triggered(ctx.now()) {
             tracing::warn!(
                 timer = %timer,
-                status = ?act.value.status,
-                owner = ?act.value.meta.owner,
+                status = ?act.status,
+                owner = ?act.meta.owner,
                 "fire arrived for a timer that is no longer Active; refused: {why}"
             );
             return Err(ProcessingError::Rejected(
@@ -67,7 +67,7 @@ impl TimerElementBehavior {
         // A container is resolved *after* the fire is recorded — the fire is the fact, and it stands
         // even for an owner that is gone — but *before* the reaction, so the absent owner is logged
         // rather than left indistinguishable from a reaction that did nothing.
-        match act.value.meta.owner.clone() {
+        match act.meta.owner.clone() {
             TimerOwner::Activity(owner) => {
                 let container = match ActivityElementBehavior::open(ctx.storage, owner).await {
                     Ok(container) => container,
@@ -117,7 +117,7 @@ impl TimerElementBehavior {
     ///
     /// Every refusal is a command that owes one followup entry and has no `Event` to give — but on three
     /// different footings. A timer row the store has never seen is an invariant violation: only a sweep
-    /// that just read the timer off a live owner's `active_children` issues this command, and the row is
+    /// that just read the timer off a live owner's ownership edges issues this command, and the row is
     /// born in the same batch as that very child edge (see `TimerActivatedApplier`). A timer that is no
     /// longer `Active` is instead a *race*: the scheduler's fire is deliberately decoupled from the
     /// dispatch loop (`spica-scheduler`), so a `TriggerTimer` can overtake a sweep's `CancelTimer` and
@@ -144,7 +144,7 @@ impl TimerElementBehavior {
         // The transition owns its own precondition: a timer that already fired or was cancelled is
         // declined by `mark_cancelled` and left untouched, so this step cannot rewrite a terminal
         // timer's state. The reason it names is folded into this command's durable rejection.
-        let mut timer_value = row.value;
+        let mut timer_value = row;
         if let Err(reason) = timer_value.mark_cancelled(ctx.now()) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
@@ -194,8 +194,8 @@ mod cancel_tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::build_state_handlers;
-    use crate::handlers::fixtures::{at, object_ref, path};
-    use crate::storage::{ActivityRecord, ExecutionRecord, Storage, ThreadRecord, TimerRecord};
+    use crate::handlers::fixtures::{Seeded, at, object_ref, path, seed_edges};
+    use crate::storage::Storage;
     use crate::types::command::{Command, TerminationReason};
     use crate::types::event::Event;
     use crate::types::execution::{Execution, ExecutionKind, ExecutionStatus};
@@ -235,8 +235,8 @@ mod cancel_tests {
     }
 
     /// The armed timer a sweep cancels, owned by `owner` through the slot's own variant.
-    fn seeded_timer(owner: TimerOwner, status: TimerStatus) -> TimerRecord {
-        let value = Timer {
+    fn seeded_timer(owner: TimerOwner, status: TimerStatus) -> Timer {
+        Timer {
             meta: ObjectMeta::builder(timer_ref().uid())
                 .name(timer_ref().name().clone())
                 .at(at())
@@ -244,15 +244,15 @@ mod cancel_tests {
             execution: execution_ref(),
             status,
             deadline: Timestamp::from_millis(2_000),
-        };
-        let mut row = TimerRecord::from_value(value);
-        row.born(at());
-        row
+        }
     }
 
     /// The activity a state's deadline hangs under, with `children` still live so the drain the
     /// cancel triggers is observable: the container may only converge an owner with nothing in flight.
-    fn seeded_activity(status: ActivityStatus, children: HashSet<RawObjectRef>) -> ActivityRecord {
+    fn seeded_activity(
+        status: ActivityStatus,
+        children: HashSet<RawObjectRef>,
+    ) -> Seeded<Activity> {
         let activity = Activity {
             meta: ObjectMeta::builder(activity_ref().uid())
                 .name(activity_ref().name().clone())
@@ -268,9 +268,8 @@ mod cancel_tests {
             retry_state: None,
             output: None,
         };
-        let mut row = ActivityRecord::from_value(activity, children);
-        row.born(at());
-        row
+        let row = activity;
+        Seeded::owning(row, children)
     }
 
     /// The run its own `TimeoutSeconds` timer hangs under. A run is the root of its tree, so it owns no
@@ -278,8 +277,8 @@ mod cancel_tests {
     fn seeded_execution(
         status: ExecutionStatus,
         children: HashSet<RawObjectRef>,
-    ) -> ExecutionRecord {
-        let execution = Execution {
+    ) -> Seeded<Execution> {
+        let row = Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
                 .name(execution_ref().name().clone())
                 .at(at())
@@ -290,9 +289,7 @@ mod cancel_tests {
             input: json!({}),
             output: None,
         };
-        let mut row = ExecutionRecord::from_value(execution, children);
-        row.born(at());
-        row
+        Seeded::owning(row, children)
     }
 
     /// The version the seeded scope resolves its machine through — the reference the run's own
@@ -303,8 +300,8 @@ mod cancel_tests {
 
     /// The scope a `Running` owner's settle is handed through: the thread the activity is owned by,
     /// carrying the input its own settle-time variables are read from.
-    fn seeded_scope() -> ThreadRecord {
-        let thread = Thread {
+    fn seeded_scope() -> Thread {
+        Thread {
             meta: ObjectMeta::builder(thread_owner().uid())
                 .name(thread_owner().name().clone())
                 .at(at())
@@ -316,16 +313,13 @@ mod cancel_tests {
             status: ThreadStatus::Running,
             input: json!({ "in": 1 }),
             output: None,
-        };
-        let mut row = ThreadRecord::from_value(thread, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// The run the scope resolves its machine through — the one row between a thread and its
     /// definition. Its `flow_version` is what [`version_ref`] has to answer to.
-    fn seeded_run() -> ExecutionRecord {
-        let execution = Execution {
+    fn seeded_run() -> Execution {
+        Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
                 .name(execution_ref().name().clone())
                 .at(at())
@@ -335,10 +329,7 @@ mod cancel_tests {
             deadline: None,
             input: json!({ "in": 1 }),
             output: None,
-        };
-        let mut row = ExecutionRecord::from_value(execution, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// The definition the seeded run binds to: `P` is a `Task`, so a settle under a `Running` owner is
@@ -394,14 +385,16 @@ mod cancel_tests {
     /// that decides it: an activity owner's settle is relayed to the state its definition puts at its
     /// own `state_path`, whatever status the activity is in when the settle lands.
     async fn cancel_over_overlay(
-        timer: TimerRecord,
-        activity: Option<ActivityRecord>,
-        execution: Option<ExecutionRecord>,
+        timer: Timer,
+        activity: Option<Seeded<Activity>>,
+        execution: Option<Seeded<Execution>>,
     ) -> Vec<EntryPayload> {
         let mut store = InMemoryStorage::new();
         if let Some(activity) = activity {
+            let owner = activity.row.meta.raw_object_ref();
+            seed_edges(&mut store, owner, activity.children).await;
             store
-                .put_activity(activity)
+                .put_activity(activity.row)
                 .await
                 .expect("the in-memory store seeds an activity row");
             store
@@ -418,8 +411,10 @@ mod cancel_tests {
                 .expect("the in-memory store seeds a flow version row");
         }
         if let Some(execution) = execution {
+            let owner = execution.row.meta.raw_object_ref();
+            seed_edges(&mut store, owner, execution.children).await;
             store
-                .put_execution(execution)
+                .put_execution(execution.row)
                 .await
                 .expect("the in-memory store seeds an execution row");
         }
@@ -463,7 +458,7 @@ mod cancel_tests {
 
     /// No row: the *command's* failure, refused with the classification the leader records. The
     /// dispatch is only ever issued by a sweep that just read this timer off a live owner's
-    /// `active_children`, so a missing row is the projection disagreeing with itself — not a duplicate
+    /// ownership edges, so a missing row is the projection disagreeing with itself — not a duplicate
     /// cancel to swallow. The owner is never read: a refusal must not depend on the container
     /// resolving.
     #[tokio::test]

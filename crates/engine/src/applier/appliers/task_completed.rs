@@ -29,14 +29,15 @@ impl TaskCompletedApplier {
             // needs no `kind` guard here.
             let parent = t.meta.owner.clone();
             t.status = TaskStatus::Completed;
-            // Sync the domain value's transition stamp from the event (the row's own `updated_at`
-            // is the entry timestamp via `with_update_at`, a separate concept).
-            t.value.meta.with_update_at(task.meta.updated_at);
-            t.with_update_at(ctx.timestamp);
+            // The row's timing facts are the domain value's `meta`; the event carries the handler's
+            // stamp for this transition, so it rides along with the status update.
+            t.meta.with_update_at(task.meta.updated_at);
             ctx.storage.put_task(t).await?;
             if let Some(mut act) = ctx.storage.get_activity(&parent).await? {
-                act.value.raw_output = Some(output.clone());
-                act.with_update_at(ctx.timestamp);
+                act.raw_output = Some(output.clone());
+                // The event carries no activity value, so this fold's own write is stamped from the
+                // entry's frozen moment — deterministic on replay, never a local clock.
+                act.meta.with_update_at(ctx.timestamp);
                 ctx.storage.put_activity(act).await?;
             }
             ctx.storage

@@ -26,7 +26,7 @@ use crate::{Activity, ActivityState, Variables};
 ///
 /// Fan-out is **flat, not recursive**: each branch runs as a *child execution* (see
 /// [`ThreadElementBehavior::spawn`](crate::elements::ThreadElementBehavior::spawn)) rooted under this
-/// activity and carrying a [`state_path`](crate::storage::ExecutionRecord), so a branch resolves its
+/// activity and carrying a [`state_path`](crate::storage::Execution), so a branch resolves its
 /// own states within the single shared machine document without copying any definition. The
 /// `Parallel` activity stays `Running` owning those children; it converges — by issuing its own
 /// `CompleteState` — once the last branch settles in `child_completed`, immediately when the
@@ -81,21 +81,26 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         let activity = activity_value.meta.object_ref();
         // A read fault is the dispatch's; a missing row is a real refusal, since the `CompleteState`
         // that opened this finish named an activity that existed.
-        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+        if ctx.storage.get_activity(&activity).await?.is_none() {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("parallel_state: activity {activity} not found"),
             ));
-        };
+        }
+        // Read from the ownership-edge index, not off the row: the live set is a cell of its own.
+        let children = ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await?;
         // Convergence issues the command only once the last branch settled, so a live child here is an
         // engine regression rather than a flow error — refused rather than swept, because the array
         // this finish projects would be missing exactly that branch's output.
-        if !act.active_children.is_empty() {
+        if !children.is_empty() {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "parallel_state: activity {activity} is completing with {} live children",
-                    act.active_children.len()
+                    children.len()
                 ),
             ));
         }
@@ -207,15 +212,20 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         let activity = activity_value.meta.object_ref();
         // A read fault is the dispatch's; a missing row is a real refusal, since the terminate that
         // opened this teardown named an activity that existed.
-        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+        if ctx.storage.get_activity(&activity).await?.is_none() {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("parallel_state: activity {activity} not found"),
             ));
-        };
+        }
+        // Read from the ownership-edge index, not off the row (see `after_completing`).
+        let children = ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await?;
         // A childless container has nothing to sweep, so it closes now: the terminal, then the relay to
         // its owner thread's container, which advances the scope.
-        if act.active_children.is_empty() {
+        if children.is_empty() {
             let container =
                 ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
@@ -238,7 +248,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         // the generic `Terminating` path). A branch is always a thread: the fan-out is `SpawnThread`,
         // and nothing else can parent an object to this activity.
         let mut pending = 0;
-        for child in act.active_children {
+        for child in children {
             if let ObjectKind::Thread = child.kind {
                 out.append_command(Command::TerminateThread(TerminateThread {
                     thread: child.typed::<ThreadKind>(),
@@ -280,7 +290,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
 
     // Fan out each branch as a child Thread after `StateActivated`. Each child inherits
     // `activity_value.execution` (the flat query anchor), is rooted under this activity (so the
-    // Parallel waits on all of them via `active_children`), and carries a state_path locating its
+    // Parallel waits on all of them via its ownership edges), and carries a state_path locating its
     // branch's `States` table. The activity stays `Running`; it completes only via `child_completed`.
     async fn after_activated(
         &self,
@@ -328,7 +338,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
     /// - if **any** branch has failed, fail the whole `Parallel` on that settle — while the survivors
     ///   may still be in flight (mirroring `fail.rs`, whose own TerminateState + TerminateExecution
     ///   sweep cancels those surviving sibling branches);
-    /// - otherwise, once the last branch has settled and drained this activity's `active_children`,
+    /// - otherwise, once the last branch has settled and drained this activity's child set,
     ///   aggregate each branch's output (in `Branches` declaration order) into an array and issue the
     ///   `CompleteState` that carries it as the state's raw result — the projection and routing then
     ///   belong to `after_completing`.
@@ -350,7 +360,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         // declared `Branches` order.
         // A non-`Parallel` repository here is an internal fault (a Parallel always fans out while
         // still `Running`); nothing to aggregate — defer.
-        let Some(ActivityState::Parallel(progress)) = act.value.activity_state.as_ref() else {
+        let Some(ActivityState::Parallel(progress)) = act.activity_state.as_ref() else {
             return;
         };
         let mut entries: Vec<(usize, ObjectRef<ThreadKind>)> = progress
@@ -386,7 +396,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                 self.fail_parallel(out, activity_value, reason).await;
                 return;
             };
-            if let Some(reason) = child.value.status.termination_reason() {
+            if let Some(reason) = child.status.termination_reason() {
                 // A failed / cancelled branch fails the whole `Parallel`; the recorded `reason` becomes
                 // the Parallel's own termination reason, and the activity's own `TerminateState` sweep
                 // stops the surviving sibling branches.
@@ -400,16 +410,25 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         // Everything settled successfully so far — but the inline child-settled reaction dispatches a
         // `Running` activity's `child_completed` on *every* child settle (so a `Map` can replenish one
         // slot at a time). A `Parallel` fans every branch out up front, so it only owns its convergence
-        // once the *last* branch has drained `active_children`; any earlier invocation (other siblings
+        // once the *last* branch has drained its children; any earlier invocation (other siblings
         // still in flight) is a no-op here.
-        if !act.active_children.is_empty() {
+        let children = match ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await
+        {
+            Ok(children) => children,
+            // A read fault is not a convergence decision; defer, so the next child settle re-runs this.
+            Err(_) => return,
+        };
+        if !children.is_empty() {
             return; // sibling branches still in flight — not converged yet.
         }
 
         let mut outputs = Vec::with_capacity(branches.len());
         for child in branches {
             if child.is_terminal() {
-                outputs.push(child.value.output.clone().unwrap_or(Value::Null));
+                outputs.push(child.output.clone().unwrap_or(Value::Null));
             } else {
                 // A non-terminal branch (still Running/Completing yet drained empty) is an internal
                 // fault; fail the Parallel rather than aggregate a partial result.
@@ -460,9 +479,9 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::storage::{ActivityRecord, ThreadRecord};
     use crate::types::command::CompleteThread;
     use crate::types::meta::HasRawObjectRef;
+    use crate::types::thread::Thread;
     use crate::{ActivityStatus, EntryPayload, ParallelActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
@@ -550,8 +569,8 @@ mod tests {
             .activity(&minted_activity_ref())
             .await
             .expect("the birth event folds the activity row");
-        assert_eq!(row.value.status, ActivityStatus::Running);
-        assert_eq!(birth.state_path, row.value.state_path);
+        assert_eq!(row.status, ActivityStatus::Running);
+        assert_eq!(birth.state_path, row.state_path);
     }
 
     /// No branch means no settle will ever arrive — and the settle is the only thing that drives
@@ -638,7 +657,7 @@ mod tests {
         branches
     }
 
-    fn branch_child(index: usize, output: Value, status: ThreadStatus) -> ThreadRecord {
+    fn branch_child(index: usize, output: Value, status: ThreadStatus) -> Thread {
         seeded_child_thread(
             path(&format!("/States/P/Branches/{index}/States")),
             index,
@@ -649,7 +668,7 @@ mod tests {
 
     /// A `Running` container activity whose branches all settled successfully and whose children have
     /// all drained: the row a convergence lands on.
-    fn converged_container() -> ActivityRecord {
+    fn converged_container() -> Seeded<Activity> {
         seeded_activity_with(
             path("/States/P"),
             seeded_input(),

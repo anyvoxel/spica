@@ -18,19 +18,14 @@ impl StateCompletedApplier {
             .await?
         {
             let parent = act
-                .value
                 .meta
                 .owner
                 .clone()
                 // A thread is the only thing that can own an activity, so the storage seam needs no
                 // `kind` guard — and storage speaks flat addresses.
                 .into_raw_object_ref();
-            // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
-            let mut row =
-                crate::storage::ActivityRecord::from_value(activity.clone(), act.active_children);
-            row.created_at = act.created_at;
-            row.updated_at = ctx.timestamp;
-            ctx.storage.put_activity(row).await?;
+            // An update, not a birth: the row keeps its identity and takes the event's value.
+            ctx.storage.put_activity(activity.clone()).await?;
             ctx.storage
                 .remove_child(parent, activity.meta.raw_object_ref())
                 .await?;

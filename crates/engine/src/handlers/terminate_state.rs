@@ -1,7 +1,7 @@
 use crate::ActivityStatus as S;
 use crate::RejectionType;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::storage::ActivityRecord;
+use crate::types::activity::Activity;
 use crate::types::command::TerminateState;
 use crate::types::error::ExecutionError;
 
@@ -51,14 +51,14 @@ impl TerminateStateHandler {
         // already opened (`Terminating`) or finished (`Terminated`/`Completed`): the duplicate is
         // refused outright, mirroring Complete's strictness instead of re-emitting a `StateTerminated`
         // and/or replaying the settle — the settled children already keep the closer advancing.
-        match act.value.status {
+        match act.status {
             // Running, or Completing, are legitimate pre-failure states: a state can fail either
             // before the complete step opens (Running) or while it is in progress (Completing, since
             // the state's `complete` opens with `StateCompleting` before it projects). Both must be
             // redirected from success to failure — resolve the state and run its terminate step.
             S::Running | S::Completing => self.resolve_and_terminate(ctx, out, p, &act).await,
             S::Terminating(_) | S::Terminated(_) | S::Completed => {
-                let phase = match act.value.status {
+                let phase = match act.status {
                     S::Terminating(_) => "terminating",
                     S::Terminated(_) => "terminated",
                     S::Completed => "completed",
@@ -69,7 +69,7 @@ impl TerminateStateHandler {
                     format!(
                         "terminate_state: activity {} is {phase}; termination refused — the drain \
                          owns its terminal",
-                        act.value.meta.object_ref(),
+                        act.meta.object_ref(),
                     ),
                 ))
             }
@@ -88,9 +88,9 @@ impl TerminateStateHandler {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         p: &TerminateState,
-        act: &ActivityRecord,
+        act: &Activity,
     ) -> Result<(), ProcessingError> {
-        let owner = act.value.meta.owner.clone();
+        let owner = act.meta.owner.clone();
         // An activity's owner slot admits only a `Thread`, so the row is read directly — no `kind`
         // guard. Rows are never removed, so an activity that exists without the thread its owner names
         // is a corrupt projection or a forged command — this command's own precondition, refused
@@ -100,7 +100,7 @@ impl TerminateStateHandler {
                 RejectionType::NotFound,
                 format!(
                     "terminate_state: owning thread {owner} of activity {} not found",
-                    act.value.meta.object_ref(),
+                    act.meta.object_ref(),
                 ),
             ));
         };
@@ -115,7 +115,7 @@ impl TerminateStateHandler {
                     RejectionType::NotFound,
                     format!(
                         "terminate_state: activity {} cannot resolve its machine: {e}",
-                        act.value.meta.object_ref(),
+                        act.meta.object_ref(),
                     ),
                 ));
             }
@@ -123,15 +123,15 @@ impl TerminateStateHandler {
         // The state to terminate is the one this activity names: its own `state_path` locates the
         // definition inside the machine the owning thread binds to. Activation resolved the same path
         // against the same machine, so a miss is the projection's, not the flow's.
-        let state_def = match sm.state_at(&act.value.state_path) {
+        let state_def = match sm.state_at(&act.state_path) {
             Ok(def) => def,
             Err(e) => {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
                         "terminate_state: activity {} names state {:?} which its machine does not define: {e}",
-                        act.value.meta.object_ref(),
-                        act.value.state_path,
+                        act.meta.object_ref(),
+                        act.state_path,
                     ),
                 ));
             }

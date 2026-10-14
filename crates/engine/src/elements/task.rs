@@ -132,10 +132,10 @@ impl TaskElementBehavior {
         // are both refusals of the request's precondition — the caller's handle on the task is not the
         // live one — so both are `InvalidState`, told apart by their reason. Both keep the state
         // advancing exactly once (duplicate/foreign settles are refused, never applied twice).
-        let mut task_value = act.value();
+        let mut task_value = act.clone();
         if let Err(reason) = task_value.mark_completed(worker_id, ctx.now()) {
             tracing::warn!(
-                task = %act.value.meta.raw_object_ref(),
+                task = %act.meta.raw_object_ref(),
                 reported = %worker_id,
                 leased = ?act.worker_id,
                 "task settlement refused: {reason}"
@@ -220,12 +220,12 @@ impl TaskElementBehavior {
 
         // The one transition this command performs, with its whole precondition (settled once, and
         // leased to the reporter) inside it — so a refused report writes nothing.
-        let mut task_value = act.value();
+        let mut task_value = act.clone();
         let outcome = match task_value.handle_failure(worker_id, error, ctx.now()) {
             Ok(outcome) => outcome,
             Err(why) => {
                 tracing::warn!(
-                    task = %act.value.meta.raw_object_ref(),
+                    task = %act.meta.raw_object_ref(),
                     reported = %worker_id,
                     status = ?act.status,
                     "failure reported against a task that cannot take it; refused: {why}"
@@ -234,7 +234,7 @@ impl TaskElementBehavior {
                     RejectionType::InvalidState,
                     format!(
                         "fail_task: task {} cannot take the failure reported by {worker_id}: {why}",
-                        act.value.meta.raw_object_ref()
+                        act.meta.raw_object_ref()
                     ),
                 ));
             }
@@ -288,8 +288,7 @@ impl TaskElementBehavior {
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
     ) -> Result<(), ProcessingError> {
-        let Some(mut task_value) = ctx.storage.get_task(task).await?.map(|task| task.value())
-        else {
+        let Some(mut task_value) = ctx.storage.get_task(task).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("task {task} not found; cancel dropped"),
@@ -374,7 +373,7 @@ impl TaskElementBehavior {
             .await?;
         let mut claimed = Vec::new();
         for t in tasks {
-            let mut value = t.value;
+            let mut value = t;
             // The claim moment is the very reading the lease window was computed from, so the row's
             // transition stamp and its `lease_expires_at` share one base.
             value.claim(worker_id, lease_expires_at, now);
@@ -394,7 +393,7 @@ impl TaskElementBehavior {
 
 #[cfg(test)]
 mod cancel_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -406,13 +405,12 @@ mod cancel_tests {
     use crate::handler::{Collector, HandlerContext, ProcessingError};
     use crate::handlers::build_state_handlers;
     use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::{ActivityRecord, ExecutionRecord, TaskRecord, ThreadRecord};
     use crate::types::event::Event;
     use crate::types::execution::ExecutionKind;
     use crate::types::flow_version::FlowVersionKind;
     use crate::types::id::EntryId;
     use crate::types::meta::HasRawObjectRef;
-    use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner};
+    use crate::types::meta::{NoOwner, ObjectMeta, ObjectRef, ThreadOwner};
     use crate::types::reject::RejectionType;
     use crate::types::task::TaskKind;
     use crate::types::thread::{Thread, ThreadStatus};
@@ -439,8 +437,8 @@ mod cancel_tests {
     }
 
     /// The live task the sweep cancels, owned by [`activity_ref`] and leased to `w1`.
-    fn seeded_task() -> TaskRecord {
-        let value = Task {
+    fn seeded_task() -> Task {
+        Task {
             meta: ObjectMeta::builder(task_ref().uid())
                 .name(task_ref().name().clone())
                 .at(at())
@@ -454,19 +452,16 @@ mod cancel_tests {
             lease_expires_at: Some(Timestamp::from_millis(2_000)),
             retry_plan: Vec::new(),
             retry_state: Default::default(),
-        };
-        let mut row = TaskRecord::from_value(value);
-        row.born(at());
-        row
+        }
     }
 
-    /// The owning activity, with the task as its one live child so the drain the cancel triggers is
-    /// observable: the container may only converge an owner that has nothing left in flight.
-    fn seeded_activity(status: ActivityStatus, children: HashSet<RawObjectRef>) -> ActivityRecord {
+    /// The owning activity — the row whose settle the cancel is handed to, resolved before the
+    /// cancellation is written.
+    fn seeded_activity(status: ActivityStatus) -> Activity {
         let mut path = jsonptr::PointerBuf::new();
         path.push_back("States");
         path.push_back("P");
-        let activity = Activity {
+        Activity {
             meta: ObjectMeta::builder(activity_ref().uid())
                 .name(activity_ref().name().clone())
                 .at(at())
@@ -480,10 +475,7 @@ mod cancel_tests {
             activity_state: None,
             retry_state: None,
             output: None,
-        };
-        let mut row = ActivityRecord::from_value(activity, children);
-        row.born(at());
-        row
+        }
     }
 
     /// The handler exercised against a **mock** read-only store: no `InMemoryStorage` and no working
@@ -524,8 +516,8 @@ mod cancel_tests {
         /// **both** reads the handler makes of it: `ActivityElementBehavior::open` resolves the owner, then
         /// the settle re-reads it — a case that gets past container resolution owes it two answers.
         fn store_with_owner(
-            task: Result<Option<TaskRecord>, StorageError>,
-            activity: ActivityRecord,
+            task: Result<Option<Task>, StorageError>,
+            activity: Activity,
         ) -> MockReadonlyStorageTxn {
             let mut store = MockReadonlyStorageTxn::new();
             store
@@ -544,9 +536,7 @@ mod cancel_tests {
         /// A mocked store for a case that must be decided **before** the owner is looked at: the task
         /// read answers `task`, and any owner read would find no expectation — the mock panics, which
         /// is the assertion that the refusal came first.
-        fn store_without_owner(
-            task: Result<Option<TaskRecord>, StorageError>,
-        ) -> MockReadonlyStorageTxn {
+        fn store_without_owner(task: Result<Option<Task>, StorageError>) -> MockReadonlyStorageTxn {
             let mut store = MockReadonlyStorageTxn::new();
             store
                 .expect_get_task()
@@ -557,15 +547,11 @@ mod cancel_tests {
         }
 
         /// The live rows the happy-path cases start from: a `Running` task owned by an activity that
-        /// still holds it as a child.
-        fn live_world() -> (TaskRecord, ActivityRecord) {
-            (
-                seeded_task(),
-                seeded_activity(
-                    ActivityStatus::Running,
-                    HashSet::from([task_ref().into_raw_object_ref()]),
-                ),
-            )
+        /// fronts the state the cancellation is settled against. The ownership edge between them lives
+        /// in the store, not on the row, and the mocked store answers no child read — the settle here
+        /// never asks for one.
+        fn live_world() -> (Task, Activity) {
+            (seeded_task(), seeded_activity(ActivityStatus::Running))
         }
 
         /// The run the scope belongs to — the row between a thread and the definition it binds to.
@@ -579,8 +565,8 @@ mod cancel_tests {
         }
 
         /// The owner's owning scope: a thread, the only kind an activity's owner slot admits.
-        fn seeded_scope() -> ThreadRecord {
-            let thread = Thread {
+        fn seeded_scope() -> Thread {
+            Thread {
                 meta: ObjectMeta::builder(thread_owner().uid())
                     .name(thread_owner().name().clone())
                     .at(at())
@@ -592,16 +578,13 @@ mod cancel_tests {
                 status: ThreadStatus::Running,
                 input: json!({ "in": 1 }),
                 output: None,
-            };
-            let mut row = ThreadRecord::from_value(thread, HashSet::new());
-            row.born(at());
-            row
+            }
         }
 
         /// The run the scope resolves its machine through. Its `flow_version` is what [`version_ref`]
         /// has to answer to.
-        fn seeded_run() -> ExecutionRecord {
-            let execution = Execution {
+        fn seeded_run() -> Execution {
+            Execution {
                 meta: ObjectMeta::builder(execution_ref().uid())
                     .name(execution_ref().name().clone())
                     .at(at())
@@ -611,10 +594,7 @@ mod cancel_tests {
                 deadline: None,
                 input: json!({ "in": 1 }),
                 output: None,
-            };
-            let mut row = ExecutionRecord::from_value(execution, HashSet::new());
-            row.born(at());
-            row
+            }
         }
 
         /// The definition the seeded run binds to: `P` is the `Task` the owner's `state_path` names.
@@ -664,7 +644,7 @@ mod cancel_tests {
         #[tokio::test]
         async fn a_live_task_emits_its_own_cancel_and_the_continue_that_advances_its_owner() {
             let (task, mut activity) = live_world();
-            activity.value.status = ActivityStatus::Terminating(TerminationReason::Cancelled);
+            activity.status = ActivityStatus::Terminating(TerminationReason::Cancelled);
             let mut store = store_with_owner(Ok(Some(task)), activity);
             expect_scope(&mut store);
             let chain = cancel_over(&store)

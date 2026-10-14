@@ -37,7 +37,7 @@ impl QueryServiceTrait for Svc {
             )));
         };
         Ok(Response::new(GetObjectResponse {
-            object: Some(to_proto_object(&obj)),
+            object: Some(self.to_proto_object(&obj).await?),
         }))
     }
 
@@ -63,7 +63,13 @@ impl QueryServiceTrait for Svc {
             .await
             .map_err(to_status)?;
         Ok(Response::new(ListObjectsResponse {
-            objects: page.objects.iter().map(to_proto_object).collect(),
+            objects: {
+                let mut objects = Vec::with_capacity(page.objects.len());
+                for obj in &page.objects {
+                    objects.push(self.to_proto_object(obj).await?);
+                }
+                objects
+            },
             continue_token: page.continue_token.unwrap_or_default(),
         }))
     }
@@ -82,21 +88,33 @@ fn parse_name(raw: &str) -> Result<ObjectName, Status> {
     ObjectName::from_parsed(raw).map_err(|e| Status::invalid_argument(format!("invalid name: {e}")))
 }
 
-/// Map an engine query row onto its wire mirror. The one place a persisted row crosses into a
-/// `spica_proto` `Object`; JSON values and the nested serde bookkeeping travel as bytes.
-fn to_proto_object(obj: &QueryObject) -> spica_proto::v1::Object {
-    use spica_proto::v1::object::Object as O;
-    let inner = match obj {
-        QueryObject::Flow(f) => O::Flow(to_proto_flow(f)),
-        QueryObject::FlowVersion(v) => O::FlowVersion(to_proto_flow_version(v)),
-        QueryObject::Execution(e) => O::Execution(to_proto_execution(e)),
-        QueryObject::Thread(t) => O::Thread(to_proto_thread(t)),
-        QueryObject::Activity(a) => O::Activity(to_proto_activity(a)),
-        QueryObject::Timer(t) => O::Timer(to_proto_timer(t)),
-        QueryObject::Task(t) => O::Task(to_proto_task(t)),
-    };
-    spica_proto::v1::Object {
-        object: Some(inner),
+impl Svc {
+    /// Map an engine query row onto its wire mirror. The one place a persisted row crosses into a
+    /// `spica_proto` `Object`; JSON values and the nested serde bookkeeping travel as bytes.
+    #[allow(clippy::result_large_err)]
+    async fn to_proto_object(&self, obj: &QueryObject) -> Result<spica_proto::v1::Object, Status> {
+        use spica_proto::v1::object::Object as O;
+        let inner = match obj {
+            QueryObject::Flow(f) => O::Flow(to_proto_flow(f)),
+            QueryObject::FlowVersion(v) => O::FlowVersion(to_proto_flow_version(v)),
+            QueryObject::Execution(e) => O::Execution(to_proto_execution(e)),
+            QueryObject::Thread(t) => {
+                // A thread's scope is derived state kept beside its row, and the wire mirror returns
+                // it alongside the entity — so this seam is where the two are joined.
+                let variables = self
+                    .engine
+                    .get_variables(&t.meta.name)
+                    .await
+                    .map_err(to_status)?;
+                O::Thread(to_proto_thread(t, &variables))
+            }
+            QueryObject::Activity(a) => O::Activity(to_proto_activity(a)),
+            QueryObject::Timer(t) => O::Timer(to_proto_timer(t)),
+            QueryObject::Task(t) => O::Task(to_proto_task(t)),
+        };
+        Ok(spica_proto::v1::Object {
+            object: Some(inner),
+        })
     }
 }
 
@@ -169,9 +187,9 @@ fn to_proto_flow_version(v: &spica_engine::FlowVersion) -> spica_proto::v1::Flow
     }
 }
 
-fn to_proto_execution(e: &spica_engine::ExecutionRecord) -> spica_proto::v1::Execution {
+fn to_proto_execution(e: &spica_engine::Execution) -> spica_proto::v1::Execution {
     use spica_proto::v1::ExecutionStatus as S;
-    let (status, reason) = match &e.value.status {
+    let (status, reason) = match &e.status {
         spica_engine::ExecutionStatus::Running => (S::Running as i32, None),
         spica_engine::ExecutionStatus::Completing => (S::Completing as i32, None),
         spica_engine::ExecutionStatus::Terminating(r) => (S::Terminating as i32, Some(r)),
@@ -179,28 +197,26 @@ fn to_proto_execution(e: &spica_engine::ExecutionRecord) -> spica_proto::v1::Exe
         spica_engine::ExecutionStatus::Terminated(r) => (S::Terminated as i32, Some(r)),
     };
     spica_proto::v1::Execution {
-        meta: Some(proto_meta(&e.value.meta)),
-        flow_version: Some(proto_ref(&e.value.flow_version)),
+        meta: Some(proto_meta(&e.meta)),
+        flow_version: Some(proto_ref(&e.flow_version)),
         status,
         termination_reason: reason.map(proto_termination_reason),
-        input: serde_json::to_vec(&e.value.input).unwrap_or_default(),
+        input: serde_json::to_vec(&e.input).unwrap_or_default(),
         output: e
-            .value
             .output
             .as_ref()
             .map(|v| serde_json::to_vec(v).unwrap_or_default())
             .unwrap_or_default(),
-        deadline_millis: e
-            .value
-            .deadline
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or_default(),
+        deadline_millis: e.deadline.map(|d| d.as_millis() as i64).unwrap_or_default(),
     }
 }
 
-fn to_proto_thread(t: &spica_engine::ThreadRecord) -> spica_proto::v1::Thread {
+fn to_proto_thread(
+    t: &spica_engine::Thread,
+    scope: &spica_engine::Variables,
+) -> spica_proto::v1::Thread {
     use spica_proto::v1::ThreadStatus as S;
-    let (status, reason) = match &t.value.status {
+    let (status, reason) = match &t.status {
         spica_engine::ThreadStatus::Running => (S::Running as i32, None),
         spica_engine::ThreadStatus::Completing => (S::Completing as i32, None),
         spica_engine::ThreadStatus::Terminating(r) => (S::Terminating as i32, Some(r)),
@@ -208,30 +224,28 @@ fn to_proto_thread(t: &spica_engine::ThreadRecord) -> spica_proto::v1::Thread {
         spica_engine::ThreadStatus::Terminated(r) => (S::Terminated as i32, Some(r)),
     };
     spica_proto::v1::Thread {
-        meta: Some(proto_meta(&t.value.meta)),
-        execution: Some(proto_ref(&t.value.execution)),
-        state_path: t.value.state_path.to_string(),
-        index: t.value.index as u64,
+        meta: Some(proto_meta(&t.meta)),
+        execution: Some(proto_ref(&t.execution)),
+        state_path: t.state_path.to_string(),
+        index: t.index as u64,
         status,
         termination_reason: reason.map(proto_termination_reason),
-        input: serde_json::to_vec(&t.value.input).unwrap_or_default(),
+        input: serde_json::to_vec(&t.input).unwrap_or_default(),
         output: t
-            .value
             .output
             .as_ref()
             .map(|v| serde_json::to_vec(v).unwrap_or_default())
             .unwrap_or_default(),
-        variables: t
-            .variables
+        variables: scope
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::to_vec(v).unwrap_or_default()))
             .collect(),
     }
 }
 
-fn to_proto_activity(a: &spica_engine::ActivityRecord) -> spica_proto::v1::Activity {
+fn to_proto_activity(a: &spica_engine::Activity) -> spica_proto::v1::Activity {
     use spica_proto::v1::ActivityStatus as S;
-    let (status, reason) = match &a.value.status {
+    let (status, reason) = match &a.status {
         spica_engine::ActivityStatus::Running => (S::Running as i32, None),
         spica_engine::ActivityStatus::Completing => (S::Completing as i32, None),
         spica_engine::ActivityStatus::Terminating(r) => (S::Terminating as i32, Some(r)),
@@ -239,23 +253,21 @@ fn to_proto_activity(a: &spica_engine::ActivityRecord) -> spica_proto::v1::Activ
         spica_engine::ActivityStatus::Terminated(r) => (S::Terminated as i32, Some(r)),
     };
     spica_proto::v1::Activity {
-        meta: Some(proto_meta(&a.value.meta)),
-        execution: Some(proto_ref(&a.value.execution)),
-        state_path: a.value.state_path.to_string(),
+        meta: Some(proto_meta(&a.meta)),
+        execution: Some(proto_ref(&a.execution)),
+        state_path: a.state_path.to_string(),
         status,
         termination_reason: reason.map(proto_termination_reason),
-        raw_input: serde_json::to_vec(&a.value.raw_input).unwrap_or_default(),
-        input: serde_json::to_vec(&a.value.input).unwrap_or_default(),
-        raw_output: serde_json::to_vec(&a.value.raw_output).unwrap_or_default(),
-        output: serde_json::to_vec(&a.value.output).unwrap_or_default(),
+        raw_input: serde_json::to_vec(&a.raw_input).unwrap_or_default(),
+        input: serde_json::to_vec(&a.input).unwrap_or_default(),
+        raw_output: serde_json::to_vec(&a.raw_output).unwrap_or_default(),
+        output: serde_json::to_vec(&a.output).unwrap_or_default(),
         activity_state: a
-            .value
             .activity_state
             .as_ref()
             .map(|s| serde_json::to_vec(s).unwrap_or_default())
             .unwrap_or_default(),
         retry_state: a
-            .value
             .retry_state
             .as_ref()
             .map(|s| serde_json::to_vec(s).unwrap_or_default())
@@ -263,46 +275,41 @@ fn to_proto_activity(a: &spica_engine::ActivityRecord) -> spica_proto::v1::Activ
     }
 }
 
-fn to_proto_timer(t: &spica_engine::TimerRecord) -> spica_proto::v1::Timer {
+fn to_proto_timer(t: &spica_engine::Timer) -> spica_proto::v1::Timer {
     use spica_proto::v1::TimerStatus as S;
     spica_proto::v1::Timer {
-        meta: Some(proto_meta(&t.value.meta)),
-        execution: Some(proto_ref(&t.value.execution)),
-        status: match t.value.status {
+        meta: Some(proto_meta(&t.meta)),
+        execution: Some(proto_ref(&t.execution)),
+        status: match t.status {
             spica_engine::TimerStatus::Active => S::Active as i32,
             spica_engine::TimerStatus::Completed => S::Completed as i32,
             spica_engine::TimerStatus::Cancelled => S::Cancelled as i32,
         },
-        deadline_millis: t.value.deadline.as_millis() as i64,
+        deadline_millis: t.deadline.as_millis() as i64,
     }
 }
 
-fn to_proto_task(t: &spica_engine::TaskRecord) -> spica_proto::v1::Task {
+fn to_proto_task(t: &spica_engine::Task) -> spica_proto::v1::Task {
     use spica_proto::v1::TaskStatus as S;
     spica_proto::v1::Task {
-        meta: Some(proto_meta(&t.value.meta)),
-        execution: Some(proto_ref(&t.value.execution)),
-        resource: t.value.resource.clone(),
-        arguments: serde_json::to_vec(&t.value.arguments).unwrap_or_default(),
-        status: match t.value.status {
+        meta: Some(proto_meta(&t.meta)),
+        execution: Some(proto_ref(&t.execution)),
+        resource: t.resource.clone(),
+        arguments: serde_json::to_vec(&t.arguments).unwrap_or_default(),
+        status: match t.status {
             spica_engine::TaskStatus::Pending => S::Pending as i32,
             spica_engine::TaskStatus::Running => S::Running as i32,
             spica_engine::TaskStatus::Completed => S::Completed as i32,
             spica_engine::TaskStatus::Failed => S::Failed as i32,
             spica_engine::TaskStatus::Cancelled => S::Cancelled as i32,
         },
-        deadline_millis: t
-            .value
-            .deadline
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or_default(),
-        worker_id: t.value.worker_id.clone().unwrap_or_default(),
+        deadline_millis: t.deadline.map(|d| d.as_millis() as i64).unwrap_or_default(),
+        worker_id: t.worker_id.clone().unwrap_or_default(),
         lease_expires_at_millis: t
-            .value
             .lease_expires_at
             .map(|d| d.as_millis() as i64)
             .unwrap_or_default(),
-        retry_plan: serde_json::to_vec(&t.value.retry_plan).unwrap_or_default(),
-        retry_state: serde_json::to_vec(&t.value.retry_state).unwrap_or_default(),
+        retry_plan: serde_json::to_vec(&t.retry_plan).unwrap_or_default(),
+        retry_state: serde_json::to_vec(&t.retry_state).unwrap_or_default(),
     }
 }

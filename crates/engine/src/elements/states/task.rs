@@ -204,7 +204,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 .get_timer(&child.clone().typed::<TimerKind>())
                 .await
             {
-                Ok(Some(t)) if t.value.status == TimerStatus::Completed => t.value.deadline,
+                Ok(Some(t)) if t.status == TimerStatus::Completed => t.deadline,
                 _ => return,
             };
             out.append_command(Command::TerminateState(TerminateState {
@@ -267,7 +267,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 else {
                     continue;
                 };
-                let mut timer_value = t.value;
+                let mut timer_value = t;
                 if timer_value.mark_cancelled(out.now()).is_err() {
                     continue;
                 }
@@ -452,13 +452,21 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         let Some(catcher) = matched else {
             return FailureRouting::Uncaught;
         };
-        // The owning thread is the catcher's scope: its variables are what the catcher's
-        // `Assign`/`Output` evaluate against. A thread row that is gone leaves the failure with no
-        // scope to route in, so it stands rather than being projected against nothing.
+        // The owning thread is the catcher's scope, and its variables are what the catcher's
+        // `Assign`/`Output` evaluate against — derived state in its own `_index` cell (see
+        // `Storage::get_variables`). A scope whose owner is gone leaves the failure with no scope to
+        // route in, so it stands rather than being projected against nothing.
         let owner = activity_value.meta.owner.clone();
-        let Some(thread) = ctx.storage.get_thread(&owner).await.ok().flatten() else {
+        if ctx
+            .storage
+            .get_thread(&owner)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
             return FailureRouting::Uncaught;
-        };
+        }
 
         let activity = activity_value.meta.object_ref();
         // The catcher's projectors read the failure it took: `$states.errorOutput` is the caught
@@ -480,7 +488,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         .with_assign_ctx(Some(&activity_value.raw_input))
         .with_error_output(Some(&error_output))
         .build();
-        let mut local_scope = thread.variables.clone();
+        let mut local_scope = ctx.storage.get_variables(&owner).await.unwrap_or_default();
         if let Some(assign_obj) = catcher.assign.as_ref() {
             let assign_value = Value::Object(assign_obj.0.clone());
             let evaluated = match ctx.env.eval_json(&assign_value, &states, &local_scope) {
@@ -537,8 +545,13 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         // *bounds* the state, so a state that finished early — this very exit — must leave no live
         // timer child behind. Swept as **events**, so they fold into this batch ahead of the terminal
         // below rather than arriving as a later log entry.
-        if let Ok(act) = ctx.storage.get_activity(&activity).await {
-            for child in act.map(|a| a.active_children).unwrap_or_default() {
+        // The live children live in the ownership-edge index, not on the row.
+        if let Ok(children) = ctx
+            .storage
+            .get_children(activity.as_raw_object_ref().clone())
+            .await
+        {
+            for child in children {
                 if child.kind != ObjectKind::Timer {
                     continue; // only timer children are swept here; the task child follows its own settle.
                 }
@@ -551,7 +564,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 else {
                     continue;
                 };
-                let mut timer_value = t.value;
+                let mut timer_value = t;
                 // A fired/cancelled timer is no longer a live child, and the transition declines it —
                 // so no second guard has to be kept in step with that.
                 if timer_value.mark_cancelled(out.now()).is_err() {
@@ -732,7 +745,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::storage::{Storage, TimerRecord};
+    use crate::storage::Storage;
     use crate::types::command::{ActivateState, CompleteState, TerminateState, TerminationReason};
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::{HasRawObjectRef, ObjectMeta};
@@ -952,11 +965,13 @@ mod tests {
             .activity(&minted_activity_ref())
             .await
             .expect("the finish folds the completed row");
-        assert_eq!(row.value.status, ActivityStatus::Completed);
+        assert_eq!(row.status, ActivityStatus::Completed);
+        let children = completed
+            .children(&minted_activity_ref().into_raw_object_ref())
+            .await;
         assert!(
-            row.active_children.is_empty(),
-            "the swept timer is no longer a child: {:?}",
-            row.active_children
+            children.is_empty(),
+            "the swept timer is no longer a child: {children:?}"
         );
     }
 
@@ -967,9 +982,9 @@ mod tests {
     async fn child_completed_of_the_invoked_task_completes_the_activity() {
         let payload = json!({ "answer": 42 });
         let mut store = InMemoryStorage::new();
-        let mut row = seeded_activity(seeded_input(), []);
-        row.value.raw_output = Some(payload.clone());
-        seed_container(&mut store, row, []).await;
+        let mut row = seeded_activity(seeded_input());
+        row.raw_output = Some(payload.clone());
+        seed_container(&mut store, Seeded::lone(row), []).await;
 
         let completed = child_completed(
             &task_state(None, None, Some("P2")),
@@ -996,8 +1011,7 @@ mod tests {
     async fn seed_deadline(store: &mut InMemoryStorage, status: TimerStatus) {
         let mut timer = timeout_timer(at());
         timer.status = status;
-        let mut row = TimerRecord::from_value(timer);
-        row.born(at());
+        let row = timer;
         store
             .put_timer(row)
             .await
@@ -1010,8 +1024,8 @@ mod tests {
     #[tokio::test]
     async fn child_completed_of_the_fired_timeout_terminates_the_activity() {
         let mut store = InMemoryStorage::new();
-        let row = seeded_activity(seeded_input(), []);
-        seed_container(&mut store, row, []).await;
+        let row = seeded_activity(seeded_input());
+        seed_container(&mut store, Seeded::lone(row), []).await;
         seed_deadline(&mut store, TimerStatus::Completed).await;
 
         let completed = child_completed(
@@ -1046,8 +1060,8 @@ mod tests {
     #[tokio::test]
     async fn child_completed_of_the_cancelled_timeout_does_nothing() {
         let mut store = InMemoryStorage::new();
-        let row = seeded_activity(seeded_input(), []);
-        seed_container(&mut store, row, []).await;
+        let row = seeded_activity(seeded_input());
+        seed_container(&mut store, Seeded::lone(row), []).await;
         seed_deadline(&mut store, TimerStatus::Cancelled).await;
 
         let completed = child_completed(
@@ -1071,9 +1085,9 @@ mod tests {
     #[tokio::test]
     async fn child_completed_of_the_timeout_after_the_task_settled_does_nothing() {
         let mut store = InMemoryStorage::new();
-        let mut row = seeded_activity(seeded_input(), []);
-        row.value.raw_output = Some(json!({ "answer": 42 }));
-        seed_container(&mut store, row, []).await;
+        let mut row = seeded_activity(seeded_input());
+        row.raw_output = Some(json!({ "answer": 42 }));
+        seed_container(&mut store, Seeded::lone(row), []).await;
         seed_deadline(&mut store, TimerStatus::Completed).await;
 
         let completed = child_completed(

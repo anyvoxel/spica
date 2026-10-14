@@ -294,8 +294,8 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 
 ### 现状为什么能工作:归属同时承担了「终结扫荡」职责
 
-- **子边只存在于三种容器行**:`ExecutionRecord` / `ThreadRecord` / `ActivityRecord` 有 `active_children`(`put_child` / `remove_child` 维护),`TaskRecord` **没有** children 集合 —— Task 在模型里是叶子。
-- **三条级联扫荡全靠这条子边**:`terminate_execution.rs`、`terminate_thread.rs`、`terminate_state.rs` 都是「遍历 scope 的 `active_children`,遇 `ObjectKind::Timer` 就 `CancelTimer`」。Timer 挂 Activity ⇒ 任何 scope 终结路径都自动兜住它,不依赖 Task 那条路径做任何事。
+- **子边是独立的存储单元**:`get_children` / `add_child` / `remove_child` 维护 `_index/children/<parent_kind>/<parent_name>/<child_kind>/<child_name>` 下的父子边表,任何 kind 都能拥有子节点,行上不再保存 children —— `Task` 与三种容器行一样都是普通行。
+- **三条级联扫荡全靠这条子边**:`terminate_execution.rs`、`terminate_thread.rs`、`terminate_state.rs` 都是「遍历 scope 的子边(`get_children`),遇 `ObjectKind::Timer` 就 `CancelTimer`」。Timer 挂 Activity ⇒ 任何 scope 终结路径都自动兜住它,不依赖 Task 那条路径做任何事。
 - **命名与 owner 无关**:timer 名来自 `execution.name.base().generated_from_key(seq)`(`handlers/mod.rs::emit_timer`),`Timer::execution` 也是顶层 flat run。所以改挂不影响子边按名匹配,这一点是中立的。
 
 ### 改挂 Task 的收益(确实存在)
@@ -305,7 +305,7 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 
 ### 改挂 Task 的代价(四条实打实)
 
-1. **要给 Task 行加 children 集合**:`TaskRecord`、相关 applier、所有写 task 的地方全动,Task 从叶子变容器。
+1. **行结构不再要改**:子边现在存在独立的 `_index` 边表里,任何 kind 都能拥有子节点,Task 不需要在行上加 children 集合 —— 「Task 从叶子变容器」那部分代价不复存在,剩下的只是第 2 条那条新不变式。
 2. **级联扫荡不再覆盖它**(最关键)。今天「`CancelTask` / `TaskCompleted` / 租约过期 / `terminate_state`」任一路径都由 activity 级一次扫荡兜底;改挂后必须成立新不变式:**每条让 task 终结的路径都扫它自己的 timer**。漏一条就会留下活着的 timer,scheduler 到点触发 `TriggerTimer` 去打一个已不存在的 task(即那堆 late-fire 防御分支要处理的情形)。
 3. **Activity 的 drain 信号变了**。`trigger_timer` 现在特意在「没找到 in-flight task」时仍跑 `child_settled`,注释明写:那正是 cancel 已扫掉 task、只剩已 fire 的 timer 撑住 activity 的场景。改挂后这个 relay 的收敛对象换成 task 的容器,而此刻 task 自身已 terminal/drained,收敛推理要重做。
 4. **容器分发扩容**:Timer 的 owner kind 从 {Execution, Thread, Activity} 变成再加 Task,`cancel_timer` / `trigger_timer` 里的 `if owner.kind != ObjectKind::Activity { return }` 需变成按 kind 分发(`TaskContainer`)。与现有 `Container` 抽象方向一致,但是**新增工作量**,不是改挂的自动结果;且与 `8e0f90f`(把每个 state 的 owner 统一到 Thread)方向相反 —— 那是在收敛「谁拥有子节点」。
@@ -325,3 +325,123 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 - 判据一句话:**Timer 的归属应跟着「谁负责终结它」走,而不是跟着「语义上它约束谁」走**。在这套引擎里负责终结它的是 Activity 侧的容器与级联扫荡。ASL 层面 `TimeoutSeconds` 确是 Task state 的字段(且 Task 自身的 `deadline` 已镜像它),但这不构成把 timer 挂到 Task 下的充分理由。
 - 若最终改挂,必须先补齐「Task 终结路径全覆盖扫自身 timer」的清单并逐条验证,再动 storage。
 - 现阶段不做;`Task::claim` / `Task::cancel` / 各 applier 均假定 task 不拥有任何子节点,改动会波及这些不变量。
+
+## 用「从 Storage 重算下一步」取代持久化 follow-up command —— 先做等价性反推盘点
+
+**状态:** 已识别,待评审;**先只做「反推表」盘点,不动实现**。触发条件 = 想简化内部跳转机制(settle 钩子 / `Continue*` 双轨、内部 command 的持久化)时。
+
+### 问题(想简化什么)
+
+CCES 让「决定下一步」与「执行下一步」解耦,并把**决定本身**持久化成 command,换来可恢复 / 可交接 / 可审计。代价是控制流被摊成「一条持久化 command + 下一轮 dispatch」,于是:
+
+- 「子完成后父要推进」这件事有**两套机制**并存:`Container` 的 settle 钩子(`crates/engine/src/elements/mod.rs` 的 `after_child_completed` / `after_child_terminated`)与一跳延迟的 `Command::ContinueComplete` / `ContinueTerminate`(`crates/engine-types/src/types/command.rs`)。读的人得先猜「这次为何不走另一条」。
+- 「每条 command 至少一条 entry」不变量(`crates/engine/src/leader.rs` 的 `dispatch_once` `assert!`)对**内部** follow-up command 也生效,而内部 command 根本没有 awaiter(`Command::request_id()` 对它们返回 `None`)。
+
+**想法**:如果恢复时能从 `Storage` 读出最新投影,直接算出「下一个应该执行的点」、执行、把结果写 log、再提交,那么**内部 follow-up command 的持久化可能是多余的**——`settle` 与 `Continue*` 可合并成一条「drive 时重算」,上述不变量可收缩到只对客户端发起的 command 生效。
+
+### 不违反核心不变量(先确立这点)
+
+`Architecture.md §2` 的不变量是「event stream 是唯一真源,`Storage` 必须能由 event 流重建」。上述想法**没动 truth model**,只改「*怎么发现下一步*」:从「读一条持久化 intent」改成「读 state 自己算」。因此这是可接受的演进(k8s reconciler / Temporal 同向),不是推翻 CCES。
+
+### 前提(决定成败的那一条)
+
+那个「下一个应该执行的点」必须是 **`(Storage, 静态定义, clock, ids)` 的纯函数**。今天持久化 command 存在的根本原因,正是有些「下一步」带了 state 里没有的信息:
+
+- 触发它的**具体 `request_id`**(要 ack 给谁);
+- 触发它的是**哪个 child** 完成、还剩几个未完成;
+- **外部副作用**(给 worker 派活、arm timer、调外部服务)。
+
+分水岭只有一条:**这一步是纯的,还是带外部副作用**。
+
+| 步骤性质 | 可行做法 |
+|---|---|
+| 纯(state → state+events) | **内存算 → 一次原子 append → 提交**;崩在提交前 = 什么都没发生,重算即可(不需要 WAL) |
+| 带外部副作用 | 必须先写意图再动手(否则崩溃重复投递),或要求副作用可从**已提交 event** 重新推导 —— spica 现状正靠 `Hook` 这么做 |
+
+### 代价(诚实记一笔:是「队列」换「扫描」)
+
+持久化 command 让「下一步」是 O(1) pop;reconciler 得从 state 里**找出**该跑的点,于是要长出索引:按 deadline 的 timer 索引、按「容器可否 settle」的索引、按 lease 过期的工作索引。复杂度没蒸发,是从「command log 的语义」搬到「索引维护 + 调度」。另有两个新失效模式:
+
+- **空转**:「下一步」若不单调,naive 循环会反复重算同一件活儿 → 需 state 里能回答「这活儿做过了吗」(每个工作项要 durable 的 done/leased 标记)。
+- **谁该跑**:需能回答「哪些对象还没到终态」,又是一个扫描面。
+
+### 候选方案(推荐:先做反推表,不动架构)
+
+**不动实现**:先把「重算」实现为**恢复路径**,让它在稳态之外作为权威;它同时就是「持久化 command 是否多余」的**判据 / 预言机**。
+
+对现存**每一条 follow-up command**逐个回答两问:
+
+1. 它能不能从 `(Storage, 静态定义, clock, ids)` **重新算出来**?
+2. 它带没带**外部副作用**?
+
+判读:
+
+- 重算结果 **==** 日志里那条 command → 该 command **冗余**,可去掉持久化,改由 drive 时重算;
+- 重算不出 / 算出来**不一致** → 它的决策依赖了 state 外的信息,那就是**必须先补进 state 或 event** 的那份信息(通常意味着给某个 event 补字段,或给某张表补一列)。
+
+这张表做完,「能简化多少」就不是猜的;并顺带回答 `settle` 与 `Continue*` 到底哪个是多余的。
+
+### 注意
+
+- 本条是**盘点 + 设计收敛**,不是直接改;**反推表产出、评审通过前不要动实现**。
+- 与本节第一条(`recover_leader` / `run_follower` 折叠)相关:恢复路径正是「重算」的落点,若那条先统一了折回逻辑,重算更容易挂上去。
+- 单节点下这不是修 bug(本地 commit == durable,现行为正确),是**简化**;若将来 multi-node,「谁该跑」的索引需与分区 / 领导权切换一起考虑(与上方三条 Zeebe / 链式参考联动)。
+- 内联 TODO 与本条同源者,落地时一并收敛。
+
+## (设计参考·备选)ASL → 低层 IR + 自建运行时 —— 「执行半边」的替代终态
+
+**状态:** 设计参考,**未落地**;设计见 `docs/asl-ir-design.md`(已从 `third_party/asl-ir-demo/{asl,scope}` 反推)。触发条件 = 决定为「简化执行半边」付一笔**前置、重写量级**的投入时。
+
+### 与上一条(「用从 Storage 重算下一步」)的关系:不同轴,且互补
+
+- 上一条问「**下一步从哪来**」——读持久化 intent,还是从投影重算。是**驱动**问题。
+- 本条问「**状态本身长什么样**」——域对象图,还是 IR 帧(`pc` + 寄存器 + scope + handle)。是**状态模型**问题。
+
+两条不是替代关系:IR 把上一条的前提「下一步必须是 `(Storage, 静态定义, clock, ids)` 的纯函数」从**祈祷**变成**结构性成立**——后继指令就躺在程序里(`pc+1` / `JMP` 目标 / `BR` 分支),不需要*推断*,直接*读出*。
+
+### 它正面命中的复杂度(最强卖点)
+
+- **父子 Terminate/Complete 矩阵**(本册多处痛点的根)被两样通用机制替掉:结构化并发(`docs/asl-ir-design.md` §7.1「a frame may not exit with live children」)+ `SCOPE_CLOSE` 等 ack(§4.3)。cancel 不再需要 runtime 认识 frame 上挂了什么(G3):外部 task / timer / 子 frame 统一为 **handle**,`kinds[kind] = {cleanup actions, NeedAck}` 是**数据表**,取代三段手写级联扫荡(`elements/{execution,thread,activity}` 里的 terminate 扫荡)。
+- **顺带解掉上方「`TaskTimeout` Timer 归属」条目**:在 IR 里是伪问题——timer 就是当前 scope 的一个 handle,`SCOPE_CLOSE` 按 `kinds` 统一清理,不需要「谁负责终结它」这个归属决定。
+- **G1**:已持久化程序的语义必须能从**指令流**读出(§1.1)。今天 spica 的语义**就是 handler 代码**——升级引擎会静默改变在飞执行的行为;IR 下 ASL 改容差取整是**重新编译**。这是当前引擎给不出的正确性性质。
+
+### 代价:不是「更简单」,是「复杂度换形状 + 前置成本」(三笔账搬家)
+
+1. **编译器成为新的复杂度中心。** 今天散在 `elements/states/*.rs` 的语义(retry backoff、Map 容差算术、error-name 匹配、ItemSelector、timeout/heartbeat)全部搬进 lowering。经典解释器→编译器取舍,但**每个 ASL 特性都要 lowering 对**。`docs/asl-ir-design.md` §9 有 **10 个 OPEN**(tie-break / cleanup landing pad vs scope 走栈 / `pc` 是否持久化 / heartbeat handle 形状 / ItemSelector 逐项还是 hoist / 容差细节 / `MATCH` 住哪……)——575 行、两份参考实现反推过仍留 10 个未决问题,规模可见。
+2. **Frame 的持久化 / 重放成为新正确性面。** 跨恢复要持久并还原 `pc`、**带类型标签**的寄存器(§4:不带标签 int 会变 float64)、scope 栈、handle 表、mailbox。§6 的 9 条是新不变量;`Recorder` 要按**调用顺序**记录非确定性函数(`$millis`/`$now`/`$random`/`$uuid`)才能逐字节重放;§8 末尾「in-process 版本藏了五件事」的表就是耐久性坑清单。
+3. **查询 / 可观测性失去形状。** 今天 `Storage` 域行**就是对外查询面**(`crates/server/src/query.rs` 把 Execution/Thread/Activity/Timer/Task 行直接转 proto,测试里 ~50 处 fixture 也在断言这些行)。IR 下状态是「frame, pc=37, regs={…}」,`pc` 离开程序不可读 → 要回答「在干什么 / 在等什么 / 目前输出」必须**另建读模型**。而 `docs/asl-ir-design.md` §1.2 明确把 durability / 查询列为 **non-goal** —— 这是**空白**,不是已解决项。
+
+### 危险点(文档自己已标,落地前须先解决)
+
+- **key 在恢复下的唯一与稳定**(§6.7、OPEN-10)。§7.3 直接点名 `scope` 的 `START_TASK` 用 `State/Attempt/task` 做 key,**N 个 item 会碰撞**。拼错的后果 = 重放把两个不同 child 别名到同一行——**正是今天「每对象一个独立 uid」在避免的失效模式**。
+- **OPEN-3**(持久化 `pc`,还是从最后挂起点重跑 + 注入取消)与上一条是**同一个决策下沉一格**(持久化 intent vs 重算)——两条讨论在此撞上,应一起定。
+
+### 定义半边不用动(使分期迁移成立)
+
+IR 是**定义(`FlowVersion`)的 lowering**,`Flow`/`FlowVersion` 的存储与语义原封不动,只多一份编译产物(可照今天 `HandlerContext::machine` 的「按需编译 + 每版本缓存」)。即**只替换执行的一半**,不是全盘重写。因此 `docs/asl-ir-design.md` §10 的 S1..S5(Task 起步 → retry/catch → fan-out → 其余 state → ItemBatcher / nested)是一条**真实迁移路线**,而非纸上计划。
+
+### 共享产物:两条路的第一步是同一件
+
+`docs/asl-ir-design.md` §8 的推导规则:
+
+> 对每一行问:**崩在这行之后,必须已经持久化了什么才能继续?** 那个集合就是 IR。
+
+把这条用在**当前的**引擎上,产出的就是上一条要的**反推表**;而表里被标成「**不可推导 / 带了 state 外信息**」的每一项,恰恰就是 **IR 寄存器必须承载的东西**。所以反推表既是「哪些 follow-up command 冗余」的答案,也是「IR 状态模型该装什么」的需求清单——**先做它,两种结局下都不浪费**。
+
+### 结论:复杂度「摊着长」还是「集中长」
+
+| | 现状(域对象图) | IR + 运行时 |
+|---|---|---|
+| 复杂度形状 | **摊开**(7 个 kind × applier × container × handler × settle/Continue)且**涌现**(要推断) | **集中**(编译器 + 一个解释器 + 一个 frame 模型)且**声明式**(可读出) |
+| 成本时机 | 可**增量**改进 | **前置**付清,重写量级 |
+| 取消 / 父子 | 手写级联扫荡 + settle/Continue 双轨 | 结构化并发 + handle `kinds` 表(通用) |
+| 已持久化程序的语义 | 在 handler 代码里(升级会漂移) | 在指令流里(G1,重新编译) |
+| 对外查询 | 域行即查询面 | 需另建读模型(文档未覆盖) |
+
+IR 是收敛更好的**终态**(也正是 durable-execution 领域收敛的方向);代价是前置的、重写量级的投入。**判断标准是「是否愿意付这笔前置成本」,不是技术优劣。**
+
+### 注意
+
+- 本条是**参考 + 决策材料**,不是立即可动的任务;**先产出上一条的反推表,再决定是否立项**。
+- 若立项,须先解决 §9 的 10 个 OPEN 与上面两个危险点(尤其 key 唯一性),再进 §10 的 S1。
+- 与本册上方三条 Zeebe / 链式参考的关系:那些是 **multi-node 的复制 / 快照**问题,与本条(单节点即可受益的**表示**问题)正交,可独立推进。

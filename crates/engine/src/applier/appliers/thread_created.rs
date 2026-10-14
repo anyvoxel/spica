@@ -1,7 +1,5 @@
 //! `ThreadCreated` event projection: folds the `Event::ThreadCreated` into Storage.
 
-use std::collections::HashSet;
-
 use crate::types::error::ExecutionError;
 use crate::types::meta::HasRawObjectRef;
 use crate::{ActivityState, ApplierContext, Thread, ThreadOwner};
@@ -14,30 +12,30 @@ impl ThreadCreatedApplier {
         ctx: &mut ApplierContext<'_>,
         thread: &Thread,
     ) -> Result<(), ExecutionError> {
-        let mut row = crate::storage::ThreadRecord::from_value(thread.clone(), HashSet::new());
-        // Birth: the row's `created_at`/`updated_at` are stamped with the `ThreadCreated` entry's
-        // moment (deterministic across replicas — see `ApplierContext::timestamp`).
-        row.born(ctx.timestamp);
+        ctx.storage.put_thread(thread.clone()).await?;
         // The child Thread inherits its **enclosing scope's** current variable snapshot, so a
         // branch/item starts already seeing the variables in scope where it was spawned (a thread's
-        // variable scope is projection-only, see `Thread`'s doc — so the seed happens here, not on
-        // the domain event). Addressed structurally: a fan-out thread's `meta.owner` is its container
-        // Activity, whose own owner is the enclosing scope — always a `Thread` (the activity slot's
-        // own type), never an `Execution` directly — so only the `Activity` variant has a scope to
-        // inherit from. Siblings spawned in the same fan-out batch all inherit the same parent
-        // snapshot.
+        // variable scope is derived state kept beside the row, see `Storage::get_variables` — so the
+        // seed happens here, not on the domain event, whose value carries no scope). Addressed
+        // structurally: a fan-out thread's `meta.owner` is its container Activity, whose own owner is
+        // the enclosing scope — always a `Thread` (the activity slot's own type), never an
+        // `Execution` directly — so only the `Activity` variant has a scope to inherit from, and an
+        // absent parent scope reads as empty. Siblings spawned in the same fan-out batch all inherit
+        // the same parent snapshot.
         if let ThreadOwner::Activity(owner) = &thread.meta.owner
             && let Ok(Some(act)) = ctx.storage.get_activity(owner).await
-            && let Some(parent) = ctx.storage.get_thread(&act.value.meta.owner).await?
         {
-            row.variables = parent.variables;
+            let scope = ctx.storage.get_variables(&act.meta.owner).await?;
+            ctx.storage
+                .put_variables(&thread.meta.object_ref(), scope)
+                .await?;
         }
-        ctx.storage.put_thread(row).await?;
         super::bump_generated_seq(ctx.storage, &thread.meta.name).await?;
-        // A thread joins its owner's `active_children` so the owner drains (Completing/Terminating)
-        // waits on it via the shared cascade, and the inline drain reaction notices it as in-flight.
-        // Either owner holds that edge: a fan-out thread's container Activity, and a root thread's
-        // top-level Execution, whose own drain waits on the root thread running its machine.
+        // A thread becomes its owner's child so the owner's drain (Completing/Terminating) waits on
+        // it via the shared cascade, and the inline drain reaction notices it as in-flight. This is an
+        // ownership edge — a cell of its own, independent of the owner's row. Either owner holds that
+        // edge: a fan-out thread's container Activity, and a root thread's top-level Execution, whose
+        // own drain waits on the root thread running its machine.
         let owner = thread.meta.owner.clone();
         ctx.storage
             .add_child(
@@ -56,7 +54,7 @@ impl ThreadCreatedApplier {
             return Ok(());
         };
         if let Some(mut act) = ctx.storage.get_activity(&owner).await? {
-            match &mut act.value.activity_state {
+            match &mut act.activity_state {
                 Some(ActivityState::Map(progress)) => {
                     progress
                         .children
@@ -73,7 +71,6 @@ impl ThreadCreatedApplier {
                 Some(ActivityState::Wait(_)) => return Ok(()),
                 None => {
                     let ActivityState::Parallel(progress) = act
-                        .value
                         .activity_state
                         .insert(ActivityState::Parallel(Default::default()))
                     else {
@@ -84,7 +81,9 @@ impl ThreadCreatedApplier {
                         .insert(thread.index, thread.meta.object_ref());
                 }
             }
-            act.with_update_at(ctx.timestamp);
+            // The event carries no activity value, so this fold's own write is stamped from the
+            // entry's frozen moment — deterministic on replay, never a local clock.
+            act.meta.with_update_at(ctx.timestamp);
             ctx.storage.put_activity(act).await?;
         }
         Ok(())

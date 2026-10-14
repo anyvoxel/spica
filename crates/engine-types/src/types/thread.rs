@@ -84,9 +84,9 @@ impl ObjectKindMarker for ThreadKind {
 /// fan-out sub-run (generated `{execution-name}-{suffix}` name, always-a-`state_path`, always owned by
 /// its container activity). The role is declared by the type, so no consumer has to infer it from fields.
 ///
-/// It carries only durable identity/lifecycle facts; runtime conveniences (variable scope, in-flight
-/// children) live on the storage projection `crate::storage::ThreadRecord`, mirroring
-/// `ExecutionRecord`.
+/// It carries only durable identity/lifecycle facts; runtime conveniences (the variable scope, the
+/// in-flight children) are **derived** state and live beside it in storage's `_index` cells rather
+/// than on this value — see `crate::storage::Storage::get_variables` / `get_children`.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
@@ -95,7 +95,7 @@ pub struct Thread {
     /// (see `SpawnThread`'s minting rule). Unlike a
     /// top-level `Execution` (which has no owner), `meta.owner` is **always** the container
     /// `Parallel`/`Map` activity that fanned this thread out — the drain cascade and the container's
-    /// `active_children` rely on that owning edge.
+    /// ownership edges rely on that owning edge.
     pub meta: ObjectMeta<ThreadKind>,
     /// The execution this thread belongs to — **always** the top-level [`Execution`](crate::types::execution::Execution)'s
     /// typed reference, regardless of nesting depth (a tree holds exactly one `Execution`, and it

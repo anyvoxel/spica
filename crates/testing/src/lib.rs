@@ -31,9 +31,9 @@ use async_trait::async_trait;
 use mockall::mock;
 use spica_engine_types::storage::ReadonlyStorageTxn;
 use spica_engine_types::{
-    ActivityKind, ActivityRecord, ExecutionKind, ExecutionRecord, Flow, FlowName, FlowVersion,
-    FlowVersionKind, ObjectRef, RawObjectRef, StorageError, TaskKind, TaskRecord, ThreadKind,
-    ThreadRecord, TimerKind, TimerRecord, Timestamp,
+    Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
+    ObjectRef, RawObjectRef, StorageError, Task, TaskKind, Thread, ThreadKind, Timer, TimerKind,
+    Timestamp, Variables,
 };
 
 pub mod assertions;
@@ -49,23 +49,27 @@ mock! {
         async fn get_execution(
             &self,
             reference: &ObjectRef<ExecutionKind>,
-        ) -> Result<Option<ExecutionRecord>, StorageError>;
+        ) -> Result<Option<Execution>, StorageError>;
         async fn get_thread(
             &self,
             reference: &ObjectRef<ThreadKind>,
-        ) -> Result<Option<ThreadRecord>, StorageError>;
+        ) -> Result<Option<Thread>, StorageError>;
+        async fn get_variables(
+            &self,
+            reference: &ObjectRef<ThreadKind>,
+        ) -> Result<Variables, StorageError>;
         async fn get_activity(
             &self,
             reference: &ObjectRef<ActivityKind>,
-        ) -> Result<Option<ActivityRecord>, StorageError>;
+        ) -> Result<Option<Activity>, StorageError>;
         async fn get_timer(
             &self,
             reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<TimerRecord>, StorageError>;
+        ) -> Result<Option<Timer>, StorageError>;
         async fn get_task(
             &self,
             reference: &ObjectRef<TaskKind>,
-        ) -> Result<Option<TaskRecord>, StorageError>;
+        ) -> Result<Option<Task>, StorageError>;
         async fn get_children(
             &self,
             id: RawObjectRef,
@@ -75,7 +79,7 @@ mock! {
             resource: &str,
             now: Timestamp,
             limit: usize,
-        ) -> Result<Vec<TaskRecord>, StorageError>;
+        ) -> Result<Vec<Task>, StorageError>;
         async fn get_flow_by_name(
             &self,
             name: FlowName,

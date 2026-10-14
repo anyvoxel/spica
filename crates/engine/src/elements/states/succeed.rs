@@ -234,7 +234,6 @@ mod tests {
                 .activity(&minted_activity_ref())
                 .await
                 .expect("the finish folds the completed row")
-                .value
                 .status,
             ActivityStatus::Completed
         );

@@ -163,8 +163,8 @@ impl Projector {
     }
 
     /// Apply one event with a caller-chosen entry timestamp (the tuple `(event, timestamp)` models a
-    /// log entry). Lets tests observe that projection `created_at`/`updated_at` fold the entry's
-    /// frozen timestamp deterministically.
+    /// log entry). Lets tests observe the two distinct time facts: what the event's own payload
+    /// carries, and the entry's frozen timestamp a time-dependent fold decision must use.
     async fn apply_at(
         &self,
         storage: &mut InMemoryStorage,
@@ -442,8 +442,8 @@ async fn storage_projects_execution_and_activity_state() {
 }
 
 /// The event-carried `Execution.created_at`/`updated_at` (stamped at event construction, not taken
-/// from log `Entry` metadata) survive the projection round-trip — including the de-flattened
-/// execution row in Storage — and a completion advances `updated_at` while `created_at` stays put.
+/// from log `Entry` metadata) survive the projection round-trip, and a completion advances
+/// `updated_at` while `created_at` stays put.
 #[tokio::test]
 async fn execution_domain_timestamps_follow_the_lifecycle() {
     let exec = exec_ref();
@@ -473,14 +473,13 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
         )
         .await;
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
-    // `e.value` is the domain `Execution`; `e.created_at` would be the record's entry-derived field.
     assert_eq!(
-        e.value.meta.created_at,
+        e.meta.created_at,
         spica_engine::Timestamp::from_millis(100),
         "birth created_at survives projection"
     );
     assert_eq!(
-        e.value.meta.updated_at,
+        e.meta.updated_at,
         spica_engine::Timestamp::from_millis(100),
         "birth updated_at equals created_at"
     );
@@ -508,22 +507,22 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
         .await;
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
     assert_eq!(
-        e.value.meta.created_at,
+        e.meta.created_at,
         spica_engine::Timestamp::from_millis(100),
         "created_at is immutable across the lifecycle"
     );
     assert_eq!(
-        e.value.meta.updated_at,
+        e.meta.updated_at,
         spica_engine::Timestamp::from_millis(300),
         "updated_at advances to the completing event's stamp"
     );
 }
 
 /// The event-carried `Activity`/`Timer`/`Task` `created_at`/`updated_at` (stamped at event
-/// construction, mirroring `Execution`) survive the projection round-trip — including the
-/// de-flattened rows in Storage — and each transition advances the domain value's `updated_at`
-/// while its `created_at` stays put. This exercises the mutation-applier value-sync (`t.value
-/// .updated_at = <event>.updated_at`) across Activity, Timer, and Task lifecycle transitions.
+/// construction, mirroring `Execution`) survive the projection round-trip, and each transition
+/// advances the domain value's `updated_at` while its `created_at` stays put. This exercises the
+/// mutation-applier value-sync (`t.meta.updated_at = <event>.meta.updated_at`) across Activity,
+/// Timer, and Task lifecycle transitions.
 #[tokio::test]
 async fn leaf_domain_timestamps_follow_the_lifecycle() {
     let exec = exec_ref();
@@ -571,16 +570,8 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         )
         .await;
     let a = storage.get_activity(&activity).await.unwrap().unwrap();
-    assert_eq!(
-        a.value.meta.created_at,
-        ts(100),
-        "activity created_at immutable"
-    );
-    assert_eq!(
-        a.value.meta.updated_at,
-        ts(200),
-        "activity updated_at advances"
-    );
+    assert_eq!(a.meta.created_at, ts(100), "activity created_at immutable");
+    assert_eq!(a.meta.updated_at, ts(200), "activity updated_at advances");
 
     // Timer birth, then completion advances `updated_at`.
     let timer_birth = Timer {
@@ -614,16 +605,8 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         )
         .await;
     let tm = storage.get_timer(&timer_ref(timer)).await.unwrap().unwrap();
-    assert_eq!(
-        tm.value.meta.created_at,
-        ts(100),
-        "timer created_at immutable"
-    );
-    assert_eq!(
-        tm.value.meta.updated_at,
-        ts(150),
-        "timer updated_at advances"
-    );
+    assert_eq!(tm.meta.created_at, ts(100), "timer created_at immutable");
+    assert_eq!(tm.meta.updated_at, ts(150), "timer updated_at advances");
 
     // Task birth, then completion advances `updated_at`.
     let task_birth = Task {
@@ -667,23 +650,16 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
         )
         .await;
     let tk = storage.get_task(&task_ref(task)).await.unwrap().unwrap();
-    assert_eq!(
-        tk.value.meta.created_at,
-        ts(100),
-        "task created_at immutable"
-    );
-    assert_eq!(
-        tk.value.meta.updated_at,
-        ts(180),
-        "task updated_at advances"
-    );
+    assert_eq!(tk.meta.created_at, ts(100), "task created_at immutable");
+    assert_eq!(tk.meta.updated_at, ts(180), "task updated_at advances");
 }
 
-/// Projection timing facts fold the applied entry's frozen `timestamp`: `created_at` is stamped once
-/// at birth (`== updated_at`), and `updated_at` advances on every later write while `created_at`
-/// stays put. Covering Execution, Activity, Timer, and Task rows.
+/// A projection row's timing facts come from the event value's own `meta`: the producing handler
+/// stamped them, so a replay reproduces what was committed rather than a moment the fold invented.
+/// Every entry below carries a `timestamp` far from its payload's stamps to pin that. Covering
+/// Execution, Activity, Timer, and Task rows.
 #[tokio::test]
-async fn projection_records_create_and_update_timestamps() {
+async fn projection_rows_take_their_stamps_from_the_event_value() {
     let exec = exec_ref();
     let activity = act_ref();
     let timer = ulid::Ulid::new();
@@ -692,7 +668,7 @@ async fn projection_records_create_and_update_timestamps() {
     let projector = Projector::new();
     let t = |ms: u64| spica_engine::Timestamp::from_millis(ms);
 
-    // Birth at t=100: created_at == updated_at == 100.
+    // Birth: the payload's stamps (`t(10)`) land on the row; the entry's own moment (`t(1)`) does not.
     projector
         .apply_at(
             &mut storage,
@@ -705,21 +681,18 @@ async fn projection_records_create_and_update_timestamps() {
                     input: json!({}),
                     output: None,
                     meta: spica_engine::ObjectMeta::builder(exec.uid())
-                        .timestamps(
-                            spica_engine::Timestamp::from_millis(0),
-                            spica_engine::Timestamp::from_millis(0),
-                        )
+                        .timestamps(t(10), t(10))
                         .with_owner(spica_engine::NoOwner::new()),
                 },
             }),
-            t(100),
+            t(1),
         )
         .await;
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
-    assert_eq!(e.created_at, t(100));
-    assert_eq!(e.updated_at, t(100));
+    assert_eq!(e.meta.created_at, t(10));
+    assert_eq!(e.meta.updated_at, t(10));
 
-    // An update at t=200 advances updated_at, leaves created_at.
+    // A later transition carries the handler's own `updated_at` (`t(20)`) and leaves `created_at` put.
     projector
         .apply_at(
             &mut storage,
@@ -731,19 +704,22 @@ async fn projection_records_create_and_update_timestamps() {
                     input: json!({}),
                     output: None,
                     meta: spica_engine::ObjectMeta::builder(exec.uid())
-                        .timestamps(t(100), t(200))
+                        .timestamps(t(10), t(20))
                         .with_owner(spica_engine::NoOwner::new()),
                 },
             },
-            t(200),
+            t(2),
         )
         .await;
     let e = storage.get_execution(&exec).await.unwrap().unwrap();
-    assert_eq!(e.created_at, t(100), "created_at is immutable after birth");
-    assert_eq!(e.updated_at, t(200));
+    assert_eq!(
+        e.meta.created_at,
+        t(10),
+        "created_at is immutable after birth"
+    );
+    assert_eq!(e.meta.updated_at, t(20));
 
-    // Activity birth at t=200 (created == updated), then completion at t=300 (created stays, updated
-    // advances to 300).
+    // Activity birth (`t(30)`), then completion carrying `t(40)`.
     projector
         .apply_at(
             &mut storage,
@@ -759,11 +735,11 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: None,
                     output: None,
                     meta: spica_engine::ObjectMeta::builder(activity.uid())
-                        .timestamps(t(200), t(200))
+                        .timestamps(t(30), t(30))
                         .with_owner(activity_root_thread_owner()),
                 },
             },
-            t(200),
+            t(3),
         )
         .await;
     projector
@@ -781,19 +757,18 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_state: None,
                     output: Some(json!(42)),
                     meta: spica_engine::ObjectMeta::builder(activity.uid())
-                        .timestamps(t(200), t(300))
+                        .timestamps(t(30), t(40))
                         .with_owner(activity_root_thread_owner()),
                 },
             },
-            t(300),
+            t(4),
         )
         .await;
     let a = storage.get_activity(&activity).await.unwrap().unwrap();
-    assert_eq!(a.created_at, t(200));
-    assert_eq!(a.updated_at, t(300));
+    assert_eq!(a.meta.created_at, t(30));
+    assert_eq!(a.meta.updated_at, t(40));
 
-    // Timer birth at t=400 (created == updated), then completion at t=450 (created stays, updated
-    // advances).
+    // Timer birth (`t(50)`), then triggering carrying `t(60)`.
     projector
         .apply_at(
             &mut storage,
@@ -803,11 +778,11 @@ async fn projection_records_create_and_update_timestamps() {
                     status: TimerStatus::Active,
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
-                        .timestamps(t(400), t(400))
+                        .timestamps(t(50), t(50))
                         .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
-            t(400),
+            t(5),
         )
         .await;
     projector
@@ -819,19 +794,18 @@ async fn projection_records_create_and_update_timestamps() {
                     status: TimerStatus::Completed,
                     deadline: t(500),
                     meta: spica_engine::ObjectMeta::builder(timer)
-                        .timestamps(t(400), t(450))
+                        .timestamps(t(50), t(60))
                         .with_owner(TimerOwner::Execution(exec.clone())),
                 },
             },
-            t(450),
+            t(6),
         )
         .await;
     let tm = storage.get_timer(&timer_ref(timer)).await.unwrap().unwrap();
-    assert_eq!(tm.created_at, t(400));
-    assert_eq!(tm.updated_at, t(450));
+    assert_eq!(tm.meta.created_at, t(50));
+    assert_eq!(tm.meta.updated_at, t(60));
 
-    // Task birth at t=600 (created == updated), then failure at t=650 (created stays, updated
-    // advances).
+    // Task birth (`t(70)`), then failure carrying `t(80)`.
     projector
         .apply_at(
             &mut storage,
@@ -847,11 +821,11 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
-                        .timestamps(t(600), t(600))
+                        .timestamps(t(70), t(70))
                         .with_owner(activity.clone()),
                 },
             },
-            t(600),
+            t(7),
         )
         .await;
     projector
@@ -869,7 +843,7 @@ async fn projection_records_create_and_update_timestamps() {
                     retry_plan: vec![],
                     retry_state: RetryState::default(),
                     meta: spica_engine::ObjectMeta::builder(task)
-                        .timestamps(t(600), t(650))
+                        .timestamps(t(70), t(80))
                         .with_owner(activity.clone()),
                 },
                 error: ExecutionError::Runtime(RuntimeError::StateFailed {
@@ -878,12 +852,12 @@ async fn projection_records_create_and_update_timestamps() {
                     output: Box::new(Value::Null),
                 }),
             }),
-            t(650),
+            t(8),
         )
         .await;
     let tk = storage.get_task(&task_ref(task)).await.unwrap().unwrap();
-    assert_eq!(tk.created_at, t(600));
-    assert_eq!(tk.updated_at, t(650));
+    assert_eq!(tk.meta.created_at, t(70));
+    assert_eq!(tk.meta.updated_at, t(80));
 }
 
 // ── Causality / atomicity ────────────────────────────────────────────────────
@@ -1124,15 +1098,14 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             },
         )
         .await;
-    let row = storage
-        .get_thread(&thread_ref.clone().typed::<ThreadKind>())
+    let scope = storage
+        .get_variables(&thread_ref.clone().typed::<ThreadKind>())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(row.variables.get("g"), Some(&json!("hi")));
+    assert_eq!(scope.get("g"), Some(&json!("hi")));
 
-    // A branch `Assign` targets the branch Thread: the applier writes into the thread's own
-    // variable snapshot, so the branch sees its own `$x` alongside the inherited `$g`.
+    // A branch `Assign` targets the branch Thread: the payload *is* the whole scope, so the applier
+    // overwrites the scope's own cell — the thread row is not read or written.
     projector
         .apply(
             &mut storage,
@@ -1142,12 +1115,24 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
             }),
         )
         .await;
-    let row = storage
-        .get_thread(&thread_ref.clone().typed::<ThreadKind>())
+    let scope = storage
+        .get_variables(&thread_ref.clone().typed::<ThreadKind>())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(row.variables.get("x"), Some(&json!(1)));
+    assert_eq!(scope.get("x"), Some(&json!(1)));
+
+    // A terminal transition rewrites the thread *row* only: the scope is a separate cell, so a run's
+    // variables are still readable after its thread has ended.
+    let mut ended = thread.clone();
+    ended.status = ThreadStatus::Terminated(spica_engine::TerminationReason::Cancelled);
+    projector
+        .apply(&mut storage, &Event::ThreadTerminated { thread: ended })
+        .await;
+    let scope = storage
+        .get_variables(&thread_ref.clone().typed::<ThreadKind>())
+        .await
+        .unwrap();
+    assert_eq!(scope.get("x"), Some(&json!(1)));
 }
 
 // ── Wait defers its `ed` until the armed timer fires ────────────────────────
@@ -1212,8 +1197,8 @@ async fn terminate_execution_cancels_wait_and_drains() {
     )
     .await;
     let projector = Projector::new();
-    // Apply the full set-up via the real ing events so `active_children`/`parent` links are
-    // projected by the same fold handlers running on the production path use.
+    // Apply the full set-up via the real ing events so the parent-child edges are projected by
+    // the same fold handlers the production path runs.
     for ev in &[
         Event::ExecutionCreated(ExecutionCreated {
             request_id: RequestId::nil(),
@@ -1231,8 +1216,8 @@ async fn terminate_execution_cancels_wait_and_drains() {
                     .with_owner(spica_engine::NoOwner::new()),
             },
         }),
-        // After `ExecutionCreated`: the root thread is attached to the execution's `active_children`
-        // by this fold, which is what makes the execution wait on it below.
+        // After `ExecutionCreated`: this fold attaches the root thread to the execution's ownership
+        // edges, which is what makes the execution wait on it below.
         Event::ThreadCreated {
             thread: root_thread.clone(),
         },
@@ -1357,7 +1342,13 @@ async fn terminate_execution_cancels_wait_and_drains() {
         exec.status,
         ExecutionStatus::Terminated(TerminationReason::Cancelled)
     ));
-    assert!(exec.active_children.is_empty(), "execution fully drained");
+    assert!(
+        Storage::get_children(&storage, exec.meta.raw_object_ref())
+            .await
+            .unwrap()
+            .is_empty(),
+        "execution fully drained"
+    );
 }
 
 // ── Race guard: a late TriggerTimer after a cancel must be refused ──────────
@@ -2491,21 +2482,16 @@ async fn create_execution_handler_rejects_existing_name_as_reject_record() {
     let name = spica_engine::ObjectName::plain("dup_run").unwrap();
     let _id = RawObjectRef::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
     storage
-        .put_execution(spica_engine::ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version: ObjectRef::<FlowVersionKind>::nil(),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(uid)
-                    .name(name.clone())
-                    .at(Timestamp::from_millis(0))
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-            active_children: std::collections::HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_execution(Execution {
+            deadline: None,
+            flow_version: ObjectRef::<FlowVersionKind>::nil(),
+            status: ExecutionStatus::Running,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine::ObjectMeta::builder(uid)
+                .name(name.clone())
+                .at(Timestamp::from_millis(0))
+                .with_owner(spica_engine::NoOwner::new()),
         })
         .await
         .unwrap();
@@ -2563,21 +2549,16 @@ async fn seed_named_execution(
 ) {
     let _id = RawObjectRef::new(spica_engine::ObjectKind::Execution, name.clone(), uid);
     storage
-        .put_execution(spica_engine::ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version: ObjectRef::<FlowVersionKind>::nil(),
-                status,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(uid)
-                    .name(name)
-                    .at(Timestamp::from_millis(0))
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-            active_children: std::collections::HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_execution(Execution {
+            deadline: None,
+            flow_version: ObjectRef::<FlowVersionKind>::nil(),
+            status,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine::ObjectMeta::builder(uid)
+                .name(name)
+                .at(Timestamp::from_millis(0))
+                .with_owner(spica_engine::NoOwner::new()),
         })
         .await
         .unwrap();
@@ -3037,23 +3018,19 @@ async fn seed_task(
 ) -> spica_engine::ObjectRef<ActivityKind> {
     let owner = act_ref();
     storage
-        .put_task(spica_engine::TaskRecord {
-            value: Task {
-                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
-                resource: "r".to_string(),
-                arguments: Value::Null,
-                status,
-                deadline: None,
-                worker_id,
-                lease_expires_at,
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::builder(task_id)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(owner.clone()),
-            },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_task(Task {
+            execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
+            resource: "r".to_string(),
+            arguments: Value::Null,
+            status,
+            deadline: None,
+            worker_id,
+            lease_expires_at,
+            retry_plan: vec![],
+            retry_state: RetryState::default(),
+            meta: spica_engine::ObjectMeta::builder(task_id)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(owner.clone()),
         })
         .await
         .unwrap();
@@ -3093,20 +3070,15 @@ async fn seed_owning_scope(
     let flow_version = seed_revision(storage, sm).await;
     let execution = exec_ref();
     storage
-        .put_execution(spica_engine::ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version,
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(execution.uid())
-                    .at(Timestamp::from_millis(0))
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-            active_children: std::collections::HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_execution(Execution {
+            deadline: None,
+            flow_version,
+            status: ExecutionStatus::Running,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine::ObjectMeta::builder(execution.uid())
+                .at(Timestamp::from_millis(0))
+                .with_owner(spica_engine::NoOwner::new()),
         })
         .await
         .unwrap();
@@ -3133,24 +3105,19 @@ async fn seed_activity_owned_by_at(
     status: ActivityStatus,
 ) {
     storage
-        .put_activity(spica_engine::ActivityRecord {
-            value: Activity {
-                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
-                state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
-                status,
-                raw_input: json!({ "x": 1 }),
-                input: Some(json!({ "x": 1 })),
-                raw_output: None,
-                activity_state: None,
-                retry_state: None,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(activity.uid())
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(owner),
-            },
-            active_children: std::collections::HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_activity(Activity {
+            execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
+            state_path: jsonptr::PointerBuf::parse("/States/S").unwrap().into(),
+            status,
+            raw_input: json!({ "x": 1 }),
+            input: Some(json!({ "x": 1 })),
+            raw_output: None,
+            activity_state: None,
+            retry_state: None,
+            output: None,
+            meta: spica_engine::ObjectMeta::builder(activity.uid())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(owner),
         })
         .await
         .unwrap();
@@ -3175,21 +3142,18 @@ async fn seed_thread_owned_by_execution_at(
     status: ThreadStatus,
 ) {
     storage
-        .put_thread(spica_engine::ThreadRecord::from_value(
-            Thread {
-                meta: spica_engine::ObjectMeta::builder(thread.uid())
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(ThreadOwner::Execution(execution.clone())),
-                execution,
-                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-                start_at: "S".into(),
-                index: 0,
-                status,
-                input: json!({}),
-                output: None,
-            },
-            std::collections::HashSet::new(),
-        ))
+        .put_thread(Thread {
+            meta: spica_engine::ObjectMeta::builder(thread.uid())
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Execution(execution.clone())),
+            execution,
+            state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+            start_at: "S".into(),
+            index: 0,
+            status,
+            input: json!({}),
+            output: None,
+        })
         .await
         .unwrap();
 }
@@ -3239,23 +3203,19 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
     seed_task(&mut storage, cancelled, TaskStatus::Cancelled, None, None).await;
     // A `Pending` task of a *different* resource is not this pull's to grant.
     storage
-        .put_task(spica_engine::TaskRecord {
-            value: Task {
-                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
-                resource: "other".to_string(),
-                arguments: Value::Null,
-                status: TaskStatus::Pending,
-                deadline: None,
-                worker_id: None,
-                lease_expires_at: None,
-                retry_plan: vec![],
-                retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::builder(other_resource)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(act_ref()),
-            },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_task(Task {
+            execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
+            resource: "other".to_string(),
+            arguments: Value::Null,
+            status: TaskStatus::Pending,
+            deadline: None,
+            worker_id: None,
+            lease_expires_at: None,
+            retry_plan: vec![],
+            retry_state: RetryState::default(),
+            meta: spica_engine::ObjectMeta::builder(other_resource)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(act_ref()),
         })
         .await
         .unwrap();
@@ -3839,21 +3799,18 @@ async fn spawn_thread_whose_owner_is_no_longer_running_is_refused_not_dropped() 
         thread_uid,
     );
     storage
-        .put_thread(spica_engine::ThreadRecord::from_value(
-            Thread {
-                meta: spica_engine::ObjectMeta::builder(thread_uid)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(ThreadOwner::Execution(exec_ref())),
-                execution: exec_ref(),
-                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-                start_at: "S".into(),
-                index: 0,
-                status: ThreadStatus::Running,
-                input: json!({}),
-                output: None,
-            },
-            std::collections::HashSet::new(),
-        ))
+        .put_thread(Thread {
+            meta: spica_engine::ObjectMeta::builder(thread_uid)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Execution(exec_ref())),
+            execution: exec_ref(),
+            state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+            start_at: "S".into(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: json!({}),
+            output: None,
+        })
         .await
         .unwrap();
     // One ref, bound once: `act_ref()` mints a fresh uid per call, and the row seeded below is what the
@@ -3994,21 +3951,18 @@ async fn complete_state_whose_machine_cannot_resolve_is_refused_not_terminated()
     // The thread row is written but the execution it names is not: resolving the machine reads that
     // execution for the tree's shared flow version, so this is where the failure surfaces.
     storage
-        .put_thread(spica_engine::ThreadRecord::from_value(
-            Thread {
-                meta: spica_engine::ObjectMeta::builder(thread_uid)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(ThreadOwner::Execution(exec.clone())),
-                execution: exec,
-                state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-                start_at: "S".into(),
-                index: 0,
-                status: ThreadStatus::Running,
-                input: json!({}),
-                output: None,
-            },
-            std::collections::HashSet::new(),
-        ))
+        .put_thread(Thread {
+            meta: spica_engine::ObjectMeta::builder(thread_uid)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(ThreadOwner::Execution(exec.clone())),
+            execution: exec,
+            state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
+            start_at: "S".into(),
+            index: 0,
+            status: ThreadStatus::Running,
+            input: json!({}),
+            output: None,
+        })
         .await
         .unwrap();
     seed_activity_owned_by(&mut storage, activity.clone(), thread_ref).await;
@@ -4202,20 +4156,15 @@ async fn activate_state_naming_a_state_its_machine_does_not_define_is_refused() 
     let flow_version = seed_revision(&mut storage, sm).await;
     let execution = exec_ref();
     storage
-        .put_execution(spica_engine::ExecutionRecord {
-            value: Execution {
-                deadline: None,
-                flow_version,
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(execution.uid())
-                    .at(Timestamp::from_millis(0))
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-            active_children: std::collections::HashSet::new(),
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_execution(Execution {
+            deadline: None,
+            flow_version,
+            status: ExecutionStatus::Running,
+            input: Value::Null,
+            output: None,
+            meta: spica_engine::ObjectMeta::builder(execution.uid())
+                .at(Timestamp::from_millis(0))
+                .with_owner(spica_engine::NoOwner::new()),
         })
         .await
         .unwrap();
@@ -4589,29 +4538,25 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
     let task = ulid::Ulid::new();
     let parent = act_ref();
     storage
-        .put_task(spica_engine::TaskRecord {
-            value: Task {
-                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
-                resource: "r".to_string(),
-                arguments: Value::Null,
-                status: TaskStatus::Running,
-                deadline: None,
-                worker_id: Some("w1".into()),
-                lease_expires_at: Some(Timestamp::from_millis(1000)),
-                retry_plan: vec![RetryPolicy {
-                    error_equals: vec!["States.ALL".into()],
-                    interval_seconds: 1,
-                    max_attempts: 3,
-                    backoff_rate: 1.0,
-                    max_delay_seconds: None,
-                }],
-                retry_state: RetryState::default(),
-                meta: spica_engine::ObjectMeta::builder(task)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(parent.clone()),
-            },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+        .put_task(Task {
+            execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
+            resource: "r".to_string(),
+            arguments: Value::Null,
+            status: TaskStatus::Running,
+            deadline: None,
+            worker_id: Some("w1".into()),
+            lease_expires_at: Some(Timestamp::from_millis(1000)),
+            retry_plan: vec![RetryPolicy {
+                error_equals: vec!["States.ALL".into()],
+                interval_seconds: 1,
+                max_attempts: 3,
+                backoff_rate: 1.0,
+                max_delay_seconds: None,
+            }],
+            retry_state: RetryState::default(),
+            meta: spica_engine::ObjectMeta::builder(task)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(parent.clone()),
         })
         .await
         .unwrap();
@@ -4673,27 +4618,23 @@ async fn retrying_task_is_not_claimable_until_gate_lapses() {
     let mut storage = InMemoryStorage::new();
     let task = ulid::Ulid::new();
     storage
-        .put_task(spica_engine::TaskRecord {
-            value: Task {
-                execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
-                resource: "r".to_string(),
-                arguments: Value::Null,
-                status: TaskStatus::Pending,
-                deadline: None,
-                worker_id: None,
-                lease_expires_at: None,
-                retry_plan: vec![],
-                retry_state: RetryState {
-                    attempts: 1,
-                    retrier_attempts: vec![],
-                    next_available_at: Some(Timestamp::from_millis(4_000_000_000_000)),
-                },
-                meta: spica_engine::ObjectMeta::builder(task)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(act_ref()),
+        .put_task(Task {
+            execution: spica_engine::ObjectRef::<ExecutionKind>::nil(),
+            resource: "r".to_string(),
+            arguments: Value::Null,
+            status: TaskStatus::Pending,
+            deadline: None,
+            worker_id: None,
+            lease_expires_at: None,
+            retry_plan: vec![],
+            retry_state: RetryState {
+                attempts: 1,
+                retrier_attempts: vec![],
+                next_available_at: Some(Timestamp::from_millis(4_000_000_000_000)),
             },
-            created_at: Timestamp::from_millis(0),
-            updated_at: Timestamp::from_millis(0),
+            meta: spica_engine::ObjectMeta::builder(task)
+                .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
+                .with_owner(act_ref()),
         })
         .await
         .unwrap();

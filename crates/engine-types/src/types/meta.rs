@@ -135,7 +135,7 @@ mod sealed {
 ///
 /// This is the single **erasure seam**: [`Self::as_raw_object_ref`] is the one way a typed
 /// reference — an owner slot or a plain typed field — becomes the flat reference the storage
-/// contract, `active_children` and command payloads speak. A `Deref` to [`RawObjectRef`] would
+/// contract, an ownership-edge set and command payloads speak. A `Deref` to [`RawObjectRef`] would
 /// hide that seam and re-open `.kind` — the read a typed field exists to forbid — so the trait
 /// deliberately exposes no `kind()`: a reference's kind is either matched at compile time through
 /// the field's own type, or dropped at this one greppable call.
@@ -765,7 +765,7 @@ impl<K: ObjectKindMarker> ObjectMetaBuilder<K> {
 ///   object's own `ObjectName` and `uid` its `meta.uid`.
 ///
 /// A **raw** reference: its kind is a stored value, not the type parameter [`ObjectRef`] carries.
-/// It is what the wire, a storage key and the genuinely heterogeneous seams (`active_children`, a
+/// It is what the wire, a storage key and the genuinely heterogeneous seams (an ownership-edge set, a
 /// scope that may be any object) speak — so every site holding one is a place typing deliberately
 /// stops, and reaching for it on a field that names a single kind is the mistake the name makes
 /// visible.
@@ -805,7 +805,7 @@ impl RawObjectRef {
 
     /// Re-establish a flat reference's type after the caller has already dispatched on its `kind`.
     ///
-    /// A mixed-kind collection — `active_children` above all — holds addresses on purpose, and every
+    /// A mixed-kind collection — an ownership-edge set above all — holds addresses on purpose, and every
     /// sweep arm matches the kind it acts on before building a typed command payload. A conversion
     /// that fails there contradicts a check the caller just made, so it is an engine bug loud enough
     /// to panic on rather than a payload to refuse with a rejection.

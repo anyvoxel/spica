@@ -197,7 +197,7 @@ pub struct Flow { pub meta: ObjectMeta, pub flow_id: FlowId, /* ... */ }
 ### 5.2 Why the typed id is *not* folded into `ObjectMeta`
 
 `ExecutionId`/`ActivityId`/`TimerId`/`TaskId` are load-bearing Rust newtypes used in storage keys,
-`NodeId`, events, and `ExecutionRecord`. Kubernetes is weakly-typed JSON and can get away with a
+`NodeId`, events, and the projection row of an `Execution`. Kubernetes is weakly-typed JSON and can get away with a
 single string; we keep type safety. So `ObjectMeta` holds the *identity* facts (name for addressing,
 uid for sameness, timestamps), while the typed handle appears on each domain struct. `meta.uid` and
 the typed id wrap the same ULID value, which is intentional: typed paths keep their safety; the

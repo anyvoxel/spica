@@ -3,13 +3,13 @@ use spica_asl::State;
 
 use super::Container;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::storage::{ActivityRecord, ReadonlyStorageTxn, ThreadRecord};
-use crate::types::activity::ActivityKind;
+use crate::storage::ReadonlyStorageTxn;
+use crate::types::activity::{Activity, ActivityKind};
 use crate::types::command::{Command, CompleteState, TerminateThread, TerminationReason};
 use crate::types::error::ExecutionError;
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::task::TaskKind;
-use crate::types::thread::ThreadKind;
+use crate::types::thread::{Thread, ThreadKind};
 use crate::types::timer::TimerKind;
 use crate::{ActivityStatus, RejectionType};
 
@@ -27,14 +27,16 @@ impl ActivityElementBehavior {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        act: &ActivityRecord,
-        thread: &ThreadRecord,
+        act: &Activity,
+        thread: &Thread,
         state_def: &State,
         child: &RawObjectRef,
-    ) {
+    ) -> Result<(), ProcessingError> {
         let activity = self.activity.clone();
-        let activity_value = act.value();
-        let variables = thread.variables.clone();
+        let activity_value = act.clone();
+        // The scope's variables are derived state in their own `_index` cell (see
+        // `Storage::get_variables`), read once here as what the state's reaction evaluates against.
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
         // Every `State` variant has a registered factory (see `build_state_handlers`), so a miss here is
         // an engine regression — fail loud rather than leave the activity stuck `Running`.
         let handler = ctx
@@ -51,6 +53,7 @@ impl ActivityElementBehavior {
                 child.clone(),
             )
             .await;
+        Ok(())
     }
 
     /// A `Wait` owns exactly one child — its resume timer — and that timer's settle **is** its
@@ -61,16 +64,12 @@ impl ActivityElementBehavior {
     /// settle, and nothing else can reach it. `Terminating` still advances, since a teardown cancels
     /// the timer it armed; every other status is the row and the lifecycle disagreeing rather than a
     /// settle to react to.
-    fn settle_wait(
-        &self,
-        out: &mut Collector<'_>,
-        act: &ActivityRecord,
-    ) -> Result<(), ProcessingError> {
-        match &act.value.status {
+    fn settle_wait(&self, out: &mut Collector<'_>, act: &Activity) -> Result<(), ProcessingError> {
+        match &act.status {
             ActivityStatus::Running => {
                 out.append_command(Command::CompleteState(CompleteState {
                     activity: self.activity.clone(),
-                    output: act.value.input.clone().unwrap_or(Value::Null),
+                    output: act.input.clone().unwrap_or(Value::Null),
                 }));
                 Ok(())
             }
@@ -101,16 +100,15 @@ impl ActivityElementBehavior {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        act: &ActivityRecord,
-        thread: &ThreadRecord,
+        act: &Activity,
+        thread: &Thread,
         state_def: &State,
         child: &RawObjectRef,
     ) -> Result<(), ProcessingError> {
-        match (child.kind, &act.value.status) {
+        match (child.kind, &act.status) {
             (ObjectKind::Task | ObjectKind::Timer, ActivityStatus::Running) => {
                 self.hand_to_state(ctx, out, act, thread, state_def, child)
-                    .await;
-                Ok(())
+                    .await
             }
             (ObjectKind::Task | ObjectKind::Timer, ActivityStatus::Completing) => {
                 out.append_command(Command::ContinueComplete {
@@ -157,16 +155,15 @@ impl ActivityElementBehavior {
         &self,
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
-        act: &ActivityRecord,
-        thread: &ThreadRecord,
+        act: &Activity,
+        thread: &Thread,
         state_def: &State,
         child: &RawObjectRef,
     ) -> Result<(), ProcessingError> {
-        match &act.value.status {
+        match &act.status {
             ActivityStatus::Running => {
                 self.hand_to_state(ctx, out, act, thread, state_def, child)
-                    .await;
-                Ok(())
+                    .await
             }
             ActivityStatus::Completing => {
                 out.append_command(Command::ContinueComplete {
@@ -208,22 +205,28 @@ impl ActivityElementBehavior {
         // The hop lands only on a `Terminating` activity — one that a settled child drained (see
         // `ActivityElementBehavior::after_child_completed`). Any other status means the row
         // moved under the read above; the reason itself stays on the row, so nothing re-derives it.
-        if !matches!(act.value.status, ActivityStatus::Terminating(_)) {
+        if !matches!(act.status, ActivityStatus::Terminating(_)) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "continue_terminate: activity {node} is not terminating (status {:?})",
-                    act.value.status
+                    act.status
                 ),
             ));
         }
-        if !act.active_children.is_empty() {
+        // The live children are read from the ownership-edge index, not off the row: the set is a cell
+        // of its own, so this read never races the status write above it.
+        let children = ctx
+            .storage
+            .get_children(act.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // Unreachable by construction — a Continue is issued only for a drained node — so this is
             // the row moving under the read. Each child is taken down by its own verb with `Cancelled`:
             // the node is being flushed, not failing, so a bystander must not carry the reason its
             // ancestor died of and, with a `Catch`, route a failure that was never its own (the same
             // rule `terminate_thread` applies).
-            for child in &act.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Thread => {
                         out.append_command(Command::TerminateThread(TerminateThread {
@@ -245,7 +248,7 @@ impl ActivityElementBehavior {
             }
             return Ok(());
         }
-        let activity_value = act.value();
+        let activity_value = act.clone();
         // A container state defers its terminal to this hop, so the drained node finishes through its
         // state's `after_terminating` — the terminal *and* the relay to the owning thread that the
         // deferred `terminate` step owes, exactly as the success side runs `after_completing`. The
@@ -306,7 +309,7 @@ impl ActivityElementBehavior {
             .state_handlers
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
-        let variables = thread.variables.clone();
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
         // The state's drained arm owns the terminal *and* the relay: it re-reads its own children,
         // finds them gone, and emits `StateTerminated` plus the owner-container relay that carries the
         // settle up, so this hop adds neither.
@@ -340,21 +343,27 @@ impl ActivityElementBehavior {
         // The hop lands only on a `Completing` node — one that a settled child drained (see
         // `ActivityElementBehavior::after_child_completed`). Any other status means the row
         // moved under the read above, leaving this command nothing to apply.
-        if !matches!(act.value.status, ActivityStatus::Completing) {
+        if !matches!(act.status, ActivityStatus::Completing) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "continue_complete: activity {node} is not completing (status {:?})",
-                    act.value.status
+                    act.status
                 ),
             ));
         }
-        if !act.active_children.is_empty() {
+        // The live children are read from the ownership-edge index, not off the row (see
+        // `continue_terminate`).
+        let children = ctx
+            .storage
+            .get_children(act.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // Unreachable by construction — a Continue is issued only for a drained node — so this is
             // the row moving under the read. Each child is taken down by its own verb with `Cancelled`:
             // the node is being flushed, not failing, so a bystander must not carry a failure a state's
             // own `Catch` could route.
-            for child in &act.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Thread => {
                         out.append_command(Command::TerminateThread(TerminateThread {
@@ -381,7 +390,7 @@ impl ActivityElementBehavior {
         // owning thread the deferred `complete` step owes. The three resolution misses below are refused
         // exactly as `activate_state` refuses the same ones: a state that cannot be resolved cannot be
         // finished at all, so nothing is closed generically in its place.
-        let activity_value = act.value();
+        let activity_value = act.clone();
         let owner = activity_value.meta.owner.clone();
         // An activity's owner slot admits only a `Thread`, so the row is read directly. A fault reading
         // it is the dispatch's, and is returned for the leader to retry.
@@ -437,7 +446,7 @@ impl ActivityElementBehavior {
             .state_handlers
             .create(state_def)
             .expect("state type has no registered handler: engine regression, not a flow error");
-        let variables = thread.variables.clone();
+        let variables = ctx.storage.get_variables(&thread.meta.object_ref()).await?;
         // The state's finish owns the terminal *and* the relay: every deferring state emits its own
         // `StateCompleted` plus the `CompleteThread`/`ActivateState` that carries the settle up, so this
         // hop adds neither — a second `CompleteThread` for the thread would only meet
@@ -495,7 +504,7 @@ impl Container for ActivityElementBehavior {
         // else can reach it, while a `Task`'s abandoned call is cancelled *after* the activity is done.
         // Resolving it needs the scope: an activity's owner slot admits only a `Thread`, so that row is
         // read directly, and the run between it and its definition resolves the machine.
-        let owner = act.value.meta.owner.clone();
+        let owner = act.meta.owner.clone();
         let Some(thread) = ctx.storage.get_thread(&owner).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
@@ -520,7 +529,7 @@ impl Container for ActivityElementBehavior {
             }
         };
         // The state that fronts this activity is the one its own `state_path` names inside that machine.
-        let state_path = act.value.state_path.clone();
+        let state_path = act.state_path.clone();
         let state_def = match machine.state_at(&state_path) {
             Ok(state_def) => state_def,
             Err(e) => {
@@ -577,7 +586,7 @@ impl Container for ActivityElementBehavior {
 }
 #[cfg(test)]
 mod settle_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::{Value, json};
@@ -592,10 +601,8 @@ mod settle_tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::build_state_handlers;
-    use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::{
-        ActivityRecord, ExecutionRecord, ReadonlyStorageTxn, Storage, ThreadRecord,
-    };
+    use crate::handlers::fixtures::{Seeded, at, object_ref, seed_edges};
+    use crate::storage::{ReadonlyStorageTxn, Storage};
     use crate::types::activity::ActivityKind;
     use crate::types::command::{Command, CompleteState, TerminationReason};
     use crate::types::execution::ExecutionKind;
@@ -647,7 +654,7 @@ mod settle_tests {
         status: ActivityStatus,
         raw_output: Option<Value>,
         children: usize,
-    ) -> ActivityRecord {
+    ) -> Seeded<Activity> {
         let mut path = jsonptr::PointerBuf::new();
         path.push_back("States");
         path.push_back("P");
@@ -668,10 +675,9 @@ mod settle_tests {
         };
         let live = (0..children)
             .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
-            .collect::<HashSet<_>>();
-        let mut row = ActivityRecord::from_value(activity, live);
-        row.born(at());
-        row
+            .collect::<Vec<_>>();
+        let row = activity;
+        Seeded::owning(row, live)
     }
 
     /// The run the seeded activity and its scope belong to.
@@ -687,8 +693,8 @@ mod settle_tests {
 
     /// The scope a `Running` activity's settle is handed through: the thread the activity is owned by,
     /// carrying the input its own settle-time variables are read from.
-    fn seeded_scope() -> ThreadRecord {
-        let thread = Thread {
+    fn seeded_scope() -> Thread {
+        Thread {
             meta: ObjectMeta::builder(thread_owner().uid())
                 .name(thread_owner().name().clone())
                 .at(at())
@@ -700,15 +706,12 @@ mod settle_tests {
             status: ThreadStatus::Running,
             input: json!({ "in": 1 }),
             output: None,
-        };
-        let mut row = ThreadRecord::from_value(thread, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// The run the scope resolves its machine through — the one row between a thread and its definition.
-    fn seeded_run() -> ExecutionRecord {
-        let execution = Execution {
+    fn seeded_run() -> Execution {
+        Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
                 .name(execution_ref().name().clone())
                 .at(at())
@@ -718,10 +721,7 @@ mod settle_tests {
             deadline: None,
             input: json!({ "in": 1 }),
             output: None,
-        };
-        let mut row = ExecutionRecord::from_value(execution, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// The definition the seeded run binds to. `definition` decides which state type the container's
@@ -779,10 +779,12 @@ mod settle_tests {
     }
 
     /// A store holding this activity row alone — all the `Completing`/`Terminating` arms read.
-    async fn store_over(activity: ActivityRecord) -> InMemoryStorage {
+    async fn store_over(activity: Seeded<Activity>) -> InMemoryStorage {
         let mut store = InMemoryStorage::new();
+        let owner = activity.row.meta.raw_object_ref();
+        seed_edges(&mut store, owner, activity.children).await;
         store
-            .put_activity(activity)
+            .put_activity(activity.row)
             .await
             .expect("the in-memory store seeds an activity row");
         store
@@ -790,7 +792,7 @@ mod settle_tests {
 
     /// A store holding the activity, its owning scope and the run `definition` resolves through — the
     /// three rows the `Running` arm reads before it hands the settle to a state.
-    async fn store_in_scope(activity: ActivityRecord, definition: &str) -> InMemoryStorage {
+    async fn store_in_scope(activity: Seeded<Activity>, definition: &str) -> InMemoryStorage {
         let mut store = store_over(activity).await;
         store
             .put_thread(seeded_scope())

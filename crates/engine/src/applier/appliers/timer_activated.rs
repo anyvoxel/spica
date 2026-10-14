@@ -19,10 +19,7 @@ impl TimerActivatedApplier {
         ctx: &mut ApplierContext<'_>,
         timer: &Timer,
     ) -> Result<(), ExecutionError> {
-        let mut row = crate::storage::TimerRecord::from_value(timer.clone());
-        // Birth: `created_at`/`updated_at` stamped with the `TimerActivated` entry's moment.
-        row.born(ctx.timestamp);
-        ctx.storage.put_timer(row).await?;
+        ctx.storage.put_timer(timer.clone()).await?;
         super::bump_generated_seq(ctx.storage, &timer.meta.raw_object_ref().name).await?;
         ctx.storage
             .add_child(

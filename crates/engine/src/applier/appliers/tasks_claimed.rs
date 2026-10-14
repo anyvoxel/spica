@@ -40,9 +40,9 @@ impl TasksClaimedApplier {
                 t.lease_expires_at = task.lease_expires_at;
                 // Claimed — clear the retry backoff gate (see `Task::next_available_at`).
                 t.retry_state.next_available_at = task.retry_state.next_available_at;
-                // Sync the domain value's transition stamp from the event (see task_completed.rs).
-                t.value.meta.with_update_at(task.meta.updated_at);
-                t.with_update_at(ctx.timestamp);
+                // The row's timing facts are the domain value's `meta`; the event carries the
+                // handler's stamp for this claim, so it rides along with the status update.
+                t.meta.with_update_at(task.meta.updated_at);
                 ctx.storage.put_task(t).await?;
             }
         }

@@ -90,7 +90,7 @@ impl Container for ExecutionElementBehavior {
                             // detached.
                             message: format!(
                                 "execution ran past its TimeoutSeconds deadline ({})",
-                                exec.value.deadline.map(|d| d.as_millis()).unwrap_or(0)
+                                exec.deadline.map(|d| d.as_millis()).unwrap_or(0)
                             ),
                         }),
                     },
@@ -105,11 +105,7 @@ impl Container for ExecutionElementBehavior {
                     .get_thread(&child.clone().typed::<ThreadKind>())
                     .await
                 {
-                    Ok(Some(thread)) => thread
-                        .value
-                        .output
-                        .clone()
-                        .unwrap_or(serde_json::Value::Null),
+                    Ok(Some(thread)) => thread.output.clone().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null,
                 };
                 out.append_command(Command::CompleteExecution(CompleteExecution {
@@ -185,7 +181,7 @@ impl Container for ExecutionElementBehavior {
                     .get_thread(&child.clone().typed::<ThreadKind>())
                     .await
                 {
-                    Ok(Some(thread)) => thread.value.status.termination_reason().cloned(),
+                    Ok(Some(thread)) => thread.status.termination_reason().cloned(),
                     _ => None,
                 };
                 let Some(reason) = reason else {
@@ -300,7 +296,7 @@ impl ExecutionElementBehavior {
 
         // The whole precondition — only a `Running` run has a teardown to begin — lives in the
         // transition (`mark_terminating`), so no call site can honor part of it and forget the rest.
-        let mut terminating_execution = exec.value();
+        let mut terminating_execution = exec.clone();
         if let Err(reason) = terminating_execution.mark_terminating(reason.clone(), ctx.now()) {
             // Not running (already terminal, or Completing/Terminating): the draining pipeline has
             // already decided this execution's outcome — its eventual event wins. Refuse with a
@@ -319,7 +315,12 @@ impl ExecutionElementBehavior {
         })
         .await;
 
-        let children = exec.active_children.clone();
+        // Read from the ownership-edge index rather than off the row, so the sweep set is never a
+        // second copy the status write above could clobber.
+        let children = ctx
+            .storage
+            .get_children(exec.meta.object_ref().into_raw_object_ref())
+            .await?;
         // Nothing owns the drain: the run lands its teardown in this same batch, with no sweep to issue
         // and no later `ContinueTerminate` to wait for. Checked before the sweep so the terminal is
         // never deferred on a set that was empty all along.
@@ -365,7 +366,7 @@ impl ExecutionElementBehavior {
                 // A `Task` and a fan-out `Thread` belong to a container *Activity*, never directly to an
                 // Execution; and an `Activity`'s own owner is a `Thread` by type (`ActivityKind::OwnedBy`
                 // is `ObjectRef<ThreadKind>`), so an Execution's direct children are exactly its timer and
-                // its root thread. Any other kind in its `active_children` is therefore an engine
+                // its root thread. Any other kind in its child set is therefore an engine
                 // invariant broken — a corrupt projection or a forged child edge. Refuse to guess and
                 // fail loud, rather than leave the run deferred on a child no sweep can reap.
                 other => panic!("engine regression: an Execution owns no {other:?} child"),
@@ -412,7 +413,7 @@ impl ExecutionElementBehavior {
         // command owes, and the only record that explains why it applied nothing — the relay lost a
         // race to the termination cascade (a cancel, a timeout) or an earlier finish, whose outcome
         // stands. Mirrors `terminate_execution`.
-        let mut completing_execution = exec.value();
+        let mut completing_execution = exec.clone();
         if let Err(reason) = completing_execution.mark_completing(output.clone(), ctx.now()) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
@@ -429,7 +430,12 @@ impl ExecutionElementBehavior {
 
         // Nothing left to wait for: the run closes in the same batch that began its finish, advancing
         // the very value the finish produced, so nothing it fixed can go missing between the two events.
-        let children = exec.active_children.clone();
+        // Read from the ownership-edge index rather than off the row, so the set is never a second copy
+        // the status write above could clobber.
+        let children = ctx
+            .storage
+            .get_children(exec.meta.object_ref().into_raw_object_ref())
+            .await?;
         if children.is_empty() {
             let mut completed_execution = completing_execution;
             debug_assert!(
@@ -453,7 +459,7 @@ impl ExecutionElementBehavior {
         // Something is still attached. A success finish cancels the deadlines it owns — a
         // `TimeoutSeconds` must not fire into a finished run — and waits for them to drain. It never
         // *terminates* a live child, because a run whose work is done has none: any other kind here is
-        // the row's `active_children` disagreeing with the lifecycle rather than a child to wait on.
+        // the row's child set disagreeing with the lifecycle rather than a child to wait on.
         // Refused rather than swept or ignored — sweeping turns a success into a failure cascade, and
         // ignoring closes the run with a live child. A refusal strands nothing: the child's own settle
         // drains the run through its `ExecutionElementBehavior` → `ContinueComplete`.
@@ -510,7 +516,13 @@ impl ExecutionElementBehavior {
                 ),
             ));
         }
-        if !exec.active_children.is_empty() {
+        // Read from the ownership-edge index rather than off the row, so the sweep set is never a
+        // second copy the status write above could clobber.
+        let children = ctx
+            .storage
+            .get_children(exec.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // A run's container does not wait for its own drain — a teardown takes down both of a run's
             // children at once, so each of their settles advances it — which means an earlier Continue
             // reaches here with the other child still attached. It is absorbed: the sweep below takes
@@ -519,7 +531,7 @@ impl ExecutionElementBehavior {
             // thread and its own timers, so any other kind here is the row disagreeing with the
             // lifecycle; both sweepable kinds carry `Cancelled`, for the reason the `Terminating`
             // activity's arm gives.
-            for child in &exec.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Timer => out.append_command(Command::CancelTimer {
                         timer: child.clone().typed::<TimerKind>(),
@@ -540,7 +552,7 @@ impl ExecutionElementBehavior {
         }
         // The reason was written when the teardown began (`mark_terminating`), so the terminal advances
         // the stored value rather than re-deriving one.
-        let mut terminated_execution = exec.value();
+        let mut terminated_execution = exec.clone();
         // The arm is the transition's own precondition, so this can only decline if the row moved
         // under the read above.
         if let Err(reason) = terminated_execution.mark_terminated(ctx.now()) {
@@ -585,14 +597,20 @@ impl ExecutionElementBehavior {
                 ),
             ));
         }
-        if !exec.active_children.is_empty() {
+        // Read from the ownership-edge index rather than off the row, so the sweep set is never a
+        // second copy the status write above could clobber.
+        let children = ctx
+            .storage
+            .get_children(exec.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if !children.is_empty() {
             // A run's container does not wait for its own drain — both of its children can settle under
             // one teardown — so an early Continue reaches here with a child still attached. It is
             // absorbed: the sweep re-issues what is still in flight and this hop stops short of
             // advancing, so the Continue that lands on the drained run is the one that completes it. A
             // success finish keeps only the deadlines it owns (`complete_execution` cancels them and
             // waits for the drain), so any other kind here is the row disagreeing with the lifecycle.
-            for child in &exec.active_children {
+            for child in &children {
                 match child.kind {
                     ObjectKind::Timer => out.append_command(Command::CancelTimer {
                         timer: child.clone().typed::<TimerKind>(),
@@ -607,7 +625,7 @@ impl ExecutionElementBehavior {
         }
         // The row already carries what the finish fixed (`output` was written when it entered
         // `Completing`), so the terminal advances the stored value rather than re-deriving one.
-        let mut completed_execution = exec.value();
+        let mut completed_execution = exec.clone();
         // The arm is the transition's own precondition, so this can only decline if the row moved
         // under the read above.
         if let Err(reason) = completed_execution.mark_completed(ctx.now()) {
@@ -816,7 +834,7 @@ impl ExecutionElementBehavior {
 
 #[cfg(test)]
 mod settle_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -832,8 +850,8 @@ mod settle_tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
     use crate::handlers::build_state_handlers;
-    use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::{ExecutionRecord, ReadonlyStorageTxn, Storage, ThreadRecord};
+    use crate::handlers::fixtures::{Seeded, at, object_ref, seed_edges};
+    use crate::storage::{ReadonlyStorageTxn, Storage};
     use crate::types::command::{Command, CompleteExecution, TerminationReason};
     use crate::types::error::{ExecutionError, RuntimeError};
     use crate::types::execution::{Execution, ExecutionKind, ExecutionStatus};
@@ -870,8 +888,8 @@ mod settle_tests {
 
     /// The run's root thread, finished with `output` — the row the success cell reads the run's own
     /// output back off of.
-    fn seeded_thread(output: serde_json::Value) -> ThreadRecord {
-        let thread = Thread {
+    fn seeded_thread(output: serde_json::Value) -> Thread {
+        Thread {
             meta: ObjectMeta::builder(thread_ref().uid())
                 .name(thread_ref().name().clone())
                 .at(at())
@@ -883,16 +901,13 @@ mod settle_tests {
             status: ThreadStatus::Completed,
             input: json!({ "in": 1 }),
             output: Some(output),
-        };
-        let mut row = ThreadRecord::from_value(thread, HashSet::new());
-        row.born(at());
-        row
+        }
     }
 
     /// A seeded execution row with `children` live children still attached. A run is the root of its
     /// tree, so it fills no owner slot, and its one owned kind is its own deadline timer — the seed
     /// therefore carries only the status the drain decision reads.
-    fn seeded_execution(status: ExecutionStatus, children: usize) -> ExecutionRecord {
+    fn seeded_execution(status: ExecutionStatus, children: usize) -> Seeded<Execution> {
         let execution = Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
                 .name(execution_ref().name().clone())
@@ -906,18 +921,18 @@ mod settle_tests {
         };
         let live = (0..children)
             .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
-            .collect::<HashSet<_>>();
-        let mut row = ExecutionRecord::from_value(execution, live);
-        row.born(at());
-        row
+            .collect::<Vec<_>>();
+        Seeded::owning(execution, live)
     }
 
     /// Drive one hook over a working overlay seeded with a single execution row — the leader's shape,
     /// so the assertion reads the command the container emitted, not merely an intent.
-    async fn settle_execution(execution: ExecutionRecord, terminated: bool) -> Vec<EntryPayload> {
+    async fn settle_execution(execution: Seeded<Execution>, terminated: bool) -> Vec<EntryPayload> {
         let mut store = InMemoryStorage::new();
+        let owner = execution.row.meta.raw_object_ref();
+        seed_edges(&mut store, owner, execution.children).await;
         store
-            .put_execution(execution)
+            .put_execution(execution.row)
             .await
             .expect("the in-memory store seeds an execution row");
 
@@ -1066,7 +1081,7 @@ mod settle_tests {
         store
             .expect_get_execution()
             .times(1)
-            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completing, 0))));
+            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completing, 0).row)));
         let result = hook_over(&store, thread_ref().as_raw_object_ref()).await.0;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a second settling root thread must be refused: {result:?}");
@@ -1107,7 +1122,7 @@ mod settle_tests {
         store
             .expect_get_execution()
             .times(1)
-            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Running, 0))));
+            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Running, 0).row)));
         store
             .expect_get_thread()
             .times(1)
@@ -1134,7 +1149,7 @@ mod settle_tests {
         store
             .expect_get_execution()
             .times(1)
-            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completed, 0))));
+            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completed, 0).row)));
         let result = hook_over(&store, timer_ref().as_raw_object_ref()).await.0;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a settle under a terminal run must be refused: {result:?}");
@@ -1239,8 +1254,7 @@ mod command_tests {
     use crate::eval_env::EvalEnv;
     use crate::handler::{Collector, HandlerContext, ProcessingError};
     use crate::handlers::build_state_handlers;
-    use crate::handlers::fixtures::{at, object_ref};
-    use crate::storage::ExecutionRecord;
+    use crate::handlers::fixtures::{Seeded, at, object_ref};
     use crate::types::command::{Command, CompleteExecution};
     use crate::types::event::Event;
     use crate::types::execution::{Execution, ExecutionKind, ExecutionStatus};
@@ -1261,7 +1275,7 @@ mod command_tests {
     fn seeded_execution(
         status: ExecutionStatus,
         children: HashSet<RawObjectRef>,
-    ) -> ExecutionRecord {
+    ) -> Seeded<Execution> {
         let execution = Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
                 .name(execution_ref().name().clone())
@@ -1273,22 +1287,31 @@ mod command_tests {
             input: json!({ "n": 1 }),
             output: None,
         };
-        let mut row = ExecutionRecord::from_value(execution, children);
-        row.born(at());
-        row
+        Seeded::owning(execution, children)
     }
 
-    /// Drive the handler over a **mock** store answering exactly the one read it makes. Both the
+    /// Drive the handler over a **mock** store answering exactly the reads it makes. Both the
     /// outcome and the entries are returned: for a refusal, the *absence* of a terminal is as much the
     /// point as the refusal itself.
     async fn complete_over(
-        row: ExecutionRecord,
+        execution: Seeded<Execution>,
     ) -> (Result<(), ProcessingError>, Vec<EntryPayload>) {
         let mut store = MockReadonlyStorageTxn::new();
+        // Only a `Running` run gets past the finish's own guard to the child read, so the expectation
+        // is armed for exactly that shape — a run refused before it keeps the mock's "nothing else was
+        // read" property intact.
+        let reads_children = matches!(execution.row.status, ExecutionStatus::Running);
+        let children: HashSet<_> = execution.children.into_iter().collect();
         store
             .expect_get_execution()
             .times(1)
-            .return_once(move |_| Ok(Some(row)));
+            .return_once(move |_| Ok(Some(execution.row)));
+        if reads_children {
+            store
+                .expect_get_children()
+                .times(1)
+                .return_once(move |_| Ok(children));
+        }
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
         let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
         let mut out = Collector::new(EntryId::new(1), None, clock.clone(), ids.clone());

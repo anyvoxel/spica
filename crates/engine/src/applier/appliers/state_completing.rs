@@ -11,17 +11,14 @@ impl StateCompletingApplier {
         ctx: &mut ApplierContext<'_>,
         activity: &Activity,
     ) -> Result<(), ExecutionError> {
-        if let Some(act) = ctx
+        // Only an existing row is updated — see `state_activated.rs`.
+        if ctx
             .storage
             .get_activity(&activity.meta.object_ref())
             .await?
+            .is_some()
         {
-            // An update, not a birth: carry the row's `created_at` over and stamp `updated_at`.
-            let mut row =
-                crate::storage::ActivityRecord::from_value(activity.clone(), act.active_children);
-            row.created_at = act.created_at;
-            row.updated_at = ctx.timestamp;
-            ctx.storage.put_activity(row).await?;
+            ctx.storage.put_activity(activity.clone()).await?;
         }
         Ok(())
     }

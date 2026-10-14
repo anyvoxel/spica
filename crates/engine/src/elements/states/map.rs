@@ -31,7 +31,7 @@ use crate::{Activity, ActivityState, MapActivityState, Variables};
 ///
 /// Each item runs through the exact same `SpawnThread` fan-out a `Parallel` branch uses (see
 /// [`ThreadElementBehavior::spawn`](crate::elements::ThreadElementBehavior::spawn)): a child execution rooted under this
-/// activity and carrying a [`state_path`](crate::storage::ExecutionRecord) of
+/// activity and carrying a [`state_path`](crate::storage::Execution) of
 /// `/States/<map>/ItemProcessor/States` (the processor's own `States` table in the single shared
 /// machine document — the same shape of pointer a root thread carries). The Map activity stays
 /// `Running` owning those children; it replenishes via `child_completed` on every settle and
@@ -91,21 +91,26 @@ impl StateHandler for MapStateElementBehavior<'_> {
         let activity = activity_value.meta.object_ref();
         // A read fault is the dispatch's; a missing row is a real refusal, since the `CompleteState`
         // that opened this finish named an activity that existed.
-        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+        if ctx.storage.get_activity(&activity).await?.is_none() {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("map_state: activity {activity} not found"),
             ));
-        };
+        }
+        // Read from the ownership-edge index, not off the row: the live set is a cell of its own.
+        let children = ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await?;
         // Convergence issues the command only once the last item settled, so a live child here is an
         // engine regression rather than a flow error — refused rather than swept, because the array
         // this finish projects would be missing exactly that item's output.
-        if !act.active_children.is_empty() {
+        if !children.is_empty() {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
                     "map_state: activity {activity} is completing with {} live children",
-                    act.active_children.len()
+                    children.len()
                 ),
             ));
         }
@@ -217,13 +222,18 @@ impl StateHandler for MapStateElementBehavior<'_> {
         let activity = activity_value.meta.object_ref();
         // A read fault is the dispatch's; a missing row is a real refusal, since the terminate that
         // opened this teardown named an activity that existed.
-        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+        if ctx.storage.get_activity(&activity).await?.is_none() {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
                 format!("map_state: activity {activity} not found"),
             ));
-        };
-        if act.active_children.is_empty() {
+        }
+        // Read from the ownership-edge index, not off the row (see `after_completing`).
+        let children = ctx
+            .storage
+            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
+            .await?;
+        if children.is_empty() {
             // Nothing left to reap: close the activity and hand it to the owning thread's container —
             // the same reaction point a `Fail`'s terminate uses, which advances a thread already
             // draining this child and takes down a still-`Running` one from the reason on the row.
@@ -247,7 +257,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
         // An item thread unwinds on cancellation so the activity drains (the last settle re-enters
         // this hook with no children left). An item is always a thread: the fan-out is `SpawnThread`,
         // and nothing else can parent an object to this activity.
-        for child in act.active_children {
+        for child in children {
             if let ObjectKind::Thread = child.kind {
                 out.append_command(Command::TerminateThread(TerminateThread {
                     thread: child.typed::<ThreadKind>(),
@@ -347,7 +357,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
     }
 
     /// The per-settle **replenish** hook, dispatched by the inline child-settled reaction's Running
-    /// arm on *every* item settle (not only when `active_children` drains — that is what lets a `Map`
+    /// arm on *every* item settle (not only when its children drain — that is what lets a `Map`
     /// refill a freed `MaxConcurrency` slot while other items are still in flight). This settle already
     /// drained one child; the hook:
     ///
@@ -373,12 +383,12 @@ impl StateHandler for MapStateElementBehavior<'_> {
         // The iteration plan + item child map live in the `Map` state-specific repository, folded
         // from the `StateActivated` activation product; without it this activity is not (or no
         // longer) a Map's — nothing to drive.
-        let Some(ActivityState::Map(progress)) = act.value.activity_state.as_ref() else {
+        let Some(ActivityState::Map(progress)) = act.activity_state.as_ref() else {
             return;
         };
 
-        // Identify this settled item by its child id. The settle drained one child from
-        // `active_children`, and the `children` map (index -> child) records who that was — so
+        // Identify this settled item by its child id. The settle drained one child from the
+        // activity's ownership edges, and the `children` map (index -> child) records who that was — so
         // membership in it is the whole test, and a node outside it is not ours to react to. Every
         // entry was folded from a `ThreadCreated`, so an item is always a `Thread`.
         let Some(child_exec) = progress
@@ -390,7 +400,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
         };
         // A child that vanished without settling counts as a failure (mirrors `parallel.rs`).
         let this_successful = match ctx.storage.get_thread(child_exec).await.ok().flatten() {
-            Some(child) => child.is_terminal() && child.value.status.termination_reason().is_none(),
+            Some(child) => child.is_terminal() && child.status.termination_reason().is_none(),
             None => false,
         };
 
@@ -434,7 +444,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
                 .await
                 .ok()
                 .flatten()
-                .map(|c| c.is_terminal() && c.value.status.termination_reason().is_none())
+                .map(|c| c.is_terminal() && c.status.termination_reason().is_none())
                 .unwrap_or(false);
             if is_done {
                 completed_now += 1;
@@ -462,7 +472,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
                     .await
                     .ok()
                     .flatten()
-                    .and_then(|c| c.value.output.clone())
+                    .and_then(|c| c.output.clone())
                     .unwrap_or(Value::Null);
                 outputs.push(output);
             }
@@ -619,8 +629,8 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::storage::{ActivityRecord, ThreadRecord};
     use crate::types::command::CompleteThread;
+    use crate::types::thread::Thread;
     use crate::{ActivityStatus, EntryPayload, MapActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
 
@@ -870,7 +880,7 @@ mod tests {
         indices.iter().rev().map(|i| (*i, child_ref(*i))).collect()
     }
 
-    fn item_child(index: usize, output: Value, status: ThreadStatus) -> ThreadRecord {
+    fn item_child(index: usize, output: Value, status: ThreadStatus) -> Thread {
         seeded_child_thread(
             path("/States/P/ItemProcessor/States"),
             index,
@@ -884,8 +894,8 @@ mod tests {
         items: Vec<Value>,
         max_concurrency: usize,
         children: HashMap<usize, ObjectRef<ThreadKind>>,
-        active_children: impl IntoIterator<Item = RawObjectRef>,
-    ) -> ActivityRecord {
+        owned: impl IntoIterator<Item = RawObjectRef>,
+    ) -> Seeded<Activity> {
         let total = items.len();
         seeded_activity_with(
             path("/States/P"),
@@ -897,7 +907,7 @@ mod tests {
                 children,
             }),
             ActivityStatus::Running,
-            active_children,
+            owned,
         )
     }
 
