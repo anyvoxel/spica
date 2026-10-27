@@ -109,10 +109,10 @@ impl Leader {
     /// `cause_id`/`timestamp` and placeholder `entry_id`/`stream_id`), ready to append atomically (the
     /// append stamps the real positions and the log's own stream id).
     ///
-    /// Single-shot, synchronous dispatch usable outside `run` (tests). Timer *scheduling* is not part
-    /// of dispatch: a `TimerActivated` event's durable arm is observed post-commit by the injected
+    /// Single-shot, synchronous dispatch usable outside `run` (tests). Deadline *scheduling* is not part
+    /// of dispatch: a deadline-carrying event's durable arm is observed post-commit by the injected
     /// `Hook` (a consumer re-derives the physical schedule), so a single-shot caller driven purely by
-    /// `dispatch` fetches no environment and fires no timers.
+    /// `dispatch` fetches no environment and arms no deadlines.
     pub async fn dispatch<S: Storage>(
         &mut self,
         command: &Command,
@@ -337,10 +337,11 @@ impl Leader {
         // `docs/durable-execution-recovery-design.md`), so the fold below is the idempotent replay path.
         // The driver supplies the already-open `txn`; we fold into it and return the watermark to commit.
         {
-            // Fold the event's projection. The recovery fold must not re-arm/cancel physical timers —
+            // Fold the event's projection. The recovery fold must not re-arm/cancel physical deadlines —
             // a replayed fold derives no scheduler side effect, only the projection rows.
-            // TODO(timer-recovery): restore pending timers from Storage during recovery so the fold's
-            // durable `TimerActivated`/`TimerCancelled` can re-drive the physical schedule via the Hook.
+            // TODO(deadline-recovery): re-arm deadlines still pending in Storage after a leadership
+            // change (the pending `Execution`/`Task`/`Wait` rows carry their own deadline), and cancel
+            // the ones whose rows are already terminal.
             let mut ctx = ApplierContext {
                 storage: &mut *txn,
                 // The entry's own frozen timestamp is the deterministic source for projection

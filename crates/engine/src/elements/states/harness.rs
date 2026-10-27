@@ -7,9 +7,8 @@
 //!
 //! - [`activate`] opens an `ActivateState` on a live scope;
 //! - [`complete`] opens a `CompleteState`, taking the store a preceding `activate` left behind (or a
-//!   hand-seeded one from [`complete_store`]). Continuing on that store is what lets a `Wait`/`Task`
-//!   test reach its `complete` with the timer child its own activation armed still attached — the
-//!   child state the two states' `after_completing` are actually written to handle.
+//!   hand-seeded one from [`complete_store`]). Continuing on that store is what lets a test reach its
+//!   `complete` over the rows its own `activate` folded.
 //!
 //! Both drivers dispatch through [`build_state_handlers`]'s registry rather than a named factory, so
 //! every test also covers the `State` → handler selection.
@@ -30,9 +29,7 @@ use crate::storage::{ReadonlyStorageTxn, Storage};
 use crate::types::command::{ActivateState, CompleteState};
 use crate::types::execution::ExecutionKind;
 use crate::types::id::EntryId;
-use crate::types::meta::{
-    HasRawObjectRef, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner, TimerOwner,
-};
+use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner};
 use crate::types::thread::ThreadKind;
 use crate::working::WorkingState;
 use crate::{
@@ -79,12 +76,6 @@ pub fn root_thread_owner(execution: ObjectRef<ExecutionKind>) -> ThreadOwner {
 /// [`ThreadOwner`], the parent a fan-out branch or item hangs off.
 pub fn fanout_thread_owner(activity: ObjectRef<ActivityKind>) -> ThreadOwner {
     ThreadOwner::Activity(activity)
-}
-
-/// The owner slot of a **timer** armed by the waiting activity (a state's own deadline): the
-/// `Activity` variant of [`TimerOwner`].
-pub fn activity_timer_owner(activity: ObjectRef<ActivityKind>) -> TimerOwner {
-    TimerOwner::Activity(activity)
 }
 
 /// The meta `activate` mints for that activity: `created_at == updated_at == at()` (the birth
@@ -213,8 +204,8 @@ pub fn seeded_child_thread(
 
 /// A store holding just the live scope and a `Running` activity row (see [`seeded_activity`]) — where
 /// a `complete` test starts when it is not continuing a preceding `activate`. `children` are the child
-/// refs still attached (a `Wait`'s resume timer, a `Task`'s deadline); the state's own
-/// `after_completing` is what disposes of them.
+/// refs still attached (e.g. a task's in-flight call); the state's own `after_completing` is what
+/// disposes of them.
 pub async fn complete_store(
     input: Value,
     children: impl IntoIterator<Item = RawObjectRef>,
@@ -297,7 +288,7 @@ impl Dispatch {
 
 /// Drive `state`'s inherited [`StateHandler::activate`](crate::elements::state_handler::StateHandler)
 /// once over a working overlay — the leader's shape, so the emitted `StateActivating`/`StateActivated`
-/// (and any timer a state arms) fold into the transaction and a later read sees them. `scope` is the
+/// (and any child a state arms) fold into the transaction and a later read sees them. `scope` is the
 /// row the leader would already have read and screened for it, seeded here so the fold has an owner to
 /// attach the activity to, and the batch is committed afterwards as the leader's driver does, so the
 /// fold lands on the store's committed face — which is what the assertions read.

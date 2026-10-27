@@ -80,7 +80,7 @@ impl ActivityStatus {
 /// - `Wait(WaitActivityState)` — the absolute moment the `Wait` resumes, harvested the same way. A
 ///   `Wait` holds no other runtime data; the instant rides `StateActivated` so every later event of
 ///   the activity carries it, which is what a client asks when it wants "when does this state
-///   resume" without having to find and filter the activity's `Seconds` timer child.
+///   resume".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ActivityState {
     Parallel(ParallelActivityState),
@@ -100,12 +100,11 @@ pub struct ParallelActivityState {
 
 /// A `Wait` state's activity-level runtime repository — the absolute instant the wait resumes.
 ///
-/// Nothing decides from it: the `Seconds` timer, armed from this same value at activation, is
-/// what actually resumes the state (matching [`Execution::deadline`](crate::Execution) and
-/// [`Task::deadline`](crate::Task), where the enforcing timer likewise stays the actor). Resolving
-/// it in the activation step rather than when the timer is armed makes the instant a property of
-/// the entering activity, so a client can read "when will this state resume" off the activity alone
-/// instead of searching its children for the timer.
+/// The scheduler arms this same instant at activation and the fire comes back as a command against
+/// this activity — matching [`Execution::deadline`](crate::Execution) and
+/// [`Task::deadline`](crate::Task), where the deadline likewise stays a field of its owner.
+/// Resolving it in the activation step makes the instant a property of the entering activity, so a
+/// client can read "when will this state resume" off the activity alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaitActivityState {
     /// The absolute moment the state's `Seconds`/`Timestamp` resolves to, measured from the

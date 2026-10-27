@@ -94,8 +94,8 @@ impl Follower {
         // re-folded on restart), rather than dropping the tail siblings.
         //
         // TODO(multi-node): a follower replays Events into its own projection and never owns the
-        // schedule — it derives no timer side effects downstream (its consumer would need to observe
-        // and co-ordinate with the leader's timer arms).
+        // schedule — it derives no deadline side effects downstream (its consumer would need to observe
+        // and co-ordinate with the leader's deadline arms).
         debug!(entry_id = %entry_id, "follower folding event");
         let mut ctx = ApplierContext {
             storage: &mut *txn,

@@ -60,7 +60,7 @@ impl ContinueTerminateHandler {
                 )
                 .await
             }
-            // A Flow / FlowVersion / Timer / Task is never a `ContinueTerminate` owner: the only
+            // A Flow / FlowVersion / Task is never a `ContinueTerminate` owner: the only
             // issuers are the three containers' settle hooks, which address an Activity, a Thread or
             // an Execution, so another kind here is a dispatch fault, not a command.
             kind => panic!(

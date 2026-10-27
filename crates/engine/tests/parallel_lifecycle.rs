@@ -5,20 +5,19 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    Act, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, epoch, fanout_thread_owner,
-    flat_ref_to, flow_name, flow_owner, indexed_refs, meta, meta_root, meta_span, meta_span_root,
-    name, path, pointer, ref_to, request, root_thread_owner, run_typed_case, stamp, thread_owner,
-    uid,
+    Act, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, epoch, fanout_thread_owner, flat_ref_to,
+    flow_name, flow_owner, indexed_refs, meta, meta_root, meta_span, meta_span_root, name, path,
+    pointer, ref_to, request, root_thread_owner, run_typed_case, stamp, thread_owner, uid,
 };
 use serde_json::json;
 use spica_engine::{
     ActivateState, Activity, ActivityKind, ActivityState, ActivityStatus, Command,
-    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
-    Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
-    FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind,
-    ParallelActivityState, Reject, RejectionType, RequestId, RuntimeError, SpawnThread,
-    StateTransitioned, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
-    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus, WaitActivityState,
+    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, DeadlineTarget,
+    EntryPayload, Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind,
+    ExecutionStatus, Flow, FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated,
+    FlowVersionKind, ObjectKind, ParallelActivityState, Reject, RejectionType, RequestId,
+    RuntimeError, SpawnThread, StateTransitioned, TerminateExecution, TerminateState,
+    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -712,15 +711,6 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(10), "lifecycle_execution-6")
-                        .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
-            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
@@ -781,17 +771,9 @@ async fn parallel_one_branch_settles_later_than_the_other() {
                     output: Some(json!("fast")),
                 },
             }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-6", 10),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(10), "lifecycle_execution-6", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 300_000))
-                        .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-5", 9)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-5", 9),
@@ -951,7 +933,7 @@ async fn parallel_one_branch_settles_later_than_the_other() {
             }),
         ],
         status: ExecutionStatus::Completed,
-        acts: vec![Act::Advance(Signal::TimerArmed, Duration::from_secs(300))],
+        acts: vec![Act::Advance(Signal::DeadlineArmed, Duration::from_secs(300))],
     };
     run_typed_case(&case).await;
 }
@@ -3064,15 +3046,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(10), "lifecycle_execution-6")
-                        .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
-            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(8), "lifecycle_execution-4")
@@ -3248,21 +3221,6 @@ async fn parallel_failure_stops_a_sibling_still_in_flight() {
                     retry_state: None,
                     output: None,
                 },
-            }),
-            EntryPayload::Command(Command::CancelTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-6", 10),
-            }),
-            EntryPayload::Event(Event::TimerCancelled {
-                timer: Timer {
-                    meta: meta(uid(10), "lifecycle_execution-6")
-                        .with_owner(activity_timer_owner("lifecycle_execution-5", 9)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Cancelled,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
-            }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {

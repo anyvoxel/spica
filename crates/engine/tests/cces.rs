@@ -7,18 +7,18 @@ mod common;
 use serde_json::{Value, json};
 use spica_asl::StateMachine;
 use spica_engine::{
-    ActivateState, ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command,
-    CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
-    Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
-    ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName, FlowStatus, FlowVersion,
-    FlowVersionCreated, FlowVersionKind, HasRawObjectRef, InMemoryLogStream, LogStream, ObjectRef,
-    RawObjectRef, RejectionType, RequestId, RetryPolicy, RetryState, RuntimeError, SpawnThread,
-    StateTransitioned, Storage, StreamProcessor, Task, TaskCompleted, TaskFailed, TaskKind,
-    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
-    TerminationReason, Thread, ThreadKind, ThreadOwner, ThreadStatus, Timer, TimerKind, TimerOwner,
-    TimerStatus, Timestamp, Variables, VariablesAssigned,
+    ActivateState, ActivateTask, Activity, ActivityKind, ActivityState, ActivityStatus, ClaimTasks,
+    Command, CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution,
+    CreateFlow, DeadlineTarget, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
+    ExecutionError, ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName,
+    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, HasRawObjectRef,
+    InMemoryLogStream, LogStream, ObjectRef, RawObjectRef, RejectionType, RequestId, RetryPolicy,
+    RetryState, RuntimeError, SpawnThread, StateTransitioned, Storage, StreamProcessor, Task,
+    TaskCompleted, TaskFailed, TaskKind, TaskStatus, TasksClaimed, TerminateExecution,
+    TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind, ThreadOwner,
+    ThreadStatus, Timestamp, Variables, VariablesAssigned, WaitActivityState,
 };
-use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
+use spica_scheduler::{DeadlineSink, InMemoryScheduler, Scheduler};
 use spica_storage::InMemoryStorage;
 use tokio_stream::StreamExt;
 
@@ -60,17 +60,6 @@ fn task_ref(task: ulid::Ulid) -> spica_engine::ObjectRef<TaskKind> {
             .expect("static literal is a valid segment")
             .generated_from_key(uid.0 as u64),
         uid,
-    )
-}
-
-/// Build the timer reference for a timer's raw id, shaped exactly like `meta.raw_object_ref()` (the
-/// generated `obj-<uid>` name + uid), so an in-memory storage round-trips by reference.
-fn timer_ref(timer: ulid::Ulid) -> spica_engine::ObjectRef<TimerKind> {
-    spica_engine::ObjectRef::new(
-        spica_engine::PlainName::new("child")
-            .expect("static literal is a valid segment")
-            .generated_from_key(timer.0 as u64),
-        timer,
     )
 }
 
@@ -191,26 +180,28 @@ impl Default for Projector {
     }
 }
 
-/// A test [`TimerSink`] that appends the fired `TriggerTimer` to a shared `logstream` — the same
-/// controlled write a real engine's `EngineTimerSink` performs, so raw-seam drivers exercise the
-/// same push-through-engine path a `EngineBuilder::start()` would wire.
+/// A test [`DeadlineSink`] that appends the fired `TriggerDeadline` to a shared `logstream` — the
+/// same controlled write a real engine's `EngineDeadlineSink` performs, so raw-seam drivers exercise
+/// the same push-through-engine path a `EngineBuilder::start()` would wire.
 struct AppendingSink {
     log: std::sync::Arc<InMemoryLogStream<EntryPayload>>,
 }
 
 #[async_trait::async_trait]
-impl TimerSink for AppendingSink {
-    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
+impl DeadlineSink for AppendingSink {
+    async fn trigger(&self, target: &DeadlineTarget, deadline: Timestamp) {
         // Envelope the fired command with placeholders; the log stamps the real position and stream.
-        // The fired `TriggerTimer` carries no cause — provenance is derived from the entry that armed it.
+        // The fired `TriggerDeadline` carries no cause — provenance is derived from the entry that
+        // recorded the deadline.
         self.log
             .append(vec![Entry {
                 stream_id: spica_engine::StreamId::nil(), // the log stamps the stream on append
                 entry_id: spica_engine::EntryId::nil(),
                 cause_id: None,
                 timestamp: spica_engine::Timestamp::now(),
-                payload: EntryPayload::Command(Command::TriggerTimer {
-                    timer: timer.clone(),
+                payload: EntryPayload::Command(Command::TriggerDeadline {
+                    target: target.clone(),
+                    deadline,
                 }),
             }])
             .await
@@ -218,25 +209,50 @@ impl TimerSink for AppendingSink {
     }
 }
 
-/// Re-derive the physical schedule from a durable timer event — the consumer-owned analogue of the
-/// engine's former post-commit effect replay (see [`collect_events`]).
+/// Re-derive the physical schedule from the durable events that record a deadline — the
+/// consumer-owned analogue of the server's `CompositeHook`.
 fn apply_event_to_scheduler(scheduler: &std::sync::Arc<InMemoryScheduler>, event: &Event) {
     match event {
-        Event::TimerActivated { timer } => {
-            scheduler.schedule(&timer.meta.object_ref(), timer.deadline);
+        Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
+            if let Some(deadline) = execution.deadline {
+                scheduler.schedule(
+                    &DeadlineTarget::Execution(execution.meta.object_ref()),
+                    deadline,
+                );
+            }
         }
-        Event::TimerCancelled { timer } => scheduler.cancel(&timer.meta.object_ref()),
+        Event::TaskActivated { task } => {
+            if let Some(deadline) = task.deadline {
+                scheduler.schedule(&DeadlineTarget::Activity(task.meta.owner.clone()), deadline);
+            }
+        }
+        Event::StateActivated { activity } => {
+            if let Some(ActivityState::Wait(WaitActivityState { resume_at })) =
+                &activity.activity_state
+            {
+                scheduler.schedule(
+                    &DeadlineTarget::Activity(activity.meta.object_ref()),
+                    *resume_at,
+                );
+            }
+        }
+        Event::StateCompleted { activity } | Event::StateTerminated { activity } => {
+            scheduler.cancel(&DeadlineTarget::Activity(activity.meta.object_ref()));
+        }
+        Event::ExecutionCompleted { execution } | Event::ExecutionTerminated { execution } => {
+            scheduler.cancel(&DeadlineTarget::Execution(execution.meta.object_ref()));
+        }
         _ => {}
     }
 }
 
 /// Drives `sm` with `input` end-to-end through the raw CCES seam (no `Engine::start` async
 /// wrapping), collecting every event applied to Storage. Stops when the execution reaches a
-/// terminal status. Timer scheduling mirrors the consumer-owned model: a real [`Scheduler`] owns a
-/// `DelayQueue`, and the physical arm/cancel is re-derived here from the durable
-/// `TimerActivated`/`TimerCancelled` event (the engine itself declares no effects). This driver
-/// injects an [`AppendingSink`] that the scheduler calls on expiry to append the fired
-/// `TriggerTimer` — the push-into-log path that keeps the log single-writer and strictly ordered.
+/// terminal status. Deadline scheduling mirrors the consumer-owned model: a real [`Scheduler`] owns a
+/// `DelayQueue`, and the physical arm/cancel is re-derived here from the durable events that record a
+/// deadline (the engine itself declares no effects). This driver injects an [`AppendingSink`] that
+/// the scheduler calls on expiry to append the fired `TriggerDeadline` — the push-into-log path that
+/// keeps the log single-writer and strictly ordered.
 async fn collect_events(sm: StateMachine, input: Value) -> Vec<Event> {
     // Boxed in `Arc` so the injected [`AppendingSink`] and this driver share the same underlying log.
     let logstream = std::sync::Arc::new(InMemoryLogStream::new());
@@ -335,9 +351,6 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::StateCompleted { .. } => "StateCompleted",
         Event::StateTerminating { .. } => "StateTerminating",
         Event::StateTerminated { .. } => "StateTerminated",
-        Event::TimerActivated { .. } => "TimerActivated",
-        Event::TimerTriggered { .. } => "TimerTriggered",
-        Event::TimerCancelled { .. } => "TimerCancelled",
         Event::TaskActivated { .. } => "TaskActivated",
         Event::TasksClaimed(TasksClaimed { .. }) => "TasksClaimed",
         Event::TaskCompleted(TaskCompleted { .. }) => "TaskCompleted",
@@ -518,16 +531,15 @@ async fn execution_domain_timestamps_follow_the_lifecycle() {
     );
 }
 
-/// The event-carried `Activity`/`Timer`/`Task` `created_at`/`updated_at` (stamped at event
-/// construction, mirroring `Execution`) survive the projection round-trip, and each transition
-/// advances the domain value's `updated_at` while its `created_at` stays put. This exercises the
-/// mutation-applier value-sync (`t.meta.updated_at = <event>.meta.updated_at`) across Activity,
-/// Timer, and Task lifecycle transitions.
+/// The event-carried `Activity`/`Task` `created_at`/`updated_at` (stamped at event construction,
+/// mirroring `Execution`) survive the projection round-trip, and each transition advances the domain
+/// value's `updated_at` while its `created_at` stays put. This exercises the mutation-applier
+/// value-sync (`t.meta.updated_at = <event>.meta.updated_at`) across Activity and Task lifecycle
+/// transitions.
 #[tokio::test]
 async fn leaf_domain_timestamps_follow_the_lifecycle() {
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = ulid::Ulid::new();
     let task = ulid::Ulid::new();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -572,41 +584,6 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
     let a = storage.get_activity(&activity).await.unwrap().unwrap();
     assert_eq!(a.meta.created_at, ts(100), "activity created_at immutable");
     assert_eq!(a.meta.updated_at, ts(200), "activity updated_at advances");
-
-    // Timer birth, then completion advances `updated_at`.
-    let timer_birth = Timer {
-        execution: exec.clone(),
-        status: TimerStatus::Active,
-        deadline: ts(500),
-        meta: spica_engine::ObjectMeta::builder(timer)
-            .timestamps(ts(100), ts(100))
-            .with_owner(TimerOwner::Execution(exec.clone())),
-    };
-    projector
-        .apply(
-            &mut storage,
-            &Event::TimerActivated {
-                timer: timer_birth.clone(),
-            },
-        )
-        .await;
-    projector
-        .apply(
-            &mut storage,
-            &Event::TimerTriggered {
-                timer: Timer {
-                    status: TimerStatus::Completed,
-                    meta: spica_engine::ObjectMeta::builder(timer)
-                        .timestamps(ts(100), ts(150))
-                        .with_owner(TimerOwner::Execution(exec.clone())),
-                    ..timer_birth
-                },
-            },
-        )
-        .await;
-    let tm = storage.get_timer(&timer_ref(timer)).await.unwrap().unwrap();
-    assert_eq!(tm.meta.created_at, ts(100), "timer created_at immutable");
-    assert_eq!(tm.meta.updated_at, ts(150), "timer updated_at advances");
 
     // Task birth, then completion advances `updated_at`.
     let task_birth = Task {
@@ -657,12 +634,11 @@ async fn leaf_domain_timestamps_follow_the_lifecycle() {
 /// A projection row's timing facts come from the event value's own `meta`: the producing handler
 /// stamped them, so a replay reproduces what was committed rather than a moment the fold invented.
 /// Every entry below carries a `timestamp` far from its payload's stamps to pin that. Covering
-/// Execution, Activity, Timer, and Task rows.
+/// Execution, Activity, and Task rows.
 #[tokio::test]
 async fn projection_rows_take_their_stamps_from_the_event_value() {
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = ulid::Ulid::new();
     let task = ulid::Ulid::new();
     let mut storage = InMemoryStorage::new();
     let projector = Projector::new();
@@ -767,43 +743,6 @@ async fn projection_rows_take_their_stamps_from_the_event_value() {
     let a = storage.get_activity(&activity).await.unwrap().unwrap();
     assert_eq!(a.meta.created_at, t(30));
     assert_eq!(a.meta.updated_at, t(40));
-
-    // Timer birth (`t(50)`), then triggering carrying `t(60)`.
-    projector
-        .apply_at(
-            &mut storage,
-            &Event::TimerActivated {
-                timer: Timer {
-                    execution: exec.clone(),
-                    status: TimerStatus::Active,
-                    deadline: t(500),
-                    meta: spica_engine::ObjectMeta::builder(timer)
-                        .timestamps(t(50), t(50))
-                        .with_owner(TimerOwner::Execution(exec.clone())),
-                },
-            },
-            t(5),
-        )
-        .await;
-    projector
-        .apply_at(
-            &mut storage,
-            &Event::TimerTriggered {
-                timer: Timer {
-                    execution: exec.clone(),
-                    status: TimerStatus::Completed,
-                    deadline: t(500),
-                    meta: spica_engine::ObjectMeta::builder(timer)
-                        .timestamps(t(50), t(60))
-                        .with_owner(TimerOwner::Execution(exec.clone())),
-                },
-            },
-            t(6),
-        )
-        .await;
-    let tm = storage.get_timer(&timer_ref(timer)).await.unwrap().unwrap();
-    assert_eq!(tm.meta.created_at, t(50));
-    assert_eq!(tm.meta.updated_at, t(60));
 
     // Task birth (`t(70)`), then failure carrying `t(80)`.
     projector
@@ -1135,10 +1074,10 @@ async fn thread_scope_receives_assign_and_inherits_parent_variables() {
     assert_eq!(scope.get("x"), Some(&json!(1)));
 }
 
-// ── Wait defers its `ed` until the armed timer fires ────────────────────────
+// ── Wait defers its `ed` until its resume instant elapses ───────────────────
 
 #[tokio::test]
-async fn wait_defers_state_completed_until_timer_fires() {
+async fn wait_defers_state_completed_until_its_resume_instant() {
     let sm = parse_sm(
         r#"{
           "StartAt": "W",
@@ -1149,9 +1088,10 @@ async fn wait_defers_state_completed_until_timer_fires() {
         }"#,
     );
     let events = collect_events(sm, Value::Null).await;
-    assert!(pos(&events, "StateActivating") < pos(&events, "TimerActivated"));
-    assert!(pos(&events, "TimerActivated") < pos(&events, "TimerTriggered"));
-    assert!(pos(&events, "TimerTriggered") < pos(&events, "StateCompleting"));
+    // The resume instant is recorded on the activated activity, and the completing transition only
+    // follows once that instant has elapsed.
+    assert!(pos(&events, "StateActivating") < pos(&events, "StateActivated"));
+    assert!(pos(&events, "StateActivated") < pos(&events, "StateCompleting"));
     assert!(pos(&events, "StateCompleting") < pos(&events, "StateCompleted"));
     assert!(pos(&events, "StateCompleted") < pos(&events, "ExecutionCompleted"));
 }
@@ -1160,13 +1100,12 @@ async fn wait_defers_state_completed_until_timer_fires() {
 
 #[tokio::test]
 async fn terminate_execution_cancels_wait_and_drains() {
-    // Set up the snapshot directly: a Running execution with a Running Wait activity that owns an
-    // Active `Seconds` timer. Injecting TerminateExecution must (a) emit ExecutionTerminating,
-    // (b) sweep the activity and its timer, (c) drain the execution to ExecutionTerminated once
-    // the children are terminal — and the cascade's emission order must be observable.
+    // Set up the snapshot directly: a Running execution with a Running Wait activity. Injecting
+    // TerminateExecution must (a) emit ExecutionTerminating, (b) sweep the activity, (c) drain the
+    // execution to ExecutionTerminated once the children are terminal — and the cascade's emission
+    // order must be observable.
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = ulid::Ulid::new();
     // The run's derived root Thread: every state hangs off it, so the execution drains *through* it
     // — the two-level chain whose emission order the assertions below pin.
     let root_thread = Thread {
@@ -1248,7 +1187,9 @@ async fn terminate_execution_cancels_wait_and_drains() {
                 raw_input: Value::Null,
                 input: Some(Value::Null),
                 raw_output: None,
-                activity_state: None,
+                activity_state: Some(ActivityState::Wait(WaitActivityState {
+                    resume_at: Timestamp::from_millis(1_000_000_000_000),
+                })),
                 retry_state: None,
                 output: None,
                 meta: spica_engine::ObjectMeta::builder(activity.uid())
@@ -1257,19 +1198,6 @@ async fn terminate_execution_cancels_wait_and_drains() {
                         spica_engine::Timestamp::from_millis(0),
                     )
                     .with_owner(common::thread_owner_of(root_thread_ref.clone())),
-            },
-        },
-        Event::TimerActivated {
-            timer: Timer {
-                execution: exec.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(timer)
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(TimerOwner::Activity(activity.clone())),
             },
         },
     ] {
@@ -1334,8 +1262,7 @@ async fn terminate_execution_cancels_wait_and_drains() {
         "parent ing must precede child ing: {:?}",
         seen.iter().map(kind_prefix).collect::<Vec<_>>()
     );
-    assert!(pos(&seen, "StateTerminating") < pos(&seen, "TimerCancelled"));
-    assert!(pos(&seen, "TimerCancelled") < pos(&seen, "StateTerminated"));
+    assert!(pos(&seen, "StateTerminating") < pos(&seen, "StateTerminated"));
     assert!(pos(&seen, "StateTerminated") < pos(&seen, "ExecutionTerminated"));
     let exec = storage.get_execution(&exec).await.unwrap().unwrap();
     assert!(matches!(
@@ -1351,65 +1278,75 @@ async fn terminate_execution_cancels_wait_and_drains() {
     );
 }
 
-// ── Race guard: a late TriggerTimer after a cancel must be refused ──────────
+// ── Race guard: a late TriggerDeadline after the activity settled is refused ──
 
 #[tokio::test]
-async fn late_trigger_timer_after_cancel_is_refused() {
-    // An armed timer is cancelled in storage first; then a stale TriggerTimer arrives (a fire
-    // that was already in flight). The handler must see the timer's terminal state and act on
-    // nothing — no TimerTriggered, no TerminateExecution — recording the refusal instead, so the
-    // durable log explains why the deadline went unenforced.
-    let timer = ulid::Ulid::new();
+async fn late_trigger_deadline_after_the_activity_settled_is_refused() {
+    // The activity settles first (its own completion cancels the arm); then a stale
+    // `TriggerDeadline` arrives — a fire that was already in flight. The handler must see the
+    // activity's terminal status and act on nothing — no StateCompleting, no TerminateExecution —
+    // recording the refusal instead, so the durable log explains why the deadline went unenforced.
     let exec = exec_ref();
-    // The payload type isn't pinned by later use here (the log is only constructed then dropped),
-    // so name it explicitly.
-    let logstream = InMemoryLogStream::<EntryPayload>::new();
-    let mut storage = InMemoryStorage::new();
-    let projector = Projector::new();
-    projector
+    let activity = act_ref();
+    let mut seeded = InMemoryStorage::new();
+    Projector::new()
         .apply(
-            &mut storage,
-            &Event::TimerActivated {
-                timer: Timer {
+            &mut seeded,
+            &Event::StateActivating {
+                activity: Activity {
                     execution: exec.clone(),
-                    status: TimerStatus::Active,
-                    deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::builder(timer)
+                    state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
+                    status: ActivityStatus::Running,
+                    raw_input: Value::Null,
+                    input: Some(Value::Null),
+                    raw_output: None,
+                    activity_state: None,
+                    retry_state: None,
+                    output: None,
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(TimerOwner::Execution(exec.clone())),
+                        .with_owner(activity_root_thread_owner()),
                 },
             },
         )
         .await;
-    projector
+    Projector::new()
         .apply(
-            &mut storage,
-            &Event::TimerCancelled {
-                timer: Timer {
+            &mut seeded,
+            &Event::StateCompleted {
+                activity: Activity {
                     execution: exec.clone(),
-                    status: TimerStatus::Cancelled,
-                    deadline: Timestamp::from_millis(1_000_000_000_000),
-                    meta: spica_engine::ObjectMeta::builder(timer)
+                    state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
+                    status: ActivityStatus::Completed,
+                    raw_input: Value::Null,
+                    input: Some(Value::Null),
+                    raw_output: None,
+                    activity_state: None,
+                    retry_state: None,
+                    output: Some(Value::Null),
+                    meta: spica_engine::ObjectMeta::builder(activity.uid())
                         .timestamps(
                             spica_engine::Timestamp::from_millis(0),
                             spica_engine::Timestamp::from_millis(0),
                         )
-                        .with_owner(TimerOwner::Execution(exec.clone())),
+                        .with_owner(activity_root_thread_owner()),
                 },
             },
         )
         .await;
 
+    let deadline = Timestamp::from_millis(1_000_000_000_000);
     let mut processor = StreamProcessor::new();
     let out = processor
         .dispatch(
-            &Command::TriggerTimer {
-                timer: timer_ref(timer),
+            &Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(activity.clone()),
+                deadline,
             },
-            &storage,
+            &seeded,
             spica_engine::EntryId::new(500),
         )
         .await
@@ -1424,35 +1361,35 @@ async fn late_trigger_timer_after_cancel_is_refused() {
     assert_eq!(
         rejects.len(),
         1,
-        "a stale TriggerTimer owes exactly one Reject and nothing else: {out:?}"
+        "a stale TriggerDeadline owes exactly one Reject and nothing else: {out:?}"
     );
     assert_eq!(
         rejects[0].rejection_type,
         RejectionType::InvalidState,
-        "a timer already past Active is the wrong-state case, not a missing row: {out:?}"
+        "an activity already settled is the wrong-state case, not a missing row: {out:?}"
     );
     assert!(
         !out.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Event(Event::TimerTriggered { .. })
+            EntryPayload::Event(Event::StateCompleting { .. })
                 | EntryPayload::Command(Command::TerminateExecution(_))
         )),
-        "a refused fire must neither fire the timer nor terminate its run: {out:?}"
+        "a refused fire must neither settle the activity nor terminate its run: {out:?}"
     );
-    drop(logstream);
 }
 
-/// A `TriggerTimer` naming a timer that does not exist is refused rather than dropped silently. The row
-/// is written by the batch that arms the timer and the scheduler only fires it once that batch is
-/// durable, so a miss is the log and the projection disagreeing — the command's own precondition, and
-/// the one entry it owes either way.
+/// A `TriggerDeadline` naming an activity that does not exist is refused rather than dropped
+/// silently. The row is written by the batch that records the resume instant and the scheduler only
+/// fires it once that batch is durable, so a miss is the log and the projection disagreeing — the
+/// command's own precondition, and the one entry it owes either way.
 #[tokio::test]
-async fn trigger_timer_without_a_row_is_refused_not_dropped() {
+async fn trigger_deadline_without_a_row_is_refused_not_dropped() {
     let storage = InMemoryStorage::new();
     let entries = dispatch_command(
         &storage,
-        Command::TriggerTimer {
-            timer: timer_ref(ulid::Ulid::new()),
+        Command::TriggerDeadline {
+            target: DeadlineTarget::Activity(act_ref()),
+            deadline: Timestamp::from_millis(1_000_000_000_000),
         },
     )
     .await;
@@ -1466,20 +1403,20 @@ async fn trigger_timer_without_a_row_is_refused_not_dropped() {
     assert_eq!(
         rejects.len(),
         1,
-        "a fire for a timer that does not exist still owes exactly one Reject: {entries:?}"
+        "a fire for an activity that does not exist still owes exactly one Reject: {entries:?}"
     );
     assert_eq!(
         rejects[0].rejection_type,
         RejectionType::NotFound,
-        "a missing timer row is the command's own precondition, not an engine fault: {entries:?}"
+        "a missing activity row is the command's own precondition, not an engine fault: {entries:?}"
     );
     assert!(
         !entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Event(Event::TimerTriggered { .. })
+            EntryPayload::Event(Event::StateCompleting { .. })
                 | EntryPayload::Command(Command::TerminateExecution(_))
         )),
-        "a refused fire must neither fire the timer nor terminate its run: {entries:?}"
+        "a refused fire must neither settle the activity nor terminate its run: {entries:?}"
     );
 }
 
@@ -1659,505 +1596,16 @@ async fn terminate_state_without_a_row_is_refused_not_dropped() {
     );
 }
 
-// ── Race guard: a cancel racing a Wait's timer fire must still drain ─────────
-
-#[tokio::test]
-async fn terminating_wait_drains_when_its_timer_fires_first() {
-    // A cancel parks the Wait activity in `Terminating` while its still-Active resume timer keeps the
-    // sweep deferred. The timer then fires *before* `CancelTimer` is dispatched, so the fired timer's
-    // child edge is gone and `CancelTimer` would no-op on it: the fired timer's own settle relay is
-    // the only thing left that can drain the stranded activity. The late `CompleteState` the fire also
-    // issues is refused rather than acted on — safe only because that relay exists.
-    let exec = exec_ref();
-    let activity = act_ref();
-    let timer = ulid::Ulid::new();
-    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
-    // activity below is owned by one, matching the shape `CreateExecution` emits.
-    let thread = Thread {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-        start_at: "W".to_string(),
-        index: 0,
-        status: ThreadStatus::Running,
-        input: Value::Null,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(ThreadOwner::Execution(exec.clone())),
-    };
-    let thread_ref = thread.meta.raw_object_ref();
-
-    // The refused `CompleteState` still resolves the owning scope's machine before it can reject, so
-    // the definition the activity's `state_path` points into must be resolvable from storage.
-    let mut storage = InMemoryStorage::new();
-    let revision = seed_revision(
-        &mut storage,
-        parse_sm(
-            r#"{ "StartAt": "W", "States": { "W": { "Type": "Wait", "Seconds": 1, "End": true } } }"#,
-        ),
-    )
-    .await;
-
-    let wait_activity = || Activity {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States/W").unwrap().into(),
-        status: ActivityStatus::Running,
-        raw_input: Value::Null,
-        input: Some(Value::Null),
-        raw_output: None,
-        activity_state: None,
-        retry_state: None,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(common::thread_owner_of(thread_ref.clone())),
-    };
-
-    let projector = Projector::new();
-    for ev in &[
-        Event::ThreadCreated {
-            thread: thread.clone(),
-        },
-        Event::ExecutionCreated(ExecutionCreated {
-            request_id: RequestId::nil(),
-            execution: Execution {
-                deadline: None,
-                flow_version: revision.clone(),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid())
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-        }),
-        Event::StateActivating {
-            activity: wait_activity(),
-        },
-        Event::StateActivated {
-            activity: wait_activity(),
-        },
-        Event::TimerActivated {
-            timer: Timer {
-                execution: exec.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(timer)
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(TimerOwner::Activity(activity.clone())),
-            },
-        },
-    ] {
-        projector.apply(&mut storage, ev).await;
-    }
-
-    // The cancel arrives first, while the timer is still live: the sweep defers on that child.
-    let entries = dispatch_command(
-        &storage,
-        Command::TerminateState(TerminateState {
-            activity: activity.clone(),
-            reason: TerminationReason::Cancelled,
-        }),
-    )
-    .await;
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::StateTerminating { .. })
-        )),
-        "the cancel opens with StateTerminating: {entries:?}"
-    );
-    assert!(
-        !entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::StateTerminated { .. })
-        )),
-        "the terminal ed must be deferred on the live timer child: {entries:?}"
-    );
-    for e in &entries {
-        if let EntryPayload::Event(ev) = &e.payload {
-            projector.apply(&mut storage, ev).await;
-        }
-    }
-
-    // The timer fires before the sweep reaches it: its edge is removed, and the fired timer must relay
-    // its own settle so the stranded `Terminating` activity drains.
-    let entries = dispatch_command(
-        &storage,
-        Command::TriggerTimer {
-            timer: timer_ref(timer),
-        },
-    )
-    .await;
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::TimerTriggered { .. })
-        )),
-        "a live timer fires: {entries:?}"
-    );
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity.clone().into_raw_object_ref()
-        )),
-        "the fired timer must relay its settle so the stranded activity drains: {entries:?}"
-    );
-    for e in &entries {
-        if let EntryPayload::Event(ev) = &e.payload {
-            projector.apply(&mut storage, ev).await;
-        }
-    }
-
-    // The `CompleteState` the fire issued arrives at a non-Running activity: refused durably, never a
-    // silent no-op.
-    let entries = dispatch_command(
-        &storage,
-        Command::CompleteState(CompleteState {
-            activity: activity.clone(),
-            output: Value::Null,
-        }),
-    )
-    .await;
-    let rejects: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EntryPayload::Reject(rej) => Some(rej),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        rejects.len(),
-        1,
-        "a late CompleteState must produce exactly one Reject: {entries:?}"
-    );
-    assert_eq!(rejects[0].rejection_type, RejectionType::InvalidState);
-
-    // The relay's Continue drives the drain that the refused command no longer performs.
-    let entries = dispatch_command(
-        &storage,
-        Command::ContinueTerminate {
-            owner: activity.clone().into_raw_object_ref(),
-        },
-    )
-    .await;
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::StateTerminated { .. })
-        )),
-        "the relayed drain must terminate the stranded activity: {entries:?}"
-    );
-}
-
-// ── Race guard: a Task's timeout timer must relay its settle too ────────────
-
-#[tokio::test]
-async fn terminating_task_drains_when_its_deadline_timer_fires() {
-    // A `TimeoutSeconds` hangs off the Task activity, so a cancel that races it strands the activity
-    // exactly like the Wait case. The relay must run *before* the in-flight task lookup: "no in-flight
-    // task" is precisely the state a cancel leaves behind (it swept the task already), and returning
-    // early there would leave the activity parked in `Terminating` forever.
-    let exec = exec_ref();
-    let activity = act_ref();
-    let timer = ulid::Ulid::new();
-    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
-    // activity below is owned by one, matching the shape `CreateExecution` emits.
-    let thread = Thread {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-        start_at: "T".to_string(),
-        index: 0,
-        status: ThreadStatus::Running,
-        input: Value::Null,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(ThreadOwner::Execution(exec.clone())),
-    };
-    let thread_ref = thread.meta.raw_object_ref();
-
-    let mut storage = InMemoryStorage::new();
-    // The terminate resolves the machine its owning thread binds to before it can sweep, so the
-    // definition the activity's `state_path` points into must be resolvable from storage — same as
-    // the Wait analogue but for a `Task`, whose `TimeoutSeconds` deadline hangs off this activity.
-    let revision = seed_revision(
-        &mut storage,
-        parse_sm(
-            r#"{ "StartAt": "T", "States": { "T": { "Type": "Task", "Resource": "arn:aws:lambda:::f", "End": true } } }"#,
-        ),
-    )
-    .await;
-
-    let task_activity = || Activity {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States/T").unwrap().into(),
-        status: ActivityStatus::Running,
-        raw_input: Value::Null,
-        input: Some(Value::Null),
-        raw_output: None,
-        activity_state: None,
-        retry_state: None,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(common::thread_owner_of(thread_ref.clone())),
-    };
-
-    let projector = Projector::new();
-    for ev in &[
-        Event::ThreadCreated {
-            thread: thread.clone(),
-        },
-        Event::ExecutionCreated(ExecutionCreated {
-            request_id: RequestId::nil(),
-            execution: Execution {
-                deadline: None,
-                flow_version: revision.clone(),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid())
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-        }),
-        Event::StateActivating {
-            activity: task_activity(),
-        },
-        Event::StateActivated {
-            activity: task_activity(),
-        },
-        Event::TimerActivated {
-            timer: Timer {
-                execution: exec.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(timer)
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(TimerOwner::Activity(activity.clone())),
-            },
-        },
-    ] {
-        projector.apply(&mut storage, ev).await;
-    }
-
-    // The cancel parks the activity in `Terminating`, deferring on the live timer.
-    let entries = dispatch_command(
-        &storage,
-        Command::TerminateState(TerminateState {
-            activity: activity.clone(),
-            reason: TerminationReason::Cancelled,
-        }),
-    )
-    .await;
-    assert!(
-        !entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::StateTerminated { .. })
-        )),
-        "the terminal ed must be deferred on the live timer child: {entries:?}"
-    );
-    for e in &entries {
-        if let EntryPayload::Event(ev) = &e.payload {
-            projector.apply(&mut storage, ev).await;
-        }
-    }
-
-    // The deadline elapses: with no in-flight task left, only the relay can drain the activity.
-    let entries = dispatch_command(
-        &storage,
-        Command::TriggerTimer {
-            timer: timer_ref(timer),
-        },
-    )
-    .await;
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Command(Command::ContinueTerminate { owner }) if *owner == activity.clone().into_raw_object_ref()
-        )),
-        "a fired deadline must relay its settle even with no in-flight task: {entries:?}"
-    );
-}
-
-// ── A supervisory timer must not block the success finish ────────────────────
-
-#[tokio::test]
-async fn complete_state_sweeps_a_live_supervisory_timer_before_finishing() {
-    // A `Task`'s `TimeoutSeconds` child only *bounds* the state; once the task settles it is moot, so the
-    // base complete step sweeps it rather than waiting on it (the deadline may be minutes out). Pinned
-    // here: a `CompleteState` arriving with one still attached must still finish — if the sweep ever
-    // moves out of the base, this step silently defers on that child forever, since a `Running`
-    // activity has no child-settle path back into `complete`.
-    let exec = exec_ref();
-    let activity = act_ref();
-    let timer = ulid::Ulid::new();
-    // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
-    // activity below is owned by one, matching the shape `CreateExecution` emits.
-    let thread = Thread {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States").unwrap().into(),
-        start_at: "T".to_string(),
-        index: 0,
-        status: ThreadStatus::Running,
-        input: Value::Null,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(ulid::Ulid::new())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(ThreadOwner::Execution(exec.clone())),
-    };
-    let thread_ref = thread.meta.raw_object_ref();
-
-    let mut storage = InMemoryStorage::new();
-    let revision = seed_revision(
-        &mut storage,
-        parse_sm(
-            r#"{ "StartAt": "T", "States": { "T": { "Type": "Task", "Resource": "arn:aws:lambda:::f", "End": true } } }"#,
-        ),
-    )
-    .await;
-
-    let task_activity = || Activity {
-        execution: exec.clone(),
-        state_path: jsonptr::PointerBuf::parse("/States/T").unwrap().into(),
-        status: ActivityStatus::Running,
-        raw_input: Value::Null,
-        input: Some(Value::Null),
-        raw_output: None,
-        activity_state: None,
-        retry_state: None,
-        output: None,
-        meta: spica_engine::ObjectMeta::builder(activity.uid())
-            .timestamps(
-                spica_engine::Timestamp::from_millis(0),
-                spica_engine::Timestamp::from_millis(0),
-            )
-            .with_owner(common::thread_owner_of(thread_ref.clone())),
-    };
-
-    let projector = Projector::new();
-    for ev in &[
-        Event::ThreadCreated {
-            thread: thread.clone(),
-        },
-        Event::ExecutionCreated(ExecutionCreated {
-            request_id: RequestId::nil(),
-            execution: Execution {
-                deadline: None,
-                flow_version: revision.clone(),
-                status: ExecutionStatus::Running,
-                input: Value::Null,
-                output: None,
-                meta: spica_engine::ObjectMeta::builder(exec.uid())
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(spica_engine::NoOwner::new()),
-            },
-        }),
-        Event::StateActivating {
-            activity: task_activity(),
-        },
-        Event::StateActivated {
-            activity: task_activity(),
-        },
-        Event::TimerActivated {
-            timer: Timer {
-                execution: exec.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(timer)
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(TimerOwner::Activity(activity.clone())),
-            },
-        },
-    ] {
-        projector.apply(&mut storage, ev).await;
-    }
-
-    // The settled task resumes the state while the timeout timer is still live.
-    let entries = dispatch_command(
-        &storage,
-        Command::CompleteState(CompleteState {
-            activity: activity.clone(),
-            output: Value::Null,
-        }),
-    )
-    .await;
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::TimerCancelled { timer: t }) if t.meta.uid == timer
-        )),
-        "the base complete step must sweep the live supervisory timer: {entries:?}"
-    );
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.payload,
-            EntryPayload::Event(Event::StateCompleted { .. })
-        )),
-        "the swept activity must reach its success finish: {entries:?}"
-    );
-
-    // The finishing decision is durable from the moment the command is accepted, so `StateCompleting`
-    // precedes everything the step does afterwards — including the supervisory sweep it opens with.
-    let events: Vec<Event> = entries
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EntryPayload::Event(ev) => Some(ev.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(pos(&events, "StateCompleting") < pos(&events, "TimerCancelled"));
-    assert!(pos(&events, "TimerCancelled") < pos(&events, "StateCompleted"));
-}
-
 // ── A Wait's complete step is never deferred ─────────────────────────────────
 
 #[tokio::test]
-async fn a_premature_complete_routes_immediately_and_a_later_timer_fire_is_a_noop() {
-    // A `Wait` owns a resume timer, but it reaches the complete step only through that timer's settle —
-    // which drains the timer's child edge in the same batch — so `after_completing` is always childless
-    // and projects in one go. A `CompleteState` that nonetheless lands while the timer is still live
-    // (the engine never issues one early; the timer is its sole producer) is therefore answered the
+async fn a_premature_complete_routes_immediately_and_a_later_fire_is_refused() {
+    // A `Wait` records its resume instant on its own row, so it has no child to defer on and projects
+    // in one go. A `CompleteState` that lands before the instant elapses is therefore answered the
     // same way: the terminal and the route to the successor land in this same batch, nothing is left
-    // to drain later, and a subsequent timer fire finds an already-terminal activity and settles as a
-    // no-op.
+    // to drain later, and a subsequent fire finds an already-terminal activity and is refused.
     let exec = exec_ref();
     let activity = act_ref();
-    let timer = ulid::Ulid::new();
     // Every state's owner is a `Thread` — the derived root thread for a top-level run — so the
     // activity below is owned by one, matching the shape `CreateExecution` emits.
     let thread = Thread {
@@ -2199,7 +1647,9 @@ async fn a_premature_complete_routes_immediately_and_a_later_timer_fire_is_a_noo
         raw_input: Value::Null,
         input: Some(Value::Null),
         raw_output: None,
-        activity_state: None,
+        activity_state: Some(ActivityState::Wait(WaitActivityState {
+            resume_at: Timestamp::from_millis(1_000_000_000_000),
+        })),
         retry_state: None,
         output: None,
         meta: spica_engine::ObjectMeta::builder(activity.uid())
@@ -2236,19 +1686,6 @@ async fn a_premature_complete_routes_immediately_and_a_later_timer_fire_is_a_noo
         },
         Event::StateActivated {
             activity: wait_activity(),
-        },
-        Event::TimerActivated {
-            timer: Timer {
-                execution: exec.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(1_000_000_000_000),
-                meta: spica_engine::ObjectMeta::builder(timer)
-                    .timestamps(
-                        spica_engine::Timestamp::from_millis(0),
-                        spica_engine::Timestamp::from_millis(0),
-                    )
-                    .with_owner(TimerOwner::Activity(activity.clone())),
-            },
         },
     ] {
         projector.apply(&mut storage, ev).await;
@@ -2297,15 +1734,24 @@ async fn a_premature_complete_routes_immediately_and_a_later_timer_fire_is_a_noo
         }
     }
 
-    // (2) The timer fires later: its owner already reached its terminal in (1), so the settle drains
-    // nothing and no Continue hop is issued.
+    // (2) The deadline fires later: its owner already reached its terminal in (1), so the fire owes
+    // one durable Reject — never a silent no-op, and never a second settle.
     let entries = dispatch_command(
         &storage,
-        Command::TriggerTimer {
-            timer: timer_ref(timer),
+        Command::TriggerDeadline {
+            target: DeadlineTarget::Activity(activity.clone()),
+            deadline: Timestamp::from_millis(1_000_000_000_000),
         },
     )
     .await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| matches!(&e.payload, EntryPayload::Reject(_)))
+            .count(),
+        1,
+        "a fire under a settled activity owes exactly one Reject: {entries:?}"
+    );
     assert!(
         !entries.iter().any(|e| matches!(
             &e.payload,
@@ -3256,14 +2702,14 @@ async fn poll_tasks_leases_only_available_tasks_of_resource() {
         assert_eq!(*status, TaskStatus::Running);
         assert_eq!(worker.as_deref(), Some("w2"));
     }
-    // A grant writes no side-effect child at all: the lease window lives only as `lease_expires_at` on the
-    // leased task itself, so a poll can never be gated behind a timer's lifecycle.
+    // A grant writes no side-effect child at all: the lease window lives only as `lease_expires_at` on
+    // the leased task itself, so a poll can never be gated behind a deadline's lifecycle.
     assert!(
         !entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Event(Event::TimerActivated { .. })
+            EntryPayload::Command(Command::TriggerDeadline { .. })
         )),
-        "a claim arms no timer: {entries:?}"
+        "a claim arms no deadline: {entries:?}"
     );
 }
 
@@ -4600,14 +4046,14 @@ async fn task_fail_requeues_same_entity_with_backoff_gate() {
     );
     assert_eq!(failed.retry_state.retrier_attempts.len(), 1);
     assert_eq!(failed.retry_state.retrier_attempts[0].attempt_count, 1);
-    // No retry timer: the task is gated by `next_available_at`, and the only child swept is the
-    // prior lease — exactly one TaskFailed, no TimerActivated for a retry.
+    // No retry deadline: the task is gated by `next_available_at`, and the only child swept is the
+    // prior lease — exactly one TaskFailed, no deadline armed for a retry.
     assert!(
         !entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Event(Event::TimerActivated { .. })
+            EntryPayload::Command(Command::TriggerDeadline { .. })
         )),
-        "a retry must not arm a timer; it gated by next_available_at: {entries:?}"
+        "a retry must not arm a deadline; it gated by next_available_at: {entries:?}"
     );
 }
 

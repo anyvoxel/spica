@@ -7,7 +7,7 @@ use crate::elements::Container;
 use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::handlers::{emit_timer, eval_string_or_expr};
+use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
 use crate::types::command::{
     ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
@@ -15,8 +15,7 @@ use crate::types::command::{
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
-use crate::types::meta::{HasRawObjectRef, ObjectKind};
-use crate::types::timer::TimerKind;
+use crate::types::meta::HasRawObjectRef;
 use crate::{Activity, ActivityState, Variables, WaitActivityState};
 
 /// The inclusive upper bound of a `Wait` `Seconds` value, per the ASL spec.
@@ -59,11 +58,10 @@ enum WaitFinish {
 
 #[async_trait]
 impl StateHandler for WaitStateElementBehavior<'_> {
-    /// (3.4) A `Wait` reaches its complete step only through its resume timer's settle — the timer's
-    /// fire is what issues the `CompleteState`, and its settle has already drained the child edge in
-    /// the same batch (see `WaitStateElementBehavior::child_completed`), so the state is always childless
-    /// here. Its whole complete path — project, then hand the finish's settle to the owning thread's
-    /// container or the successor — runs in one go, mirroring `Pass`/`Choice`. A projection failure
+    /// (3.4) A `Wait` reaches its complete step only through its resume deadline's fire — that fire is
+    /// what issues the `CompleteState`, and a `Wait` owns no child row, so the state is always
+    /// childless here. Its whole complete path — project, then hand the finish's settle to the owning
+    /// thread's container or the successor — runs in one go, mirroring `Pass`/`Choice`. A projection failure
     /// is turned into a terminate here rather than returned: the activity is already `Completing`, so
     /// there is no later hop to report it from.
     async fn after_completing(
@@ -162,10 +160,9 @@ impl StateHandler for WaitStateElementBehavior<'_> {
         Ok(())
     }
 
-    // A `Wait`'s only child is its resume deadline, swept because the activity is going down: a
-    // still-armed timer must not outlive the state it bounds. Cancelling it defers the terminal to the
-    // timer's settle; the base already opened `StateTerminating`, so a `Wait` with no timer left closes
-    // inline.
+    // A `Wait` owns no child row: its resume instant is a field on its own row, so going down needs
+    // no child sweep and the terminal closes inline. The physical arm dies with the row — the
+    // scheduler-side cancel is driven by the `StateTerminated` this emits.
     async fn after_terminating(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -173,44 +170,21 @@ impl StateHandler for WaitStateElementBehavior<'_> {
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
-        let mut pending = 0;
-        if let Ok(children) = ctx
-            .storage
-            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
-            .await
-        {
-            for child in children {
-                if child.kind == ObjectKind::Timer {
-                    out.append_command(Command::CancelTimer {
-                        timer: child.typed::<TimerKind>(),
-                    });
-                    pending += 1;
-                }
-            }
-        }
-        if pending == 0 {
-            let container =
-                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
-            let mut terminated = activity_value.clone();
-            debug_assert!(
-                terminated.mark_terminated(out.now()).is_ok(),
-                "the terminate step that dispatched this after_terminating opened the activity as Terminating"
-            );
-            let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
-            out.append_event(Event::StateTerminated {
-                activity: terminated,
-            })
-            .await;
-            container
-                .after_child_terminated(ctx, out, &activity_ref)
-                .await?;
-        } else {
-            tracing::debug!(
-                activity = %activity_value.meta.object_ref(),
-                pending,
-                "wait state terminating deferred: waiting on the deadline"
-            );
-        }
+        let container =
+            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
+        let mut terminated = activity_value.clone();
+        debug_assert!(
+            terminated.mark_terminated(out.now()).is_ok(),
+            "the terminate step that dispatched this after_terminating opened the activity as Terminating"
+        );
+        let activity_ref = terminated.meta.object_ref().into_raw_object_ref();
+        out.append_event(Event::StateTerminated {
+            activity: terminated,
+        })
+        .await;
+        container
+            .after_child_terminated(ctx, out, &activity_ref)
+            .await?;
         Ok(())
     }
 
@@ -224,39 +198,12 @@ impl StateHandler for WaitStateElementBehavior<'_> {
         states: &Value,
         now: Timestamp,
     ) -> Result<Value, ExecutionError> {
-        // Resolve the deadline here rather than when the timer is armed, so the instant is a property
-        // of the entering activity (carried by `StateActivated` and every later event) and *one*
-        // computation feeds both carriers: this repository field and the `Seconds` timer
-        // `after_activated` arms from it.
+        // Resolve the deadline here, so the instant is a property of the entering activity: it is
+        // carried by `StateActivated` and every later event, and the observer that owns the physical
+        // schedule re-derives the arm from that one durable fact — no second record of it exists.
         let resume_at = self.resolve_wait_deadline(env, variables, states, now)?;
         activity.activity_state = Some(ActivityState::Wait(WaitActivityState { resume_at }));
         Ok(activity.raw_input.clone())
-    }
-
-    // The only post-activation work is arming the resume timer, from the instant resolved above — the
-    // timer is what actually resumes the state; the field only records when that will be.
-    async fn after_activated(
-        &self,
-        _env: &mut EvalEnv,
-        out: &mut Collector<'_>,
-        activity_value: &Activity,
-        _variables: &Variables,
-        _states: &Value,
-    ) -> Result<(), ExecutionError> {
-        let Some(ActivityState::Wait(wait)) = activity_value.activity_state.as_ref() else {
-            return Ok(()); // deadline not recorded — nothing to arm.
-        };
-        emit_timer(
-            out,
-            // The timer's `execution` anchor is the flat top-level run (`activity.execution`), not
-            // the immediate owner scope — it drives `Timer::execution` and the timer's
-            // `{execution.name}-{suffix}` generated name, so a branch Wait still names its root run.
-            activity_value.execution.clone(),
-            activity_value,
-            wait.resume_at,
-        )
-        .await;
-        Ok(())
     }
 
     fn complete_directly(&self, _activity: &Activity) -> bool {
@@ -430,13 +377,12 @@ mod tests {
         ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
     };
     use crate::types::event::{Event, StateTransitioned};
-    use crate::types::meta::{HasRawObjectRef, ObjectMeta};
-    use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
+    use crate::types::meta::HasRawObjectRef;
+    use crate::{ActivityStatus, EntryPayload, ThreadStatus};
 
-    // A `Wait`'s activation product: the deadline is resolved in `process_input` (so it is a property
-    // of the entering activity) and the resume timer is armed from that same instant in
-    // `after_activated`. Its `complete_directly() == false` is what makes the timer — not an inline
-    // `CompleteState` — the thing that resumes the state.
+    // A `Wait`'s activation product is the resume instant resolved in `process_input`: it is a field
+    // of the entering activity, carried by `StateActivated`. Its `complete_directly() == false` is what
+    // makes the deadline — not an inline `CompleteState` — the thing that resumes the state.
 
     /// The absolute instant `seconds` after [`at`].
     fn deadline(seconds: i64) -> Timestamp {
@@ -462,26 +408,11 @@ mod tests {
         activated
     }
 
-    /// The resume timer `after_activated` arms: its own minted uid/name, anchored on the *root run*
-    /// rather than the immediate owner — so a `Wait` inside a branch still names the execution it
-    /// belongs to — and owned by the waiting activity, which is what makes it that activity's child.
-    fn resume_timer(resume_at: Timestamp) -> Timer {
-        Timer {
-            execution: execution_ref(),
-            status: TimerStatus::Active,
-            deadline: resume_at,
-            meta: ObjectMeta::builder(uid(2))
-                .name(obj_name("execution-1"))
-                .at(at())
-                .with_owner(activity_timer_owner(minted_activity_ref())),
-        }
-    }
-
-    /// `activate` resolves the resume instant onto the activity, then arms the timer for that same
-    /// instant and stops: a `Wait` completes when the timer fires, so there is no inline
-    /// `CompleteState` — the state's whole activation is the pair (recorded deadline, armed timer).
+    /// `activate` resolves the resume instant onto the activity and stops: a `Wait` completes when the
+    /// deadline fires, so there is no inline `CompleteState`. The instant is the only durable record
+    /// of the arm — the observer that owns the physical schedule derives it from `StateActivated`.
     #[tokio::test]
-    async fn activate_records_the_resume_instant_and_arms_the_resume_timer() {
+    async fn activate_records_the_resume_instant() {
         let resume_at = deadline(30);
         let activated = activate(
             &wait_state(Some(30), Some("P2")),
@@ -499,29 +430,21 @@ mod tests {
                 EntryPayload::Event(Event::StateActivated {
                     activity: activated_activity(resume_at),
                 }),
-                EntryPayload::Event(Event::TimerActivated {
-                    timer: resume_timer(resume_at),
-                }),
             ]
         );
-
-        // The timer is folded as the waiting activity's child — the edge its settle detaches when it
-        // fires, which is what lets the state finish.
-        let timer = resume_timer(resume_at).meta.raw_object_ref();
         assert!(
             activated
                 .children(minted_activity_ref().as_raw_object_ref())
                 .await
-                .contains(&timer),
-            "TimerActivated folds the owner's child edge"
+                .is_empty(),
+            "a Wait owns no child row"
         );
     }
 
-    /// Once the resume timer has drained (its settle detached it), the complete step finishes:
-    /// the projection runs and the state routes to its successor. The timer's own settle drives that
-    /// drain, so nothing here re-arms or re-issues anything.
+    /// Once the resume deadline has fired, the complete step finishes: the projection runs and the
+    /// state routes to its successor.
     #[tokio::test]
-    async fn complete_finishes_once_the_resume_timer_has_drained() {
+    async fn complete_routes_to_its_successor() {
         let state = wait_state(Some(30), Some("P2"));
         let completed = complete(
             &state,

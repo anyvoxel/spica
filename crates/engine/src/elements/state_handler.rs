@@ -146,9 +146,9 @@ pub trait StateHandler: Send + Sync {
         Ok(activity.raw_input.clone())
     }
 
-    /// (2.6) Post-activation side effects: arm a timer (`Wait`, `Task` timeout), throw an external
-    /// call (`Task`), or fan out children (`Parallel`/`Map`). An error terminates the activity via
-    /// the base.
+    /// (2.6) Post-activation side effects: record a deadline (`Wait`, `Task` timeout), throw an
+    /// external call (`Task`), or fan out children (`Parallel`/`Map`). An error terminates the
+    /// activity via the base.
     async fn after_activated(
         &self,
         _env: &mut EvalEnv,

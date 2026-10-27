@@ -51,7 +51,7 @@ pub struct Collector<'a> {
 
 /// The eager-apply channel from the [`Collector`] into the leader's working overlay: on each
 /// [`Collector::append_event`] the emitted `Event` is folded into the working txn. The fold is a pure
-/// projection — a consumer re-derives any external side effect (e.g. a timer arm) from the durable
+/// projection — a consumer re-derives any external side effect (e.g. a deadline arm) from the durable
 /// event via the injectable [`Hook`](crate::Hook).
 pub(crate) struct OverlaySink<'a> {
     work: &'a WorkingState,

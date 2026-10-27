@@ -57,7 +57,7 @@ impl TaskElementBehavior {
                 arguments: arguments.clone(),
                 status: TaskStatus::Pending,
                 // The state's `TimeoutSeconds` instant, decided once by the state handler; the
-                // `TimeoutSeconds` timer armed from the same value is what enforces it.
+                // deadline re-derived from this same value is what enforces it.
                 deadline: *deadline,
                 worker_id: None,
                 lease_expires_at: None,
@@ -169,9 +169,9 @@ impl TaskElementBehavior {
             output: output.clone(),
         }))
         .await;
-        // The activity's own `TimeoutSeconds` child needs no sweep here: the Task state declares it
-        // supervisory, so the base complete step cancels it before it finishes. (A claim leaves no
-        // child at all — the delivery lease is a field on the task, not a timer.)
+        // The activity's own `TimeoutSeconds` needs no sweep here: it is a field on the settled task,
+        // so the state's terminal cancels the physical arm. (A claim leaves no child at all — the
+        // delivery lease is a field on the task.)
         //
         // The settle is handed to the activity that owns the task rather than acted on here: what a
         // settled task means for its owner is the owner's business, so the child only names its owner
@@ -184,8 +184,8 @@ impl TaskElementBehavior {
     }
 
     /// Handles `FailTask`: a claimed task was reported **failed** (Zeebe `FailJob`). A state's own
-    /// `TimeoutSeconds` does not take this route — a deadline is the state's failure, not the task's, so it
-    /// terminates the state itself (`TimerElementBehavior::trigger`).
+    /// `TimeoutSeconds` does not take this route — a deadline is the state's failure, not the task's, so
+    /// it terminates the state itself.
     ///
     /// The handler is only orchestration: the task decides its own next life
     /// ([`Task::handle_failure`](crate::Task::handle_failure) — re-queued for a retry, or terminally
@@ -266,8 +266,8 @@ impl TaskElementBehavior {
     /// being torn down. Emits `TaskCancelled`, which marks the task `Cancelled` in storage and drains it
     /// from its parent; the physical work on the worker is deliberately left running (the worker owns
     /// cancellation of its own call), and a later `CompleteTask` for this task is swallowed by the
-    /// `TaskElementBehavior::complete`'s non-`Running` guard — exactly the race guard a `CancelTimer` + late
-    /// `TriggerTimer` already uses.
+    /// `TaskElementBehavior::complete`'s non-`Running` guard — exactly the race guard a cancelled
+    /// deadline plus a late `TriggerDeadline` already uses.
     ///
     /// The owning activity's container is resolved *before* the cancel is written, because this settle is
     /// the sweep's own last move for a `Task` child and it is what lets the `Terminating` owner that

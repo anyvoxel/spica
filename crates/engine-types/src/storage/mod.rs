@@ -1,7 +1,7 @@
 //! The CCES storage **contract**: the [`Storage`] trait plus the projection row types it names.
 //!
 //! This module owns the *interface*. A projection row is the canonical domain value itself —
-//! `Execution`, `Thread`, `Activity`, `Task`, `Timer` — keyed by `meta.name`. A thread's variable
+//! `Execution`, `Thread`, `Activity`, `Task` — keyed by `meta.name`. A thread's variable
 //! scope is **derived** state the event-carried `Thread` does not hold, so it is not a row field
 //! but its own cell in the storage's `_index` namespace (see [`Storage::get_variables`]). The
 //! concrete implementations — the durable `RocksStorage`, the in-memory
@@ -25,7 +25,6 @@ use crate::types::id::FlowName;
 use crate::types::meta::{ObjectKind, ObjectName, ObjectRef, RawObjectRef};
 use crate::types::task::{Task, TaskKind};
 use crate::types::thread::{Thread, ThreadKind};
-use crate::types::timer::{Timer, TimerKind};
 use crate::types::variables::Variables;
 use spica_machinery::Timestamp;
 
@@ -68,13 +67,9 @@ pub trait Storage: Send + Sync {
         &self,
         reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<Activity>, StorageError>;
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError>;
     async fn get_task(&self, reference: &ObjectRef<TaskKind>)
     -> Result<Option<Task>, StorageError>;
-    /// Every node `id` still **owns** — its in-flight children (active activities / timers / child
+    /// Every node `id` still **owns** — its in-flight children (active activities / child
     /// threads). An ownership edge is its own row in the storage's `_index` side table (keys are
     /// `/<scope>/_index/children/<parent-kind>/<parent-name>/<child-kind>/<child-name>`), not a set
     /// embedded on the parent's row — so a parent's own writes and its child set are independent
@@ -136,8 +131,6 @@ pub trait Storage: Send + Sync {
     ) -> Result<(), StorageError>;
     /// Upsert an `Activity` row.
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError>;
-    /// Upsert a `Timer` row.
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError>;
     /// Upsert a `Task` row.
     async fn put_task(&mut self, task: Task) -> Result<(), StorageError>;
     /// Remove the ownership edge `parent` → `child` (a terminal child draining its owner). A no-op
@@ -259,10 +252,6 @@ pub trait StorageTxn: Send {
         &mut self,
         reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<Activity>, StorageError>;
-    async fn get_timer(
-        &mut self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError>;
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
@@ -308,8 +297,6 @@ pub trait StorageTxn: Send {
     ) -> Result<(), StorageError>;
     /// Upsert an `Activity` row into this transaction's pending batch.
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError>;
-    /// Upsert a `Timer` row into this transaction's pending batch.
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError>;
     /// Upsert a `Task` row into this transaction's pending batch.
     async fn put_task(&mut self, task: Task) -> Result<(), StorageError>;
     /// Remove the ownership edge `parent` → `child` from this fold's pending batch.
@@ -378,10 +365,6 @@ pub trait ReadonlyStorageTxn: Send + Sync {
         &self,
         reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<Activity>, StorageError>;
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError>;
     async fn get_task(&self, reference: &ObjectRef<TaskKind>)
     -> Result<Option<Task>, StorageError>;
     /// The in-flight children `id` owns (see [`Storage::get_children`]).
@@ -433,12 +416,6 @@ impl<T: ?Sized + Storage> ReadonlyStorageTxn for T {
         reference: &ObjectRef<ActivityKind>,
     ) -> Result<Option<Activity>, StorageError> {
         <T as Storage>::get_activity(self, reference).await
-    }
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        <T as Storage>::get_timer(self, reference).await
     }
     async fn get_task(
         &self,

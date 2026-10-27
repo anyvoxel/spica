@@ -7,7 +7,7 @@ use crate::elements::Container;
 use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::handlers::{emit_timer, eval_string_or_expr};
+use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
@@ -19,7 +19,6 @@ use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::task::TaskKind;
-use crate::types::timer::{TimerKind, TimerStatus};
 use crate::{Activity, ActivityStatus, Variables};
 
 pub struct TaskStateHandlerFactory;
@@ -87,7 +86,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
     ) -> Result<(), ExecutionError> {
         // Resolve the state's `Retry` array once into a frozen per-retrier plan baked onto the task,
         // so the reused task decides its own retries without revisiting this definition. Empty = no
-        // retry. TODO(M2): arm a fresh `TimeoutSeconds` timer per attempt — the single deadline armed
+        // retry. TODO(M2): a fresh `TimeoutSeconds` deadline per attempt — the single deadline resolved
         // at activation (below) bounds the state *across* its retries, so a retry that outlives the
         // whole budget is failed by it rather than getting a window of its own.
         let retry_plan = self
@@ -98,8 +97,8 @@ impl StateHandler for TaskStateElementBehavior<'_> {
             .unwrap_or_default();
 
         // Resolve the state's `TimeoutSeconds` (if any) into an absolute deadline **before** the task is
-        // minted, so one computation feeds both carriers: the task's own `deadline` (via the command)
-        // and the `TimeoutSeconds` timer armed below.
+        // minted: the task's own `deadline` (carried by the command) is the single record of it, and the
+        // physical arm is re-derived from the `TaskActivated` that folds that deadline.
         //
         // An invalid value is a definition error, but it is raised *after* the command: the chain still
         // names the task the state would have invoked (carrying no deadline, as it did before the task
@@ -118,7 +117,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         let activity = activity_value.meta.object_ref();
         let task_uid = out.mint();
         // The task's reference is minted with a name derived from the owning execution's plain base
-        // (finding #13), exactly like the activity (#3) and timer (#11) names — not the opaque
+        // (finding #13), exactly like the activity (#3) names — not the opaque
         // `child-<uid>` handle. `execution` is the tree anchor, so a branch task still names its
         // root run.
         let task_name = activity_value
@@ -142,21 +141,6 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         if let Some(e) = timeout_error {
             return Err(e);
         }
-        // Arm the Task's `TimeoutSeconds` deadline (a timer parented on the activity, so it is swept
-        // when the activity terminates). Its fire terminates the state that armed it — the deadline
-        // bounds the state, so the failure is the state's, and the in-flight task goes down with the
-        // terminate that follows rather than being reached for here.
-        if let Some(deadline) = deadline {
-            emit_timer(
-                out,
-                // The timer's `execution` anchor is the flat top-level run (`activity.execution`),
-                // not the immediate owner scope — see `emit_timer`.
-                activity_value.execution.clone(),
-                activity_value,
-                deadline,
-            )
-            .await;
-        }
         Ok(())
     }
 
@@ -164,63 +148,28 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         false
     }
 
-    /// A child of this state reached a terminal, and *which* child it was is the whole decision — this
-    /// state arms two kinds and they mean opposite things.
+    /// The in-flight task is the only child in this state's settle relation, and its settle is the
+    /// completion trigger: its payload is the `raw_output` the `TaskCompleted` applier folded onto the
+    /// row in this same batch, and the base `finish` reads it via `$states.result`.
     ///
-    /// The **in-flight task** settling is the completion trigger: its payload is the `raw_output` the
-    /// `TaskCompleted` applier folded onto the row in this same batch, and the base `finish` reads it
-    /// via `$states.result`.
-    ///
-    /// The **`TimeoutSeconds` timer** firing is instead this state's own failure — the deadline bounds
-    /// the state, so its elapsing terminates the state `TimedOut` and the terminate path owns
-    /// everything past that (the in-flight task is disposed of by that teardown, or by the catch exit's
-    /// sweep when a catcher takes the failure). Two guards keep that reading honest, both of which the
-    /// fire itself would otherwise get wrong:
-    ///
-    /// - Only a *fire* counts. A cancel reaches this hook too — `ActivityElementBehavior` routes both
-    ///   outcomes through `child_completed`, so a `Parallel`/`Map` sees a failed branch — so the timer's
-    ///   own recorded status is the discriminator, and a swept deadline fails nothing.
-    /// - Only while the attempt is still in flight. The scheduler's fire is decoupled from the dispatch
-    ///   loop, so a deadline can land in the window between the task's own settle and the `CompleteState`
-    ///   that follows it; by then the timer has stopped bounding anything. A `Task` state's `raw_output`
-    ///   is written by nothing but its task's settle, so its absence *is* "the attempt has not landed".
+    /// The `TimeoutSeconds` deadline is not a settle: its fire terminates the activity directly
+    /// (`ActivityElementBehavior::on_deadline_fired`), because the deadline bounds the state rather than
+    /// being work the state waits on.
     async fn child_completed(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        _ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
         child: RawObjectRef,
     ) {
-        if child.kind == ObjectKind::Timer {
-            if activity_value.raw_output.is_some() {
-                return; // the attempt already landed; the deadline stopped bounding at that moment.
-            }
-            // The deadline the fire names, read off the timer's own row: `Completed` is a fire, so a
-            // timer a sweep cancelled (or one the read cannot account for) fails nothing.
-            let deadline = match ctx
-                .storage
-                .get_timer(&child.clone().typed::<TimerKind>())
-                .await
-            {
-                Ok(Some(t)) if t.status == TimerStatus::Completed => t.deadline,
-                _ => return,
-            };
-            out.append_command(Command::TerminateState(TerminateState {
-                activity,
-                reason: TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::TimedOut {
-                        message: format!(
-                            "task ran past its TimeoutSeconds deadline ({})",
-                            deadline.as_millis()
-                        ),
-                    }),
-                },
-            }));
-            return;
-        }
         if child.kind != ObjectKind::Task {
+            tracing::warn!(
+                activity = %activity,
+                child = %child,
+                "task state settled by a child that is not its invocation; no reaction"
+            );
             return;
         }
         out.append_command(Command::CompleteState(CompleteState {
@@ -233,11 +182,11 @@ impl StateHandler for TaskStateElementBehavior<'_> {
     }
 
     /// A `Task`'s complete step runs here in one go, mirroring `Pass`/`Succeed`/`Wait`: the task's
-    /// own settle drained the task child in the batch that produced this `CompleteState`, so the only
-    /// child left is the `TimeoutSeconds` bound — which stopped applying the moment the task landed.
-    /// It is swept first so no live timer child outlives the finish. A projection failure is turned
-    /// into a terminate here rather than returned: the activity is already `Completing`, so there is
-    /// no later hop to report it from.
+    /// own settle drained the task child in the batch that produced this `CompleteState`. The
+    /// `TimeoutSeconds` deadline needs no sweep — it is a field on the settled task, so the terminal
+    /// this step emits is what cancels the physical arm. A projection failure is turned into a
+    /// terminate here rather than returned: the activity is already `Completing`, so there is no later
+    /// hop to report it from.
     async fn after_completing(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -245,36 +194,6 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         activity_value: &Activity,
         variables: &Variables,
     ) -> Result<(), ProcessingError> {
-        // Sweep the `TimeoutSeconds` deadline: it only bounds the state, so a finished Task must leave
-        // no live timer child behind. The child refs come off the edge query rather than a re-read of
-        // the activity value we already hold; a fired/cancelled timer is no longer a live child, and
-        // `mark_cancelled` returns `Err` for it, so the sweep keeps no second guard in step with that.
-        if let Ok(children) = ctx
-            .storage
-            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
-            .await
-        {
-            for child in children {
-                if child.kind != ObjectKind::Timer {
-                    continue; // only the timer child is swept here; the task child follows its own settle.
-                }
-                let Some(t) = ctx
-                    .storage
-                    .get_timer(&child.clone().typed::<TimerKind>())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    continue;
-                };
-                let mut timer_value = t;
-                if timer_value.mark_cancelled(out.now()).is_err() {
-                    continue;
-                }
-                out.append_event(Event::TimerCancelled { timer: timer_value })
-                    .await;
-            }
-        }
         let finish = match self
             .process_task(ctx.env, out, activity_value, variables)
             .await
@@ -364,10 +283,11 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         Ok(())
     }
 
-    /// A `Task`'s own terminate: the activity is going down, so its deadline timer and in-flight call
-    /// are swept — the physical call is left running, but the `Task` child is cancelled so it drains
-    /// and this state is not left waiting on it. A `Task` with nothing left closes inline; the base
-    /// already opened `StateTerminating`, so the terminal is `StateTerminated` + the settle relay.
+    /// A `Task`'s own terminate: the activity is going down, so in-flight call is cancelled — the
+    /// physical call is left running, but the `Task` child drains and this state is not left waiting on
+    /// it. The `TimeoutSeconds` deadline needs no sweep: it is a field on the task row, and the terminal
+    /// below cancels the physical arm. A `Task` with no in-flight call closes inline; the base already
+    /// opened `StateTerminating`, so the terminal is `StateTerminated` + the settle relay.
     async fn after_terminating(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -382,20 +302,11 @@ impl StateHandler for TaskStateElementBehavior<'_> {
             .await
         {
             for child in children {
-                match child.kind {
-                    ObjectKind::Timer => {
-                        out.append_command(Command::CancelTimer {
-                            timer: child.typed::<TimerKind>(),
-                        });
-                        pending += 1;
-                    }
-                    ObjectKind::Task => {
-                        out.append_command(Command::CancelTask {
-                            task: child.typed::<TaskKind>(),
-                        });
-                        pending += 1;
-                    }
-                    _ => {}
+                if child.kind == ObjectKind::Task {
+                    out.append_command(Command::CancelTask {
+                        task: child.typed::<TaskKind>(),
+                    });
+                    pending += 1;
                 }
             }
         }
@@ -540,40 +451,6 @@ impl StateHandler for TaskStateElementBehavior<'_> {
             },
             None => raw_result.clone(),
         };
-
-        // A completion disposes of the activity's own deadlines: a `TimeoutSeconds` deadline only
-        // *bounds* the state, so a state that finished early — this very exit — must leave no live
-        // timer child behind. Swept as **events**, so they fold into this batch ahead of the terminal
-        // below rather than arriving as a later log entry.
-        // The live children live in the ownership-edge index, not on the row.
-        if let Ok(children) = ctx
-            .storage
-            .get_children(activity.as_raw_object_ref().clone())
-            .await
-        {
-            for child in children {
-                if child.kind != ObjectKind::Timer {
-                    continue; // only timer children are swept here; the task child follows its own settle.
-                }
-                let Some(t) = ctx
-                    .storage
-                    .get_timer(&child.clone().typed::<TimerKind>())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    continue;
-                };
-                let mut timer_value = t;
-                // A fired/cancelled timer is no longer a live child, and the transition declines it —
-                // so no second guard has to be kept in step with that.
-                if timer_value.mark_cancelled(out.now()).is_err() {
-                    continue;
-                }
-                out.append_event(Event::TimerCancelled { timer: timer_value })
-                    .await;
-            }
-        }
 
         // A catcher takes the failure the attempt produced, so the attempt's in-flight call is
         // abandoned with it: the task has no state left to report to, and the complete step that would
@@ -745,41 +622,23 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::storage::Storage;
     use crate::types::command::{ActivateState, CompleteState, TerminateState, TerminationReason};
     use crate::types::event::{Event, StateTransitioned};
-    use crate::types::meta::{HasRawObjectRef, ObjectMeta};
-    use crate::{ActivityStatus, EntryPayload, ThreadStatus, Timer, TimerStatus};
+    use crate::types::meta::HasRawObjectRef;
+    use crate::{ActivityStatus, EntryPayload, ThreadStatus};
 
     // A `Task` is the engine's external-call edge: the invocation is thrown in `after_activated` (not
-    // from `process_input`), so the state's activation product is a pair of side effects — the
-    // `ActivateTask` command naming the invoked entity, and the optional `TimeoutSeconds` timer
-    // bounding it — with no inline `CompleteState`: only the task's own settle resumes the state. The
-    // tests
-    // cover the two side effects, their invalidation, and the sweep the complete step performs before
-    // it may finish.
+    // from `process_input`), so the state's activation product is the `ActivateTask` command naming
+    // the invoked entity — carrying the optional `TimeoutSeconds` deadline on the task row — with no
+    // inline `CompleteState`: only the task's own settle resumes the state.
 
     const RESOURCE: &str = "arn:aws:states:::lambda:invoke";
 
     /// The invoked entity's reference: named from the execution's plain base (the same convention the
-    /// activity and timer names follow) off the partition counter's second free suffix, and minted
-    /// from the injected generator's second id.
+    /// activity names follow) off the partition counter's second free suffix, and minted from the
+    /// injected generator's second id.
     fn invoked_task_ref() -> ObjectRef<TaskKind> {
         ObjectRef::new(obj_name("execution-1"), uid(2))
-    }
-
-    /// The `TimeoutSeconds` timer `after_activated` arms: parented on the invoking activity — which is
-    /// what makes it that activity's child, and so what the complete step sweeps.
-    fn timeout_timer(deadline: Timestamp) -> Timer {
-        Timer {
-            execution: execution_ref(),
-            status: TimerStatus::Active,
-            deadline,
-            meta: ObjectMeta::builder(uid(3))
-                .name(obj_name("execution-2"))
-                .at(at())
-                .with_owner(activity_timer_owner(minted_activity_ref())),
-        }
     }
 
     fn task_state(
@@ -796,9 +655,9 @@ mod tests {
         })
     }
 
-    /// `activate` projects `Arguments` as the task's input, throws the invocation, and arms the
-    /// `TimeoutSeconds` deadline — three side effects on one activation. The task and its timer are
-    /// both named off the execution's base, so a branch task still names its root run.
+    /// `activate` projects `Arguments` as the task's input and throws the invocation carrying the
+    /// `TimeoutSeconds` deadline on the task row. The task is named off the execution's base, so a
+    /// branch task still names its root run.
     #[tokio::test]
     async fn activate_invokes_the_resource_and_arms_the_timeout() {
         let deadline = at()
@@ -837,9 +696,6 @@ mod tests {
                     retry_plan: vec![],
                     deadline: Some(deadline),
                 })),
-                EntryPayload::Event(Event::TimerActivated {
-                    timer: timeout_timer(deadline),
-                }),
             ]
         );
     }
@@ -868,11 +724,14 @@ mod tests {
             activated.chain().last()
         );
         assert!(
-            !activated
-                .chain()
-                .iter()
-                .any(|p| matches!(p, EntryPayload::Event(Event::TimerActivated { .. }))),
-            "a task with no TimeoutSeconds arms no bound: {:?}",
+            !activated.chain().iter().any(|p| matches!(
+                p,
+                EntryPayload::Command(Command::ActivateTask(ActivateTask {
+                    deadline: Some(_),
+                    ..
+                }))
+            )),
+            "a task with no TimeoutSeconds carries no deadline: {:?}",
             activated.chain()
         );
     }
@@ -912,14 +771,10 @@ mod tests {
         );
     }
 
-    /// The complete step disposes of the deadline before it finishes: the `TimeoutSeconds` timer only
-    /// *bounds* the state, so waiting it out would be wrong — it is swept, and the sweep detaches the
-    /// child so the state is free to finish in the same step.
+    /// The complete step leaves no timer event behind: the `TimeoutSeconds` deadline is a field on the
+    /// settled task, so the state finishes in one go and only the terminal cancels the physical arm.
     #[tokio::test]
-    async fn complete_sweeps_the_deadline_timer_then_finishes() {
-        let deadline = at()
-            .checked_add(std::time::Duration::from_secs(60))
-            .expect("the fixture deadline is representable");
+    async fn complete_finishes_without_sweeping_a_timer() {
         let state = task_state(None, Some(60), Some("P2"));
         let activated = activate(
             &state,
@@ -938,16 +793,12 @@ mod tests {
         let mut done = completing.clone();
         done.status = ActivityStatus::Completed;
         done.output = Some(seeded_input());
-        let mut cancelled = timeout_timer(deadline);
-        cancelled.status = TimerStatus::Cancelled;
-
         assert_eq!(
             completed.chain(),
             vec![
                 EntryPayload::Event(Event::StateCompleting {
                     activity: completing
                 }),
-                EntryPayload::Event(Event::TimerCancelled { timer: cancelled }),
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
                 EntryPayload::Event(Event::StateTransitioned(StateTransitioned {
                     activity: minted_activity_ref(),
@@ -971,7 +822,7 @@ mod tests {
             .await;
         assert!(
             children.is_empty(),
-            "the swept timer is no longer a child: {children:?}"
+            "a finished Task owns no child row: {children:?}"
         );
     }
 
@@ -1002,106 +853,6 @@ mod tests {
                     output: payload,
                 }
             ))]
-        );
-    }
-
-    /// Seed the deadline row a fire (or a sweep) left behind, owned by the invoking activity exactly
-    /// as `after_activated`'s timer is: the handler reads the timer's own recorded status to tell a
-    /// fire from a cancel, so the row — not the child reference — is what the decision is made on.
-    async fn seed_deadline(store: &mut InMemoryStorage, status: TimerStatus) {
-        let mut timer = timeout_timer(at());
-        timer.status = status;
-        let row = timer;
-        store
-            .put_timer(row)
-            .await
-            .expect("the in-memory store seeds a timer row");
-    }
-
-    /// A fired `TimeoutSeconds` deadline is this state's own failure: while the attempt is still in
-    /// flight the state terminates `TimedOut`, naming the deadline the fired row carries — not a
-    /// completion, and not a reason the container had to invent.
-    #[tokio::test]
-    async fn child_completed_of_the_fired_timeout_terminates_the_activity() {
-        let mut store = InMemoryStorage::new();
-        let row = seeded_activity(seeded_input());
-        seed_container(&mut store, Seeded::lone(row), []).await;
-        seed_deadline(&mut store, TimerStatus::Completed).await;
-
-        let completed = child_completed(
-            &task_state(None, Some(60), Some("P2")),
-            store,
-            minted_activity_ref(),
-            timeout_timer(at()).meta.raw_object_ref().clone(),
-        )
-        .await;
-
-        assert_eq!(
-            completed.chain(),
-            vec![EntryPayload::Command(Command::TerminateState(
-                TerminateState {
-                    activity: minted_activity_ref(),
-                    reason: TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::TimedOut {
-                            message: format!(
-                                "task ran past its TimeoutSeconds deadline ({})",
-                                at().as_millis()
-                            ),
-                        }),
-                    },
-                }
-            ))]
-        );
-    }
-
-    /// A *cancelled* deadline reaches this hook too — `ActivityElementBehavior` routes both outcomes through
-    /// `child_completed` — so the timer's own recorded status is the discriminator: a swept deadline
-    /// fails nothing, since the sweep is the complete step retiring a bound that has stopped applying.
-    #[tokio::test]
-    async fn child_completed_of_the_cancelled_timeout_does_nothing() {
-        let mut store = InMemoryStorage::new();
-        let row = seeded_activity(seeded_input());
-        seed_container(&mut store, Seeded::lone(row), []).await;
-        seed_deadline(&mut store, TimerStatus::Cancelled).await;
-
-        let completed = child_completed(
-            &task_state(None, Some(60), Some("P2")),
-            store,
-            minted_activity_ref(),
-            timeout_timer(at()).meta.raw_object_ref().clone(),
-        )
-        .await;
-
-        assert!(
-            completed.chain().is_empty(),
-            "a cancelled deadline must fail nothing: {:?}",
-            completed.chain()
-        );
-    }
-
-    /// A fire landing after the attempt already settled is moot: the `TaskCompleted` applier wrote
-    /// `raw_output` in this same batch, and the state is about to complete on it — so a late deadline
-    /// must not terminate a state that is already on its way out.
-    #[tokio::test]
-    async fn child_completed_of_the_timeout_after_the_task_settled_does_nothing() {
-        let mut store = InMemoryStorage::new();
-        let mut row = seeded_activity(seeded_input());
-        row.raw_output = Some(json!({ "answer": 42 }));
-        seed_container(&mut store, Seeded::lone(row), []).await;
-        seed_deadline(&mut store, TimerStatus::Completed).await;
-
-        let completed = child_completed(
-            &task_state(None, Some(60), Some("P2")),
-            store,
-            minted_activity_ref(),
-            timeout_timer(at()).meta.raw_object_ref().clone(),
-        )
-        .await;
-
-        assert!(
-            completed.chain().is_empty(),
-            "a deadline that stopped bounding the state must not fail it: {:?}",
-            completed.chain()
         );
     }
 }

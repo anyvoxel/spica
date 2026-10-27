@@ -13,7 +13,7 @@ use serde_json::Value;
 use spica_engine_types::{
     ActivityKind, FlowKind, FlowName, NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta,
     ObjectMetaBuilder, ObjectName, ObjectRef, RawObjectRef, RequestId, StatePath, ThreadKind,
-    ThreadOwner, TimerOwner, Timestamp, Variables,
+    ThreadOwner, Timestamp, Variables,
 };
 
 /// The first identity the harness mints for a **request** — deliberately far from `1`, where the
@@ -28,7 +28,7 @@ pub const FIRST_REQUEST_ID: u64 = 1 << 32;
 /// the wall clock — but a round one keeps a failure's numbers readable, and starting far from the epoch
 /// means a deadline computed from it can never be mistaken for an un-set (`0`) timestamp.
 pub const VIRTUAL_EPOCH_MILLIS: u64 = 1_700_000_000_000;
-/// The instant every stamp of a timer-free typed case carries — the virtual client's own clock
+/// The instant every stamp of a deadline-free typed case carries — the virtual client's own clock
 /// reading, which is what makes a timestamp assertable at all.
 pub fn epoch() -> Timestamp {
     Timestamp::from_millis(VIRTUAL_EPOCH_MILLIS)
@@ -63,7 +63,7 @@ pub fn flow_name(name: &str) -> FlowName {
     FlowName::new(name).expect("a static literal is a valid flow name")
 }
 
-/// The metadata a timer-free run mints for the object `object_name`, identified by the `n`-th uid:
+/// The metadata a deadline-free run mints for the object `object_name`, identified by the `n`-th uid:
 /// every object's own name plus the injected identity, stamped at the clock's single instant
 /// ([`epoch`]). The kind is the caller's business — it comes from `K`, resolved at the record the
 /// meta is written into, and so is the owner: a case with an owner finishes the builder with
@@ -207,31 +207,6 @@ pub fn fanout_thread_owner_of(activity: RawObjectRef) -> ThreadOwner {
         activity
             .try_into()
             .expect("fixture: a fan-out thread is owned by its container activity"),
-    )
-}
-
-/// The owner slot of a **timer** armed by the run itself (a run's `TimeoutSeconds`), in the union's
-/// own type (see `TimerOwner`), for a fixture already holding the execution's *flat* reference.
-pub fn execution_timer_owner_of(execution: RawObjectRef) -> TimerOwner {
-    TimerOwner::Execution(
-        execution
-            .try_into()
-            .expect("fixture: an execution-timeout timer is owned by its run"),
-    )
-}
-
-/// The owner slot of a **timer** armed by the waiting activity (a `Wait`'s `Seconds` or a state's
-/// `TimeoutSeconds`): `object`/`n` is the owning activity.
-pub fn activity_timer_owner(object: &str, n: u64) -> TimerOwner {
-    TimerOwner::Activity(ObjectRef::new(name(object), uid(n)))
-}
-
-/// [`activity_timer_owner`] for a fixture already holding the waiting activity's *flat* reference.
-pub fn activity_timer_owner_of(activity: RawObjectRef) -> TimerOwner {
-    TimerOwner::Activity(
-        activity
-            .try_into()
-            .expect("fixture: a state timer is owned by its waiting activity"),
     )
 }
 

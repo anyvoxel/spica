@@ -187,7 +187,7 @@ impl EngineBuilder {
     /// as its ids — a test advances the clock instead of waiting for it. Defaults to the wall clock.
     ///
     /// The consumer must inject the **same** clock into whatever drives the waits (the scheduler
-    /// armed from the `TimerActivated` facts), otherwise a timer's deadline is computed against one
+    /// armed from the durable deadline-carrying events), otherwise a deadline is computed against one
     /// clock and awaited against another.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -481,10 +481,6 @@ impl EngineInner {
                 .get_activity(&ref_for::<_>(name))
                 .await?
                 .map(QueryObject::Activity)),
-            ObjectKind::Timer => Ok(storage
-                .get_timer(&ref_for::<_>(name))
-                .await?
-                .map(QueryObject::Timer)),
             ObjectKind::Task => Ok(storage
                 .get_task(&ref_for::<_>(name))
                 .await?

@@ -1,7 +1,7 @@
 //! Per-`Event` applier implementations, one unit-struct per file.
 //!
-//! Each applier folds one [`Event`](crate::types::event::Event) variant into Storage (and, for
-//! timers, the scheduler). Splitting them one-per-file mirrors how the command handlers live
+//! Each applier folds one [`Event`](crate::types::event::Event) variant into Storage. Splitting
+//! them one-per-file mirrors how the command handlers live
 //! one-per-file under `handlers/`, keeping each fold rule local and greppable. The exhaustive
 //! [`dispatch_event`](super::dispatch_event) routes every variant to its applier's inherent `apply`.
 
@@ -29,9 +29,6 @@ mod thread_completing;
 mod thread_created;
 mod thread_terminated;
 mod thread_terminating;
-mod timer_activated;
-mod timer_cancelled;
-mod timer_triggered;
 mod variables_assigned;
 
 pub(crate) use execution_completed::ExecutionCompletedApplier;
@@ -58,9 +55,6 @@ pub(crate) use thread_completing::ThreadCompletingApplier;
 pub(crate) use thread_created::ThreadCreatedApplier;
 pub(crate) use thread_terminated::ThreadTerminatedApplier;
 pub(crate) use thread_terminating::ThreadTerminatingApplier;
-pub(crate) use timer_activated::TimerActivatedApplier;
-pub(crate) use timer_cancelled::TimerCancelledApplier;
-pub(crate) use timer_triggered::TimerTriggeredApplier;
 pub(crate) use variables_assigned::VariablesAssignedApplier;
 
 /// Raise the partition's generated-name counter to `suffix + 1` when a create event folds a

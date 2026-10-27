@@ -5,20 +5,20 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    Act, Call, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_owner, activity_timer_owner,
-    epoch, flat_ref_to, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name,
-    path, pointer, ref_to, request, root_thread_owner, run_typed_case, stamp, thread_owner, uid,
+    Act, Call, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_owner, epoch, flat_ref_to,
+    flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name, path, pointer, ref_to,
+    request, root_thread_owner, run_typed_case, stamp, thread_owner, uid,
 };
 use serde_json::json;
 use spica_engine::{
     ActivateState, ActivateTask, Activity, ActivityKind, ActivityStatus, ClaimTasks, Command,
     CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
-    EntryPayload, Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind,
-    ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated,
-    FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState, RetryPolicy,
-    RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed, TaskKind,
-    TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
-    TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus,
+    DeadlineTarget, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
+    ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion,
+    FlowVersionCreated, FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState,
+    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed,
+    TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
+    TerminationReason, Thread, ThreadKind, ThreadStatus,
 };
 
 #[rustfmt::skip]
@@ -903,15 +903,6 @@ async fn task_timeout_seconds_fails_the_run() {
                 retry_plan: vec![],
                 deadline: Some(stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
             })),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(7), "lifecycle_execution-3")
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
-                },
-            }),
             EntryPayload::Event(Event::TaskActivated {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
@@ -931,17 +922,9 @@ async fn task_timeout_seconds_fails_the_run() {
                     },
                 },
             }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-1", 5)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
             }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
@@ -1104,7 +1087,7 @@ async fn task_timeout_seconds_fails_the_run() {
                 ),
             }),
         }),
-        acts: vec![Act::Advance(Signal::TimerArmed, Duration::from_secs(30))],
+        acts: vec![Act::Advance(Signal::DeadlineArmed, Duration::from_secs(30))],
     };
     run_typed_case(&case).await;
 }
@@ -1233,15 +1216,6 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 retry_plan: vec![],
                 deadline: Some(stamp(VIRTUAL_EPOCH_MILLIS + 30_000)),
             })),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(7), "lifecycle_execution-3")
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
-                },
-            }),
             EntryPayload::Event(Event::TaskActivated {
                 task: Task {
                     meta: meta(uid(6), "lifecycle_execution-2")
@@ -1261,17 +1235,9 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                     },
                 },
             }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-1", 5)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 30_000),
             }),
             // The terminal failure is handed to the activity's own terminate, which is where the
             // state's `Catch` gets its say — so the catcher's route follows as a *completion*.
@@ -1339,7 +1305,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
             }),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
+                    meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
@@ -1354,7 +1320,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
+                    meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
@@ -1368,12 +1334,12 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to::<ActivityKind>("lifecycle_execution-4", 8),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
+                    meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
@@ -1390,7 +1356,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
             // off its input: both are pinned here, so a state that echoed its input instead would show.
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta_span(uid(8), "lifecycle_execution-4", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
+                    meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
                         .with_owner(thread_owner("lifecycle_execution-0", 4)),
                     execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
                     state_path: path("/States/Ok"),
@@ -1460,7 +1426,7 @@ async fn task_timeout_caught_routes_on_its_catcher() {
         ],
         status: ExecutionStatus::Completed,
         acts: vec![
-            Act::Advance(Signal::TimerArmed, Duration::from_secs(29)),
+            Act::Advance(Signal::DeadlineArmed, Duration::from_secs(29)),
             Act::Advance(Signal::None, Duration::from_secs(1)),
         ],
     };

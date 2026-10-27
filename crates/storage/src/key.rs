@@ -34,7 +34,6 @@
 //! | `execution` | `/<t>/<ns>/execution/<name>` | Execution row (name is the primary key) |
 //! | `thread` | `/<t>/<ns>/thread/<name>` | Thread row (name is the primary key) |
 //! | `activity` | `/<t>/<ns>/activity/<name>` | Activity row (name is the primary key) |
-//! | `timer` | `/<t>/<ns>/timer/<name>` | Timer row (name is the primary key) |
 //! | `task` | `/<t>/<ns>/task/<name>` | Task row (name is the primary key) |
 //! | `flow` | `/<t>/<ns>/flow/<flow_name>` | Flow row (name is the primary key) |
 //! | `flowversion` | `/<t>/<ns>/flowversion/<flow_name>-<ver>` | FlowVersion row |
@@ -58,7 +57,7 @@
 
 use spica_engine_types::{
     ActivityKind, ExecutionKind, FlowName, ObjectKind, ObjectName, ObjectRef, RawObjectRef,
-    ScopeName, TaskKind, ThreadKind, TimerKind,
+    ScopeName, TaskKind, ThreadKind,
 };
 
 /// The two fixed scope segments of every key (tenant + namespace).
@@ -114,7 +113,6 @@ pub enum Kind {
     Execution,
     Thread,
     Activity,
-    Timer,
     Task,
     Flow,
     FlowVersion,
@@ -128,7 +126,6 @@ impl Kind {
             Kind::Execution => "execution",
             Kind::Thread => "thread",
             Kind::Activity => "activity",
-            Kind::Timer => "timer",
             Kind::Task => "task",
             Kind::Flow => "flow",
             Kind::FlowVersion => "flowversion",
@@ -143,7 +140,6 @@ impl Kind {
             ObjectKind::Execution => Kind::Execution,
             ObjectKind::Thread => Kind::Thread,
             ObjectKind::Activity => Kind::Activity,
-            ObjectKind::Timer => Kind::Timer,
             ObjectKind::Task => Kind::Task,
             ObjectKind::Flow => Kind::Flow,
             ObjectKind::FlowVersion => Kind::FlowVersion,
@@ -193,19 +189,13 @@ impl KeyBuilder {
     }
 
     /// Activity row: `/<t>/<ns>/activity/<name>`. The activity's generated `obj-<uid>` name is its
-    /// primary key (aligned with executions/flows/timers).
+    /// primary key (aligned with executions/flows).
     pub fn activity(&self, reference: &ObjectRef<ActivityKind>) -> Vec<u8> {
         self.row(Kind::Activity, &reference.name().as_str())
     }
 
-    /// Timer row: `/<t>/<ns>/timer/<name>`. The timer's generated `obj-<uid>` name is its primary key
-    /// (aligned with executions/flows), even though the uid happens to be a bijective source for it.
-    pub fn timer(&self, reference: &ObjectRef<TimerKind>) -> Vec<u8> {
-        self.row(Kind::Timer, &reference.name().as_str())
-    }
-
     /// Task row: `/<t>/<ns>/task/<name>`. The task's generated `obj-<uid>` name is its primary key
-    /// (aligned with executions/flows/timers).
+    /// (aligned with executions/flows).
     pub fn task(&self, reference: &ObjectRef<TaskKind>) -> Vec<u8> {
         self.row(Kind::Task, &reference.name().as_str())
     }
@@ -405,23 +395,11 @@ mod tests {
         )
     }
 
-    /// A timer reference for the given uid (`obj-<uid>` generated name), matching
-    /// `meta.raw_object_ref()` so the uid/key round-trips.
-    fn timer_ref(uid: Ulid) -> ObjectRef<TimerKind> {
-        ObjectRef::new(
-            PlainName::new("child")
-                .unwrap()
-                .generated_from_key(uid.0 as u64),
-            uid,
-        )
-    }
-
     #[test]
     fn entity_row_keys_match_the_spec() {
         let kb = KeyBuilder::new(scope("acme", "prod"));
         let exec = exec_ref(Ulid::new());
         let act = act_ref(Ulid::new());
-        let tim = timer_ref(Ulid::new());
         let task = task_ref(Ulid::new());
         let vname = PlainName::new("order").unwrap().generated_from_key(1);
         let name = FlowName::new("order").unwrap();
@@ -434,11 +412,6 @@ mod tests {
             String::from_utf8(kb.activity(&act))
                 .unwrap()
                 .starts_with("/acme/prod/activity/")
-        );
-        assert!(
-            String::from_utf8(kb.timer(&tim))
-                .unwrap()
-                .starts_with("/acme/prod/timer/")
         );
         assert!(
             String::from_utf8(kb.task(&task))

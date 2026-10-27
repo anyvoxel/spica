@@ -14,7 +14,6 @@ use crate::types::flow_version::FlowVersion;
 use crate::types::meta::{ObjectKind, ObjectName, ObjectRef};
 use crate::types::task::Task;
 use crate::types::thread::Thread;
-use crate::types::timer::Timer;
 
 /// The persisted projection of one object of any kind, in its typed record form — the value behind a
 /// `GetObject`/`ListObjects` read. Each variant names the entity kind it mirrors, so `kind()` is a
@@ -30,7 +29,6 @@ pub enum QueryObject {
     Execution(Execution),
     Thread(Thread),
     Activity(Activity),
-    Timer(Timer),
     Task(Task),
 }
 
@@ -42,7 +40,6 @@ impl QueryObject {
             QueryObject::Execution(_) => ObjectKind::Execution,
             QueryObject::Thread(_) => ObjectKind::Thread,
             QueryObject::Activity(_) => ObjectKind::Activity,
-            QueryObject::Timer(_) => ObjectKind::Timer,
             QueryObject::Task(_) => ObjectKind::Task,
         }
     }
@@ -55,7 +52,6 @@ impl QueryObject {
             QueryObject::Execution(e) => &e.meta.name,
             QueryObject::Thread(t) => &t.meta.name,
             QueryObject::Activity(a) => &a.meta.name,
-            QueryObject::Timer(t) => &t.meta.name,
             QueryObject::Task(t) => &t.meta.name,
         }
     }
@@ -146,9 +142,6 @@ fn decode(kind: ObjectKind, name: ObjectName, bytes: &[u8]) -> Result<QueryObjec
             .map_err(|_| bad()),
         ObjectKind::Activity => serde_json::from_slice::<Activity>(bytes)
             .map(QueryObject::Activity)
-            .map_err(|_| bad()),
-        ObjectKind::Timer => serde_json::from_slice::<Timer>(bytes)
-            .map(QueryObject::Timer)
             .map_err(|_| bad()),
         ObjectKind::Task => serde_json::from_slice::<Task>(bytes)
             .map(QueryObject::Task)

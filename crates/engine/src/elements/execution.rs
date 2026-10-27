@@ -12,21 +12,21 @@ use crate::types::meta::{
     HasRawObjectRef, NoOwner, ObjectKind, ObjectMeta, ObjectRef, RawObjectRef,
 };
 use crate::types::thread::ThreadKind;
-use crate::types::timer::TimerKind;
-use crate::{ExecutionStatus, RejectionType, StatePath};
+use crate::{ExecutionStatus, RejectionType, StatePath, Timestamp};
 
 /// The behavior of an `Execution` — the run at the root of the object graph.
 ///
 /// Two faces of one element, gathered here from where they were split before: the **container** side
-/// (what a run does when one of its own children settles — its root thread finishing, its deadline
-/// firing) and the **command** side (the `TerminateExecution`/`CompleteExecution` verbs that open its
-/// teardown or its finish, and the `Continue*` hops that advance each). A run owns two kinds of child:
-/// its **root thread** (the run's own top-level scope) and its own `TimeoutSeconds` timer (see
-/// `create_execution`). There is no state-specific half — a run has no container state to replenish —
-/// so the settle hooks only decide what an individual settle *means* to a still-`Running` run: its
-/// scope going down abnormally starts the run's teardown, and its scope finishing successfully closes
-/// it. A run already winding down instead converges through its own `Completing`/`Terminating` to
-/// decide.
+/// (what a run does when its root thread settles) and the **deadline** side (what its own
+/// `TimeoutSeconds` fire means — see `on_deadline_fired`),
+/// plus the **command** side: the `TerminateExecution`/`CompleteExecution` verbs that open its teardown
+/// or its finish, and the `Continue*` hops that advance each. A run owns one kind of child in the settle
+/// relation — its **root thread**, the run's own top-level scope — and its deadline stands beside that
+/// relation rather than inside it, exactly as Zeebe's timer subscriptions act on their host element.
+/// There is no state-specific half — a run has no container state to replenish — so the settle hooks
+/// only decide what an individual settle *means* to a still-`Running` run: its scope going down
+/// abnormally starts the run's teardown, and its scope finishing successfully closes it. A run already
+/// winding down instead converges through its own `Completing`/`Terminating` to decide.
 pub(crate) struct ExecutionElementBehavior {
     execution: ObjectRef<ExecutionKind>,
 }
@@ -70,33 +70,12 @@ impl Container for ExecutionElementBehavior {
         };
 
         // Every cell below is one `(child kind, run status)` pair, and the pair is the whole decision: a
-        // run owns exactly two kinds of child — its root thread and its own `TimeoutSeconds` timer — and
-        // a settle means something different to each status. Whether the run has *drained* is not checked
-        // here: a `Continue*` cell names the run this settle is advancing, and that command's own handler
-        // takes down anything still attached and stops short of advancing, so the settle that finally
-        // drains the run is the one that advances it.
+        // run's deadline is not a child in this relation — its fire reaches `on_deadline_fired` — so the
+        // settle seen here is its root thread's. Whether the run has *drained* is not checked here: a
+        // `Continue*` cell names the run this settle is advancing, and that command's own handler takes
+        // down anything still attached and stops short of advancing, so the settle that finally drains
+        // the run is the one that advances it.
         match (child.kind, &exec.status) {
-            // The deadline fired: the run goes down `TimedOut` rather than closing. Only a *fire*
-            // reaches this hook; a cancelled timer takes `after_child_terminated`.
-            (ObjectKind::Timer, ExecutionStatus::Running) => {
-                out.append_command(Command::TerminateExecution(TerminateExecution {
-                    name: self.execution.name().clone(),
-                    uid: Some(self.execution.uid()),
-                    reason: TerminationReason::Failed {
-                        error: ExecutionError::Runtime(RuntimeError::TimedOut {
-                            // The run's own row carries the instant the definition's `TimeoutSeconds`
-                            // resolved to — the same one its timer was armed from, so the reason names
-                            // the deadline without a second read of the timer the fire has just
-                            // detached.
-                            message: format!(
-                                "execution ran past its TimeoutSeconds deadline ({})",
-                                exec.deadline.map(|d| d.as_millis()).unwrap_or(0)
-                            ),
-                        }),
-                    },
-                }));
-                Ok(())
-            }
             // The run's own top-level scope finished, so the run closes on its output — folded onto the
             // thread's row by the `ThreadCompleted` applier in this same batch.
             (ObjectKind::Thread, ExecutionStatus::Running) => {
@@ -114,16 +93,9 @@ impl Container for ExecutionElementBehavior {
                 }));
                 Ok(())
             }
-            // Already finishing: this settle is what advances the run, whether it was a `Completing`
-            // run's cancelled deadline landing or a `Terminating` run's swept child. A deadline that
-            // fires here is late, not decisive: a run already closing does not reopen as a timeout.
-            (ObjectKind::Timer, ExecutionStatus::Completing) => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
-            }
-            (ObjectKind::Timer | ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
+            // Already finishing: this settle is what advances the run. A run already closing does not
+            // reopen as a timeout or a completion.
+            (ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
                 out.append_command(Command::ContinueTerminate {
                     owner: self.execution.as_raw_object_ref().clone(),
                 });
@@ -199,27 +171,9 @@ impl Container for ExecutionElementBehavior {
                 }));
                 Ok(())
             }
-            // A run's deadline is cancelled only by its own finish or by a teardown, so an abnormal
-            // settle of it under a still-`Running` run asks for none: a teardown sweeps the deadline,
-            // it never starts one.
-            (ObjectKind::Timer, ExecutionStatus::Running) => {
-                tracing::debug!(
-                    execution = %self.execution,
-                    child = %child,
-                    "child terminated under a Running execution; no reaction"
-                );
-                Ok(())
-            }
-            // Already finishing: this settle is what advances the run, whatever state the run was in
-            // when it began to finish and whether or not anything else is still attached — see the
-            // drain note on `after_child_completed`.
-            (ObjectKind::Timer, ExecutionStatus::Completing) => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
-            }
-            (ObjectKind::Timer | ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
+            // A teardown swept the root thread and the thread relays that settle back here; the run then
+            // advances its own teardown.
+            (ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
                 out.append_command(Command::ContinueTerminate {
                     owner: self.execution.as_raw_object_ref().clone(),
                 });
@@ -250,10 +204,69 @@ impl Container for ExecutionElementBehavior {
 }
 
 impl ExecutionElementBehavior {
+    /// The run's own `TimeoutSeconds` deadline elapsed: a still-`Running` run goes down `TimedOut`
+    /// rather than closing, and one already finishing converges through its own phase. The reason names
+    /// the deadline the fire carried, not the timer that delivered it.
+    pub(crate) async fn on_deadline_fired(
+        &self,
+        ctx: &mut HandlerContext<'_>,
+        out: &mut Collector<'_>,
+        deadline: Timestamp,
+    ) -> Result<(), ProcessingError> {
+        let Some(exec) = ctx.storage.get_execution(&self.execution).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "execution_element: execution {} is gone from under its deadline",
+                    self.execution
+                ),
+            ));
+        };
+        match &exec.status {
+            ExecutionStatus::Running => {
+                out.append_command(Command::TerminateExecution(TerminateExecution {
+                    name: self.execution.name().clone(),
+                    uid: Some(self.execution.uid()),
+                    reason: TerminationReason::Failed {
+                        error: ExecutionError::Runtime(RuntimeError::TimedOut {
+                            message: format!(
+                                "execution ran past its TimeoutSeconds deadline ({})",
+                                deadline.as_millis()
+                            ),
+                        }),
+                    },
+                }));
+                Ok(())
+            }
+            // A deadline that fires under a run already finishing is late, not decisive: the run does
+            // not reopen as a timeout, it only advances the finish it already began.
+            ExecutionStatus::Completing => {
+                out.append_command(Command::ContinueComplete {
+                    owner: self.execution.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            ExecutionStatus::Terminating(_) => {
+                out.append_command(Command::ContinueTerminate {
+                    owner: self.execution.as_raw_object_ref().clone(),
+                });
+                Ok(())
+            }
+            status => Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "execution_element: execution {} fired a deadline while {}",
+                    self.execution,
+                    status.phase()
+                ),
+            )),
+        }
+    }
+
     /// Handles `TerminateExecution`: begins the abnormal finish of a running execution with `reason`.
-    /// Emits `ExecutionTerminating`, sweeps its two kinds of direct child (`CancelTimer` for its timer,
-    /// `TerminateThread` for its root thread — each child recursively terminates its own subtree), and —
-    /// once drained — emits `ExecutionTerminated{reason}`.
+    /// Emits `ExecutionTerminating`, sweeps its single direct child (`TerminateThread` for its root
+    /// thread — which recursively terminates its own subtree), and — once drained — emits
+    /// `ExecutionTerminated{reason}`.
     pub(crate) async fn terminate(
         p: &TerminateExecution,
         ctx: &mut HandlerContext<'_>,
@@ -346,11 +359,6 @@ impl ExecutionElementBehavior {
 
         for child in children.iter().cloned() {
             match child.kind {
-                ObjectKind::Timer => {
-                    out.append_command(Command::CancelTimer {
-                        timer: child.typed::<TimerKind>(),
-                    });
-                }
                 // The execution's single root Thread (the top-level owner) is swept here too:
                 // terminating the run must tear down the root thread's whole subtree, after which the
                 // thread relays its settle back (via its `ThreadContainer`) letting this execution drain and
@@ -365,10 +373,10 @@ impl ExecutionElementBehavior {
                 }
                 // A `Task` and a fan-out `Thread` belong to a container *Activity*, never directly to an
                 // Execution; and an `Activity`'s own owner is a `Thread` by type (`ActivityKind::OwnedBy`
-                // is `ObjectRef<ThreadKind>`), so an Execution's direct children are exactly its timer and
-                // its root thread. Any other kind in its child set is therefore an engine
-                // invariant broken — a corrupt projection or a forged child edge. Refuse to guess and
-                // fail loud, rather than leave the run deferred on a child no sweep can reap.
+                // is `ObjectRef<ThreadKind>`), so an Execution's only direct child is its root thread.
+                // Any other kind in its child set is therefore an engine invariant broken — a corrupt
+                // projection or a forged child edge. Refuse to guess and fail loud, rather than leave
+                // the run deferred on a child no sweep can reap.
                 other => panic!("engine regression: an Execution owns no {other:?} child"),
             }
         }
@@ -383,8 +391,8 @@ impl ExecutionElementBehavior {
 
     /// Handles `CompleteExecution`: begins the success finish of a **top-level** `Execution` (the root
     /// run, terminal `Succeed`/`End` reached). Emits `ExecutionCompleting`, which fixes its output on
-    /// its row, cancels any owned timers, and — once children drain (immediately if none) — emits
-    /// `ExecutionCompleted` then finishes.
+    /// its row and — once children drain (immediately if none) — emits `ExecutionCompleted` then
+    /// finishes.
     pub(crate) async fn complete(
         p: &CompleteExecution,
         ctx: &mut HandlerContext<'_>,
@@ -456,34 +464,22 @@ impl ExecutionElementBehavior {
             return Ok(());
         }
 
-        // Something is still attached. A success finish cancels the deadlines it owns — a
-        // `TimeoutSeconds` must not fire into a finished run — and waits for them to drain. It never
-        // *terminates* a live child, because a run whose work is done has none: any other kind here is
-        // the row's child set disagreeing with the lifecycle rather than a child to wait on.
-        // Refused rather than swept or ignored — sweeping turns a success into a failure cascade, and
-        // ignoring closes the run with a live child. A refusal strands nothing: the child's own settle
-        // drains the run through its `ExecutionElementBehavior` → `ContinueComplete`.
-        for child in &children {
-            match child.kind {
-                ObjectKind::Timer => out.append_command(Command::CancelTimer {
-                    timer: child.clone().typed::<TimerKind>(),
-                }),
-                kind => {
-                    return Err(ProcessingError::Rejected(
-                        RejectionType::InvalidState,
-                        format!(
-                            "complete_execution: execution {execution} still owns a live {kind} child \
-                             {child}; completion refused"
-                        ),
-                    ));
-                }
-            }
+        // Something is still attached. A success finish never *terminates* a live child, because a run
+        // whose work is done has none: any child here is the row's child set disagreeing with the
+        // lifecycle rather than a child to wait on. Refused rather than swept or ignored — sweeping
+        // turns a success into a failure cascade, and ignoring closes the run with a live child. A
+        // refusal strands nothing: the child's own settle drains the run through its
+        // `ExecutionElementBehavior` → `ContinueComplete`.
+        if let Some(child) = children.iter().next() {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "complete_execution: execution {execution} still owns a live {} child {child}; \
+                     completion refused",
+                    child.kind
+                ),
+            ));
         }
-        tracing::debug!(
-            execution = %execution,
-            pending = children.len(),
-            "execution completing deferred: waiting on owned children"
-        );
 
         Ok(())
     }
@@ -523,19 +519,14 @@ impl ExecutionElementBehavior {
             .get_children(exec.meta.object_ref().into_raw_object_ref())
             .await?;
         if !children.is_empty() {
-            // A run's container does not wait for its own drain — a teardown takes down both of a run's
-            // children at once, so each of their settles advances it — which means an earlier Continue
-            // reaches here with the other child still attached. It is absorbed: the sweep below takes
-            // that child down again and this hop stops short of advancing, so only the Continue that
-            // lands on the drained run terminates it. A run's direct children are exactly its root
-            // thread and its own timers, so any other kind here is the row disagreeing with the
-            // lifecycle; both sweepable kinds carry `Cancelled`, for the reason the `Terminating`
-            // activity's arm gives.
+            // A run's only direct child is its root thread, so a child still attached here is the
+            // thread's own teardown not being done yet: the sweep takes it down again and this hop
+            // stops short of advancing, so only the Continue that lands on the drained run terminates
+            // it. Any other kind is the row disagreeing with the lifecycle — fail loud rather than
+            // sweep a child the run cannot own. The thread carries `Cancelled`, for the reason the
+            // `Terminating` activity's arm gives.
             for child in &children {
                 match child.kind {
-                    ObjectKind::Timer => out.append_command(Command::CancelTimer {
-                        timer: child.clone().typed::<TimerKind>(),
-                    }),
                     ObjectKind::Thread => {
                         out.append_command(Command::TerminateThread(TerminateThread {
                             thread: child.clone().typed::<ThreadKind>(),
@@ -544,7 +535,7 @@ impl ExecutionElementBehavior {
                     }
                     kind => panic!(
                         "continue_terminate: execution {node} owns a live {kind} child {child}; a \
-                         run's children are only its root Thread and its own timers"
+                         run's only child is its root Thread"
                     ),
                 }
             }
@@ -603,25 +594,15 @@ impl ExecutionElementBehavior {
             .storage
             .get_children(exec.meta.object_ref().into_raw_object_ref())
             .await?;
-        if !children.is_empty() {
-            // A run's container does not wait for its own drain — both of its children can settle under
-            // one teardown — so an early Continue reaches here with a child still attached. It is
-            // absorbed: the sweep re-issues what is still in flight and this hop stops short of
-            // advancing, so the Continue that lands on the drained run is the one that completes it. A
-            // success finish keeps only the deadlines it owns (`complete_execution` cancels them and
-            // waits for the drain), so any other kind here is the row disagreeing with the lifecycle.
-            for child in &children {
-                match child.kind {
-                    ObjectKind::Timer => out.append_command(Command::CancelTimer {
-                        timer: child.clone().typed::<TimerKind>(),
-                    }),
-                    kind => panic!(
-                        "continue_complete: execution {node} owns a live {kind} child {child}; a \
-                         completing run only keeps its own timers"
-                    ),
-                }
-            }
-            return Ok(());
+        // A completing run's live child cannot be advanced by a sweep — a success finish never
+        // terminates one — so a child still attached here is the row disagreeing with the lifecycle.
+        // Fail loud rather than close the run with a live child.
+        if let Some(child) = children.iter().next() {
+            panic!(
+                "continue_complete: execution {node} owns a live {} child {child}; a completing \
+                 run owns nothing",
+                child.kind
+            );
         }
         // The row already carries what the finish fixed (`output` was written when it entered
         // `Completing`), so the terminal advances the stored value rather than re-deriving one.
@@ -641,9 +622,9 @@ impl ExecutionElementBehavior {
         // Nothing to relay: a run is the root of its object tree, so it has no owner to settle up to.
         Ok(())
     }
-    /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`) and starts it. Also
-    /// arms the state-machine `TimeoutSeconds` timer if configured. Immediately enters the start state
-    /// via `ActivateState`.
+    /// Handles `CreateExecution`: records the execution (via `ExecutionCreated`, carrying the
+    /// state-machine `TimeoutSeconds` as an absolute deadline) and starts it. Immediately enters the
+    /// start state via `ActivateState`.
     pub(crate) async fn create(
         p: &CreateExecution,
         ctx: &mut HandlerContext<'_>,
@@ -700,8 +681,8 @@ impl ExecutionElementBehavior {
             )
         })?;
         // Normalize the machine's relative `TimeoutSeconds` into an absolute deadline here, before the
-        // birth event, so the run's own `deadline` and the timer that enforces it are
-        // written from one computation and cannot disagree. A `TimeoutSeconds` the clock cannot add is a
+        // birth event, so the run's own `deadline` is the single record of it — the physical arm is
+        // re-derived from the `ExecutionCreated` that folds that deadline. A `TimeoutSeconds` the clock cannot add is a
         // malformed definition, so it is refused *before* the run exists: accepting it, birthing the
         // execution, and then failing it immediately would leave a dead row standing for a command the
         // engine had already decided not to apply — and would answer the caller with a creation that
@@ -747,39 +728,6 @@ impl ExecutionElementBehavior {
         // which returns the execution id at that point, leaving the terminal settle to
         // `wait_for_execution`).
         out.append_event(created_event).await;
-
-        if let Some(deadline) = deadline {
-            // The run's own deadline timer is generated **here** (inline): mint the
-            // timer's durable uid, and derive the timer's name as `{execution.name}-{counter-suffix}`
-            // (k8s generateName style, `PlainName::generated_from_key`) — deterministic and
-            // replay-safe, since this `TimerActivated` lands in the
-            // same atomic batch as the `ExecutionCreated`. The name is decoupled from the timer's own
-            // `uid`, and must be carried forward by later timer events, so TimerActivated children
-            // stay resolvable (see `TimerTriggered`/`TimerCancelled`, which preserve the row's meta
-            // rather than re-deriving the name).
-            let uid: ulid::Ulid = ctx.mint();
-            // A generated child's base is the execution's own base name. `ObjectName::base` is total —
-            // a `Plain` name is its own base and a `Generated` one carries a plain base by construction
-            // (nested generated names are unrepresentable) — so both flavors derive the timer's
-            // `{base}-{suffix}` handle the same way, as the root thread below already does.
-            let base = id.name().base();
-            // The suffix is this partition's local generated-name counter (see `Storage::next_generated_seq`),
-            // read via the working overlay so a sibling minted earlier in the same batch is visible; the
-            // `TimerActivated` applier bumps the counter past it in the same fold.
-            let name = base.generated_from_key(out.next_generated_seq().await);
-            let timer = crate::Timer {
-                meta: crate::types::meta::ObjectMeta::builder(uid)
-                    .name(name)
-                    .at(ctx.now())
-                    // An execution timeout is armed by the run itself — the `Execution` variant of the
-                    // timer slot, never an activity's.
-                    .with_owner(crate::types::meta::TimerOwner::Execution(id.clone())),
-                execution: id.clone(),
-                status: crate::TimerStatus::Active,
-                deadline,
-            };
-            out.append_event(Event::TimerActivated { timer }).await;
-        }
 
         // Derive the execution's single root Thread — the top-level owner of every state, standing in
         // for a whole top-level run the way a Process has one main Thread. It is owned by the
@@ -861,20 +809,15 @@ mod settle_tests {
         HasRawObjectRef, NoOwner, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner,
     };
     use crate::types::thread::{Thread, ThreadKind, ThreadStatus};
-    use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
 
-    /// The run whose own children settle — its `TimeoutSeconds` deadline.
+    /// The run whose own deadline fires and whose root thread settles.
     fn execution_ref() -> ObjectRef<ExecutionKind> {
         object_ref("execution", 70)
     }
 
-    /// The child a run hands over — its deadline, the only kind it owns.
-    fn timer_ref() -> ObjectRef<TimerKind> {
-        object_ref("deadline", 200)
-    }
-
-    /// The run's *other* child kind — its root thread, whose settle is what closes the run.
+    /// The run's child kind in the settle relation — its root thread, whose settle is what closes the
+    /// run.
     fn thread_ref() -> ObjectRef<ThreadKind> {
         object_ref("execution-1", 80)
     }
@@ -904,9 +847,8 @@ mod settle_tests {
         }
     }
 
-    /// A seeded execution row with `children` live children still attached. A run is the root of its
-    /// tree, so it fills no owner slot, and its one owned kind is its own deadline timer — the seed
-    /// therefore carries only the status the drain decision reads.
+    /// A seeded execution row with `children` live children still attached — the drain the `Continue*`
+    /// hop must see. A run is the root of its tree, so it fills no owner slot.
     fn seeded_execution(status: ExecutionStatus, children: usize) -> Seeded<Execution> {
         let execution = Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
@@ -920,14 +862,14 @@ mod settle_tests {
             output: None,
         };
         let live = (0..children)
-            .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
+            .map(|n| object_ref::<ThreadKind>("thread", 200 + n as u64).into_raw_object_ref())
             .collect::<Vec<_>>();
         Seeded::owning(execution, live)
     }
 
-    /// Drive one hook over a working overlay seeded with a single execution row — the leader's shape,
-    /// so the assertion reads the command the container emitted, not merely an intent.
-    async fn settle_execution(execution: Seeded<Execution>, terminated: bool) -> Vec<EntryPayload> {
+    /// Drive the run's deadline hook over a working overlay seeded with a single execution row — the
+    /// leader's shape, so the assertion reads the command the container emitted, not merely an intent.
+    async fn deadline_over(execution: Seeded<Execution>) -> Vec<EntryPayload> {
         let mut store = InMemoryStorage::new();
         let owner = execution.row.meta.raw_object_ref();
         seed_edges(&mut store, owner, execution.children).await;
@@ -960,22 +902,48 @@ mod settle_tests {
                 definitions: &mut definitions,
                 state_handlers: &state_handlers,
             };
-            if terminated {
-                container
-                    .after_child_terminated(&mut ctx, &mut out, timer_ref().as_raw_object_ref())
-                    .await
-                    .expect("the hook relays the settle");
-            } else {
-                container
-                    .after_child_completed(&mut ctx, &mut out, timer_ref().as_raw_object_ref())
-                    .await
-                    .expect("the hook relays the settle");
-            }
+            container
+                .on_deadline_fired(&mut ctx, &mut out, at())
+                .await
+                .expect("the fired deadline is answered against a live run");
         }
         out.into_entries()
             .into_iter()
             .map(|entry| entry.payload)
             .collect()
+    }
+
+    /// Drive a deadline hook against a mock store answering the one run read, with the container built
+    /// directly: the shapes that need this (a vanished row, a terminal run) are the ones `open` cannot
+    /// hand a container back for. Returns the hook's own outcome beside the chain it emitted, so a
+    /// refusal and a command are asserted the same way.
+    async fn deadline_hook_over(
+        store: &dyn ReadonlyStorageTxn,
+    ) -> (Result<(), ProcessingError>, Vec<EntryPayload>) {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
+        let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
+        let mut out = Collector::new(EntryId::new(1), None, clock.clone(), ids.clone());
+        let mut env = EvalEnv::new();
+        let mut definitions = HashMap::new();
+        let state_handlers = build_state_handlers();
+        let container = ExecutionElementBehavior {
+            execution: execution_ref(),
+        };
+        let mut ctx = HandlerContext {
+            env: &mut env,
+            storage: store,
+            clock,
+            ids,
+            definitions: &mut definitions,
+            state_handlers: &state_handlers,
+        };
+        let result = container.on_deadline_fired(&mut ctx, &mut out, at()).await;
+        let chain = out
+            .into_entries()
+            .into_iter()
+            .map(|entry| entry.payload)
+            .collect();
+        (result, chain)
     }
 
     /// Drive the **completed** hook against a mock store answering the reads the cell needs, with the
@@ -1054,19 +1022,19 @@ mod settle_tests {
     /// child settled with nothing after it. The container is built directly — `open` refuses the same
     /// missing row before any hook could be reached.
     #[tokio::test]
-    async fn a_vanished_execution_refuses_the_settle() {
+    async fn a_vanished_execution_refuses_the_deadline() {
         let mut store = MockReadonlyStorageTxn::new();
         store
             .expect_get_execution()
             .times(1)
             .return_once(|_| Ok(None));
-        let result = hook_over(&store, timer_ref().as_raw_object_ref()).await.0;
+        let result = deadline_hook_over(&store).await.0;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
-            panic!("a vanished run must refuse the settle: {result:?}");
+            panic!("a vanished run must refuse the deadline: {result:?}");
         };
         assert_eq!(ty, RejectionType::InvalidState);
         assert!(
-            reason.contains("is gone from under its settled child"),
+            reason.contains("is gone from under its deadline"),
             "the refusal names what it could not relay to: {reason}"
         );
     }
@@ -1097,7 +1065,7 @@ mod settle_tests {
     /// reason naming its own `TimeoutSeconds` deadline rather than the timer that carried the news.
     #[tokio::test]
     async fn a_fired_deadline_terminates_a_running_execution() {
-        let chain = settle_execution(seeded_execution(ExecutionStatus::Running, 0), false).await;
+        let chain = deadline_over(seeded_execution(ExecutionStatus::Running, 0)).await;
         let [EntryPayload::Command(Command::TerminateExecution(terminate))] = &chain[..] else {
             panic!("a fired deadline must terminate the run: {chain:?}");
         };
@@ -1106,10 +1074,10 @@ mod settle_tests {
             matches!(
                 &terminate.reason,
                 TerminationReason::Failed {
-                    error: ExecutionError::Runtime(RuntimeError::TimedOut { .. })
-                }
+                    error: ExecutionError::Runtime(RuntimeError::TimedOut { message })
+                } if message.contains(&at().as_millis().to_string())
             ),
-            "the run must go down as `TimedOut`: {:?}",
+            "the run must go down as `TimedOut`, naming its deadline: {:?}",
             terminate.reason
         );
     }
@@ -1140,32 +1108,32 @@ mod settle_tests {
         );
     }
 
-    /// A settle under a run that already reached a terminal is the row disagreeing with the lifecycle —
-    /// a terminal run has no child left to settle — so it is refused rather than answered with a no-op
-    /// the log would have no way to explain.
+    /// A deadline under a run that already reached a terminal is the row disagreeing with the
+    /// lifecycle — a terminal run has no deadline left — so it is refused rather than answered with a
+    /// no-op the log would have no way to explain.
     #[tokio::test]
-    async fn a_settle_under_a_terminal_execution_is_refused() {
+    async fn a_deadline_under_a_terminal_execution_is_refused() {
         let mut store = MockReadonlyStorageTxn::new();
         store
             .expect_get_execution()
             .times(1)
             .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completed, 0).row)));
-        let result = hook_over(&store, timer_ref().as_raw_object_ref()).await.0;
+        let result = deadline_hook_over(&store).await.0;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
-            panic!("a settle under a terminal run must be refused: {result:?}");
+            panic!("a deadline under a terminal run must be refused: {result:?}");
         };
         assert_eq!(ty, RejectionType::InvalidState);
         assert!(
             reason.contains("while Completed"),
-            "the refusal names the status the settle cannot mean anything to: {reason}"
+            "the refusal names the status the deadline cannot mean anything to: {reason}"
         );
     }
 
-    /// A settled child of a `Completing` run that has just drained advances the run's own finish — the
-    /// one-hop `ContinueComplete` the generic child-settled reaction issued for it.
+    /// A deadline under a `Completing` run that has just drained advances the run's own finish — the
+    /// one-hop `ContinueComplete` the deadline reaction issues for it.
     #[tokio::test]
-    async fn a_settled_child_advances_a_drained_completing_execution() {
-        let chain = settle_execution(seeded_execution(ExecutionStatus::Completing, 0), false).await;
+    async fn a_fired_deadline_advances_a_drained_completing_execution() {
+        let chain = deadline_over(seeded_execution(ExecutionStatus::Completing, 0)).await;
         assert_eq!(
             chain,
             vec![EntryPayload::Command(Command::ContinueComplete {
@@ -1174,69 +1142,18 @@ mod settle_tests {
         );
     }
 
-    /// A terminated child of a `Terminating` run drains it the same way — and its reason is read back
-    /// off the run's own status rather than carried by the child.
+    /// A run that is already finishing advances on **every** deadline outcome, drained or not: whether
+    /// the drain is complete is the `Continue*` hop's own business — it takes down whatever is still
+    /// attached and stops short of advancing — so an early `Continue` costs a hop, never the run's
+    /// convergence.
     #[tokio::test]
-    async fn a_terminated_child_advances_a_drained_terminating_execution() {
-        let chain = settle_execution(
-            seeded_execution(
-                ExecutionStatus::Terminating(TerminationReason::Cancelled),
-                0,
-            ),
-            true,
-        )
-        .await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::ContinueTerminate {
-                owner: execution_ref().into_raw_object_ref(),
-            })]
-        );
-    }
-
-    /// A run that is already finishing advances on **every** settle, drained or not: whether the drain
-    /// is complete is the `Continue*` hop's own business — it takes down whatever is still attached and
-    /// stops short of advancing — so an early `Continue` costs a hop, never the run's convergence.
-    #[tokio::test]
-    async fn a_settled_child_advances_a_completing_execution_before_the_drain() {
-        let chain = settle_execution(seeded_execution(ExecutionStatus::Completing, 1), false).await;
+    async fn a_fired_deadline_advances_a_completing_execution_before_the_drain() {
+        let chain = deadline_over(seeded_execution(ExecutionStatus::Completing, 1)).await;
         assert_eq!(
             chain,
             vec![EntryPayload::Command(Command::ContinueComplete {
                 owner: execution_ref().into_raw_object_ref(),
             })]
-        );
-    }
-
-    /// The terminated twin of the above — the shape a teardown takes when a run still holds both its
-    /// children: the root thread's settle and the deadline's settle each advance the run, and the hop
-    /// that lands on the drained run is the one that terminates it.
-    #[tokio::test]
-    async fn a_settled_child_advances_a_terminating_execution_before_the_drain() {
-        let chain = settle_execution(
-            seeded_execution(
-                ExecutionStatus::Terminating(TerminationReason::Cancelled),
-                1,
-            ),
-            true,
-        )
-        .await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::ContinueTerminate {
-                owner: execution_ref().into_raw_object_ref(),
-            })]
-        );
-    }
-
-    /// A run still `Running` has no finish to advance, and no container state of its own to replenish
-    /// — a `Running` child settle under it asks for no reaction at all.
-    #[tokio::test]
-    async fn a_settled_child_leaves_a_running_execution_alone() {
-        let chain = settle_execution(seeded_execution(ExecutionStatus::Running, 0), true).await;
-        assert!(
-            chain.is_empty(),
-            "a Running execution must not react: {chain:?}"
         );
     }
 }
@@ -1255,14 +1172,13 @@ mod command_tests {
     use crate::handler::{Collector, HandlerContext, ProcessingError};
     use crate::handlers::build_state_handlers;
     use crate::handlers::fixtures::{Seeded, at, object_ref};
-    use crate::types::command::{Command, CompleteExecution};
+    use crate::types::command::CompleteExecution;
     use crate::types::event::Event;
     use crate::types::execution::{Execution, ExecutionKind, ExecutionStatus};
     use crate::types::flow_version::FlowVersionKind;
     use crate::types::id::EntryId;
     use crate::types::meta::{HasRawObjectRef, NoOwner, ObjectMeta, ObjectRef, RawObjectRef};
     use crate::types::thread::ThreadKind;
-    use crate::types::timer::TimerKind;
     use crate::{EntryPayload, RejectionType};
 
     /// The run under completion.
@@ -1371,40 +1287,11 @@ mod command_tests {
         );
     }
 
-    /// A run still owning its deadline cancels it and **waits**: the deadline must not fire
-    /// into a finished run, and no terminal may land before it drains.
+    /// A live child is refused, not obeyed: a success finish never terminates a live child, and a run
+    /// whose work is done owns none. Nothing is swept either — the child's own settle drains the run
+    /// instead.
     #[tokio::test]
-    async fn a_run_waits_for_the_deadlines_it_cancels() {
-        let deadline = object_ref::<TimerKind>("deadline", 200);
-        let (result, entries) = complete_over(seeded_execution(
-            ExecutionStatus::Running,
-            HashSet::from([deadline.clone().into_raw_object_ref()]),
-        ))
-        .await;
-        assert!(
-            result.is_ok(),
-            "a run awaiting its deadline completes later"
-        );
-        assert_eq!(entries.len(), 2, "the finish and the sweep: {entries:?}");
-        assert!(
-            matches!(
-                &entries[0],
-                EntryPayload::Event(Event::ExecutionCompleting { .. })
-            ),
-            "the finish still begins: {entries:?}"
-        );
-        assert_eq!(
-            entries[1],
-            EntryPayload::Command(Command::CancelTimer { timer: deadline })
-        );
-    }
-
-    /// A live **non-deadline** child is refused, not obeyed: a success finish never terminates a live
-    /// child, and `pending == 0` over the swept deadlines alone would have declared this run complete
-    /// while a child was still running. Nothing is swept either — the child's own settle will drain the
-    /// run instead.
-    #[tokio::test]
-    async fn a_live_non_deadline_child_refuses_the_completion() {
+    async fn a_live_child_refuses_the_completion() {
         let child = object_ref::<ThreadKind>("execution-1", 80);
         let (result, entries) = complete_over(seeded_execution(
             ExecutionStatus::Running,

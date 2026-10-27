@@ -16,7 +16,7 @@ use spica_machinery::Timestamp;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExecutionStatus {
     Running,
-    /// Success finish initiated; waiting on owned children (e.g. the execution's timeout timer).
+    /// Success finish initiated; waiting on owned children (its root thread).
     Completing,
     /// Abnormal finish initiated with its final reason already decided; waiting on owned children to
     /// terminate before the terminal ed lands.
@@ -108,11 +108,9 @@ pub struct Execution {
     pub flow_version: ObjectRef<FlowVersionKind>,
     pub status: ExecutionStatus,
     /// The absolute moment the state machine's `TimeoutSeconds` expires, `Some` iff the definition
-    /// sets one. The run is terminated by the timer armed from this *same* instant (both written from
-    /// one computation at creation), so this is the run's own answer to "when is it due", where a
-    /// client would otherwise have to find and filter the timer child — and the `TimedOut` the timer's
-    /// fire terminates the run with. The run-level counterpart of a state's
-    /// [`Task::deadline`](crate::Task).
+    /// sets one. The scheduler arms this *same* instant at creation, so the field is the run's own
+    /// answer to "when is it due" — and the `TimedOut` its fire terminates the run with. The
+    /// run-level counterpart of a state's [`Task::deadline`](crate::Task).
     #[serde(default)]
     pub deadline: Option<Timestamp>,
     /// The original execution input.

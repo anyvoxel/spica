@@ -40,7 +40,6 @@ pub enum ObjectKind {
     /// [`ObjectKind::Execution`], which is always a top-level run.
     Thread,
     Activity,
-    Timer,
     Task,
 }
 
@@ -53,7 +52,6 @@ impl ObjectKind {
             ObjectKind::Execution => "execution",
             ObjectKind::Thread => "thread",
             ObjectKind::Activity => "activity",
-            ObjectKind::Timer => "timer",
             ObjectKind::Task => "task",
         }
     }
@@ -70,7 +68,6 @@ impl ObjectKind {
             "execution" => ObjectKind::Execution,
             "thread" => ObjectKind::Thread,
             "activity" => ObjectKind::Activity,
-            "timer" => ObjectKind::Timer,
             "task" => ObjectKind::Task,
             _ => return None,
         })
@@ -447,20 +444,6 @@ declare_owner! {
     }
 }
 
-declare_owner! {
-    /// The owner slot of a **Timer**: the scope whose deadline it is, of the two scopes that arm one.
-    ///
-    /// A run's `TimeoutSeconds` is armed by the run itself, while a state's own `Seconds`/
-    /// `TimeoutSeconds` is armed by the activity holding the deadline — so the slot is the same
-    /// `Execution`-or-`Activity` sum as a thread's, but its own type: a timer's owner is a fact about
-    /// timers, so widening it later must not widen a thread's by accident. Nothing else on the timer
-    /// says what the deadline is *for*: the owner is both who holds it and why it exists.
-    TimerOwner {
-        Execution => ExecutionKind,
-        Activity => ActivityKind,
-    }
-}
-
 impl OwnerKindMarker for NoOwner {
     fn to_raw_object_ref(&self) -> Option<&RawObjectRef> {
         None
@@ -549,7 +532,7 @@ impl<'de, K: ObjectKindMarker> Deserialize<'de> for KindTag<K> {
 ///
 /// [`Self::owner`] links each object to its single owning parent in the object tree. `owner` is the
 /// **single parent edge** for every entity — the former ad-hoc `Execution.parent`/`Activity.parent`/
-/// `Task.parent`/`Timer.parent` handle fields have migrated into it — and its type is
+/// `Task.parent` handle fields have migrated into it — and its type is
 /// [`ObjectKindMarker::OwnedBy`], so which kinds may occupy it is fixed by the object type: no reader
 /// has to branch on a runtime kind to know who owns what. A root object (a top-level `Execution`)
 /// declares [`NoOwner`], so it has no parent *by type*. `root_execution` is a separate flat
@@ -897,7 +880,6 @@ mod tests {
             ObjectKind::Execution,
             ObjectKind::Thread,
             ObjectKind::Activity,
-            ObjectKind::Timer,
             ObjectKind::Task,
         ];
         for k in all {
@@ -907,8 +889,7 @@ mod tests {
                 ObjectKind::Execution => 2,
                 ObjectKind::Thread => 3,
                 ObjectKind::Activity => 4,
-                ObjectKind::Timer => 5,
-                ObjectKind::Task => 6,
+                ObjectKind::Task => 5,
             };
             assert_eq!(all[i], k);
             assert_eq!(ObjectKind::parse(k.as_str()), Some(k));
@@ -1162,30 +1143,6 @@ mod tests {
         assert!(msg.contains("carries kind Task"), "{msg}");
         assert!(msg.contains("admits only Execution or Activity"), "{msg}");
         assert!(msg.contains("ThreadOwner"), "{msg}");
-    }
-
-    /// A timer's slot is its own type over the same two scopes, and refusing what *it* does not admit
-    /// names `TimerOwner`: the two unions are deliberately separate, so widening one never widens the
-    /// other silently.
-    #[test]
-    fn timer_owner_refuses_a_kind_it_does_not_admit() {
-        let thread = RawObjectRef::new(
-            ObjectKind::Thread,
-            ObjectName::plain("branch").unwrap(),
-            ulid::Ulid::new(),
-        );
-        let err = serde_json::from_value::<TimerOwner>(serde_json::to_value(&thread).unwrap())
-            .expect_err("no thread ever arms a timer");
-        let msg = err.to_string();
-        assert!(msg.contains("carries kind Thread"), "{msg}");
-        assert!(msg.contains("admits only Execution or Activity"), "{msg}");
-        assert!(msg.contains("TimerOwner"), "{msg}");
-
-        // A thread is a node, never a scope: neither union takes one, so a thread's own owner slot
-        // (`ThreadOwner`) refuses this payload too — the two unions overlap only where reality does.
-        assert!(
-            serde_json::from_value::<ThreadOwner>(serde_json::to_value(&thread).unwrap()).is_err()
-        );
     }
 
     #[test]

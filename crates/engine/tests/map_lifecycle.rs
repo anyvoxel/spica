@@ -3,9 +3,9 @@
 mod common;
 
 use common::{
-    TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, fanout_thread_owner, flat_ref_to,
-    flow_name, flow_owner, indexed_refs, meta, meta_root, name, path, pointer, ref_to, request,
-    root_thread_owner, run_typed_case, stamp, thread_owner, uid,
+    TypedCase, VIRTUAL_EPOCH_MILLIS, fanout_thread_owner, flat_ref_to, flow_name, flow_owner,
+    indexed_refs, meta, meta_root, name, path, pointer, ref_to, request, root_thread_owner,
+    run_typed_case, stamp, thread_owner, uid,
 };
 use serde_json::json;
 use spica_engine::{
@@ -14,8 +14,7 @@ use spica_engine::{
     Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, MapActivityState,
     ObjectKind, RuntimeError, SpawnThread, StateTransitioned, TerminateExecution, TerminateState,
-    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, Timer, TimerKind,
-    TimerStatus, WaitActivityState,
+    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -2623,15 +2622,6 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(12), "lifecycle_execution-8")
-                        .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
-            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity { // Map.Thread-1
                     meta: meta(uid(10), "lifecycle_execution-6")
@@ -2811,21 +2801,6 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     retry_state: None,
                     output: None,
                 },
-            }),
-            EntryPayload::Command(Command::CancelTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-8", 12),
-            }),
-            EntryPayload::Event(Event::TimerCancelled {
-                timer: Timer {
-                    meta: meta(uid(12), "lifecycle_execution-8")
-                        .with_owner(activity_timer_owner("lifecycle_execution-7", 11)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Cancelled,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 300_000),
-                },
-            }),
-            EntryPayload::Command(Command::ContinueTerminate {
-                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {

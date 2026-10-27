@@ -147,7 +147,7 @@ message Object {
     Execution execution = 3;
     Thread thread = 4;
     Activity activity = 5;
-    Timer timer = 6;
+    // 6 was the Timer row; a deadline is now a field of the element that owns it.
     Task task = 7;
   }
 }
@@ -266,24 +266,6 @@ enum ActivityStatus {
   ACTIVITY_STATUS_TERMINATING = 3;
   ACTIVITY_STATUS_COMPLETED = 4;
   ACTIVITY_STATUS_TERMINATED = 5;
-}
-
-// The persisted projection row of a Timer, mirroring `Timer`.
-message Timer {
-  ObjectMeta meta = 1;
-  // The top-level execution this timer belongs to.
-  ObjectReference execution = 2;
-  // Was a per-timer purpose; who armed the timer and why are both `meta.owner` now.
-  reserved 3;
-  TimerStatus status = 4;
-  // Absolute wall-clock moment the timer fires, milliseconds since the UNIX epoch.
-  int64 deadline_millis = 5;
-}
-enum TimerStatus {
-  TIMER_STATUS_UNSPECIFIED = 0;
-  TIMER_STATUS_ACTIVE = 1;
-  TIMER_STATUS_COMPLETED = 2;
-  TIMER_STATUS_CANCELLED = 3;
 }
 
 // The persisted projection row of a Task, mirroring `Task`.

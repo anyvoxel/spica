@@ -18,7 +18,7 @@ use spica_engine::{
     TerminationReason,
 };
 
-/// Branch 0 lingers on a timer and *then* fails, so branch 1's task is already in flight when the
+/// Branch 0 lingers on its deadline and *then* fails, so branch 1's task is already in flight when the
 /// sweep reaches it — a catcher that never routed because nothing live was swept would prove nothing.
 /// Branch 1's task is never claimed by a worker: it is still `Running` when its sibling's failure takes
 /// the `Parallel` down.

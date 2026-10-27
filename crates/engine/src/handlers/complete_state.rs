@@ -9,7 +9,7 @@ use crate::types::error::ExecutionError;
 /// which emits the projection
 /// (`StateCompleting` + `StateCompleted`) and the transition. If the activity owns children (M2
 /// states only), the ed is deferred until they finish — only M1 synchronous/timed states reach here
-/// childless (Wait fires its own timer before `CompleteState`).
+/// childless (a `Wait` is resumed by its deadline fire before `CompleteState`).
 pub struct CompleteStateHandler;
 
 impl Default for CompleteStateHandler {
@@ -96,8 +96,8 @@ impl CompleteStateHandler {
         // race, so the success finish no longer applies — a target past the state this command expects
         // is its own precondition, refused rather than answered, exactly as the sibling handlers'
         // wrong-state guards are. Recovering the activity's *own* terminal is deliberately not this
-        // step's job: the child whose settle stranded it drives that drain (see
-        // `crate::handlers::trigger_timer`), so emitting `StateTerminated` from here would duplicate a
+        // step's job: the child whose settle stranded it drives that drain (see the owner's settle
+        // hook), so emitting `StateTerminated` from here would duplicate a
         // terminal event the settle path already owns.
         if !act.status.is_running() {
             return Err(ProcessingError::Rejected(

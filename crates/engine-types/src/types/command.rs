@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::types::activity::ActivityKind;
+use crate::types::deadline::DeadlineTarget;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::execution::ExecutionKind;
 use crate::types::flow_version::FlowVersionKind;
@@ -10,7 +11,6 @@ use crate::types::meta::{ObjectName, ObjectRef, RawObjectRef};
 use crate::types::task::RetryPolicy;
 use crate::types::task::TaskKind;
 use crate::types::thread::ThreadKind;
-use crate::types::timer::TimerKind;
 use spica_asl::StatePath;
 use spica_machinery::Timestamp;
 
@@ -26,7 +26,7 @@ use spica_machinery::Timestamp;
 pub enum TerminationReason {
     /// A definitive runtime failure (a `Fail` state, a JSONata error prefix, `NoChoiceMatched`).
     Failed { error: ExecutionError },
-    /// The state-machine `TimeoutSeconds` timer fired before the execution completed.
+    /// The element's `TimeoutSeconds` deadline elapsed before it completed.
     TimedOut,
     /// An external request aborted the execution — **or** the entity is being swept: a teardown
     /// reached it because an ancestor is going down, not because it did anything itself.
@@ -206,8 +206,8 @@ pub struct ActivateTask {
     pub arguments: Value,
     pub retry_plan: Vec<RetryPolicy>,
     /// The state's resolved `TimeoutSeconds` instant, if it sets one — carried on the command so the
-    /// born task records it (`Task::deadline`). The timer that bounds the state is armed from the same
-    /// computation, so the field and the timer can never name different moments.
+    /// born task records it (`Task::deadline`). That row field is the deadline the observed
+    /// `TaskActivated` arms, so the recorded instant and the armed one cannot differ.
     #[serde(default)]
     pub deadline: Option<Timestamp>,
 }
@@ -239,8 +239,8 @@ pub struct FailTask {
     pub error: ExecutionError,
 }
 
-/// An operation to perform against an [`Execution`](crate::Execution), [`Activity`](crate::Activity),
-/// or [`Timer`](crate::Timer). Commands are appended to the `LogStream` and
+/// An operation to perform against an [`Execution`](crate::Execution) or an
+/// [`Activity`](crate::Activity). Commands are appended to the `LogStream` and
 /// consumed by the `StreamProcessor`, which dispatches each to the matching handler.
 ///
 /// The model is **Command-driven lifecycle** per entity — three verbs: `Activate` (enter),
@@ -275,8 +275,8 @@ pub enum Command {
     /// Begin executing a state machine. `flow_version` is the [`RawObjectRef`] of the immutable
     /// flow version the execution binds to (its definition); the machine is resolved from Storage at
     /// dispatch time, never carried in the command. Produces `ExecutionCreated` +
-    /// `ActivateState`(start state) + (if `TimeoutSeconds` is set) the run's `TimerActivated`,
-    /// emitted inline.
+    /// `ActivateState`(start state); a `TimeoutSeconds` is recorded on the run's own row, from which
+    /// the observed `ExecutionCreated` arms its deadline.
     CreateExecution(CreateExecution),
 
     /// Fan out one branch of a `Parallel` state as a **child execution** (M3). Produces an
@@ -301,7 +301,7 @@ pub enum Command {
     SpawnThread(SpawnThread),
 
     /// Drive an execution to a successful finish (terminal `Succeed`/`End` reached). Carries the
-    /// output (the terminal state's result). Produces `ExecutionCompleting`, cancels the sm-timer,
+    /// output (the terminal state's result). Produces `ExecutionCompleting`,
     /// and `ExecutionCompleted` once drained. The output itself is already fixed at
     /// `ExecutionCompleting` and is stored directly on the execution row.
     CompleteExecution(CompleteExecution),
@@ -313,7 +313,7 @@ pub enum Command {
     /// container Activity. Address by the thread's `RawObjectRef` (its generated single-use uid),
     /// never a user name.
     ///
-    /// Produces `ThreadCompleting`, cancels the branch's sm-timers, and `ThreadCompleted` once
+    /// Produces `ThreadCompleting` and `ThreadCompleted` once
     /// drained — mirroring `CompleteExecution`'s cascade but resolved against thread storage and
     /// running the inline child-settled reaction back to the owning container.
     CompleteThread(CompleteThread),
@@ -323,7 +323,7 @@ pub enum Command {
     /// **incarnation guard** — when set, only the named execution with exactly this `uid` is
     /// terminated (a stale/wrong incarnation is refused with an `InvalidState` `Reject`), while
     /// `None` addresses by name alone. Produces `ExecutionTerminating`, terminates active children
-    /// (states / timers), and `ExecutionTerminated{reason}` once drained.
+    /// (states / threads), and `ExecutionTerminated{reason}` once drained.
     TerminateExecution(TerminateExecution),
 
     /// Drive a fan-out [`Thread`](crate::Thread) to an abnormal finish with `reason`. Distinct from
@@ -342,8 +342,8 @@ pub enum Command {
     /// Enter a single state (create its `Activity`). Emits `StateActivating` and runs the state's
     /// `activate` step; the state's handler then emits `StateActivated` once it has processed the
     /// input, followed by its command: synchronous states immediately self-emit
-    /// `CompleteState`/`TerminateState`; asynchronous `Wait` arms its resume timer inline (a
-    /// `TimerActivated`).
+    /// `CompleteState`/`TerminateState`; an asynchronous `Wait` records its resume instant on the
+    /// activity and is resumed by the deadline armed from it.
     ///
     /// `execution` and `owner` are distinct: `execution` is the **top-level anchor** of the tree
     /// this state lives in (carried verbatim through every nesting level, so every Activity can
@@ -382,20 +382,21 @@ pub enum Command {
     /// the parent execution.
     TerminateState(TerminateState),
 
-    // ── Timer (fire → cancel) ────────────────────────────────────────────────
-    /// Signal that an armed timer has fired (its deadline passed). The owner named by the timer's own
-    /// slot decides what the fire means to it: a `Wait`'s deadline resumes the state that armed it, a
-    /// `Task`'s terminates it `TimedOut`, and a run's terminates the run. Idempotent if the owner
-    /// already moved past.
-    TriggerTimer { timer: ObjectRef<TimerKind> },
-
-    /// Cancel a pending timer (e.g. the execution's `TimeoutSeconds` once it finishes). Refused with
-    /// an `InvalidState` reject when the timer is already terminal — the scheduler's fire can
-    /// overtake this command — and with `NotFound` when the row is absent entirely.
-    CancelTimer { timer: ObjectRef<TimerKind> },
+    // ── Deadline (a fire on the element whose row records it) ────────────────
+    /// Signal that `target`'s deadline elapsed. The target decides what the fire means to it: a
+    /// `Wait`'s deadline completes the waiting activity, a `Task` state's terminates the activity
+    /// `TimedOut`, and a run's own terminates the run. The `deadline` is the armed instant the
+    /// scheduler held, so the target can refuse a fire against a row that no longer is due then.
+    ///
+    /// Refused (rather than ignored) when the target already finished: every command owes an answer,
+    /// and a stale fire is a fact worth recording.
+    TriggerDeadline {
+        target: DeadlineTarget,
+        deadline: Timestamp,
+    },
 
     // ── Task (external-resource call, Zeebe-style lease lifecycle) ─────────────
-    /// Invoke an external `Task` — the Task-state analogue of inline timer arming. The
+    /// Invoke an external `Task` — the state's fan-out of its call to a worker. The
     /// side-effect handler emits only `Event::TaskActivated`, which makes the task **available**
     /// (`Pending`) for a worker to claim; the physical call is performed by the worker (see
     /// `spica-client`'s `worker` module), not by the engine. `owner` is the invoking activity's
@@ -463,7 +464,7 @@ pub enum Command {
 impl Command {
     /// The correlation id a **client-originated** command carries, if any: the id whose success
     /// `Event` (or `Reject`) tells the awaiting caller this command's outcome. `None` for an internal
-    /// follow-up command — the engine's own `ActivateState`/timer traffic has nobody waiting on it.
+    /// follow-up command — the engine's own `ActivateState` traffic has nobody waiting on it.
     ///
     /// A dispatch that produces no outcome must still answer its caller, and the caller is keyed by
     /// this id (see the `Hook`-driven acknowledgement path), so a refusal the engine decides *around*
@@ -484,8 +485,7 @@ impl Command {
             | Command::TerminateState(_)
             | Command::ActivateTask(_)
             | Command::FailTask(_)
-            | Command::TriggerTimer { .. }
-            | Command::CancelTimer { .. }
+            | Command::TriggerDeadline { .. }
             | Command::CancelTask { .. }
             | Command::ContinueComplete { .. }
             | Command::ContinueTerminate { .. } => None,

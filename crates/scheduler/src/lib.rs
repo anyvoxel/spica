@@ -1,26 +1,27 @@
-//! Timer scheduling, decoupled from the engine's serial dispatch loop.
+//! Deadline scheduling, decoupled from the engine's serial dispatch loop.
 //!
-//! Arming a timer (`TimerActivated`) is recorded in the stream as a durable fact; the actual
-//! *physical* timing is a side effect derived downstream from that fact (via the injectable
-//! `Hook` observer) and driven by the [`Scheduler`] implementation in this crate. Both sides of the
-//! seam live here: the [`Scheduler`]/[`TimerSink`] **contract** ([`contract`]) and its concrete
-//! implementation. Keeping the timer loop separate from dispatch means an external
-//! `TerminateExecution` (or another timer) flows through the stream while a `Wait`'s timer is
-//! pending — the earlier deadlock where an inline `sleep` blocked the whole stream can't recur.
+//! A deadline is recorded on the element that acts on it (a run's `TimeoutSeconds` on its row, a
+//! `Task` state's on the task, a `Wait`'s resume instant on the activity), so the *physical* timing
+//! is a side effect derived downstream from those durable facts (via the injectable `Hook` observer)
+//! and driven by the [`Scheduler`] implementation in this crate. Both sides of the seam live here:
+//! the [`Scheduler`]/[`DeadlineSink`] **contract** ([`contract`]) and its concrete implementation.
+//! Keeping the deadline loop separate from dispatch means an external `TerminateExecution` (or
+//! another deadline) flows through the stream while a `Wait` is pending — the earlier deadlock where
+//! an inline `sleep` blocked the whole stream can't recur.
 //!
 //! This crate depends on `spica-engine` for the value types the contract carries
-//! ([`ObjectRef<TimerKind>`](spica_engine::ObjectRef), [`Timestamp`](spica_engine::Timestamp)) and
+//! ([`DeadlineTarget`](spica_engine::DeadlineTarget), [`Timestamp`](spica_engine::Timestamp)) and
 //! on `spica-machinery` for the [`Clock`](spica_machinery::Clock) its expiry decisions read; the
 //! graph stays acyclic (`scheduler → engine`/`machinery`, never the reverse), and the assembly binary
 //! (`spica-server`) selects a concrete implementation and injects it as `Arc<dyn Scheduler>`.
 //!
-//! The one implementation today is [`InMemoryScheduler`], an in-process loop that fires each timer
-//! once its injected clock reaches the timer's deadline. It is the scheduler's analogue of
+//! The one implementation today is [`InMemoryScheduler`], an in-process loop that fires each
+//! deadline once its injected clock reaches it. It is the scheduler's analogue of
 //! `InMemoryStorage`: sufficient for single-node operation and tests, and a drop-in shape a
 //! distributed / remote timer implementation can later match behind the same traits.
 
 mod contract;
 mod in_memory;
 
-pub use contract::{Scheduler, TimerSink};
+pub use contract::{DeadlineSink, Scheduler};
 pub use in_memory::InMemoryScheduler;
