@@ -10,7 +10,6 @@ use crate::types::id::RequestId;
 use crate::types::meta::ObjectRef;
 use crate::types::task::Task;
 use crate::types::thread::{Thread, ThreadKind};
-use crate::types::timer::Timer;
 use crate::types::variables::Variables;
 
 /// Payload of [`Event::FlowCreated`] — the durable birth record plus the creation's correlation key.
@@ -176,8 +175,8 @@ pub enum Event {
     StateActivating { activity: Activity },
     /// The state finished activating — emitted by the `BoundStateHandler::activate` **only after** it has
     /// processed the state's input. It is the ed of `StateActivating` and precedes the state's own
-    /// follow-up: a `CompleteState`/`TerminateState` sequence or an armed side-effect (e.g. a Wait
-    /// resume timer). Full per-entry chain: `StateActivating → StateActivated → …`.
+    /// follow-up: a `CompleteState`/`TerminateState` sequence or a recorded deadline (a `Wait`'s
+    /// resume instant). Full per-entry chain: `StateActivating → StateActivated → …`.
     ///
     /// Carries the same entity-shaped [`Activity`], now updated to
     /// reflect the activation result (for example, a Task/Parallel processed input or a Map activity
@@ -197,15 +196,6 @@ pub enum Event {
     /// The state terminated after its owner/children drained. Carries the same Activity entity with
     /// `status = Terminated(reason)`.
     StateTerminated { activity: Activity },
-
-    /// A timer was armed and the lifecycle stream records the full event-carried
-    /// [`Timer`] for that moment.
-    TimerActivated { timer: Timer },
-    /// A timer's deadline passed. Carries the same timer entity with `status = Completed`.
-    TimerTriggered { timer: Timer },
-    /// A timer was cancelled before firing. Carries the same timer entity with
-    /// `status = Cancelled`.
-    TimerCancelled { timer: Timer },
 
     /// Variables assigned by an Activity's `Assign`. Carries the full post-assign variable snapshot
     /// for the owning **scope** projection (always a `Thread`) so replay does not need to re-merge
@@ -232,8 +222,8 @@ pub enum Event {
     /// [`Task`] for that moment, with `status = Active` (available for a
     /// worker to claim).
     ///
-    /// Like `TimerActivated`, this is the durable single creation record for a leaf side effect: the
-    /// task owns no children. Applying it makes the task **claimable** (a worker pulls it via
+    /// This is the durable single creation record for a leaf side effect: the task owns no
+    /// children. Applying it makes the task **claimable** (a worker pulls it via
     /// `TaskApi::poll_tasks`); the physical call is performed by the
     /// worker, never the engine.
     TaskActivated { task: Task },

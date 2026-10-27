@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use spica_engine_types::{
     Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
     ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError, StorageTxn, Task,
-    TaskKind, Thread, ThreadKind, Timer, TimerKind, Timestamp, Variables,
+    TaskKind, Thread, ThreadKind, Timestamp, Variables,
 };
 
 /// The in-memory projection state, kept behind a shared interior (see [`InMemoryStorage`]). The
@@ -29,7 +29,6 @@ struct InMemoryDb {
     /// never wipe the scope.
     variables: HashMap<ObjectName, Variables>,
     activities: HashMap<ObjectName, Activity>,
-    timers: HashMap<ObjectName, Timer>,
     tasks: HashMap<ObjectName, Task>,
     /// Flow rows, addressed by the immutable name (the primary key).
     flows: HashMap<FlowName, Flow>,
@@ -128,13 +127,6 @@ impl Storage for InMemoryStorage {
         Ok(self.db().activities.get(reference.name()).cloned())
     }
 
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        Ok(self.db().timers.get(reference.name()).cloned())
-    }
-
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
@@ -178,7 +170,6 @@ impl Storage for InMemoryStorage {
             ObjectKind::Execution => encode_rows(&db.executions),
             ObjectKind::Thread => encode_rows(&db.threads),
             ObjectKind::Activity => encode_rows(&db.activities),
-            ObjectKind::Timer => encode_rows(&db.timers),
             ObjectKind::Task => encode_rows(&db.tasks),
             // Flows are keyed by their immutable `FlowName`, a plain name — convert to an
             // `ObjectName` so the returned key matches the other kinds' addressing shape.
@@ -230,11 +221,6 @@ impl Storage for InMemoryStorage {
 
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.db().activities.insert(act.meta.name.clone(), act);
-        Ok(())
-    }
-
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-        self.db().timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
@@ -344,7 +330,6 @@ struct InMemoryBatch {
     /// never wipe the scope.
     variables: HashMap<ObjectName, Variables>,
     activities: HashMap<ObjectName, Activity>,
-    timers: HashMap<ObjectName, Timer>,
     tasks: HashMap<ObjectName, Task>,
     flows: HashMap<FlowName, Flow>,
     // Version rows, keyed by the version's own `{flow}-{version}` name (see `InMemoryDb`).
@@ -456,22 +441,6 @@ impl StorageTxn for InMemoryTxn {
             .cloned())
     }
 
-    async fn get_timer(
-        &mut self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        if let Some(timer) = self.batch.timers.get(reference.name()) {
-            return Ok(Some(timer.clone()));
-        }
-        Ok(self
-            .inner
-            .lock()
-            .expect("in-memory storage lock poisoned")
-            .timers
-            .get(reference.name())
-            .cloned())
-    }
-
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
@@ -544,11 +513,6 @@ impl StorageTxn for InMemoryTxn {
 
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.batch.activities.insert(act.meta.name.clone(), act);
-        Ok(())
-    }
-
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-        self.batch.timers.insert(timer.meta.name.clone(), timer);
         Ok(())
     }
 
@@ -669,7 +633,6 @@ impl StorageTxn for InMemoryTxn {
         db.threads.extend(batch.threads);
         db.variables.extend(batch.variables);
         db.activities.extend(batch.activities);
-        db.timers.extend(batch.timers);
         db.tasks.extend(batch.tasks);
         db.flows.extend(batch.flows);
         db.flow_versions.extend(batch.flow_versions);
@@ -716,7 +679,7 @@ mod tests {
     use serde_json::{Value, json};
     use spica_engine_types::{
         Execution, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName, RetryState, StatePath,
-        Task, TaskStatus, ThreadOwner, ThreadStatus, TimerKind, Timestamp,
+        Task, TaskStatus, ThreadOwner, ThreadStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
@@ -759,8 +722,9 @@ mod tests {
         }
     }
 
-    /// A distinct timer reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
-    fn timer_ref() -> ObjectRef<TimerKind> {
+    /// A distinct activity reference (`obj-<uid>`), matching `meta.raw_object_ref()` — used as an
+    /// arbitrary child in the edge tests.
+    fn activity_ref() -> ObjectRef<ActivityKind> {
         let uid = ulid::Ulid::new();
         ObjectRef::new(
             PlainName::new("child")
@@ -958,8 +922,8 @@ mod tests {
         let mut store = InMemoryStorage::new();
         let id = test_exec_ref();
         let parent = id.clone().into_raw_object_ref();
-        let child = timer_ref().into_raw_object_ref();
-        let other = timer_ref().into_raw_object_ref();
+        let child = activity_ref().into_raw_object_ref();
+        let other = activity_ref().into_raw_object_ref();
         store
             .put_execution(sample_execution(id.clone()))
             .await

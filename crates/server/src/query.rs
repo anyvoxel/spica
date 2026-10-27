@@ -109,7 +109,6 @@ impl Svc {
                 O::Thread(to_proto_thread(t, &variables))
             }
             QueryObject::Activity(a) => O::Activity(to_proto_activity(a)),
-            QueryObject::Timer(t) => O::Timer(to_proto_timer(t)),
             QueryObject::Task(t) => O::Task(to_proto_task(t)),
         };
         Ok(spica_proto::v1::Object {
@@ -272,20 +271,6 @@ fn to_proto_activity(a: &spica_engine::Activity) -> spica_proto::v1::Activity {
             .as_ref()
             .map(|s| serde_json::to_vec(s).unwrap_or_default())
             .unwrap_or_default(),
-    }
-}
-
-fn to_proto_timer(t: &spica_engine::Timer) -> spica_proto::v1::Timer {
-    use spica_proto::v1::TimerStatus as S;
-    spica_proto::v1::Timer {
-        meta: Some(proto_meta(&t.meta)),
-        execution: Some(proto_ref(&t.execution)),
-        status: match t.status {
-            spica_engine::TimerStatus::Active => S::Active as i32,
-            spica_engine::TimerStatus::Completed => S::Completed as i32,
-            spica_engine::TimerStatus::Cancelled => S::Cancelled as i32,
-        },
-        deadline_millis: t.deadline.as_millis() as i64,
     }
 }
 

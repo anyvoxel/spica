@@ -74,14 +74,13 @@ impl StreamProcessor {
     /// synchronous `Engine::start`, a caller-tail loop drives the StreamProcessor and cancels it once
     /// the target execution reaches a terminal state.
     ///
-    /// Real-time scheduling: armed timers are *facts* (`TimerActivated`), and the actual wall-clock
-    /// delay is a side effect **derived downstream** from that durable fact via the injected
-    /// [`Hook`](crate::Hook) observer — this loop does not know a scheduler. After a batch's commit,
-    /// `after_commit` reports each applied event (including `TimerActivated`, which carries the
-    /// timer's absolute `deadline`); a consumer re-derives the arm/cancel on its scheduler from those
-    /// facts. An expired timer re-enters this loop as an ordinary inbound `TriggerTimer` command
-    /// appended by the consumer's sink — so the engine never pulls fired timers and the log keeps a
-    /// single writer.
+    /// Real-time scheduling: an armed deadline is a *fact* (an `ExecutionCreated`/`TaskActivated`/
+    /// `StateActivated` carrying the owning row's `deadline`), and the actual wall-clock delay is a side
+    /// effect **derived downstream** from that durable fact via the injected [`Hook`](crate::Hook)
+    /// observer — this loop does not know a scheduler. After a batch's commit, `after_commit` reports
+    /// each applied event; a consumer re-derives the arm on its scheduler from those facts. An expired
+    /// deadline re-enters this loop as an ordinary inbound `TriggerDeadline` command appended by the
+    /// consumer's sink — so the engine never pulls fired deadlines and the log keeps a single writer.
     ///
     /// **Resume watermark (single-node model):** `Storage` is a disposable projection rebuilt by
     /// replaying Events (idempotent fold) — Commands are **never re-run** here. To make "which
@@ -253,7 +252,7 @@ impl StreamProcessor {
     ///
     /// - **Command** — dispatch it; append `batch ++ [Noop]` atomically, then commit the work
     ///   transaction the dispatch already eager-folded into (with the batch-end watermark), replay its
-    ///   deferred timer side effects, and (post-commit) drain the correlated acks. Grants and
+    ///   deferred side effects of the batch, and (post-commit) drain the correlated acks. Grants and
     ///   rejections are answered right after the append.
     /// - **Event** — always skipped: `recover_leader` folded any crash residue at startup, and the
     ///   work transaction eagerly applied this batch, so the Event is at/below the watermark.
@@ -491,7 +490,7 @@ impl StreamProcessor {
     }
 
     /// Routes a [`Command`] to its handler, producing the [`Entry`]s it emitted (single-shot,
-    /// dispatch-only — no append, no timer scheduling). This is the **leader** role's capability (a
+    /// dispatch-only — no append, no deadline scheduling). This is the **leader** role's capability (a
     /// follower produces no entries), so it is reached by downcasting the installed role; M1's only
     /// role is [`Leader`], so the cast always succeeds.
     ///
@@ -549,7 +548,7 @@ pub(crate) fn log_reject(reject: &Reject) {
 
 /// Emits a human-friendly tracing line for each [`Event`] as it is applied to Storage — the
 /// detailed execution trace. Milestones (execution started / terminal) are `info`; per-phase
-/// (activating/activated/completing/completed) and timers are `debug`; failures are `warn`.
+/// (activating/activated/completing/completed) is `debug`; failures are `warn`.
 pub(crate) fn log_event(event: &Event) {
     match event {
         Event::FlowCreated(FlowCreated { flow, .. }) => {
@@ -657,30 +656,6 @@ pub(crate) fn log_event(event: &Event) {
                 "state terminated"
             );
         }
-        Event::TimerActivated { timer } => {
-            debug!(
-                timer = %timer.meta.raw_object_ref(),
-                parent = ?timer.meta.owner,
-                deadline_ms = timer.deadline.as_millis(),
-                "timer activated"
-            );
-        }
-        Event::TimerTriggered { timer } => {
-            debug!(
-                timer = %timer.meta.raw_object_ref(),
-                parent = ?timer.meta.owner,
-                deadline_ms = timer.deadline.as_millis(),
-                "timer completed"
-            );
-        }
-        Event::TimerCancelled { timer } => {
-            debug!(
-                timer = %timer.meta.raw_object_ref(),
-                parent = ?timer.meta.owner,
-                deadline_ms = timer.deadline.as_millis(),
-                "timer cancelled"
-            );
-        }
         Event::TaskActivated { task } => {
             debug!(
                 task = %task.meta.raw_object_ref(),
@@ -757,8 +732,7 @@ mod tests {
     use crate::types::reject::RejectionType;
     use crate::types::thread::Thread;
     use crate::{
-        Activity, ActivityKind, Execution, ExecutionKind, Task, TaskKind, ThreadKind, Timer,
-        TimerKind, Variables,
+        Activity, ActivityKind, Execution, ExecutionKind, Task, TaskKind, ThreadKind, Variables,
     };
 
     use super::*;
@@ -910,7 +884,7 @@ mod tests {
         let (ts, ev) = flow_version_event();
         let residue_ref = version_ref(&ev);
         let residual_uid: ulid::Ulid = ulid::Ulid::new();
-        let residual_timer = ObjectRef::new(
+        let residual_task: ObjectRef<TaskKind> = ObjectRef::new(
             PlainName::new("child")
                 .expect("static literal is a valid segment")
                 .generated_from_key(residual_uid.0 as u64),
@@ -918,14 +892,14 @@ mod tests {
         );
         log.append(vec![
             // The residual Command: recovery must skip it — re-dispatching would re-append a duplicate
-            // batch. `CancelTimer` needs only a timer id, so it's the cheapest Command to fabricate.
+            // batch. `CancelTask` needs only a task ref, so it's the cheapest Command to fabricate.
             Entry {
                 stream_id: StreamId::nil(),
                 entry_id: EntryId::nil(),
                 cause_id: None,
                 timestamp: ts,
-                payload: EntryPayload::Command(Command::CancelTimer {
-                    timer: residual_timer,
+                payload: EntryPayload::Command(Command::CancelTask {
+                    task: residual_task,
                 }),
             },
             Entry {
@@ -965,7 +939,7 @@ mod tests {
             .unwrap();
 
         // The residue reached the projection in the one commit at its Noop, and recovery resumes from
-        // that Noop. The `CancelTimer` the batch led with was skipped, not re-dispatched.
+        // that Noop. The `CancelTask` the batch led with was skipped, not re-dispatched.
         assert_eq!(w, 3, "recovery resumes from the last durable Noop");
         assert!(
             committed_version(&storage, &residue_ref).await.is_some(),
@@ -1059,12 +1033,6 @@ mod tests {
         ) -> Result<Option<Activity>, StorageError> {
             self.inner.get_activity(reference).await
         }
-        async fn get_timer(
-            &self,
-            reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<Timer>, StorageError> {
-            self.inner.get_timer(reference).await
-        }
         async fn get_task(
             &self,
             reference: &ObjectRef<TaskKind>,
@@ -1100,9 +1068,6 @@ mod tests {
         }
         async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
-        }
-        async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-            self.inner.put_timer(timer).await
         }
         async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
             self.inner.put_task(task).await
@@ -1213,13 +1178,6 @@ mod tests {
             self.read()?;
             self.inner.get_activity(reference).await
         }
-        async fn get_timer(
-            &mut self,
-            reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<Timer>, StorageError> {
-            self.read()?;
-            self.inner.get_timer(reference).await
-        }
         async fn get_task(
             &mut self,
             reference: &ObjectRef<TaskKind>,
@@ -1277,9 +1235,6 @@ mod tests {
         }
         async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
             self.inner.put_activity(act).await
-        }
-        async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-            self.inner.put_timer(timer).await
         }
         async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
             self.inner.put_task(task).await

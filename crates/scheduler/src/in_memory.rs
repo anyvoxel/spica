@@ -1,11 +1,11 @@
 //! The M1 in-memory implementation of the [`Scheduler`] contract.
 //!
-//! The armed timers are recorded in the stream as durable facts (`TimerActivated`); this runtime is
-//! the *physical* time side effect driven by those facts. It receives `schedule`/`cancel` calls from
-//! the consumer (which re-derives them from the durable timer events), tracks the pending timers as
-//! reference → absolute deadline, and on expiry pushes the resumption command
-//! (`Command::TriggerTimer`) back to the engine through the injected [`TimerSink`] — never writing to
-//! the log itself, so the engine keeps its write/validation boundary.
+//! An armed deadline is recorded on the element that acts on it (the owner row the events carry);
+//! this runtime is the *physical* time side effect driven by those facts. It receives
+//! `schedule`/`cancel` calls from the consumer (which re-derives them from the durable events),
+//! tracks the pending deadlines as target → absolute instant, and on expiry pushes the fire
+//! (`Command::TriggerDeadline`) back to the engine through the injected [`DeadlineSink`] — never
+//! writing to the log itself, so the engine keeps its write/validation boundary.
 //!
 //! Deadlines are compared against an injected [`Clock`] rather than against elapsed real time: the
 //! loop waits out the earliest deadline's *remaining* duration and then re-checks the clock, so with
@@ -15,47 +15,47 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use spica_engine::{ObjectRef, TimerKind, Timestamp};
+use spica_engine::{DeadlineTarget, Timestamp};
 use spica_machinery::{Clock, SystemClock};
 use tokio::sync::mpsc;
 
-use crate::{Scheduler, TimerSink};
+use crate::{DeadlineSink, Scheduler};
 
 /// A message the consumer pushes into the scheduler's inbox.
 enum SchedulerInput {
-    /// Arm a timer to fire `TriggerTimer` at the absolute `deadline`.
+    /// Arm `target` to fire at the absolute `deadline`.
     Schedule {
-        timer: ObjectRef<TimerKind>,
+        target: DeadlineTarget,
         deadline: Timestamp,
     },
-    /// Cancel a previously-armed timer (a `TimerCancelled` event was applied).
-    Cancel { timer: ObjectRef<TimerKind> },
+    /// Cancel a previously-armed `target` (its element finished first).
+    Cancel { target: DeadlineTarget },
     /// The clock was moved; re-evaluate what is due (see [`Scheduler::tick`]). Carried on the inbox
     /// rather than a bare wake primitive so it cannot be lost to a select race — a lost wake would
     /// hang a manually-advanced test.
     Wake,
 }
 
-/// Apply one inbox message to the armed set. A re-arm for the same reference replaces the prior
-/// deadline (defensive; arms are unique).
-fn apply(input: SchedulerInput, armed: &mut HashMap<ObjectRef<TimerKind>, Timestamp>) {
+/// Apply one inbox message to the armed set. A re-arm for the same target replaces the prior
+/// deadline.
+fn apply(input: SchedulerInput, armed: &mut HashMap<DeadlineTarget, Timestamp>) {
     match input {
-        SchedulerInput::Schedule { timer, deadline } => {
-            armed.insert(timer, deadline);
+        SchedulerInput::Schedule { target, deadline } => {
+            armed.insert(target, deadline);
         }
-        SchedulerInput::Cancel { timer } => {
-            armed.remove(&timer);
+        SchedulerInput::Cancel { target } => {
+            armed.remove(&target);
         }
         SchedulerInput::Wake => {}
     }
 }
 
-/// The M1 in-process [`Scheduler`]: a single long-lived loop that arms/cancels timers off an inbox
-/// and, on expiry, calls the consumer-injected [`TimerSink`] to append the `TriggerTimer` resumption
-/// command.
+/// The M1 in-process [`Scheduler`]: a single long-lived loop that arms/cancels deadlines off an
+/// inbox and, on expiry, calls the consumer-injected [`DeadlineSink`] to append the
+/// `TriggerDeadline` command.
 ///
 /// The **push is into the engine**, not a pull the engine performs: the consumer injects an
-/// `Arc<dyn TimerSink>` via [`Scheduler::attach_sink`] after construction, and this impl calls
+/// `Arc<dyn DeadlineSink>` via [`Scheduler::attach_sink`] after construction, and this impl calls
 /// `sink.trigger` on expiry. That keeps the contract a single injectable value
 /// (`Arc<dyn Scheduler>`), exactly the shape the storage split established — and mirrors what a
 /// distributed executor (a service that already owns its own transport) would look like behind the
@@ -64,9 +64,9 @@ pub struct InMemoryScheduler {
     /// Inbox for `schedule`/`cancel`/`wake`, produced by the consumer.
     tx: mpsc::UnboundedSender<SchedulerInput>,
     /// The consumer-injected write entry, called on expiry. `None` until the consumer attaches it —
-    /// which happens *before* any timer is armed, so a fire with no sink is a wiring bug (logged and
-    /// skipped rather than writing to the log raw, which the engine owns).
-    sink: Arc<std::sync::RwLock<Option<Arc<dyn TimerSink>>>>,
+    /// which happens *before* any deadline is armed, so a fire with no sink is a wiring bug (logged
+    /// and skipped rather than writing to the log raw, which the engine owns).
+    sink: Arc<std::sync::RwLock<Option<Arc<dyn DeadlineSink>>>>,
 }
 
 impl InMemoryScheduler {
@@ -80,22 +80,22 @@ impl InMemoryScheduler {
     ///
     /// The loop's lifetime tracks `self`: once this `Arc` is dropped (the engine is done with the
     /// scheduler), the inbox closes and the loop drains and exits — no task leaks past the engine's
-    /// use. The engine injects its [`TimerSink`] afterwards via [`Scheduler::attach_sink`] (called
-    /// from `start()` before any timer is armed). Requires a Tokio runtime context (the loop runs on
+    /// use. The engine injects its [`DeadlineSink`] afterwards via [`Scheduler::attach_sink`]
+    /// (called from `start()` before any deadline is armed). Requires a Tokio runtime context (the loop runs on
     /// `tokio::spawn`), which the engine's [`tokio::main`] / `#[tokio::test]` provides.
     pub fn spawn_with_clock(clock: Arc<dyn Clock>) -> Arc<Self> {
         let (tx, mut input_rx) = mpsc::unbounded_channel();
         // Shared sink slot: one handle stays in `Arc<Self>` for `attach_sink`, a clone goes to the
         // loop so it can call `trigger` on expiry.
-        let sink: Arc<std::sync::RwLock<Option<Arc<dyn TimerSink>>>> =
+        let sink: Arc<std::sync::RwLock<Option<Arc<dyn DeadlineSink>>>> =
             Arc::new(std::sync::RwLock::new(None));
         let loop_sink = Arc::clone(&sink);
         let loop_clock = Arc::clone(&clock);
         tokio::spawn(async move {
-            // Armed timers as reference -> deadline. A flat map rather than a delay queue: the queue
+            // Armed deadlines as target -> instant. A flat map rather than a delay queue: the queue
             // would key its waiting on real elapsed time, which is precisely what an injected clock
-            // must be able to disagree with. The scan below is over a handful of live timers.
-            let mut armed: HashMap<ObjectRef<TimerKind>, Timestamp> = HashMap::new();
+            // must be able to disagree with. The scan below is over a handful of live deadlines.
+            let mut armed: HashMap<DeadlineTarget, Timestamp> = HashMap::new();
             loop {
                 // Drain the inbox first, so a cancel that raced its own deadline is honoured before
                 // the fire below rather than after it.
@@ -115,18 +115,18 @@ impl InMemoryScheduler {
                     break;
                 }
 
-                // Fire everything the clock says is due. Cloning the references out first keeps the
-                // map unborrowed while each trigger is awaited.
+                // Fire everything the clock says is due. Cloning the targets out first keeps the map
+                // unborrowed while each trigger is awaited.
                 let now = loop_clock.now();
-                let due: Vec<ObjectRef<TimerKind>> = armed
+                let due: Vec<DeadlineTarget> = armed
                     .iter()
                     .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(timer, _)| timer.clone())
+                    .map(|(target, _)| target.clone())
                     .collect();
-                for timer in due {
-                    armed.remove(&timer);
-                    // Push the fired timer's resumption into the engine's controlled write entry
-                    // (the engine validates + appends the `TriggerTimer`). Clone the sink out of the
+                for target in due {
+                    let deadline = armed.remove(&target).expect("a due target is armed");
+                    // Push the fire into the engine's controlled write entry (the engine validates +
+                    // appends the `TriggerDeadline`). Clone the sink out of the
                     // lock to drop the guard before awaiting — the engine appends on its own log,
                     // which must not be blocked by this scheduler's read lock.
                     let sink = loop_sink
@@ -134,14 +134,14 @@ impl InMemoryScheduler {
                         .expect("scheduler sink lock is not poisoned")
                         .clone();
                     match sink {
-                        Some(sink) => sink.trigger(&timer).await,
+                        Some(sink) => sink.trigger(&target, deadline).await,
                         None => {
-                            // The engine should always attach a sink before arming a timer; a fire
-                            // here means the wiring is broken. We must NOT write to the log raw (the
-                            // engine owns that path), so this fire is dropped.
+                            // The engine should always attach a sink before arming a deadline; a
+                            // fire here means the wiring is broken. We must NOT write to the log raw
+                            // (the engine owns that path), so this fire is dropped.
                             tracing::warn!(
-                                timer = %timer,
-                                "timer fired before the engine attached a sink; trigger dropped"
+                                target = %target,
+                                "deadline fired before the engine attached a sink; trigger dropped"
                             );
                         }
                     }
@@ -175,7 +175,7 @@ impl InMemoryScheduler {
 
 #[async_trait::async_trait]
 impl Scheduler for InMemoryScheduler {
-    fn attach_sink(&self, sink: Arc<dyn TimerSink>) {
+    fn attach_sink(&self, sink: Arc<dyn DeadlineSink>) {
         // Replacing any prior sink (defensive; the engine attaches exactly once at boot).
         *self
             .sink
@@ -183,16 +183,16 @@ impl Scheduler for InMemoryScheduler {
             .expect("scheduler sink lock is not poisoned") = Some(sink);
     }
 
-    fn schedule(&self, timer: &ObjectRef<TimerKind>, deadline: Timestamp) {
+    fn schedule(&self, target: &DeadlineTarget, deadline: Timestamp) {
         let _ = self.tx.send(SchedulerInput::Schedule {
-            timer: timer.clone(),
+            target: target.clone(),
             deadline,
         });
     }
 
-    fn cancel(&self, timer: &ObjectRef<TimerKind>) {
+    fn cancel(&self, target: &DeadlineTarget) {
         let _ = self.tx.send(SchedulerInput::Cancel {
-            timer: timer.clone(),
+            target: target.clone(),
         });
     }
 
@@ -204,7 +204,7 @@ impl Scheduler for InMemoryScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spica_engine::PlainName;
+    use spica_engine::{ObjectRef, PlainName};
     use spica_machinery::ManualClock;
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -212,14 +212,14 @@ mod tests {
     use tokio::time::sleep;
     use ulid::Ulid;
 
-    fn timer() -> ObjectRef<TimerKind> {
+    fn target() -> DeadlineTarget {
         let uid = Ulid::new();
-        ObjectRef::new(
+        DeadlineTarget::Execution(ObjectRef::new(
             PlainName::new("child")
                 .expect("static literal is a valid segment")
                 .generated_from_key(uid.0 as u64),
             uid,
-        )
+        ))
     }
 
     /// An absolute deadline `from` now by `offset`.
@@ -231,25 +231,26 @@ mod tests {
             .expect("now + a small offset never overflows")
     }
 
-    /// A test [`TimerSink`] that records the triggers it receives into a shared `Vec`, so tests can
-    /// observe the expiry callback without a real log. Mirrors how the engine connects its sink.
+    /// A test [`DeadlineSink`] that records the targets it is asked to fire into a shared `Vec`, so
+    /// tests can observe the expiry callback without a real log. Mirrors how the engine connects its
+    /// sink.
     #[derive(Clone, Default)]
     struct RecordingSink {
-        triggered: Arc<Mutex<Vec<ObjectRef<TimerKind>>>>,
+        triggered: Arc<Mutex<Vec<DeadlineTarget>>>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self::default()
         }
-        /// Snapshot of every timer this sink has been asked to trigger.
-        fn snaps(&self) -> Vec<ObjectRef<TimerKind>> {
+        /// Snapshot of every target this sink has been asked to fire.
+        fn snaps(&self) -> Vec<DeadlineTarget> {
             self.triggered.lock().unwrap().clone()
         }
 
         /// Wait (bounded) for `count` triggers to land — the loop runs on a background task, so a
         /// manual-clock test still has to let that task run before it can assert.
-        async fn wait_for(&self, count: usize) -> Vec<ObjectRef<TimerKind>> {
+        async fn wait_for(&self, count: usize) -> Vec<DeadlineTarget> {
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
                     let fired = self.snaps();
@@ -265,9 +266,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl TimerSink for RecordingSink {
-        async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
-            self.triggered.lock().unwrap().push(timer.clone());
+    impl DeadlineSink for RecordingSink {
+        async fn trigger(&self, target: &DeadlineTarget, _deadline: Timestamp) {
+            self.triggered.lock().unwrap().push(target.clone());
         }
     }
 
@@ -278,39 +279,39 @@ mod tests {
     const NOT_ENOUGH_REAL_TIME: Duration = Duration::from_millis(20);
 
     #[tokio::test]
-    async fn fires_trigger_timer_after_deadline() {
+    async fn fires_a_trigger_deadline_after_the_instant() {
         let s = InMemoryScheduler::spawn();
         let sink = RecordingSink::new();
         s.attach_sink(Arc::new(sink.clone()));
 
-        let timer = timer();
-        s.schedule(&timer, deadline_after(Duration::from_millis(30)));
+        let target = target();
+        s.schedule(&target, deadline_after(Duration::from_millis(30)));
 
         // Poll the recording sink until the trigger lands (it arrives on a background loop).
         let fired = sink.wait_for(1).await;
-        assert_eq!(fired, vec![timer]);
+        assert_eq!(fired, vec![target]);
     }
 
     #[tokio::test]
-    async fn cancel_suppresses_a_pending_timer() {
+    async fn cancel_suppresses_a_pending_deadline() {
         let s = InMemoryScheduler::spawn();
         let sink = RecordingSink::new();
         s.attach_sink(Arc::new(sink.clone()));
 
-        let timer = timer();
-        s.schedule(&timer, deadline_after(Duration::from_millis(15)));
-        s.cancel(&timer);
+        let target = target();
+        s.schedule(&target, deadline_after(Duration::from_millis(15)));
+        s.cancel(&target);
 
         // Allow enough time that a leaked arm would definitely have fired, then assert silence.
         sleep(Duration::from_millis(60)).await;
         assert!(
             sink.snaps().is_empty(),
-            "a cancelled timer must not reach the sink"
+            "a cancelled deadline must not reach the sink"
         );
     }
 
     #[tokio::test]
-    async fn a_clock_advance_fires_a_timer_without_waiting_for_it() {
+    async fn a_clock_advance_fires_a_deadline_without_waiting_for_it() {
         // The whole point of the injected clock: a 60-second deadline fires after a virtual advance,
         // in no real time at all.
         let clock = Arc::new(ManualClock::new(Timestamp::from_millis(1_000)));
@@ -318,26 +319,26 @@ mod tests {
         let sink = RecordingSink::new();
         s.attach_sink(Arc::new(sink.clone()));
 
-        let timer = timer();
+        let target = target();
         let deadline = clock
             .now()
             .checked_add(Duration::from_secs(60))
             .expect("a minute from the epoch never overflows");
-        s.schedule(&timer, deadline);
+        s.schedule(&target, deadline);
 
-        // Not due yet: half the wait passes, and the timer stays armed.
+        // Not due yet: half the wait passes, and the deadline stays armed.
         clock.advance(Duration::from_secs(30));
         s.tick();
         sleep(NOT_ENOUGH_REAL_TIME).await;
         assert!(
             sink.snaps().is_empty(),
-            "a timer must not fire before the clock reaches its deadline"
+            "a deadline must not fire before the clock reaches it"
         );
 
         // The rest of the wait, in one step, with no real waiting.
         clock.advance(Duration::from_secs(30));
         s.tick();
-        assert_eq!(sink.wait_for(1).await, vec![timer]);
+        assert_eq!(sink.wait_for(1).await, vec![target]);
     }
 
     #[tokio::test]
@@ -347,7 +348,7 @@ mod tests {
         let sink = RecordingSink::new();
         s.attach_sink(Arc::new(sink.clone()));
 
-        let (first, second, beyond) = (timer(), timer(), timer());
+        let (first, second, beyond) = (target(), target(), target());
         let at = |secs: u64| {
             clock
                 .now()
@@ -361,7 +362,7 @@ mod tests {
         // Jump past two of the three: both fire, and the third stays armed.
         clock.advance(Duration::from_secs(30));
         s.tick();
-        let fired: HashSet<ObjectRef<TimerKind>> = sink.wait_for(2).await.into_iter().collect();
+        let fired: HashSet<DeadlineTarget> = sink.wait_for(2).await.into_iter().collect();
         assert_eq!(
             fired,
             HashSet::from([first, second]),
@@ -383,15 +384,15 @@ mod tests {
         let sink = RecordingSink::new();
         s.attach_sink(Arc::new(sink.clone()));
 
-        let timer = timer();
+        let target = target();
         let deadline = clock
             .now()
             .checked_add(Duration::from_secs(60))
             .expect("a minute from the epoch never overflows");
-        s.schedule(&timer, deadline);
+        s.schedule(&target, deadline);
         // Cancelled in the same instant the clock reaches the deadline: the cancel was queued first,
         // so the loop must honour it instead of firing.
-        s.cancel(&timer);
+        s.cancel(&target);
         clock.advance(Duration::from_secs(60));
         s.tick();
 

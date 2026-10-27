@@ -65,7 +65,7 @@ impl ThreadCreatedApplier {
                         .branches
                         .insert(thread.index, thread.meta.object_ref());
                 }
-                // A `Wait` owns no fan-out — its only child is its resume timer — so no thread is
+                // A `Wait` owns no fan-out — its resume instant is a field on its own row — so no thread is
                 // ever spawned under one and there is nothing to fold. Leaving the row untouched
                 // keeps this projection free of a write for an owner it can never apply to.
                 Some(ActivityState::Wait(_)) => return Ok(()),

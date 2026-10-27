@@ -32,8 +32,8 @@ use mockall::mock;
 use spica_engine_types::storage::ReadonlyStorageTxn;
 use spica_engine_types::{
     Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
-    ObjectRef, RawObjectRef, StorageError, Task, TaskKind, Thread, ThreadKind, Timer, TimerKind,
-    Timestamp, Variables,
+    ObjectRef, RawObjectRef, StorageError, Task, TaskKind, Thread, ThreadKind, Timestamp,
+    Variables,
 };
 
 pub mod assertions;
@@ -62,10 +62,6 @@ mock! {
             &self,
             reference: &ObjectRef<ActivityKind>,
         ) -> Result<Option<Activity>, StorageError>;
-        async fn get_timer(
-            &self,
-            reference: &ObjectRef<TimerKind>,
-        ) -> Result<Option<Timer>, StorageError>;
         async fn get_task(
             &self,
             reference: &ObjectRef<TaskKind>,

@@ -23,17 +23,17 @@ use spica_client::worker::{
 };
 use spica_engine::{
     ActivatedTask, ActivityKind, ClaimTasks, Command, CompleteTask, CreateExecution, CreateFlow,
-    Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution, ExecutionCreated,
-    ExecutionError, ExecutionKind, ExecutionStatus, FailTask, FlowKind, FlowName,
+    DeadlineTarget, Engine, EngineBuilder, Entry, EntryId, EntryPayload, Event, Execution,
+    ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, FailTask, FlowKind, FlowName,
     FlowVersionCreated, FlowVersionKind, Hook, LogStream, NoOwner, ObjectKind, ObjectKindMarker,
     ObjectMeta, ObjectMetaBuilder, ObjectName, ObjectRef, PlainName, RawObjectRef, Reject,
     RequestId, RuntimeError, StatePath, StreamId, Task, TaskApi, TaskCompleted, TaskKind,
-    TasksClaimed, ThreadKind, ThreadOwner, TimerKind, TimerOwner, Timestamp, Variables,
+    TasksClaimed, ThreadKind, ThreadOwner, Timestamp, Variables,
 };
 use spica_machinery::{
     Clock, CountingIdGenerator, IdGenerator, ManualClock, SystemClock, SystemIdGenerator,
 };
-use spica_scheduler::{InMemoryScheduler, Scheduler, TimerSink};
+use spica_scheduler::{DeadlineSink, InMemoryScheduler, Scheduler};
 use spica_storage::InMemoryStorage;
 use tokio::sync::{Mutex, oneshot};
 use tokio_stream::Stream;
@@ -45,8 +45,7 @@ pub use spica_testing::assertions::{
     Stamps, assert_envelope, assert_typed_chain, payload_kind, payload_values,
 };
 pub use spica_testing::fixtures::{
-    FIRST_REQUEST_ID, VIRTUAL_EPOCH_MILLIS, activity_owner, activity_owner_of,
-    activity_timer_owner, activity_timer_owner_of, epoch, execution_timer_owner_of,
+    FIRST_REQUEST_ID, VIRTUAL_EPOCH_MILLIS, activity_owner, activity_owner_of, epoch,
     fanout_thread_owner, fanout_thread_owner_of, flat_ref_to, flow_name, flow_owner, indexed_refs,
     meta, meta_root, meta_span, meta_span_root, name, path, pointer, ref_to, request,
     root_thread_owner, root_thread_owner_of, stamp, thread_owner, thread_owner_of, uid, vars,
@@ -148,7 +147,7 @@ impl WorkerTaskApi for EngineTaskApi {
 /// no longer fabricates backends (it takes caller-supplied trait objects; see
 /// [`EngineBuilder::with_backends`](spica_engine::EngineBuilder::with_backends)), so the in-memory
 /// log/store pair is assembled here from the seam crates and injected. A scheduler is **not** part of
-/// `EngineBuilder` anymore — the consumer owns timer scheduling (see [`LocalClient::start`], which
+/// `EngineBuilder` anymore — the consumer owns deadline scheduling (see [`LocalClient::start`], which
 /// builds the scheduler + sink around the booted engine).
 pub fn in_memory_builder() -> EngineBuilder {
     EngineBuilder::with_backends(
@@ -255,10 +254,11 @@ const LIFECYCLE_EXECUTION: &str = "lifecycle_execution";
 /// before it wrote. A case that acts once is unaffected: its window opens at the run's first entry.
 #[derive(Clone, Copy, Debug)]
 pub enum Signal {
-    /// A `TimerActivated` in the window: the run has armed a deadline against the reading it held at
-    /// the time. Moving the clock before the arm lands would make the deadline read the moved
-    /// reading, so the case would pin an expiry the engine never decided.
-    TimerArmed,
+    /// A `TaskActivated` in the window that carries a `deadline` — or a `StateActivated` that carries
+    /// a `Wait`'s resume instant — the run has armed a deadline against the reading it held at the
+    /// time. Moving the clock before the arm lands would make the deadline read the moved reading, so
+    /// the case would pin an expiry the engine never decided.
+    DeadlineArmed,
     /// A `TaskActivated` in the window: the `Task` state has minted the task an external worker is
     /// meant to settle, so a call naming it addresses something that exists.
     TaskArmed,
@@ -266,9 +266,9 @@ pub enum Signal {
     /// is the only state from which a settle is accepted.
     TasksClaimed,
     /// A `TaskFailed` in the window that put the task **back in the queue** — one whose retrier matched,
-    /// leaving a `next_available_at` gate. That gate is an instant, not a deadline recorded as a timer
-    /// the run would wake on, so the case has to move the clock onto it itself: this signal is what says
-    /// the instant exists.
+    /// leaving a `next_available_at` gate. That gate is an instant, not a deadline the run would wake
+    /// on, so the case has to move the clock onto it itself: this signal is what says the instant
+    /// exists.
     TaskRequeued,
     /// **No record** gates this act. Nothing is awaited: the act rests on what the previous one left
     /// behind, which is the run's own state rather than a new entry — a clock instant the run has
@@ -282,8 +282,18 @@ impl Signal {
     fn holds(&self, payload: &EntryPayload) -> bool {
         match self {
             Self::None => true,
-            Self::TimerArmed => {
-                matches!(payload, EntryPayload::Event(Event::TimerActivated { .. }))
+            Self::DeadlineArmed => {
+                matches!(
+                    payload,
+                    EntryPayload::Event(Event::TaskActivated { task }) if task.deadline.is_some()
+                ) || matches!(
+                    payload,
+                    EntryPayload::Event(Event::StateActivated { activity })
+                        if matches!(
+                            activity.activity_state,
+                            Some(spica_engine::ActivityState::Wait(_))
+                        )
+                )
             }
             Self::TaskArmed => matches!(payload, EntryPayload::Event(Event::TaskActivated { .. })),
             Self::TasksClaimed => matches!(payload, EntryPayload::Event(Event::TasksClaimed(_))),
@@ -299,7 +309,7 @@ impl Signal {
     fn describe(&self) -> &'static str {
         match self {
             Self::None => "nothing (the act is gated on the run's own state)",
-            Self::TimerArmed => "a timer to be armed",
+            Self::DeadlineArmed => "a deadline to be armed",
             Self::TaskArmed => "a task to be minted",
             Self::TasksClaimed => "a task to be leased",
             Self::TaskRequeued => "a failed attempt to be re-queued",
@@ -475,7 +485,7 @@ pub struct TypedCase {
 ///
 /// The virtual clock is what makes the typed form assertable: `created_at`, `updated_at` and every
 /// deadline are read off the injected clock, so under the wall clock they are unknowable and a literal
-/// could only mask them. Fixed at [`VIRTUAL_EPOCH_MILLIS`], every stamp of a case that arms no timer is
+/// could only mask them. Fixed at [`VIRTUAL_EPOCH_MILLIS`], every stamp of a case that arms no deadline is
 /// that one instant, and the identities are the injected counter's in mint order; a case that does arm
 /// one carries the move that fires it in [`TypedCase::acts`], after which its stamps are that
 /// instant plus the move. A deadline in the chain is then an absolute instant rather than "some time
@@ -577,7 +587,7 @@ pub async fn run_raw_entries(definition: &str, input: &str) -> Vec<Entry> {
 pub(crate) const NOT_ENOUGH_REAL_TIME: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Wait (bounded) for `what` to become true of the run's log — how a suite observes a step of a run no
-/// caller is awaiting, e.g. that a fired timer's resumption has been appended. The bound is a failure
+/// caller is awaiting, e.g. that a fired deadline's resumption has been appended. The bound is a failure
 /// detector, not a delay: the wait ends the moment the step lands, and a step that never lands reports
 /// `what` rather than timing out silently. Real time is the right budget here because what it waits on
 /// is the engine's own dispatch making progress, not the run's clock.
@@ -612,7 +622,7 @@ pub(crate) async fn await_log_where<T>(
     }
 }
 
-/// Whether the log holds a record of `kind` — the [`payload_kind`] name, e.g. `"TimerTriggered"`.
+/// Whether the log holds a record of `kind` — the [`payload_kind`] name, e.g. `"TaskActivated"`.
 pub(crate) fn has_record(log: &spica_engine::InMemoryLogStream<EntryPayload>, kind: &str) -> bool {
     log.entries().iter().any(|entry| {
         !matches!(entry.payload, EntryPayload::Noop) && payload_kind(&entry.payload) == kind
@@ -813,7 +823,7 @@ pub fn anonymous_name() -> FlowName {
 
 /// A throwaway, collision-free execution name for tests that don't care about the (now required)
 /// user-supplied execution name. Uses the plain (**user**) form — a `CreateExecution` execution is
-/// user-named by contract, and a generated child (e.g. the run's `TimeoutSeconds` timer) derives its own
+/// user-named by contract, and a generated child (e.g. the run's root thread) derives its own
 /// name from this *plain* base, so it must not itself be generated. The random `_<ulid>` tail keeps
 /// it collision-free without `-`.
 pub fn execution_name() -> ObjectName {
@@ -942,9 +952,8 @@ impl Hook for AckHook {
 }
 
 /// The composite [`Hook`] a [`LocalClient`] injects: routes the acknowledgement facts to its
-/// [`AckHook`], and re-derives physical timer arms/cancels from the durable
-/// `TimerActivated`/`TimerCancelled` events — the consumer-owned side of timer scheduling (see
-/// [`LocalClient::start`]).
+/// [`AckHook`], and re-derives physical deadline arms/cancels from the durable events that record one
+/// — the consumer-owned side of deadline scheduling (see [`LocalClient::start`]).
 struct CompositeHook {
     ack: Arc<AckHook>,
     scheduler: Arc<dyn Scheduler>,
@@ -954,13 +963,39 @@ struct CompositeHook {
 impl Hook for CompositeHook {
     async fn on_event_applied(&self, event: &Event) {
         match event {
-            Event::TimerActivated { timer } => {
-                // The durable event carries the timer's absolute deadline; re-arm the physical
-                // schedule from that persisted moment.
-                self.scheduler
-                    .schedule(&timer.meta.object_ref(), timer.deadline);
+            Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
+                if let Some(deadline) = execution.deadline {
+                    self.scheduler.schedule(
+                        &DeadlineTarget::Execution(execution.meta.object_ref()),
+                        deadline,
+                    );
+                }
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.object_ref()),
+            Event::TaskActivated { task } => {
+                // A task's `TimeoutSeconds` bounds the state that invoked it, so the owning activity
+                // is the element the fire acts on.
+                if let Some(deadline) = task.deadline {
+                    self.scheduler
+                        .schedule(&DeadlineTarget::Activity(task.meta.owner.clone()), deadline);
+                }
+            }
+            Event::StateActivated { activity } => {
+                // A `Wait`'s resume instant is its activation product; a fire resumes the state.
+                if let Some(spica_engine::ActivityState::Wait(wait)) = &activity.activity_state {
+                    self.scheduler.schedule(
+                        &DeadlineTarget::Activity(activity.meta.object_ref()),
+                        wait.resume_at,
+                    );
+                }
+            }
+            Event::StateCompleted { activity } | Event::StateTerminated { activity } => {
+                self.scheduler
+                    .cancel(&DeadlineTarget::Activity(activity.meta.object_ref()));
+            }
+            Event::ExecutionCompleted { execution } | Event::ExecutionTerminated { execution } => {
+                self.scheduler
+                    .cancel(&DeadlineTarget::Execution(execution.meta.object_ref()));
+            }
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -971,19 +1006,19 @@ impl Hook for CompositeHook {
     }
 }
 
-/// The [`TimerSink`] a [`LocalClient`] attaches to its scheduler: routes an expired timer's
-/// `TriggerTimer` back into the engine's append path. Holds the engine behind a **weak** slot filled
+/// The [`DeadlineSink`] a [`LocalClient`] attaches to its scheduler: routes an expired deadline's
+/// `TriggerDeadline` back into the engine's append path. Holds the engine behind a **weak** slot filled
 /// at boot (see [`LocalClient::start`]): the slot is owned by the observer chain the engine itself
 /// holds (hook → scheduler → sink), so a strong reference there would keep the engine alive forever
 /// and defeat `LocalClient::stop`'s `Arc::try_unwrap`. A fire happens only while the engine is alive
 /// (post-start), so the weak upgrade succeeds right up to teardown.
-struct EngineTimerSink {
+struct EngineDeadlineSink {
     engine: Arc<Mutex<Option<std::sync::Weak<Engine>>>>,
 }
 
 #[async_trait]
-impl TimerSink for EngineTimerSink {
-    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
+impl DeadlineSink for EngineDeadlineSink {
+    async fn trigger(&self, target: &DeadlineTarget, deadline: Timestamp) {
         let Some(engine) = self
             .engine
             .lock()
@@ -995,8 +1030,9 @@ impl TimerSink for EngineTimerSink {
         };
         // Fire-and-forget: a dropped append (engine shutting down) is not this consumer's fault.
         let _ = engine
-            .append_command(Command::TriggerTimer {
-                timer: timer.clone(),
+            .append_command(Command::TriggerDeadline {
+                target: target.clone(),
+                deadline,
             })
             .await;
     }
@@ -1015,7 +1051,7 @@ pub(crate) struct LocalClient {
     /// sees one time on both sides of the seam.
     clock: Arc<dyn Clock>,
     /// The scheduler booted alongside the engine, kept so a caller that moves the clock itself can
-    /// re-evaluate the armed timers against it (see [`VirtualClient`]).
+    /// re-evaluate the armed deadlines against it (see [`VirtualClient`]).
     scheduler: Arc<dyn Scheduler>,
     /// The caller-side id source behind [`Self::request_id`] — ack correlation is the caller's to
     /// name, so reproducibility is only complete if this client mints predictably too.
@@ -1034,10 +1070,10 @@ impl std::ops::Deref for LocalClient {
 impl LocalClient {
     /// Inject the composite observer and boot the engine, then wrap it.
     ///
-    /// Timer scheduling is **consumer-owned** (the engine no longer holds a scheduler): this boots
-    /// an [`InMemoryScheduler`], injects a comosite [`Hook`] that (a) routes the `AckHook` facts and
-    /// (b) re-derives physical timer arms from durable `TimerActivated`/`TimerCancelled` events, and
-    /// attaches a [`TimerSink`] that routes an expired timer's `TriggerTimer` back into the engine's
+    /// Deadline scheduling is **consumer-owned** (the engine no longer holds a scheduler): this boots
+    /// an [`InMemoryScheduler`], injects a composite [`Hook`] that (a) routes the `AckHook` facts and
+    /// (b) re-derives physical deadline arms from the durable events that record one, and attaches a
+    /// [`DeadlineSink`] that routes an expired deadline's `TriggerDeadline` back into the engine's
     /// append path.
     pub(crate) async fn start(builder: EngineBuilder) -> Result<Self, ExecutionError> {
         Self::start_with_seams(builder, Arc::new(SystemClock), Arc::new(SystemIdGenerator)).await
@@ -1060,9 +1096,9 @@ impl LocalClient {
         // The sink can only append once the engine exists, but the engine needs the hook at boot; a
         // fire happens strictly post-start, so a slot filled here after boot closes the gap. Held as
         // a `Weak` to keep the observer chain (hook → scheduler → sink) from keeping the engine alive
-        // (see `EngineTimerSink`).
+        // (see `EngineDeadlineSink`).
         let engine_slot: Arc<Mutex<Option<std::sync::Weak<Engine>>>> = Arc::new(Mutex::new(None));
-        scheduler.attach_sink(Arc::new(EngineTimerSink {
+        scheduler.attach_sink(Arc::new(EngineDeadlineSink {
             engine: engine_slot.clone(),
         }));
         let hook = CompositeHook {
@@ -1097,7 +1133,7 @@ impl LocalClient {
         RequestId::from(self.requests.next_ulid())
     }
 
-    /// Re-evaluate the booted scheduler's armed timers against the clock's current reading — a no-op
+    /// Re-evaluate the booted scheduler's armed deadlines against the clock's current reading — a no-op
     /// under the wall clock, and the second half of a manual advance (see [`VirtualClient::advance`]).
     pub(crate) fn tick(&self) {
         self.scheduler.tick();
@@ -1245,7 +1281,7 @@ impl LocalClient {
 }
 
 /// A [`LocalClient`] whose time belongs to the test: one [`ManualClock`] is injected into the engine
-/// (every stamp it writes, every deadline it decides) *and* into the scheduler its timers expire on, so
+/// (every stamp it writes, every deadline it decides) *and* into the scheduler its deadlines expire on, so
 /// moving it moves the whole run — a `Wait` of 60 s, a task `TimeoutSeconds`, a lease lapse and a retry
 /// backoff all reach their boundary in no real time and with no slack.
 ///

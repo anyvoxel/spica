@@ -45,7 +45,7 @@ use rocksdb::{Direction, IteratorMode, OptimisticTransactionDB, Transaction};
 use spica_engine_types::{
     Activity, ActivityKind, Execution, ExecutionKind, Flow, FlowName, FlowVersion, FlowVersionKind,
     ObjectKind, ObjectName, ObjectRef, RawObjectRef, Storage, StorageError, StorageTxn, Task,
-    TaskKind, Thread, ThreadKind, Timer, TimerKind, Timestamp, Variables,
+    TaskKind, Thread, ThreadKind, Timestamp, Variables,
 };
 
 use crate::{KeyBuilder, Kind, Scope};
@@ -156,13 +156,6 @@ impl Storage for RocksStorage {
         self.get_row(self.keys.activity(reference))
     }
 
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        self.get_row(self.keys.timer(reference))
-    }
-
     async fn get_task(
         &self,
         reference: &ObjectRef<TaskKind>,
@@ -271,10 +264,6 @@ impl Storage for RocksStorage {
 
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
-    }
-
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
     async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
@@ -474,13 +463,6 @@ impl StorageTxn for RocksTxn {
         self.get_row(self.keys.activity(reference))
     }
 
-    async fn get_timer(
-        &mut self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        self.get_row(self.keys.timer(reference))
-    }
-
     async fn get_task(
         &mut self,
         reference: &ObjectRef<TaskKind>,
@@ -567,10 +549,6 @@ impl StorageTxn for RocksTxn {
 
     async fn put_activity(&mut self, act: Activity) -> Result<(), StorageError> {
         self.put_row(self.keys.activity(&act.meta.object_ref()), &act)
-    }
-
-    async fn put_timer(&mut self, timer: Timer) -> Result<(), StorageError> {
-        self.put_row(self.keys.timer(&timer.meta.object_ref()), &timer)
     }
 
     async fn put_task(&mut self, task: Task) -> Result<(), StorageError> {
@@ -670,8 +648,7 @@ mod tests {
     use serde_json::{Value, json};
     use spica_engine_types::{
         Execution, ExecutionKind, ExecutionStatus, HasRawObjectRef, ObjectRef, PlainName,
-        RetryState, StatePath, Task, TaskStatus, ThreadOwner, ThreadStatus, Timer, TimerOwner,
-        TimerStatus, Timestamp,
+        RetryState, StatePath, Task, TaskStatus, ThreadOwner, ThreadStatus, Timestamp,
     };
 
     /// A distinct execution reference (`obj-<uid>`), matching `meta.raw_object_ref()`.
@@ -714,8 +691,9 @@ mod tests {
         }
     }
 
-    /// A distinct timer reference (`child-<uid>`), matching a `meta.raw_object_ref()`.
-    fn timer_ref() -> ObjectRef<TimerKind> {
+    /// A distinct activity reference (`child-<uid>`), matching a `meta.raw_object_ref()` — an
+    /// arbitrary child in the edge tests.
+    fn activity_ref() -> ObjectRef<ActivityKind> {
         let uid = ulid::Ulid::new();
         ObjectRef::new(
             PlainName::new("child")
@@ -782,7 +760,7 @@ mod tests {
     async fn add_and_remove_child_tracks_ownership_edges() {
         let path = temp_path("children");
         let id = test_exec_ref();
-        let child = timer_ref();
+        let child = activity_ref();
         {
             let mut store = RocksStorage::open(&path).unwrap();
             store
@@ -846,14 +824,14 @@ mod tests {
     /// The edge table is keyed by `(parent_kind, parent_name)`, so two parents that merely *share a
     /// name* across kinds hold different child sets — the property `child_edge`'s kind-in-key note
     /// pins. A leaf kind is also a legal parent now: nothing about the edge space is node-specific,
-    /// which is what lets a Task own its timeout timer.
+    /// which is what lets a Task own the deadline it records.
     #[tokio::test]
     async fn edge_sets_are_per_parent_kind_and_admit_any_parent() {
         let path = temp_path("edges-kinds");
         let name = PlainName::new("order").unwrap().generated_from_key(7);
         let exec = ObjectRef::<ExecutionKind>::new(name.clone(), ulid::Ulid::new());
         let thread = ObjectRef::<ThreadKind>::new(name, exec.uid());
-        let timer = timer_ref();
+        let child_ref = activity_ref();
         {
             let mut store = RocksStorage::open(&path).unwrap();
             store
@@ -861,7 +839,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let child = timer.clone().into_raw_object_ref();
+            let child = child_ref.clone().into_raw_object_ref();
             store
                 .add_child(exec.clone().into_raw_object_ref(), child.clone())
                 .await
@@ -894,14 +872,14 @@ mod tests {
                 HashSet::from([child.clone()])
             );
             // A leaf kind is a legal parent too — the edge space is not node-specific, which is what
-            // lets a Task own its timeout timer.
+            // lets a leaf own its own children.
             store
-                .add_child(timer.clone().into_raw_object_ref(), child.clone())
+                .add_child(child_ref.clone().into_raw_object_ref(), child.clone())
                 .await
                 .unwrap();
             assert_eq!(
                 store
-                    .get_children(timer.into_raw_object_ref())
+                    .get_children(child_ref.into_raw_object_ref())
                     .await
                     .unwrap(),
                 HashSet::from([child])
@@ -917,7 +895,7 @@ mod tests {
     async fn a_parent_write_and_its_edges_do_not_clobber_each_other() {
         let path = temp_path("edges-clobber");
         let id = test_exec_ref();
-        let child = timer_ref();
+        let child = activity_ref();
         {
             let mut store = RocksStorage::open(&path).unwrap();
             let mut row = sample_execution(id.clone());
@@ -945,7 +923,7 @@ mod tests {
             store
                 .add_child(
                     id.clone().into_raw_object_ref(),
-                    timer_ref().into_raw_object_ref(),
+                    activity_ref().into_raw_object_ref(),
                 )
                 .await
                 .unwrap();
@@ -1019,34 +997,21 @@ mod tests {
                 .put_execution(sample_execution(id.clone()))
                 .await
                 .unwrap();
-            // A timer under the same numeric-ish space is a distinct key namespace.
+            // A task under the same numeric-ish space is a distinct key namespace.
             let uid: ulid::Ulid = ulid::Ulid::new();
-            let timer_ref = ObjectRef::<TimerKind>::new(
-                PlainName::new("child")
-                    .unwrap()
-                    .generated_from_key(uid.0 as u64),
-                uid,
-            );
-            let t = Timer {
-                execution: id.clone(),
-                status: TimerStatus::Active,
-                deadline: Timestamp::from_millis(0),
-                meta: spica_engine_types::ObjectMeta::builder(uid)
-                    .timestamps(Timestamp::from_millis(0), Timestamp::from_millis(0))
-                    .with_owner(TimerOwner::Execution(id.clone())),
-            };
-            store.put_timer(t.clone()).await.unwrap();
+            let task = sample_task(uid, "r", TaskStatus::Pending, None, None, None);
+            store.put_task(task.clone()).await.unwrap();
             assert_eq!(
                 store
-                    .get_timer(&timer_ref)
+                    .get_task(&task.meta.object_ref())
                     .await
                     .unwrap()
                     .unwrap()
                     .meta
                     .object_ref(),
-                timer_ref
+                task.meta.object_ref()
             );
-            // the execution row is untouched by writing a timer
+            // the execution row is untouched by writing a task
             assert_eq!(
                 store
                     .get_execution(&id)

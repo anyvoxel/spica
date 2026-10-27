@@ -13,9 +13,10 @@
 //! [`VirtualClient`](common::VirtualClient)): a 60-second `Wait` and a 30-second timeout are both
 //! reached in no real time at all, and reached *exactly*. The clock is moved to one second short of a
 //! deadline (and the chain asserted silent for it), then onto it (and asserted to fire), with a
-//! `TimerActivated`'s `deadline` pinned as an **absolute instant** — so the arithmetic the engine did is
-//! asserted, not merely that something fired. A deadline with no timer behind it reads the same way: a
-//! claim's delivery lease is crossed by moving the clock and observing the poll that reclaims it. The one
+//! deadline-carrying row pinned as an **absolute instant** — so the arithmetic the engine did is
+//! asserted, not merely that something fired. A deadline with no scheduler behind it reads the same
+//! way: a claim's delivery lease is crossed by moving the clock and observing the poll that reclaims
+//! it. The one
 //! real pause those cases take is
 //! [`NOT_ENOUGH_REAL_TIME`], and it is deliberately not a wait on the deadline: it is room for the
 //! engine's dispatch to make progress in, so that an implementation still keyed on elapsed real time
@@ -85,28 +86,26 @@ async fn ticking_under_the_wall_clock_appends_nothing() {
     client.stop().await;
 }
 
-/// A run's `deadline` is the run's own answer to "when is it due"; its `TimeoutSeconds` timer is what
-/// actually enforces it. Both are written from one computation when the run is created, so the two
-/// carriers must name the *same* instant — a reader that found them disagreeing would have to trust one
-/// of them arbitrarily. The clock is then moved onto that instant, so the value asserted is the one that
-/// really fired rather than one that merely looks right.
+/// A run's `deadline` is the run's own answer to "when is it due", and it is recorded once — on the
+/// row its birth event folds. The clock is then moved onto that instant, so the value asserted is the
+/// one that really fired rather than one that merely looks right.
 #[tokio::test]
-async fn a_runs_deadline_is_the_instant_its_timeout_timer_carries() {
+async fn a_runs_deadline_is_recorded_on_its_birth() {
     let definition = r#"{
         "StartAt": "W",
         "TimeoutSeconds": 30,
         "States": { "W": { "Type": "Wait", "Seconds": 600, "End": true } }
     }"#;
     let (client, log, execution) = common::virtual_run(definition, "{}").await;
-    // The timer must be armed *and* handed to the scheduler before the clock passes it: a late arm
-    // would still fire (its deadline is already reached) and the instant compared below would then be
-    // the run's own only by accident.
+    // The run's birth must be applied (and so handed to the scheduler) before the clock passes the
+    // deadline: a late arm would still fire, and the instant compared below would then be the run's
+    // own only by accident.
     await_log(&log, "the execution timeout to be armed", |entries| {
         entries.iter().any(|entry| {
             matches!(
                 &entry.payload,
-                EntryPayload::Event(Event::TimerActivated { timer })
-                    if matches!(timer.meta.owner, spica_engine::TimerOwner::Execution(_))
+                EntryPayload::Event(Event::ExecutionCreated(created))
+                    if created.execution.deadline.is_some()
             )
         })
     })
@@ -135,22 +134,6 @@ async fn a_runs_deadline_is_the_instant_its_timeout_timer_carries() {
             _ => None,
         })
         .expect("the run is created");
-    let armed = entries
-        .iter()
-        .find_map(|entry| match &entry.payload {
-            EntryPayload::Event(Event::TimerActivated { timer })
-                if matches!(timer.meta.owner, spica_engine::TimerOwner::Execution(_)) =>
-            {
-                Some(timer.deadline)
-            }
-            _ => None,
-        })
-        .expect("the execution timeout is armed");
     assert_eq!(born, Some(deadline), "the run's own deadline");
-    assert_eq!(
-        born,
-        Some(armed),
-        "the deadline and the timer that enforces it are one instant"
-    );
     client.stop().await;
 }

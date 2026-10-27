@@ -26,6 +26,7 @@ pub use types::command::{
     CompleteTask, CompleteThread, CreateExecution, CreateFlow, FailTask, SpawnThread,
     TerminateExecution, TerminateState, TerminateThread, TerminationReason,
 };
+pub use types::deadline::DeadlineTarget;
 pub use types::error::{ExecutionError, InfraError, RuntimeError, StorageError};
 pub use types::event::{
     Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
@@ -38,10 +39,9 @@ pub use types::id::{EntryId, FlowName, RequestId, StreamId};
 pub use types::meta::{
     HasRawObjectRef, KindMismatch, MissingOwner, NoOwner, ObjectKind, ObjectKindMarker, ObjectMeta,
     ObjectMetaBuilder, ObjectName, ObjectRef, OwnerKindMarker, PlainName, RawObjectRef, ScopeName,
-    ThreadOwner, TimerOwner,
+    ThreadOwner,
 };
 pub use types::reject::{Reject, RejectionType};
 pub use types::task::{RetrierAttemptState, RetryPolicy, RetryState, Task, TaskKind, TaskStatus};
 pub use types::thread::{Thread, ThreadKind, ThreadStatus};
-pub use types::timer::{Timer, TimerKind, TimerStatus};
 pub use types::variables::Variables;

@@ -13,11 +13,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use spica_engine::{
-    ActivatedTask, Command, Engine, Event, ExecutionCreated, ExecutionError, ExecutionKind,
-    FlowName, FlowVersionCreated, FlowVersionKind, Hook, ObjectName, ObjectRef, Reject, RequestId,
-    RuntimeError, Task, TaskCompleted, TasksClaimed, TimerKind, Timestamp,
+    ActivatedTask, ActivityState, Command, DeadlineTarget, Engine, Event, ExecutionCreated,
+    ExecutionError, ExecutionKind, FlowName, FlowVersionCreated, FlowVersionKind, Hook, ObjectName,
+    ObjectRef, Reject, RequestId, RuntimeError, Task, TaskCompleted, TasksClaimed, Timestamp,
+    WaitActivityState,
 };
-use spica_scheduler::{Scheduler, TimerSink};
+use spica_scheduler::{DeadlineSink, Scheduler};
 use tokio::sync::{Mutex, oneshot};
 
 /// The awaited outcome event variant a pending entry expects (see [`AckHook`]). Gating on the variant
@@ -161,29 +162,31 @@ pub(crate) struct Gateway {
     ack: Arc<AckHook>,
 }
 
-/// The engine slot a [`TimerSink`] fires through once booted (see [`build_observer`]). Held as a
+/// The engine slot a [`DeadlineSink`] fires through once booted (see [`build_observer`]). Held as a
 /// **weak** slot: it is owned by the observer chain the engine itself holds (hook → scheduler →
 /// sink), so a strong reference there would keep the engine alive forever.
 type EngineSlot = Arc<Mutex<Option<std::sync::Weak<Engine>>>>;
 
 /// Build the composite [`Hook`] injected at boot and the sink slot the booted engine fills in. The
-/// engine no longer holds a scheduler — timer scheduling is gateway-owned: the hook re-derives
-/// physical arms/cancels from durable `TimerActivated`/`TimerCancelled` events, and the attached
-/// [`TimerSink`] routes an expired timer's `TriggerTimer` back through the engine's append path (the
-/// slot closes the boot-time cycle: the sink needs the engine, the engine needs the hook).
+/// engine no longer holds a scheduler — deadline scheduling is gateway-owned: the hook re-derives
+/// physical arms/cancels from the durable events that record a deadline, and the attached
+/// [`DeadlineSink`] routes an expired deadline's `TriggerDeadline` back through the engine's append
+/// path (the slot closes the boot-time cycle: the sink needs the engine, the engine needs the hook).
 pub(crate) fn build_observer(
     ack: Arc<AckHook>,
     scheduler: Arc<dyn Scheduler>,
 ) -> (Arc<dyn Hook>, EngineSlot) {
     let engine_slot: EngineSlot = Arc::new(Mutex::new(None));
-    scheduler.attach_sink(Arc::new(EngineTimerSink {
+    scheduler.attach_sink(Arc::new(EngineDeadlineSink {
         engine: engine_slot.clone(),
     }));
     (Arc::new(CompositeHook { ack, scheduler }), engine_slot)
 }
 
 /// The composite [`Hook`]: forwards the acknowledgement facts to [`AckHook`] and re-derives the
-/// physical timer schedule from the durable timer events (the engine declares no effects in band).
+/// physical deadline schedule from the durable events that carry one (the engine declares no effects
+/// in band). A deadline is a field of the element that owns it, so the arm is read off that element's
+/// own event — arming at its birth, cancelling when it reaches a terminal.
 struct CompositeHook {
     ack: Arc<AckHook>,
     scheduler: Arc<dyn Scheduler>,
@@ -193,12 +196,41 @@ struct CompositeHook {
 impl Hook for CompositeHook {
     async fn on_event_applied(&self, event: &Event) {
         match event {
-            Event::TimerActivated { timer } => {
-                // The durable event carries the timer's absolute deadline; re-arm from that moment.
-                self.scheduler
-                    .schedule(&timer.meta.object_ref(), timer.deadline);
+            Event::ExecutionCreated(ExecutionCreated { execution, .. }) => {
+                if let Some(deadline) = execution.deadline {
+                    self.scheduler.schedule(
+                        &DeadlineTarget::Execution(execution.meta.object_ref()),
+                        deadline,
+                    );
+                }
             }
-            Event::TimerCancelled { timer } => self.scheduler.cancel(&timer.meta.object_ref()),
+            Event::TaskActivated { task } => {
+                // A task's `TimeoutSeconds` bounds the state that invoked it, so its owner activity is
+                // the element the fire acts on.
+                if let Some(deadline) = task.deadline {
+                    self.scheduler
+                        .schedule(&DeadlineTarget::Activity(task.meta.owner.clone()), deadline);
+                }
+            }
+            // A `Wait`'s resume instant is its activation product; a fire resumes the state.
+            Event::StateActivated { activity } => {
+                if let Some(ActivityState::Wait(WaitActivityState { resume_at })) =
+                    &activity.activity_state
+                {
+                    self.scheduler.schedule(
+                        &DeadlineTarget::Activity(activity.meta.object_ref()),
+                        *resume_at,
+                    );
+                }
+            }
+            Event::StateCompleted { activity } | Event::StateTerminated { activity } => {
+                self.scheduler
+                    .cancel(&DeadlineTarget::Activity(activity.meta.object_ref()));
+            }
+            Event::ExecutionCompleted { execution } | Event::ExecutionTerminated { execution } => {
+                self.scheduler
+                    .cancel(&DeadlineTarget::Execution(execution.meta.object_ref()));
+            }
             _ => {}
         }
         self.ack.on_event_applied(event).await;
@@ -209,16 +241,16 @@ impl Hook for CompositeHook {
     }
 }
 
-/// The [`TimerSink`] attached to the scheduler: routes an expired timer's `TriggerTimer` into the
-/// engine's append path. Holds the engine behind a slot filled at boot (a fire happens only
+/// The [`DeadlineSink`] attached to the scheduler: routes an expired deadline's `TriggerDeadline` into
+/// the engine's append path. Holds the engine behind a slot filled at boot (a fire happens only
 /// post-start, so by then the slot is set).
-struct EngineTimerSink {
+struct EngineDeadlineSink {
     engine: EngineSlot,
 }
 
 #[tonic::async_trait]
-impl TimerSink for EngineTimerSink {
-    async fn trigger(&self, timer: &ObjectRef<TimerKind>) {
+impl DeadlineSink for EngineDeadlineSink {
+    async fn trigger(&self, target: &DeadlineTarget, deadline: Timestamp) {
         let Some(engine) = self
             .engine
             .lock()
@@ -230,8 +262,9 @@ impl TimerSink for EngineTimerSink {
         };
         // Fire-and-forget: a dropped append (engine shutting down) is not the gateway's fault.
         let _ = engine
-            .append_command(Command::TriggerTimer {
-                timer: timer.clone(),
+            .append_command(Command::TriggerDeadline {
+                target: target.clone(),
+                deadline,
             })
             .await;
     }

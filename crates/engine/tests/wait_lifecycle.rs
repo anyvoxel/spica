@@ -5,19 +5,17 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    Act, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, activity_timer_owner, activity_timer_owner_of,
-    epoch, flat_ref_to, flow_name, flow_owner, meta, meta_root, meta_span, meta_span_root, name,
-    path, pointer, ref_to, request, root_thread_owner, root_thread_owner_of, run_typed_case, stamp,
-    thread_owner, uid, vars,
+    Act, Signal, TypedCase, VIRTUAL_EPOCH_MILLIS, epoch, flat_ref_to, flow_name, flow_owner, meta,
+    meta_root, meta_span, meta_span_root, name, path, pointer, ref_to, request, root_thread_owner,
+    root_thread_owner_of, run_typed_case, stamp, thread_owner, uid, vars,
 };
 use serde_json::json;
 use spica_engine::{
     ActivateState, Activity, ActivityKind, ActivityState, ActivityStatus, Command,
-    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
-    Event, Execution, ExecutionCreated, ExecutionKind, ExecutionStatus, Flow, FlowCreated,
-    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind, StateTransitioned,
-    Thread, ThreadKind, ThreadStatus, Timer, TimerKind, TimerStatus, VariablesAssigned,
-    WaitActivityState,
+    CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, DeadlineTarget,
+    EntryPayload, Event, Execution, ExecutionCreated, ExecutionKind, ExecutionStatus, Flow,
+    FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, ObjectKind,
+    StateTransitioned, Thread, ThreadKind, ThreadStatus, VariablesAssigned, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -123,34 +121,9 @@ async fn wait_seconds_literal_routes_on_its_next() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
-                },
-            }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-2", 6),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(6),
-                        "lifecycle_execution-2",
-                        epoch(),
-                        stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
-                    )
-                    .with_owner(activity_timer_owner_of(flat_ref_to(
-                        ObjectKind::Activity,
-                        "lifecycle_execution-1",
-                        5,
-                    ))),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-1", 5)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
@@ -206,8 +179,8 @@ async fn wait_seconds_literal_routes_on_its_next() {
             })),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
-                    meta: meta_span(uid(7),
-                        "lifecycle_execution-3",
+                    meta: meta_span(uid(6),
+                        "lifecycle_execution-2",
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
@@ -225,8 +198,8 @@ async fn wait_seconds_literal_routes_on_its_next() {
             }),
             EntryPayload::Event(Event::StateActivated {
                 activity: Activity {
-                    meta: meta_span(uid(7),
-                        "lifecycle_execution-3",
+                    meta: meta_span(uid(6),
+                        "lifecycle_execution-2",
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
@@ -243,13 +216,13 @@ async fn wait_seconds_literal_routes_on_its_next() {
                 },
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
-                activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
+                activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
                 output: json!({"n": 1}),
             })),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
-                    meta: meta_span(uid(7),
-                        "lifecycle_execution-3",
+                    meta: meta_span(uid(6),
+                        "lifecycle_execution-2",
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
@@ -267,8 +240,8 @@ async fn wait_seconds_literal_routes_on_its_next() {
             }),
             EntryPayload::Event(Event::StateCompleted {
                 activity: Activity {
-                    meta: meta_span(uid(7),
-                        "lifecycle_execution-3",
+                    meta: meta_span(uid(6),
+                        "lifecycle_execution-2",
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                         stamp(VIRTUAL_EPOCH_MILLIS + 60_000),
                     )
@@ -364,7 +337,7 @@ async fn wait_seconds_literal_routes_on_its_next() {
             }),
         ],
         status: ExecutionStatus::Completed,
-        acts: vec![Act::Advance(Signal::TimerArmed, Duration::from_secs(60))],
+        acts: vec![Act::Advance(Signal::DeadlineArmed, Duration::from_secs(60))],
     };
     run_typed_case(&case).await;
 }
@@ -471,26 +444,9 @@ async fn wait_until_a_literal_timestamp() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(6), "lifecycle_execution-2")
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
-                },
-            }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-2", 6),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(6), "lifecycle_execution-2", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 90_000))
-                        .with_owner(activity_timer_owner("lifecycle_execution-1", 5)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-1", 5)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 90_000),
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
@@ -582,7 +538,7 @@ async fn wait_until_a_literal_timestamp() {
             }),
         ],
         status: ExecutionStatus::Completed,
-        acts: vec![Act::Advance(Signal::TimerArmed, Duration::from_secs(90))],
+        acts: vec![Act::Advance(Signal::DeadlineArmed, Duration::from_secs(90))],
     };
     run_typed_case(&case).await;
 }
@@ -774,26 +730,9 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                     output: None,
                 },
             }),
-            EntryPayload::Event(Event::TimerActivated {
-                timer: Timer {
-                    meta: meta(uid(7), "lifecycle_execution-3")
-                        .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Active,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
-                },
-            }),
-            EntryPayload::Command(Command::TriggerTimer {
-                timer: ref_to::<TimerKind>("lifecycle_execution-3", 7),
-            }),
-            EntryPayload::Event(Event::TimerTriggered {
-                timer: Timer {
-                    meta: meta_span(uid(7), "lifecycle_execution-3", epoch(), stamp(VIRTUAL_EPOCH_MILLIS + 45_000))
-                        .with_owner(activity_timer_owner("lifecycle_execution-2", 6)),
-                    execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
-                    status: TimerStatus::Completed,
-                    deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
-                },
+            EntryPayload::Command(Command::TriggerDeadline {
+                target: DeadlineTarget::Activity(ref_to::<ActivityKind>("lifecycle_execution-2", 6)),
+                deadline: stamp(VIRTUAL_EPOCH_MILLIS + 45_000),
             }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-2", 6),
@@ -889,7 +828,7 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
             }),
         ],
         status: ExecutionStatus::Completed,
-        acts: vec![Act::Advance(Signal::TimerArmed, Duration::from_secs(45))],
+        acts: vec![Act::Advance(Signal::DeadlineArmed, Duration::from_secs(45))],
     };
     run_typed_case(&case).await;
 }

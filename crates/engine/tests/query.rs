@@ -108,10 +108,6 @@ async fn list_objects_reads_descendant_kinds_of_a_completed_run() {
         .list_objects(ObjectKind::Thread, 100, None)
         .await
         .unwrap();
-    let _timers = engine
-        .list_objects(ObjectKind::Timer, 100, None)
-        .await
-        .unwrap();
     let _tasks = engine
         .list_objects(ObjectKind::Task, 100, None)
         .await

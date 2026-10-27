@@ -21,11 +21,11 @@ mod common;
 use std::time::Duration;
 
 use common::{await_log, virtual_run_from};
-use spica_engine::{Entry, EntryPayload, Event};
+use spica_engine::{Command, Entry, EntryPayload, Event};
 
-/// A definition that reaches a terminal state only through a fired timer: the boot cascade mints the
-/// flow, version, execution, root thread and each activity's uid, arms the `Wait`'s timer against the
-/// virtual clock, and the advance below resumes it. One run therefore exercises both seams at once and
+/// A definition that reaches a terminal state only through a fired deadline: the boot cascade mints
+/// the flow, version, execution, root thread and each activity's uid, arms the `Wait`'s deadline
+/// against the virtual clock, and the advance below resumes it. One run therefore exercises both seams at once and
 /// writes ~50 entries (the envelope and the `Noop` terminators included), so the equality compared
 /// below is over a stream with real content.
 const REPRO_FLOW: &str = r#"{
@@ -48,14 +48,15 @@ const PAST_THE_WAIT: Duration = Duration::from_secs(6);
 async fn log_of_a_run(first_id: u64) -> Vec<Entry> {
     let (client, log, execution) = virtual_run_from(REPRO_FLOW, REPRO_INPUT, first_id).await;
 
-    // Park on the armed timer before moving the clock: the `Wait` computes its deadline when it is
+    // Park on the armed deadline before moving the clock: the `Wait` computes its deadline when it is
     // entered, so an advance issued any earlier would be arithmetic on a deadline that does not exist
     // yet — and the run would then hang rather than differ.
-    await_log(&log, "the Wait's timer to be armed", |entries| {
+    await_log(&log, "the Wait's deadline to be armed", |entries| {
         entries.iter().any(|entry| {
             matches!(
                 &entry.payload,
-                EntryPayload::Event(Event::TimerActivated { .. })
+                EntryPayload::Event(Event::StateActivated { activity })
+                    if activity.activity_state.is_some()
             )
         })
     })
@@ -81,14 +82,14 @@ async fn the_same_definition_writes_the_same_log_twice() {
     let second = log_of_a_run(1).await;
 
     // The comparison is only worth making over a stream that has the content it claims: the fired
-    // timer proves the run passed through the clock's advance, so the two logs below are compared over
-    // a run that really happened rather than over two empty vectors.
+    // deadline proves the run passed through the clock's advance, so the two logs below are compared
+    // over a run that really happened rather than over two empty vectors.
     assert!(
         first.iter().any(|entry| matches!(
             &entry.payload,
-            EntryPayload::Event(Event::TimerTriggered { .. })
+            EntryPayload::Command(Command::TriggerDeadline { .. })
         )),
-        "the run must reach the Wait's timer before its two logs are compared"
+        "the run must reach the Wait's deadline before its two logs are compared"
     );
 
     assert_eq!(

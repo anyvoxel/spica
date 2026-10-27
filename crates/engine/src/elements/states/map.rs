@@ -604,7 +604,7 @@ impl MapStateElementBehavior<'_> {
     /// records here. A hand-written `StateTerminated` marks the activity terminal before the owning
     /// scope's own sweep reaches it, and a `TerminateState` on an already-terminal activity is a
     /// duplicate — so the sweep that should stop this Map's item children would have nothing left to
-    /// sweep, and an in-flight item keeps running (with any timer it armed) behind a run that has
+    /// sweep, and an in-flight item keeps running (with any deadline it armed) behind a run that has
     /// already ended. Letting the state's own terminate handler open the close instead means the same
     /// sweep every other teardown uses also cancels the items, recursively.
     async fn fail_map(

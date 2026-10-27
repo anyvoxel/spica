@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&log_dir).with_context(|| "create log dir")?;
 
     // One durable engine backs every RPC. This binary owns the **assembly**: it opens the RocksDB
-    // log + storage here (from the `spica-logstream` / `spica-storage` crates) and spawns the timer
+    // log + storage here (from the `spica-logstream` / `spica-storage` crates) and spawns the deadline
     // scheduler (from `spica-scheduler`), injecting all three into the engine as type-erased trait
     // objects — `Engine::start` then consumes the unstarted builder (typestate: an unstarted engine
     // has no RPC-bound operation methods), boots the StreamProcessor, and returns the running `Engine`; its
@@ -84,9 +84,10 @@ async fn main() -> anyhow::Result<()> {
     let scheduler: Arc<dyn Scheduler> = InMemoryScheduler::spawn();
     // The application layer: an `AckHook` observer injected into the engine correlates awaited commands'
     // outcomes to their callers; the `Gateway` wraps engine + ack to expose the blocking request/response
-    // API (the entry point future auth / backpressure run through). Timer scheduling is gateway-owned:
-    // `build_observer` composes the ack correlation with a hook that re-derives physical timer arms from
-    // durable events, and returns the engine slot the booted engine fills in for the sink
+    // API (the entry point future auth / backpressure run through). Deadline scheduling is
+    // gateway-owned: `build_observer` composes the ack correlation with a hook that re-derives physical
+    // deadline arms from durable events, and returns the engine slot the booted engine fills in for the
+    // sink
     // (see `spica_server::gateway`).
     let ack = Arc::new(gateway::AckHook::new());
     let (hook, engine_slot) = gateway::build_observer(ack.clone(), scheduler);

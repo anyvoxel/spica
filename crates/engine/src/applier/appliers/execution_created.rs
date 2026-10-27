@@ -15,7 +15,7 @@ impl ExecutionCreatedApplier {
         let ExecutionCreated { execution, .. } = event;
         ctx.storage.put_execution(execution.clone()).await?;
         // No child edge to add: a run is the root of its own tree (its owner slot is `NoOwner`), and
-        // everything it owns — its root thread, activities and timers — hangs below it.
+        // everything it owns — its root thread and activities — hangs below it.
         Ok(())
     }
 }

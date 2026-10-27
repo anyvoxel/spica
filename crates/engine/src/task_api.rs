@@ -4,9 +4,9 @@
 //! A worker *pulls* available work by `resource` ([`TaskApi::poll_tasks`]), executes it, then
 //! *reports* the outcome ([`TaskApi::complete`] / [`TaskApi::fail`]). Every call is validated by the
 //! engine and funnelled into the log as an ordered [`Command`](crate::Command) — the engine stays
-//! the single writer that owns the task lifecycle. This is deliberately distinct from the timer path:
-//! the inbound report is an **external claim the engine must
-//! validate**, not an engine-internal push.
+//! the single writer that owns the task lifecycle. This is deliberately distinct from a deadline fire:
+//! the inbound report is an **external claim the engine must validate**, not an engine-internal
+//! push.
 //!
 //! [`EngineInner`](crate::engine::EngineInner) implements this trait; [`Engine::task_api`]
 //! (crate::Engine::task_api) hands a worker an `Arc<dyn TaskApi>` pointing at the running engine.

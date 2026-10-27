@@ -461,7 +461,7 @@ impl ParallelStateElementBehavior<'_> {
         // Issue the activity's termination instead of writing its terminal records here: a
         // hand-written `StateTerminated` closes the activity before the scope's own sweep reaches it,
         // and the `TerminateState` that sweep issues onto an already-terminal activity is a
-        // duplicate — so the surviving branch threads, and the timers they armed, are never stopped
+        // duplicate — so the surviving branch threads, and the deadlines they armed, are never stopped
         // and outlive a run that has already ended. The state's own terminate handler sweeps them.
         out.append_command(Command::TerminateState(TerminateState {
             activity: activity.meta.object_ref(),

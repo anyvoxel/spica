@@ -296,10 +296,10 @@ impl ThreadElementBehavior {
         }
 
         // A thread's only child kind is `Activity`: `ActivityKind::OwnedBy` is `ObjectRef<ThreadKind>`
-        // and so is the one edge that can parent an object to a thread, while `ThreadOwner` and
-        // `TimerOwner` admit no thread at all and an `Execution`/`Task` is never owned by one. A nested
-        // fan-out therefore reaches its teardown through the `TerminateState` below — that activity's
-        // own sweep reaps its child threads, timers and tasks — never thread-sweeping-thread.
+        // and so is the one edge that can parent an object to a thread, while `ThreadOwner` admits no
+        // thread at all and an `Execution`/`Task` is never owned by one. A nested fan-out therefore
+        // reaches its teardown through the `TerminateState` below — that activity's own sweep reaps
+        // its child threads and tasks — never thread-sweeping-thread.
         //
         // Any other kind in the child set is thus an engine invariant broken — a corrupt projection
         // or a forged child edge. Refuse to guess and fail loud, rather than leave the teardown
@@ -388,10 +388,9 @@ impl ThreadElementBehavior {
         })
         .await;
 
-        // A thread owns **activities only** — a deadline belongs to the activity that armed it
-        // (`TimerOwner` has no `Thread` variant) — and the activity relaying this completion has
-        // already drained, so an empty set is the ordinary case: the thread finishes here and hands its
-        // result up to its owner.
+        // A thread owns **activities only** — a deadline belongs to the execution or the activity
+        // that armed it — and the activity relaying this completion has already drained, so an empty
+        // set is the ordinary case: the thread finishes here and hands its result up to its owner.
         // Read from the ownership-edge index rather than off the row, so the set is never a second copy
         // the status write above could clobber.
         let children = ctx
@@ -816,7 +815,6 @@ mod settle_tests {
     use crate::types::id::EntryId;
     use crate::types::meta::{HasRawObjectRef, ObjectMeta, ObjectRef, RawObjectRef, ThreadOwner};
     use crate::types::thread::{Thread, ThreadKind, ThreadStatus};
-    use crate::types::timer::TimerKind;
     use crate::working::WorkingState;
     use crate::{Activity, EntryPayload};
 
@@ -857,7 +855,7 @@ mod settle_tests {
             output: None,
         };
         let live = (0..children)
-            .map(|n| object_ref::<TimerKind>("deadline", 200 + n as u64).into_raw_object_ref())
+            .map(|n| object_ref::<ActivityKind>("activity", 200 + n as u64).into_raw_object_ref())
             .collect::<Vec<_>>();
         Seeded::owning(thread, live)
     }

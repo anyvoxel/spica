@@ -104,8 +104,8 @@ pub struct RetryState {
     pub next_available_at: Option<Timestamp>,
 }
 
-/// Lifecycle status of a Task (the spica name for what Zeebe calls a *job*). Like `TimerStatus`, a
-/// task is a leaf side-effect node: it never initiates its own completion — it is either claimed
+/// Lifecycle status of a Task (the spica name for what Zeebe calls a *job*). A task is a leaf
+/// side-effect node: it never initiates its own completion — it is either claimed
 /// and settled by a worker, or cancelled. The two non-terminal states model the Zeebe job lifecycle:
 /// a task is created **pending** (`Pending`), a worker **claims** it (`Running`, leased to that
 /// worker until `lease_expires_at`), and only the leasing worker's `CompleteTask`/`FailTask` settles
@@ -178,7 +178,7 @@ impl ObjectKindMarker for TaskKind {
 /// A task is an in-flight external call invoked by a `Task` state (`"Type": "Task"`) — a call to
 /// a connected `Resource` with projected `arguments` as input. The value carries the task's own
 /// domain facts; storage may wrap it so the domain/projection boundary stays explicit, just as it
-/// does for `Activity` and `Timer`.
+/// does for `Activity`.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -187,7 +187,7 @@ pub struct Task {
     pub meta: ObjectMeta<TaskKind>,
     /// The owning top-level run (the flat execution anchor), always carried so a task (wherever it
     /// lives in a branch) is traceable to, and nameable from, its root run — the same ownership
-    /// channel an `Activity`/`Timer` carries. `meta.owner` is the immediate invoking activity; this
+    /// channel an `Activity` carries. `meta.owner` is the immediate invoking activity; this
     /// is the run itself.
     pub execution: ObjectRef<ExecutionKind>,
     /// The `Resource` URI the task calls (a downstream service / activity identifier).

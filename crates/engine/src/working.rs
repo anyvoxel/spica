@@ -12,7 +12,7 @@
 //! it (with the batch-end watermark) once the batch is durably appended, and drops it — rolling back —
 //! on an append failure. No post-append `apply_batch` re-fold exists on the live path. The fold is a
 //! pure projection: no applier performs external side effects, so nothing here accumulates or drains —
-//! timer arming is re-derived by the consumer from the durable event via the Hook.
+//! deadline arming is re-derived by the consumer from the durable event via the Hook.
 //!
 //! The handler view is a single shared [`Mutex`] around the txn: reads and the collector's eager-apply
 //! both lock it (the leader is single-threaded over the log, so it is uncontended). A plain `Mutex`
@@ -36,9 +36,8 @@ use crate::types::id::FlowName;
 use crate::types::meta::{ObjectRef, RawObjectRef};
 use crate::types::task::Task;
 use crate::types::thread::Thread;
-use crate::types::timer::Timer;
 use crate::types::variables::Variables;
-use crate::{ActivityKind, ExecutionKind, FlowVersionKind, TaskKind, ThreadKind, TimerKind};
+use crate::{ActivityKind, ExecutionKind, FlowVersionKind, TaskKind, ThreadKind};
 
 /// The ephemeral overlay backing one handled command. Shared between the handler's read face and the
 /// collector's eager-apply through a mutex; the leader is single-threaded over the log, so the lock
@@ -144,14 +143,6 @@ impl ReadonlyStorageTxn for WorkingState {
         let mut txn = self.txn.lock().await;
         let storage = txn.as_mut().expect("working txn alive during dispatch");
         storage.get_activity(reference).await
-    }
-    async fn get_timer(
-        &self,
-        reference: &ObjectRef<TimerKind>,
-    ) -> Result<Option<Timer>, StorageError> {
-        let mut txn = self.txn.lock().await;
-        let storage = txn.as_mut().expect("working txn alive during dispatch");
-        storage.get_timer(reference).await
     }
     async fn get_task(
         &self,

@@ -5,7 +5,7 @@
 //! canonical byte [`KeyBuilder`] / [`Scope`] encoding the durable store keys its rows by.
 //!
 //! The [`Storage`] *contract* — the trait plus the projection row types it names
-//! ([`Execution`]/[`Activity`]/[`Task`]/[`Timer`]) — lives in `spica-engine-types`, the leaf crate both
+//! ([`Execution`]/[`Activity`]/[`Task`]) — lives in `spica-engine-types`, the leaf crate both
 //! this crate and `spica-engine` implement or consume it from. Neither backend crate depends on the
 //! other: a binary (`spica-server`) wires them together by constructing an implementation here and
 //! injecting it into the engine as a `Box<dyn Storage>`. The engine never fabricates concrete storage

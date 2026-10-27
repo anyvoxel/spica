@@ -6,11 +6,11 @@
 //! [`appliers`]), keeping each event's fold rule local.
 //!
 //! An applier is a **pure function of the fold**: it mutates the store only. External side effects are
-//! *derived* elsewhere from the durable event itself — e.g. a `TimerActivated` event carries the
-//! absolute `deadline`, so a consumer (via the injected [`Hook`](crate::Hook) observer) re-derives the
-//! physical timer arm from the event without the engine knowing a scheduler. Keeping the fold free of
-//! any environment (no scheduler handle, no log) makes the same fold safe on both the pre-append work
-//! transaction and post-commit recovery replay alike.
+//! *derived* elsewhere from the durable event itself — e.g. an `ExecutionCreated` carries the
+//! `deadline` its run recorded, so a consumer (via the injected [`Hook`](crate::Hook) observer)
+//! re-derives the physical arm from the event without the engine knowing a scheduler. Keeping the
+//! fold free of any environment (no scheduler handle, no log) makes the same fold safe on both the
+//! pre-append work transaction and post-commit recovery replay alike.
 //!
 //! A storage implementation needs only supply the read/mutate primitives ([`Storage`](crate::Storage));
 //! the applier dispatch is a single exhaustive [`dispatch_event`] match.
@@ -52,9 +52,6 @@ pub async fn dispatch_event(
         Event::StateCompleted { activity } => StateCompletedApplier.apply(ctx, activity).await,
         Event::StateTerminating { activity } => StateTerminatingApplier.apply(ctx, activity).await,
         Event::StateTerminated { activity } => StateTerminatedApplier.apply(ctx, activity).await,
-        Event::TimerActivated { timer } => TimerActivatedApplier.apply(ctx, timer).await,
-        Event::TimerTriggered { timer } => TimerTriggeredApplier.apply(ctx, timer).await,
-        Event::TimerCancelled { timer } => TimerCancelledApplier.apply(ctx, timer).await,
         Event::VariablesAssigned(p) => VariablesAssignedApplier.apply(ctx, p).await,
         Event::StateTransitioned(p) => StateTransitionedApplier.apply(ctx, p).await,
         Event::TaskActivated { task } => TaskActivatedApplier.apply(ctx, task).await,

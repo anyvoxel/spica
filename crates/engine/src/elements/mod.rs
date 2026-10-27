@@ -3,7 +3,7 @@
 //!
 //! The object graph is made of *elements*: the definitions a run is built from (`Flow`, with its
 //! immutable `FlowVersion`s), the run itself (`Execution`), its `Thread`s, their `Activity` states,
-//! and the leaf work each activity hands out (`Task`, `Timer`) — plus, one layer down, the
+//! and the leaf work each activity hands out (`Task`) — plus, one layer down, the
 //! state-type behaviors. Historically one element's rules were scattered across the command handler
 //! that opened it, the `Container` impl that reacted to its children settling, and the `Continue*`
 //! hop that advanced it, so they had to be reconstructed from four or five files. This module
@@ -22,22 +22,20 @@ pub(crate) mod state_handler;
 pub(crate) mod states;
 mod task;
 mod thread;
-mod timer;
 
 pub(crate) use activity::ActivityElementBehavior;
 pub(crate) use execution::ExecutionElementBehavior;
 pub(crate) use flow::FlowElementBehavior;
 pub(crate) use task::TaskElementBehavior;
 pub(crate) use thread::ThreadElementBehavior;
-pub(crate) use timer::TimerElementBehavior;
 
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::storage::ReadonlyStorageTxn;
 use crate::types::meta::{ObjectKindMarker, ObjectRef, RawObjectRef};
 
 /// A node that owns children: the reaction point for one of them settling. The implementor is chosen
-/// from the owner's *kind* at the call site (a timer's owner is an `Activity` or the `Execution`, a
-/// root thread's is the `Execution`, …), so the concrete type is known statically and this is never
+/// from the owner's *kind* at the call site (an activity's owner is its root thread, a root thread's
+/// is the `Execution`, …), so the concrete type is known statically and this is never
 /// used as `dyn`.
 pub(crate) trait Container {
     /// The kind of owner this container owns children for — the type of [`Self::open`]'s parameter,
@@ -57,7 +55,7 @@ pub(crate) trait Container {
     /// the hooks' own re-reads.
     ///
     /// A handful of callers must **not** fail on a gone owner: their settle is already a fact in this
-    /// same batch (a timer's fire, a node's own terminal), so a refusal here would drop the batch and
+    /// same batch (a fired deadline, a node's own terminal), so a refusal here would drop the batch and
     /// lose it. They match out the `Rejected` arm and answer the absence themselves.
     ///
     /// This read is the *existence* check only. The hooks re-read the row: the settle's own batch

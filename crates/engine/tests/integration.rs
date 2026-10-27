@@ -132,70 +132,9 @@ async fn activity_name_derives_from_execution_name_base() {
 }
 
 #[tokio::test]
-async fn timer_name_derives_from_execution_name_base() {
-    // finding #11: a Wait-resume timer's generated name uses the owning execution's name (its plain
-    // base) as base, mirroring #3 — so a timer is locatable at the run level rather than the opaque
-    // `child-<ulid>` placeholder. Read the real durable log (same RetainedLog idiom).
-    let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
-    let engine = common::LocalClient::start(EngineBuilder::with_backends(
-        Box::new(RetainedLog(Arc::clone(&log))),
-        Box::new(InMemoryStorage::new()),
-    ))
-    .await
-    .expect("engine starts");
-
-    let exec_name = ObjectName::plain("run_waitnaming").expect("a plain execution name is valid");
-    let sm = parse_sm(
-        r#"{
-          "StartAt": "W",
-          "States": {
-            "W": { "Type": "Wait", "Seconds": 0, "Next": "P" },
-            "P": { "Type": "Pass", "End": true }
-          }
-        }"#,
-    );
-    let flow_version = engine
-        .create_flow(
-            FlowName::new("run_waitnaming_flow").expect("anon flow name is valid"),
-            &serde_json::to_string(&sm).expect("sm serializes"),
-        )
-        .await
-        .expect("flow created");
-    let execution_id = engine
-        .start_for_revision(exec_name.clone(), flow_version, Value::Null)
-        .await
-        .expect("execution starts");
-    let _result = engine
-        .wait_for_execution(&execution_id)
-        .await
-        .expect("run succeeds");
-
-    let entries = log.lock().await.entries();
-    let timer = entries
-        .iter()
-        .find_map(|e| match &e.payload {
-            EntryPayload::Event(Event::TimerActivated { timer }) => Some(timer.meta.name.clone()),
-            _ => None,
-        })
-        .expect("a wait-resume TimerActivated event was emitted");
-    assert_eq!(
-        timer.base().as_str(),
-        exec_name.as_str(),
-        "timer name base must be the owning execution's name (finding #11), not 'child'"
-    );
-    assert!(
-        timer
-            .as_str()
-            .starts_with(&format!("{}-", exec_name.as_str())),
-        "timer name {} must be <execution>-<suffix>",
-        timer
-    );
-}
-
-#[tokio::test]
 async fn task_name_derives_from_execution_name_base() {
     // finding #13: a Task's generated name uses its owning execution's name (the plain base) as base,
-    // mirroring #3/#11 — not the old `child-<uid>` placeholder. Read the real durable log and check
+    // mirroring #3 — not the old `child-<uid>` placeholder. Read the real durable log and check
     // the `TaskActivated` event's task name.
     let log = Arc::new(Mutex::new(InMemoryLogStream::<EntryPayload>::new()));
     let engine = common::LocalClient::start(EngineBuilder::with_backends(
@@ -1183,7 +1122,7 @@ async fn task_retry_exhausted_no_catch_terminates() {
 #[tokio::test]
 async fn task_timeout_with_catch() {
     // A Task with `TimeoutSeconds` that never settles (a handler sleeping past the deadline): the
-    // `TimeoutSeconds` timer fails it with `States.Timeout`, which the `Catch` routes to a fallback.
+    // `TimeoutSeconds` deadline fails it with `States.Timeout`, which the `Catch` routes to a fallback.
     let sm = parse_sm(
         r#"{
           "StartAt": "T",
@@ -1205,7 +1144,7 @@ async fn task_timeout_with_catch() {
 }
 
 /// A `TaskHandler` that sleeps well past any reasonable test timeout, so only the `TimeoutSeconds`
-/// timer terminates the task.
+/// deadline terminates the task.
 #[derive(Default)]
 struct SleepHandler;
 
