@@ -1,0 +1,272 @@
+{
+  "Comment": "Spica ASL subset: every state type and every modeled field",
+  "StartAt": "Init",
+  "Version": "1.0",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "Seed the order context",
+      "Output": {
+        "orderId": "{% $states.input.orderId %}",
+        "phase": "init"
+      },
+      "Assign": {
+        "orderId": "{% $states.input.orderId %}",
+        "attempts": 0
+      },
+      "Next": "RouteOrder"
+    },
+
+    "RouteOrder": {
+      "Type": "Choice",
+      "Comment": "Pick a lane from the order shape",
+      "Assign": {
+        "routed": true
+      },
+      "Output": {
+        "seenAt": "{% $states.context.Execution.StartTime %}"
+      },
+      "Choices": [
+        {
+          "Condition": "{% $states.input.express %}",
+          "Assign": {
+            "lane": "express"
+          },
+          "Next": "ChargeCard"
+        },
+        {
+          "Condition": "{% $states.input.stock < $states.input.quantity %}",
+          "Output": {
+            "shortfall": "{% $states.input.quantity - $states.input.stock %}"
+          },
+          "Next": "WaitForStock"
+        },
+        {
+          "Condition": false,
+          "Next": "Finalize"
+        }
+      ],
+      "Default": "WaitUntilDeadline"
+    },
+
+    "WaitForStock": {
+      "Type": "Wait",
+      "Comment": "Relative wait, JSONata-evaluated",
+      "Seconds": "{% $states.input.pollSeconds %}",
+      "Output": {
+        "waitedFor": "stock"
+      },
+      "Assign": {
+        "waitKind": "seconds-expr"
+      },
+      "Next": "ChargeCard"
+    },
+
+    "WaitUntilDeadline": {
+      "Type": "Wait",
+      "Comment": "Absolute wait, literal timestamp",
+      "Timestamp": "2026-11-01T00:00:00Z",
+      "Output": {
+        "cutoff": "2026-11-01T00:00:00Z"
+      },
+      "Next": "ChargeCard"
+    },
+
+    "ChargeCard": {
+      "Type": "Task",
+      "Comment": "Charge the customer, with retry and catch",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:charge",
+        "Payload": {
+          "orderId": "{% $orderId %}",
+          "amount": "{% $states.input.total %}"
+        }
+      },
+      "TimeoutSeconds": "{% $states.input.chargeTimeout %}",
+      "HeartbeatSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": ["States.ALL"]
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Assign": {
+            "paymentError": "{% $states.errorOutput %}"
+          },
+          "Output": {
+            "error": "{% $states.errorOutput %}"
+          },
+          "Next": "FailOrder"
+        }
+      ],
+      "Assign": {
+        "charge": "{% $states.result.Payload %}"
+      },
+      "Output": {
+        "chargeId": "{% $states.result.Payload.id %}"
+      },
+      "Next": "FanOut"
+    },
+
+    "FanOut": {
+      "Type": "Map",
+      "Comment": "One child execution per line item, bounded concurrency",
+      "Items": "{% $states.input.items %}",
+      "ItemSelector": {
+        "item": "{% $states.context.Map.Item.Value %}",
+        "index": "{% $states.context.Map.Item.Index %}",
+        "orderId": "{% $orderId %}"
+      },
+      "MaxConcurrency": "{% $states.input.maxParallel %}",
+      "ToleratedFailureCount": 1,
+      "ToleratedFailurePercentage": 10,
+      "ItemProcessor": {
+        "StartAt": "PickItem",
+        "States": {
+          "PickItem": {
+            "Type": "Pass",
+            "Comment": "Project the selected item",
+            "Output": {
+              "item": "{% $states.input.item %}"
+            },
+            "Next": "ItemTask"
+          },
+          "ItemTask": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": {
+              "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:line",
+              "Payload": "{% $states.input %}"
+            },
+            "Output": "{% $states.result.Payload %}",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "MaxAttempts": 1
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Assign": {
+        "itemsDone": true
+      },
+      "Output": {
+        "lines": "{% $states.result %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "MaxAttempts": 0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FailOrder"
+        }
+      ],
+      "Next": "ParallelShip"
+    },
+
+    "ParallelShip": {
+      "Type": "Parallel",
+      "Comment": "Ship and audit concurrently, then end the execution",
+      "Arguments": {
+        "orderId": "{% $orderId %}",
+        "lines": "{% $states.input.lines %}"
+      },
+      "Branches": [
+        {
+          "StartAt": "WaitCooldown",
+          "States": {
+            "WaitCooldown": {
+              "Type": "Wait",
+              "Comment": "Literal seconds",
+              "Seconds": 5,
+              "Next": "ShipTask"
+            },
+            "ShipTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Arguments": {
+                "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:ship",
+                "Payload": "{% $states.input %}"
+              },
+              "TimeoutSeconds": 120,
+              "HeartbeatSeconds": "{% $states.input.heartbeat %}",
+              "Output": "{% $states.result.Payload %}",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "WaitUntilExpr",
+          "States": {
+            "WaitUntilExpr": {
+              "Type": "Wait",
+              "Comment": "Absolute wait, JSONata-evaluated",
+              "Timestamp": "{% $states.input.notifyAt %}",
+              "Next": "Audit"
+            },
+            "Audit": {
+              "Type": "Succeed",
+              "Comment": "Branch succeeds with the input as output",
+              "Output": "{% $states.input %}"
+            }
+          }
+        }
+      ],
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 1
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FailOrder"
+        }
+      ],
+      "Assign": {
+        "shipped": true
+      },
+      "Output": {
+        "ship": "{% $states.result[0] %}",
+        "audit": "{% $states.result[1] %}"
+      },
+      "End": true
+    },
+
+    "Finalize": {
+      "Type": "Pass",
+      "Comment": "Nothing to do: succeed with a receipt",
+      "Output": {
+        "status": "skipped"
+      },
+      "End": true
+    },
+
+    "FailOrder": {
+      "Type": "Fail",
+      "Comment": "Terminal failure, values resolved from the error output",
+      "Error": "{% $states.input.errorType %}",
+      "Cause": "{% $states.input.errorCause %}"
+    }
+  }
+}
