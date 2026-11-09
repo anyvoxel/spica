@@ -1,6 +1,5 @@
 use super::{
-    ActivateStateHandler, CompleteStateHandler, ContinueCompleteHandler, ContinueTerminateHandler,
-    TerminateStateHandler,
+    ActivateStateHandler, CompleteStateHandler, HandleChildFinishedHandler, TerminateStateHandler,
 };
 use crate::elements::state_handler::StateHandlerRegistry;
 use crate::elements::states::{
@@ -9,13 +8,12 @@ use crate::elements::states::{
     TaskStateHandlerFactory, WaitStateHandlerFactory,
 };
 use crate::elements::{
-    ActivityElementBehavior, Container, ExecutionElementBehavior, FlowElementBehavior,
-    TaskElementBehavior, ThreadElementBehavior,
+    ActivityElementBehavior, ExecutionElementBehavior, FlowElementBehavior, TaskElementBehavior,
+    ThreadElementBehavior,
 };
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::Command;
 use crate::types::deadline::DeadlineTarget;
-use crate::types::reject::RejectionType;
 
 /// Registers one or more `StateHandlerFactory`s into the shared [`StateHandlerRegistry`].
 ///
@@ -66,29 +64,22 @@ async fn fire_deadline(
 ) -> Result<(), ProcessingError> {
     match target {
         DeadlineTarget::Execution(execution) => {
-            let container = ExecutionElementBehavior::open(ctx.storage, execution.clone()).await?;
-            container.on_deadline_fired(ctx, out, deadline).await
+            ExecutionElementBehavior::new(execution.clone())
+                .on_deadline_fired(ctx, out, deadline)
+                .await
         }
         DeadlineTarget::Activity(activity) => {
-            // A fired deadline for a vanished activity is refused, not skipped: the fire is a durable
-            // command and `dispatch_once` holds every command to an answer.
-            let container = ActivityElementBehavior::open(ctx.storage, activity.clone())
+            // A fired deadline for a vanished or settled activity is refused by the behaviour itself,
+            // not skipped: the fire is a durable command and `dispatch_once` holds every command to an
+            // answer, so the refusal it returns names the state the row is actually in.
+            ActivityElementBehavior::new(activity.clone())
+                .on_deadline_fired(ctx, out, deadline)
                 .await
-                .map_err(|err| match err {
-                    ProcessingError::Rejected(..) => ProcessingError::Rejected(
-                        RejectionType::NotFound,
-                        format!(
-                            "trigger_deadline: activity {activity} does not exist; fire refused"
-                        ),
-                    ),
-                    err => err,
-                })?;
-            container.on_deadline_fired(ctx, out, deadline).await
         }
     }
 }
 
-/// Dispatches a [`Command`] to its typed handler. One exhaustive match over all 19 variants, so the
+/// Dispatches a [`Command`] to its typed handler. One exhaustive match over all 17 variants, so the
 /// `else unreachable!` narrowing a handler used to do on a generic `&Command` is now a compile-time
 /// guarantee: each arm hands the handler exactly its own payload/fields, and a new variant fails to
 /// compile here rather than panicking at runtime.
@@ -120,11 +111,10 @@ pub(crate) async fn dispatch_command(
             fire_deadline(target, *deadline, ctx, out).await
         }
         Command::CancelTask { task } => TaskElementBehavior::cancel(task, ctx, out).await,
-        Command::ContinueComplete { owner } => {
-            ContinueCompleteHandler.handle(owner, ctx, out).await
-        }
-        Command::ContinueTerminate { owner } => {
-            ContinueTerminateHandler.handle(owner, ctx, out).await
+        Command::HandleChildFinished { owner, child } => {
+            HandleChildFinishedHandler
+                .handle(owner, child, ctx, out)
+                .await
         }
     }
 }

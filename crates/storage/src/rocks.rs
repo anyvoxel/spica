@@ -1221,7 +1221,7 @@ mod tests {
     /// Pins the absent-key contract of both read seats: RocksDB reports a miss as a null value, **not**
     /// as a `NotFound` status, so `db.get`/`txn.get` answer `Ok(None)` and the backend-error mapping on
     /// each path stays reserved for genuine faults. If a miss ever became an `Err`, every
-    /// read-modify-write applier and `ActivityContainer::open`'s optional answer would break — hence the
+    /// read-modify-write applier and every element behaviour's existence check would break — hence the
     /// `Ok(None)` shape is asserted with `matches!` rather than an `is_none()` on an unwrapped value, so
     /// an `Err` cannot masquerade as a miss.
     #[tokio::test]

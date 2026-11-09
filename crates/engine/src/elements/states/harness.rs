@@ -23,7 +23,7 @@ use spica_storage::InMemoryStorage;
 
 use crate::StatePath;
 use crate::eval_env::EvalEnv;
-use crate::handler::{Collector, HandlerContext, OverlaySink};
+use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};
 use crate::handlers::build_state_handlers;
 use crate::storage::{ReadonlyStorageTxn, Storage};
 use crate::types::command::{ActivateState, CompleteState};
@@ -262,6 +262,9 @@ pub async fn seed_container(
 pub struct Dispatch {
     pub entries: Vec<Entry>,
     pub store: InMemoryStorage,
+    /// The handler's own outcome — `Ok` for a decision recorded as entries, `Err` for a refusal that
+    /// recorded none.
+    pub result: Result<(), ProcessingError>,
 }
 
 impl Dispatch {
@@ -334,7 +337,11 @@ pub async fn activate(state: &State, cmd: &ActivateState, scope: Thread) -> Disp
     let entries = out.into_entries();
     work.commit(None).await.expect("the batch commits");
 
-    Dispatch { entries, store }
+    Dispatch {
+        entries,
+        store,
+        result: Ok(()),
+    }
 }
 
 /// Drive `state`'s inherited [`StateHandler::complete`](crate::elements::state_handler::StateHandler)
@@ -383,7 +390,11 @@ pub async fn complete(state: &State, store: InMemoryStorage, cmd: &CompleteState
     let entries = out.into_entries();
     work.commit(None).await.expect("the batch commits");
 
-    Dispatch { entries, store }
+    Dispatch {
+        entries,
+        store,
+        result: Ok(()),
+    }
 }
 
 /// Drive `state`'s [`StateHandler::child_completed`](crate::elements::state_handler::StateHandler)
@@ -413,7 +424,7 @@ pub async fn child_completed(
     let mut env = EvalEnv::new();
     let mut definitions = HashMap::new();
     let state_handlers = build_state_handlers();
-    {
+    let settled = {
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: &work,
@@ -447,10 +458,15 @@ pub async fn child_completed(
                 &variables,
                 child,
             )
-            .await;
-    }
+            .await
+    };
+    let result = settled;
     let entries = out.into_entries();
     work.commit(None).await.expect("the batch commits");
 
-    Dispatch { entries, store }
+    Dispatch {
+        entries,
+        store,
+        result,
+    }
 }

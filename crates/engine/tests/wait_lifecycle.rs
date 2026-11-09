@@ -257,6 +257,10 @@ async fn wait_seconds_literal_routes_on_its_next() {
                     output: Some(json!({"n": 1})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
@@ -302,6 +306,10 @@ async fn wait_seconds_literal_routes_on_its_next() {
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -482,6 +490,10 @@ async fn wait_until_a_literal_timestamp() {
                     output: Some(json!({"n": 1})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
@@ -511,6 +523,10 @@ async fn wait_until_a_literal_timestamp() {
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -772,6 +788,10 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                     output: Some(json!({"echo": 1.0, "waited": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"echo": 1.0, "waited": true}),
@@ -801,6 +821,10 @@ async fn wait_seconds_from_an_expression_with_assign_and_output() {
                     input: json!({"n": 1}),
                     output: Some(json!({"echo": 1.0, "waited": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),

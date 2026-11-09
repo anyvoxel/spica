@@ -23,7 +23,7 @@ use spica_asl::StateMachine;
 use spica_machinery::{Clock, IdGenerator};
 use tracing::{debug, warn};
 
-use crate::applier::{ApplierContext, dispatch_event};
+use crate::appliers::{ApplierContext, dispatch_event};
 use crate::elements::state_handler::StateHandlerRegistry;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, OverlaySink, ProcessingError};

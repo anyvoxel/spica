@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 /// threaded down** into the item-processor child execution's own states: a state inside the
 /// processor referencing `$states.context.Map.Item` will resolve it as absent. Threading it would
 /// require carrying the current item on the child execution/activity row; deferred. See
-/// `handlers/states/map.rs`.
+/// `elements/states/map.rs`.
 pub struct States<'a> {
     input: &'a Value,
     result: Option<&'a Value>,

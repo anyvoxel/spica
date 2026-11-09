@@ -1,0 +1,15 @@
+{
+  "Comment": "Minimal machine: machine-level timeout + a single Pass state",
+  "StartAt": "Only",
+  "TimeoutSeconds": 5,
+  "States": {
+    "Only": {
+      "Type": "Pass",
+      "Comment": "Nothing to compute: succeed with a constant",
+      "Output": {
+        "done": true
+      },
+      "End": true
+    }
+  }
+}

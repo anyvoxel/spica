@@ -17,8 +17,8 @@ use crate::storage::{Storage, StorageTxn};
 use crate::types::command::Command;
 use crate::types::error::ExecutionError;
 use crate::types::event::{
-    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
-    TaskFailed, TasksClaimed, VariablesAssigned,
+    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateChildSettled, StateTransitioned,
+    TaskCompleted, TaskFailed, TasksClaimed, VariablesAssigned,
 };
 use crate::types::id::{EntryId, StreamId};
 use crate::types::reject::Reject;
@@ -707,6 +707,13 @@ pub(crate) fn log_event(event: &Event) {
         }
         Event::StateTransitioned(StateTransitioned { activity, next, .. }) => {
             info!(activity = %activity, next = %next, "state routed to next");
+        }
+        Event::StateChildSettled(StateChildSettled { activity, child }) => {
+            debug!(
+                activity = %activity,
+                child = %child,
+                "fan-out state consumed a child settle"
+            );
         }
     }
 }

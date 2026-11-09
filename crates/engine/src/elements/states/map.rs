@@ -4,20 +4,18 @@ use spica_asl::{IntOrExpr, MapItems, MapState, State};
 
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::RejectionType;
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    ActivateState, Command, CompleteState, CompleteThread, SpawnThread, TerminateState,
-    TerminateThread, TerminationReason,
+    ActivateState, Command, CompleteState, SpawnThread, TerminateState, TerminateThread,
+    TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::{Event, StateTransitioned};
+use crate::types::event::{Event, StateChildSettled, StateTransitioned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, MapActivityState, Variables};
@@ -174,17 +172,19 @@ impl StateHandler for MapStateElementBehavior<'_> {
                 .is_ok(),
             "the complete that dispatched this after_completing opened the activity as Completing"
         );
+        let activity_ref = completed.meta.object_ref().into_raw_object_ref();
         out.append_event(Event::StateCompleted {
             activity: completed,
         })
         .await;
-        // The routing owns the owner notification: an `End` completes the owning thread (whose own
-        // container then advances the scope), a `Next` activates the successor state.
+        // The routing owns the owner notification: an `End` hands the finish to the owning thread as
+        // a deferred hop (whose own container then advances the scope), a `Next` activates the
+        // successor state.
         if self.state.end == Some(true) {
-            out.append_command(Command::CompleteThread(CompleteThread {
-                thread: activity_value.meta.owner.clone(),
-                output: output_value,
-            }));
+            out.append_command(Command::HandleChildFinished {
+                owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                child: activity_ref,
+            });
         } else if let Some(next) = self.state.next.as_deref() {
             // The successor lives as a sibling of this state in the same enclosing `States` table —
             // that table is this activity's `state_path` minus its own leaf.
@@ -211,7 +211,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
     // A `Map`'s terminate sweeps its in-flight fan-out: every item thread is cancelled so its own
     // subtree unwinds and relays its settle back. The base already opened `StateTerminating`; the
     // drained side of this hook — re-entered by the generic `Terminating` path once the last sweep
-    // settles (see `handlers::continue_terminate`) — emits the activity's terminal.
+    // finishes — emits the activity's terminal.
     async fn after_terminating(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -237,8 +237,6 @@ impl StateHandler for MapStateElementBehavior<'_> {
             // Nothing left to reap: close the activity and hand it to the owning thread's container —
             // the same reaction point a `Fail`'s terminate uses, which advances a thread already
             // draining this child and takes down a still-`Running` one from the reason on the row.
-            let container =
-                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -249,9 +247,10 @@ impl StateHandler for MapStateElementBehavior<'_> {
                 activity: terminated,
             })
             .await;
-            container
-                .after_child_terminated(ctx, out, &activity_ref)
-                .await?;
+            out.append_command(Command::HandleChildFinished {
+                owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                child: activity_ref,
+            });
             return Ok(());
         }
         // An item thread unwinds on cancellation so the activity drains (the last settle re-enters
@@ -297,6 +296,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
             total: items.len(),
             max_concurrency,
             children: std::collections::HashMap::new(),
+            settled: Vec::new(),
         }));
         Ok(activity.raw_input.clone())
     }
@@ -356,18 +356,17 @@ impl StateHandler for MapStateElementBehavior<'_> {
         false
     }
 
-    /// The per-settle **replenish** hook, dispatched by the inline child-settled reaction's Running
-    /// arm on *every* item settle (not only when its children drain — that is what lets a `Map`
-    /// refill a freed `MaxConcurrency` slot while other items are still in flight). This settle already
-    /// drained one child; the hook:
+    /// The per-settle **replenish** hook, dispatched by the child-finished hand-off on *every* item
+    /// settle (not only when its children drain — that is what lets a `Map` refill a freed
+    /// `MaxConcurrency` slot while other items are still in flight). This settle already drained one
+    /// child; the hook:
     ///
     /// 1. identifies the settled item (by `child` → `children` reverse lookup) and reads its
-    ///    outcome live from the child execution's status (no persisted settle tally — each child's own
-    ///    terminal event, applied before this hook runs, is the source of truth);
-    /// 2. on any failure, fails the whole `Map` (default tolerance 0) — mirroring `fail.rs`;
-    /// 3. otherwise refills up to `MaxConcurrency` free slots from the never-spawned tail of the
-    ///    items array, then converges (a `CompleteState` that projects the ordered outputs) once
-    ///    `completed == total`.
+    ///    outcome live from the child's status (a failed item fails the whole Map, tolerance 0);
+    /// 2. records the settle on the activity, so the consumed count survives a replay;
+    /// 3. refills up to `MaxConcurrency` free slots from the never-spawned tail of the items array,
+    ///    then converges (a `CompleteState` that projects the ordered outputs) once the recorded
+    ///    count reaches `total`.
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -376,39 +375,54 @@ impl StateHandler for MapStateElementBehavior<'_> {
         activity_value: &Activity,
         _variables: &Variables,
         child: RawObjectRef,
-    ) {
-        let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
-            return; // activity gone — nothing to converge.
+    ) -> Result<(), ProcessingError> {
+        // A vanished activity or a foreign repository means the lifecycle disagrees with the log, not
+        // that there is nothing to do — refused, so the durable answer names the disagreement.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("map: activity {activity} is gone from under its settled item"),
+            ));
         };
         // The iteration plan + item child map live in the `Map` state-specific repository, folded
         // from the `StateActivated` activation product; without it this activity is not (or no
-        // longer) a Map's — nothing to drive.
+        // longer) a Map's.
         let Some(ActivityState::Map(progress)) = act.activity_state.as_ref() else {
-            return;
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "map: activity {activity} settled an item {child}, but its row carries no Map \
+                     repository"
+                ),
+            ));
         };
 
-        // Identify this settled item by its child id. The settle drained one child from the
-        // activity's ownership edges, and the `children` map (index -> child) records who that was — so
-        // membership in it is the whole test, and a node outside it is not ours to react to. Every
-        // entry was folded from a `ThreadCreated`, so an item is always a `Thread`.
+        // A settle this activity already consumed is a duplicate hand-off, refused so the log names
+        // it instead of letting a replayed settle drive a second replenish or convergence.
+        if progress.settled.contains(&child) {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("map: activity {activity} already consumed {child}'s settle"),
+            ));
+        }
+        // Identify this settled item by its child id. The `children` map (index -> child) records every
+        // item spawned so far — membership in it is the whole test, and every entry was folded from a
+        // `ThreadCreated`, so an item is always a `Thread`. A node outside the map is not ours.
         let Some(child_exec) = progress
             .children
             .values()
             .find(|e| e.as_raw_object_ref() == &child)
         else {
-            return;
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("map: activity {activity} settled {child}, which is not one of its items"),
+            ));
         };
         // A child that vanished without settling counts as a failure (mirrors `parallel.rs`).
         let this_successful = match ctx.storage.get_thread(child_exec).await.ok().flatten() {
             Some(child) => child.is_terminal() && child.status.termination_reason().is_none(),
             None => false,
         };
-
-        // No tallies are persisted here: the convergence/replenish decision is derived entirely from
-        // each item child's own terminal event (`children` + per-child `status`), so a
-        // follower rebuilding from the stream needs no Map-specific bookkeeping event. The only
-        // Map-specific state that *is* persisted is the activation product on `StateActivated` (the
-        // iteration plan), which is static and not re-derivable.
 
         // With no failure tolerance implemented, any item failure fails the whole Map immediately —
         // the ASL `ToleratedFailureCount` default of 0. The `TerminateExecution` sweep below stops
@@ -423,38 +437,24 @@ impl StateHandler for MapStateElementBehavior<'_> {
                 }),
             };
             self.fail_map(out, activity_value, reason).await;
-            return;
+            return Ok(());
         }
+        // Record the settle before deciding anything: the item's row already reads terminal, so the
+        // recorded list is the only durable trace of how many settles this Map has consumed — and
+        // the replenish arithmetic below runs on that count, not on the children's statuses.
+        out.append_event(Event::StateChildSettled(StateChildSettled {
+            activity: activity.clone(),
+            child: child.clone(),
+        }))
+        .await;
+        let handled = progress.settled.len() + 1;
 
-        // The convergence/replenish decision is derived from *currently-terminal* children, counted
-        // live here. It must NOT be derived from any persisted settle counter: when several item
-        // children settle in the same batch, their terminal events are only applied to storage *after*
-        // all of this batch's `child_completed` calls have run, so any folded counter would read the
-        // same stale pre-batch value and a Map whose items all settle together would never observe
-        // `completed == total`. Counting the `Completed` executions among `progress.children`
-        // directly is exact regardless of batch coalescing.
         let spawn_count = progress.children.len();
-        let mut completed_now = 0usize;
-        for exec in progress.children.values() {
-            // It is a `Completed` item iff terminal and not terminated (a `Terminated`/`Terminating`
-            // item failed and fails the Map separately).
-            let is_done = ctx
-                .storage
-                .get_thread(exec)
-                .await
-                .ok()
-                .flatten()
-                .map(|c| c.is_terminal() && c.status.termination_reason().is_none())
-                .unwrap_or(false);
-            if is_done {
-                completed_now += 1;
-            }
-        }
         // All items have settled successfully — the last settle drained the final slot, so
-        // `completed_now == total` implies no in-flight children remain. The aggregated array becomes
-        // the `CompleteState` raw result: the finish itself belongs to `after_completing`, so the
+        // `handled == total` implies no in-flight children remain. The aggregated array becomes the
+        // `CompleteState` raw result: the finish itself belongs to `after_completing`, so the
         // projection and routing live in one place for every way a Map can converge.
-        if completed_now == progress.total {
+        if handled == progress.total {
             // Aggregate the per-item outputs in item-index order (mirroring a `Parallel`'s
             // branch-order aggregation). Every child is `Completed` by now.
             let mut entries: Vec<(usize, ObjectRef<ThreadKind>)> = progress
@@ -477,15 +477,17 @@ impl StateHandler for MapStateElementBehavior<'_> {
                 outputs.push(output);
             }
             out.append_command(Command::CompleteState(CompleteState {
-                activity: activity.clone(),
+                activity,
                 output: Value::Array(outputs),
             }));
-            return;
+            return Ok(());
         }
 
         // Replenish: refill the freed slots up to `MaxConcurrency` from the never-spawned tail.
-        // `in_flight` after this settle is the spawned-but-not-yet-terminal children.
-        let in_flight = spawn_count - completed_now;
+        // `in_flight` after this settle is the spawned but not yet settled items — derived from the
+        // recorded settle count, because a child's own terminal row no longer tells us whether its
+        // settle was consumed.
+        let in_flight = spawn_count - handled;
         let capacity = if progress.max_concurrency == 0 {
             progress.total // unlimited — can fill every remaining slot
         } else {
@@ -494,9 +496,10 @@ impl StateHandler for MapStateElementBehavior<'_> {
         let free_slots = capacity.saturating_sub(in_flight);
         let to_spawn = free_slots.min(progress.total - spawn_count);
         if to_spawn == 0 {
-            // No free slot and not converged — a transient state (a sibling settle will refill us).
+            // No free slot and not converged — a sibling settle will refill us; the recorded settle
+            // above already answered the hand-off.
             tracing::debug!(activity = %activity, "map replenish: no free slot");
-            return;
+            return Ok(());
         }
         let owner = activity.clone();
         let pointer = activity_value.state_path.item_processor();
@@ -522,6 +525,7 @@ impl StateHandler for MapStateElementBehavior<'_> {
             }));
         }
         tracing::debug!(activity = %activity, to_spawn, "map replenishing items");
+        Ok(())
     }
 }
 
@@ -629,7 +633,6 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::CompleteThread;
     use crate::types::thread::Thread;
     use crate::{ActivityStatus, EntryPayload, MapActivityState, ThreadStatus};
     use spica_storage::InMemoryStorage;
@@ -675,6 +678,7 @@ mod tests {
             items,
             max_concurrency,
             children: HashMap::new(),
+            settled: Vec::new(),
         })
     }
 
@@ -865,10 +869,10 @@ mod tests {
                     activity: completing
                 }),
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
-                    output: aggregated,
-                })),
+                EntryPayload::Command(Command::HandleChildFinished {
+                    owner: thread_ref().into_raw_object_ref(),
+                    child: minted_activity_ref().into_raw_object_ref(),
+                }),
             ]
         );
     }
@@ -894,6 +898,7 @@ mod tests {
         items: Vec<Value>,
         max_concurrency: usize,
         children: HashMap<usize, ObjectRef<ThreadKind>>,
+        settled: Vec<RawObjectRef>,
         owned: impl IntoIterator<Item = RawObjectRef>,
     ) -> Seeded<Activity> {
         let total = items.len();
@@ -905,6 +910,7 @@ mod tests {
                 total,
                 max_concurrency,
                 children,
+                settled,
             }),
             ActivityStatus::Running,
             owned,
@@ -920,7 +926,14 @@ mod tests {
         let mut store = InMemoryStorage::new();
         seed_container(
             &mut store,
-            planned_container(items.clone(), 0, item_children(&[0, 1]), []),
+            // Item 0's settle was consumed earlier; the call under test is item 1's.
+            planned_container(
+                items.clone(),
+                0,
+                item_children(&[0, 1]),
+                vec![child_ref(0).into_raw_object_ref()],
+                [],
+            ),
             [
                 item_child(1, json!({ "i": 1 }), ThreadStatus::Completed),
                 item_child(0, json!({ "i": 0 }), ThreadStatus::Completed),
@@ -939,12 +952,16 @@ mod tests {
 
         assert_eq!(
             completed.chain(),
-            vec![EntryPayload::Command(Command::CompleteState(
-                CompleteState {
+            vec![
+                EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                    activity: minted_activity_ref(),
+                    child: child_ref(1).into_raw_object_ref(),
+                })),
+                EntryPayload::Command(Command::CompleteState(CompleteState {
                     activity: minted_activity_ref(),
                     output: aggregated,
-                }
-            ))]
+                })),
+            ]
         );
     }
 
@@ -957,7 +974,7 @@ mod tests {
         let mut store = InMemoryStorage::new();
         seed_container(
             &mut store,
-            planned_container(items.clone(), 1, item_children(&[0]), []),
+            planned_container(items.clone(), 1, item_children(&[0]), Vec::new(), []),
             [item_child(0, json!(null), ThreadStatus::Completed)],
         )
         .await;
@@ -972,19 +989,26 @@ mod tests {
 
         assert_eq!(
             completed.chain(),
-            vec![EntryPayload::Command(Command::SpawnThread(SpawnThread {
-                owner: minted_activity_ref(),
-                execution: execution_ref(),
-                state_path: Some(path("/States/P/ItemProcessor/States")),
-                index: 1,
-                start_at: "I0".to_string(),
-                input: json!(2),
-            }))]
+            vec![
+                EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                    activity: minted_activity_ref(),
+                    child: child_ref(0).into_raw_object_ref(),
+                })),
+                EntryPayload::Command(Command::SpawnThread(SpawnThread {
+                    owner: minted_activity_ref(),
+                    execution: execution_ref(),
+                    state_path: Some(path("/States/P/ItemProcessor/States")),
+                    index: 1,
+                    start_at: "I0".to_string(),
+                    input: json!(2),
+                })),
+            ]
         );
     }
 
     /// A settle that frees no slot — the cap is still occupied by an in-flight item — has nothing to
-    /// replenish and has not converged either: a transient state whose sibling settle will move it on.
+    /// replenish and has not converged either: the settle is absorbed, and its hand-off still answers
+    /// the log.
     #[tokio::test]
     async fn child_settle_with_no_free_slot_replenishes_nothing() {
         let items = vec![json!(1), json!(2), json!(3)];
@@ -997,6 +1021,7 @@ mod tests {
                 items.clone(),
                 1,
                 item_children(&[0, 1]),
+                Vec::new(),
                 [child_ref(0).into_raw_object_ref()],
             ),
             [
@@ -1014,10 +1039,15 @@ mod tests {
         )
         .await;
 
-        assert!(
-            completed.chain().is_empty(),
-            "a settle with no free slot emits nothing: {:?}",
-            completed.chain()
+        assert_eq!(
+            completed.chain(),
+            vec![EntryPayload::Event(Event::StateChildSettled(
+                StateChildSettled {
+                    activity: minted_activity_ref(),
+                    child: child_ref(1).into_raw_object_ref(),
+                }
+            ))],
+            "a settle with no free slot is absorbed, and its hand-off still answers the log"
         );
     }
 
@@ -1040,6 +1070,7 @@ mod tests {
                 items.clone(),
                 0,
                 item_children(&[0, 1]),
+                Vec::new(),
                 [child_ref(0).into_raw_object_ref()],
             ),
             [
@@ -1077,15 +1108,15 @@ mod tests {
         );
     }
 
-    /// A child the plan does not know is not this Map's to react to — a settle under the same activity
-    /// from some other fan-out leaves the plan untouched and emits nothing.
+    /// A child the plan does not know is not this Map's to react to: the row and the log disagree, so
+    /// the settle is refused rather than absorbed as if it had been the plan's.
     #[tokio::test]
-    async fn child_settle_ignores_an_unknown_child() {
+    async fn child_settle_of_an_unknown_child_is_refused() {
         let items = vec![json!(1), json!(2)];
         let mut store = InMemoryStorage::new();
         seed_container(
             &mut store,
-            planned_container(items.clone(), 0, item_children(&[0, 1]), []),
+            planned_container(items.clone(), 0, item_children(&[0, 1]), Vec::new(), []),
             [item_child(0, json!(null), ThreadStatus::Completed)],
         )
         .await;
@@ -1100,9 +1131,20 @@ mod tests {
         .await;
 
         assert!(
-            completed.chain().is_empty(),
-            "a settle from outside the plan emits nothing: {:?}",
+            completed.entries.is_empty(),
+            "a refusal records no entry of its own: {:?}",
             completed.chain()
+        );
+        assert!(
+            matches!(
+                completed.result,
+                Err(ProcessingError::Rejected(
+                    RejectionType::InvalidState,
+                    ref reason
+                )) if reason.contains("not one of its items")
+            ),
+            "a settle from outside the plan is refused: {:?}",
+            completed.result
         );
     }
 }

@@ -11,8 +11,8 @@ use spica_engine::{
     ActivateState, Activity, ActivityKind, ActivityStatus, Command, CompleteExecution,
     CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution,
     ExecutionCreated, ExecutionKind, ExecutionStatus, Flow, FlowCreated, FlowStatus, FlowVersion,
-    FlowVersionCreated, FlowVersionKind, StateTransitioned, Thread, ThreadKind, ThreadStatus,
-    VariablesAssigned,
+    FlowVersionCreated, FlowVersionKind, HasRawObjectRef, StateTransitioned, Thread, ThreadKind,
+    ThreadStatus, VariablesAssigned,
 };
 
 #[rustfmt::skip]
@@ -149,6 +149,10 @@ async fn succeed_with_explicit_output() {
                     output: Some(json!({"ok": true, "count": 7})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-1", 5).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true, "count": 7}),
@@ -178,6 +182,10 @@ async fn succeed_with_explicit_output() {
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true, "count": 7})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -344,6 +352,10 @@ async fn succeed_without_output_passes_its_input_through() {
                     output: Some(json!({"n": 1})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-1", 5).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
@@ -373,6 +385,10 @@ async fn succeed_without_output_passes_its_input_through() {
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -620,6 +636,10 @@ async fn succeed_output_as_jsonata() {
                     output: Some(json!({"echo": 1.0, "code": "E-42"})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-2", 6).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"echo": 1.0, "code": "E-42"}),
@@ -649,6 +669,10 @@ async fn succeed_output_as_jsonata() {
                     input: json!({"n": 1}),
                     output: Some(json!({"echo": 1.0, "code": "E-42"})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),

@@ -3,15 +3,11 @@ use serde_json::Value;
 use spica_asl::{IntOrExpr, State, StatePath, WaitState, WaitTimestamp};
 
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
-use crate::types::command::{
-    ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
-};
+use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned};
@@ -113,16 +109,17 @@ impl StateHandler for WaitStateElementBehavior<'_> {
                     completed.mark_completed(output.clone(), out.now()).is_ok(),
                     "the complete step that dispatched this after_completing opened the activity as Completing"
                 );
+                let activity_ref = completed.meta.object_ref().into_raw_object_ref();
                 out.append_event(Event::StateCompleted {
                     activity: completed,
                 })
                 .await;
                 // `End` routes to the owner thread's completion rather than a sibling hop, so it
-                // carries no `StateTransitioned` marker.
-                out.append_command(Command::CompleteThread(CompleteThread {
-                    thread: activity_value.meta.owner.clone(),
-                    output,
-                }));
+                // carries no `StateTransitioned` marker; the finish itself is handed over deferred.
+                out.append_command(Command::HandleChildFinished {
+                    owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                    child: activity_ref,
+                });
             }
             // No route at all: the definition is malformed, so unwind the finishing activity and let
             // its owner thread's container carry the scope down with the failure.
@@ -130,8 +127,6 @@ impl StateHandler for WaitStateElementBehavior<'_> {
                 let reason = TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
-                let owner = activity_value.meta.owner.clone();
-                let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -152,9 +147,10 @@ impl StateHandler for WaitStateElementBehavior<'_> {
                     activity: terminated,
                 })
                 .await;
-                thread_container
-                    .after_child_terminated(ctx, out, &activity_ref)
-                    .await?;
+                out.append_command(Command::HandleChildFinished {
+                    owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                    child: activity_ref,
+                });
             }
         }
         Ok(())
@@ -165,13 +161,11 @@ impl StateHandler for WaitStateElementBehavior<'_> {
     // scheduler-side cancel is driven by the `StateTerminated` this emits.
     async fn after_terminating(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        _ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
-        let container =
-            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
@@ -182,9 +176,10 @@ impl StateHandler for WaitStateElementBehavior<'_> {
             activity: terminated,
         })
         .await;
-        container
-            .after_child_terminated(ctx, out, &activity_ref)
-            .await?;
+        out.append_command(Command::HandleChildFinished {
+            owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+            child: activity_ref,
+        });
         Ok(())
     }
 
@@ -373,9 +368,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{
-        ActivateState, Command, CompleteThread, TerminateState, TerminationReason,
-    };
+    use crate::types::command::{ActivateState, Command, TerminateState, TerminationReason};
     use crate::types::event::{Event, StateTransitioned};
     use crate::types::meta::HasRawObjectRef;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus};
@@ -508,14 +501,13 @@ mod tests {
         assert!(
             matches!(
                 completed.chain().last(),
-                Some(EntryPayload::Command(Command::CompleteThread(
-                    CompleteThread {
-                        thread: t,
-                        output,
-                    }
-                ))) if *t == thread_ref() && *output == seeded_input()
+                Some(EntryPayload::Command(Command::HandleChildFinished {
+                    owner,
+                    child,
+                })) if *owner == thread_ref().into_raw_object_ref()
+                    && *child == minted_activity_ref().into_raw_object_ref()
             ),
-            "an `End` Wait completes its owner thread with the result: {:?}",
+            "an `End` Wait hands its finish to the owner thread: {:?}",
             completed.chain().last()
         );
         assert!(

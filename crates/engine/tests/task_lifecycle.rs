@@ -15,10 +15,10 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteTask, CompleteThread, CreateExecution, CreateFlow,
     DeadlineTarget, EntryPayload, Event, Execution, ExecutionCreated, ExecutionError,
     ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowStatus, FlowVersion,
-    FlowVersionCreated, FlowVersionKind, ObjectKind, Reject, RejectionType, RetrierAttemptState,
-    RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task, TaskCompleted, TaskFailed,
-    TaskKind, TaskStatus, TasksClaimed, TerminateExecution, TerminateState, TerminateThread,
-    TerminationReason, Thread, ThreadKind, ThreadStatus,
+    FlowVersionCreated, FlowVersionKind, ObjectKind, Reject, RejectionType, RequestId,
+    RetrierAttemptState, RetryPolicy, RetryState, RuntimeError, StateTransitioned, Task,
+    TaskCompleted, TaskFailed, TaskKind, TaskStatus, TasksClaimed, TerminateExecution,
+    TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus,
 };
 
 #[rustfmt::skip]
@@ -206,6 +206,10 @@ async fn task_poll_then_complete_routes_on_its_next() {
                 },
                 output: json!({"ok": true}),
             })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+            }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
@@ -314,6 +318,10 @@ async fn task_poll_then_complete_routes_on_its_next() {
                     output: Some(json!({"ok": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
@@ -343,6 +351,10 @@ async fn task_poll_then_complete_routes_on_its_next() {
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -593,6 +605,10 @@ async fn task_settled_before_a_claim_is_refused() {
                 },
                 output: json!({"late": true}),
             })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+            }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"late": true}),
@@ -701,6 +717,10 @@ async fn task_settled_before_a_claim_is_refused() {
                     output: Some(json!({"late": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"late": true}),
@@ -730,6 +750,10 @@ async fn task_settled_before_a_claim_is_refused() {
                     input: json!({"n": 1}),
                     output: Some(json!({"late": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -975,8 +999,9 @@ async fn task_timeout_seconds_fails_the_run() {
                     },
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
+            EntryPayload::Command(Command::HandleChildFinished {
                 owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
@@ -996,6 +1021,10 @@ async fn task_timeout_seconds_fails_the_run() {
                     retry_state: None,
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -1038,6 +1067,10 @@ async fn task_timeout_seconds_fails_the_run() {
                     input: json!({"n": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),
@@ -1303,6 +1336,10 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                     },
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Event(Event::StateActivating {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
@@ -1337,6 +1374,13 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-3", 7),
                 output: json!({"n": 1}),
             })),
+            // The cancelled task's deferred hand-off lands after its owner already completed, so the
+            // owner refuses it rather than consuming a settle it no longer owes.
+            EntryPayload::Reject(Reject {
+                request_id: RequestId::nil(),
+                rejection_type: RejectionType::InvalidState,
+                rejection_reason: "activity_element: activity activity/lifecycle_execution-1 finished a child task/lifecycle_execution-2 while Completed".to_string(),
+            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta_span(uid(7), "lifecycle_execution-3", stamp(VIRTUAL_EPOCH_MILLIS + 30_000), stamp(VIRTUAL_EPOCH_MILLIS + 30_000))
@@ -1369,6 +1413,10 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                     output: Some(json!({"caught": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"caught": true}),
@@ -1398,6 +1446,10 @@ async fn task_timeout_caught_routes_on_its_catcher() {
                     input: json!({"n": 1}),
                     output: Some(json!({"caught": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -1755,6 +1807,10 @@ async fn task_retry_re_arms_across_the_backoff() {
                 },
                 output: json!({"ok": true}),
             })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+            }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
@@ -1871,6 +1927,10 @@ async fn task_retry_re_arms_across_the_backoff() {
                     output: Some(json!({"ok": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
@@ -1900,6 +1960,10 @@ async fn task_retry_re_arms_across_the_backoff() {
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -2285,6 +2349,10 @@ async fn task_catch_routes_on_a_failed_task() {
                     output: Some(json!({"n": 1})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"n": 1}),
@@ -2314,6 +2382,10 @@ async fn task_catch_routes_on_a_failed_task() {
                     input: json!({"n": 1}),
                     output: Some(json!({"n": 1})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -2545,8 +2617,9 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     },
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
+            EntryPayload::Command(Command::HandleChildFinished {
                 owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 6),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
@@ -2564,6 +2637,10 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     retry_state: None,
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -2603,6 +2680,10 @@ async fn task_with_an_invalid_timeout_seconds_is_a_definition_error() {
                     input: json!({"n": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),
@@ -2872,6 +2953,10 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                 },
                 output: json!({"ok": true}),
             })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Task, "lifecycle_execution-2", 0),
+            }),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!({"ok": true}),
@@ -2980,6 +3065,10 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                     output: Some(json!({"ok": true})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"ok": true}),
@@ -3009,6 +3098,10 @@ async fn task_lease_lapse_is_reclaimed_by_the_next_poll() {
                     input: json!({"n": 1}),
                     output: Some(json!({"ok": true})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),

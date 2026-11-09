@@ -14,9 +14,9 @@ use spica_engine::{
     ActivateState, Activity, ActivityKind, ActivityStatus, Command, CompleteExecution,
     CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload, Event, Execution,
     ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow, FlowCreated,
-    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, RuntimeError, StateTransitioned,
-    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
-    ThreadStatus, VariablesAssigned,
+    FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, HasRawObjectRef, RuntimeError,
+    StateTransitioned, TerminateExecution, TerminateState, TerminateThread, TerminationReason,
+    Thread, ThreadKind, ThreadStatus, VariablesAssigned,
 };
 
 #[rustfmt::skip]
@@ -241,6 +241,10 @@ async fn choice_first_matching_rule_wins() {
                     output: Some(json!({"branch": "big"})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-2", 6).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"branch": "big"}),
@@ -270,6 +274,10 @@ async fn choice_first_matching_rule_wins() {
                     input: json!({"n": 10}),
                     output: Some(json!({"branch": "big"})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -530,6 +538,10 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                     output: Some(json!({"chosen": "rule", "range": "rule"})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-2", 6).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"chosen": "rule", "range": "rule"}),
@@ -559,6 +571,10 @@ async fn choice_rule_assign_and_output_override_the_state_level() {
                     input: json!({"v": 25}),
                     output: Some(json!({"chosen": "rule", "range": "rule"})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -813,6 +829,10 @@ async fn choice_without_a_match_takes_the_default() {
                     output: Some(json!({"chosen": "default", "range": "state"})),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-2", 6).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 output: json!({"chosen": "default", "range": "state"}),
@@ -842,6 +862,10 @@ async fn choice_without_a_match_takes_the_default() {
                     input: json!({"v": 1}),
                     output: Some(json!({"chosen": "default", "range": "state"})),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -1045,6 +1069,10 @@ async fn choice_without_a_match_or_default_fails() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-1", 5).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
@@ -1086,6 +1114,10 @@ async fn choice_without_a_match_or_default_fails() {
                     input: json!({"v": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),
@@ -1311,6 +1343,10 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
+                child: ref_to::<ActivityKind>("lifecycle_execution-1", 5).into_raw_object_ref(),
+            }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
                 reason: TerminationReason::Failed {
@@ -1355,6 +1391,10 @@ async fn choice_condition_that_is_not_a_boolean_is_a_runtime_error() {
                     input: json!({"v": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: ref_to::<ExecutionKind>("lifecycle_execution", 3).into_raw_object_ref(),
+                child: ref_to::<ThreadKind>("lifecycle_execution-0", 4).into_raw_object_ref(),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::applier::{ApplierContext, dispatch_event};
+use crate::appliers::{ApplierContext, dispatch_event};
 use crate::log::Timestamp;
 use crate::storage::{ReadonlyStorageTxn, StorageTxn};
 use crate::types::activity::Activity;

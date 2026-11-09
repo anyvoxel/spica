@@ -25,8 +25,8 @@
 //! (`Execution`/`State`/`Map.Item`) binding, and execution cancellation (`Engine::cancel_execution`).
 //!
 //! Not yet implemented (each carries a `TODO` marker at its site; see in particular
-//! `handlers/states/task.rs`, `handlers/complete_task.rs`,
-//! `handlers/states/map.rs`, and `handlers/states/mod.rs`):
+//! `elements/states/task.rs`, `elements/task.rs`, `elements/states/map.rs`, and
+//! `elements/states/mod.rs`):
 //!
 //! - **M2**: Task `HeartbeatSeconds` (`States.HeartbeatTimeout`) — the current worker/handler
 //!   contract (in `spica-client`'s `worker` module) cannot express a client-keepalive-driven
@@ -38,9 +38,8 @@
 //!   deferred): `ItemSelector` (per-item input transform), `ToleratedFailureCount` /
 //!   `ToleratedFailurePercentage` (current behavior equals the default tolerance of 0), and
 //!   threading `$states.context.Map.Item` down into the item-processor child states.
-//! - **Cross-cutting**: submission-time `spica_asl::StateMachine::validate()`; a fully-designed
-//!   recovery path for the inline child-settled reaction over container (Map/Parallel) states;
-//!   `$states.context.StateMachine` stats.
+//! - **Cross-cutting**: submission-time `spica_asl::StateMachine::validate()`; `$states.context.StateMachine`
+//!   stats.
 //!
 //! The CCES seams (LogStream/Storage/StreamProcessor) are the foundation a distributed
 //! deployment implements.
@@ -50,7 +49,7 @@
 //! `jsonata-core` represents all JSON numbers as `f64`, so an integer assigned or output via
 //! JSONata (e.g. `5`) round-trips as `5.0`. Comparisons inside JSONata are unaffected.
 
-mod applier;
+mod appliers;
 mod elements;
 mod engine;
 mod eval_env;
@@ -68,7 +67,7 @@ mod task_api;
 mod types;
 mod working;
 
-pub use applier::{ApplierContext, dispatch_event};
+pub use appliers::{ApplierContext, dispatch_event};
 pub use engine::{Engine, EngineBuilder};
 pub use handler::{Collector, HandlerContext};
 pub use hook::Hook;
@@ -90,8 +89,8 @@ pub use types::command::{
 pub use types::deadline::DeadlineTarget;
 pub use types::error::{ExecutionError, InfraError, RuntimeError, StorageError};
 pub use types::event::{
-    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateTransitioned, TaskCompleted,
-    TaskFailed, TasksClaimed, VariablesAssigned,
+    Event, ExecutionCreated, FlowCreated, FlowVersionCreated, StateChildSettled, StateTransitioned,
+    TaskCompleted, TaskFailed, TasksClaimed, VariablesAssigned,
 };
 pub use types::execution::{Execution, ExecutionKind, ExecutionStatus};
 pub use types::flow::{Flow, FlowKind, FlowStatus};

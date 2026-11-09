@@ -1,10 +1,11 @@
 //! Per-`Event` applier implementations, one unit-struct per file.
 //!
 //! Each applier folds one [`Event`](crate::types::event::Event) variant into Storage. Splitting
-//! them one-per-file mirrors how the command handlers live
-//! one-per-file under `handlers/`, keeping each fold rule local and greppable. The exhaustive
-//! [`dispatch_event`](super::dispatch_event) routes every variant to its applier's inherent `apply`.
+//! them one-per-file mirrors how the command handlers live one-per-file under `handlers/`, keeping
+//! each fold rule local and greppable. The exhaustive [`dispatch_event`] (in [`dispatch`]) routes
+//! every variant to its applier's inherent `apply`.
 
+mod dispatch;
 mod execution_completed;
 mod execution_completing;
 mod execution_created;
@@ -14,6 +15,7 @@ mod flow_created;
 mod flow_version_created;
 mod state_activated;
 mod state_activating;
+mod state_child_settled;
 mod state_completed;
 mod state_completing;
 mod state_terminated;
@@ -31,6 +33,7 @@ mod thread_terminated;
 mod thread_terminating;
 mod variables_assigned;
 
+pub use dispatch::{ApplierContext, dispatch_event};
 pub(crate) use execution_completed::ExecutionCompletedApplier;
 pub(crate) use execution_completing::ExecutionCompletingApplier;
 pub(crate) use execution_created::ExecutionCreatedApplier;
@@ -40,6 +43,7 @@ pub(crate) use flow_created::FlowCreatedApplier;
 pub(crate) use flow_version_created::FlowVersionCreatedApplier;
 pub(crate) use state_activated::StateActivatedApplier;
 pub(crate) use state_activating::StateActivatingApplier;
+pub(crate) use state_child_settled::StateChildSettledApplier;
 pub(crate) use state_completed::StateCompletedApplier;
 pub(crate) use state_completing::StateCompletingApplier;
 pub(crate) use state_terminated::StateTerminatedApplier;

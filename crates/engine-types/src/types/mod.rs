@@ -1,6 +1,6 @@
 //! Pure domain data types shared across the engine — commands, events, rejections, and the
 //! projected entity values (activity / execution / flow / task). No execution logic lives here: the
-//! engine proper (`engine`, `stream_processor`, `handler`, `applier`, `handlers`) consumes and
+//! engine proper (`engine`, `stream_processor`, `handler`, `appliers`, `handlers`) consumes and
 //! produces these values.
 
 pub mod activity;
