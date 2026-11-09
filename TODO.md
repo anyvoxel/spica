@@ -308,7 +308,7 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 1. **行结构不再要改**:子边现在存在独立的 `_index` 边表里,任何 kind 都能拥有子节点,Task 不需要在行上加 children 集合 —— 「Task 从叶子变容器」那部分代价不复存在,剩下的只是第 2 条那条新不变式。
 2. **级联扫荡不再覆盖它**(最关键)。今天「`CancelTask` / `TaskCompleted` / 租约过期 / `terminate_state`」任一路径都由 activity 级一次扫荡兜底;改挂后必须成立新不变式:**每条让 task 终结的路径都扫它自己的 timer**。漏一条就会留下活着的 timer,scheduler 到点触发 `TriggerTimer` 去打一个已不存在的 task(即那堆 late-fire 防御分支要处理的情形)。
 3. **Activity 的 drain 信号变了**。`trigger_timer` 现在特意在「没找到 in-flight task」时仍跑 `child_settled`,注释明写:那正是 cancel 已扫掉 task、只剩已 fire 的 timer 撑住 activity 的场景。改挂后这个 relay 的收敛对象换成 task 的容器,而此刻 task 自身已 terminal/drained,收敛推理要重做。
-4. **容器分发扩容**:Timer 的 owner kind 从 {Execution, Thread, Activity} 变成再加 Task,`cancel_timer` / `trigger_timer` 里的 `if owner.kind != ObjectKind::Activity { return }` 需变成按 kind 分发(`TaskContainer`)。与现有 `Container` 抽象方向一致,但是**新增工作量**,不是改挂的自动结果;且与 `8e0f90f`(把每个 state 的 owner 统一到 Thread)方向相反 —— 那是在收敛「谁拥有子节点」。
+4. **容器分发扩容**:Timer 的 owner kind 从 {Execution, Thread, Activity} 变成再加 Task,`cancel_timer` / `trigger_timer` 里的 `if owner.kind != ObjectKind::Activity { return }` 需变成按 kind 分发(`TaskContainer`)。与「按 kind 分发到各 element 行为」的方向一致,但是**新增工作量**,不是改挂的自动结果;且与 `8e0f90f`(把每个 state 的 owner 统一到 Thread)方向相反 —— 那是在收敛「谁拥有子节点」。
 
 ### 候选方案:Task 持有自己的 timeout timer 引用(倾向这条)
 
@@ -328,16 +328,16 @@ raft commit index X ─► delta 1..X 一次性原子写成 RocksDB batch
 
 ## 用「从 Storage 重算下一步」取代持久化 follow-up command —— 先做等价性反推盘点
 
-**状态:** 已识别,待评审;**先只做「反推表」盘点,不动实现**。触发条件 = 想简化内部跳转机制(settle 钩子 / `Continue*` 双轨、内部 command 的持久化)时。
+**状态:** 已识别,待评审;**先只做「反推表」盘点,不动实现**。触发条件 = 想简化内部跳转机制(一跳 `HandleChildFinished`、内部 command 的持久化)时。
 
 ### 问题(想简化什么)
 
 CCES 让「决定下一步」与「执行下一步」解耦,并把**决定本身**持久化成 command,换来可恢复 / 可交接 / 可审计。代价是控制流被摊成「一条持久化 command + 下一轮 dispatch」,于是:
 
-- 「子完成后父要推进」这件事有**两套机制**并存:`Container` 的 settle 钩子(`crates/engine/src/elements/mod.rs` 的 `after_child_completed` / `after_child_terminated`)与一跳延迟的 `Command::ContinueComplete` / `ContinueTerminate`(`crates/engine-types/src/types/command.rs`)。读的人得先猜「这次为何不走另一条」。
+- 「子完成后父要推进」已统一为一条一跳延迟的 `Command::HandleChildFinished`（`crates/engine-types/src/types/command.rs`），owner 按自身类型在自己的 element `on_child_finished` 里决定含义；旧的 `Container` 钩子与 `ContinueComplete` / `ContinueTerminate` 双轨已删除，读的人不再需要猜「这次为何不走另一条」。
 - 「每条 command 至少一条 entry」不变量(`crates/engine/src/leader.rs` 的 `dispatch_once` `assert!`)对**内部** follow-up command 也生效,而内部 command 根本没有 awaiter(`Command::request_id()` 对它们返回 `None`)。
 
-**想法**:如果恢复时能从 `Storage` 读出最新投影,直接算出「下一个应该执行的点」、执行、把结果写 log、再提交,那么**内部 follow-up command 的持久化可能是多余的**——`settle` 与 `Continue*` 可合并成一条「drive 时重算」,上述不变量可收缩到只对客户端发起的 command 生效。
+**想法**:如果恢复时能从 `Storage` 读出最新投影,直接算出「下一个应该执行的点」、执行、把结果写 log、再提交,那么**内部 follow-up command 的持久化可能是多余的**——child-finish 的 hop 与内部 command 可合并成一条「drive 时重算」,上述不变量可收缩到只对客户端发起的 command 生效。
 
 ### 不违反核心不变量(先确立这点)
 
@@ -379,7 +379,7 @@ CCES 让「决定下一步」与「执行下一步」解耦,并把**决定本身
 - 重算结果 **==** 日志里那条 command → 该 command **冗余**,可去掉持久化,改由 drive 时重算;
 - 重算不出 / 算出来**不一致** → 它的决策依赖了 state 外的信息,那就是**必须先补进 state 或 event** 的那份信息(通常意味着给某个 event 补字段,或给某张表补一列)。
 
-这张表做完,「能简化多少」就不是猜的;并顺带回答 `settle` 与 `Continue*` 到底哪个是多余的。
+这张表做完,「能简化多少」就不是猜的;并顺带回答 child-finish 的 hop 与内部 command 之间哪些是多余的。
 
 ### 注意
 
@@ -432,9 +432,9 @@ IR 是**定义(`FlowVersion`)的 lowering**,`Flow`/`FlowVersion` 的存储与语
 
 | | 现状(域对象图) | IR + 运行时 |
 |---|---|---|
-| 复杂度形状 | **摊开**(7 个 kind × applier × container × handler × settle/Continue)且**涌现**(要推断) | **集中**(编译器 + 一个解释器 + 一个 frame 模型)且**声明式**(可读出) |
+| 复杂度形状 | **摊开**(7 个 kind × applier × container × handler × child-finish hop)且**涌现**(要推断) | **集中**(编译器 + 一个解释器 + 一个 frame 模型)且**声明式**(可读出) |
 | 成本时机 | 可**增量**改进 | **前置**付清,重写量级 |
-| 取消 / 父子 | 手写级联扫荡 + settle/Continue 双轨 | 结构化并发 + handle `kinds` 表(通用) |
+| 取消 / 父子 | 手写级联扫荡 + child-finish hop + 内部 command | 结构化并发 + handle `kinds` 表(通用) |
 | 已持久化程序的语义 | 在 handler 代码里(升级会漂移) | 在指令流里(G1,重新编译) |
 | 对外查询 | 域行即查询面 | 需另建读模型(文档未覆盖) |
 

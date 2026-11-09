@@ -13,10 +13,10 @@ use spica_engine::{
     ExecutionError, ExecutionKind, ExecutionStatus, FailTask, Flow, FlowCreated, FlowName,
     FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, HasRawObjectRef,
     InMemoryLogStream, LogStream, ObjectRef, RawObjectRef, RejectionType, RequestId, RetryPolicy,
-    RetryState, RuntimeError, SpawnThread, StateTransitioned, Storage, StreamProcessor, Task,
-    TaskCompleted, TaskFailed, TaskKind, TaskStatus, TasksClaimed, TerminateExecution,
-    TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind, ThreadOwner,
-    ThreadStatus, Timestamp, Variables, VariablesAssigned, WaitActivityState,
+    RetryState, RuntimeError, SpawnThread, StateChildSettled, StateTransitioned, Storage,
+    StreamProcessor, Task, TaskCompleted, TaskFailed, TaskKind, TaskStatus, TasksClaimed,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
+    ThreadOwner, ThreadStatus, Timestamp, Variables, VariablesAssigned, WaitActivityState,
 };
 use spica_scheduler::{DeadlineSink, InMemoryScheduler, Scheduler};
 use spica_storage::InMemoryStorage;
@@ -358,6 +358,7 @@ fn kind_prefix(e: &Event) -> &'static str {
         Event::TaskCancelled { .. } => "TaskCancelled",
         Event::VariablesAssigned(VariablesAssigned { .. }) => "VariablesAssigned",
         Event::StateTransitioned(StateTransitioned { .. }) => "StateTransitioned",
+        Event::StateChildSettled(StateChildSettled { .. }) => "StateChildSettled",
     }
 }
 
@@ -1755,7 +1756,7 @@ async fn a_premature_complete_routes_immediately_and_a_later_fire_is_refused() {
     assert!(
         !entries.iter().any(|e| matches!(
             &e.payload,
-            EntryPayload::Command(Command::ContinueComplete { .. })
+            EntryPayload::Command(Command::HandleChildFinished { .. })
         )),
         "a terminal activity has no finish left to drain: {entries:?}"
     );
@@ -2933,13 +2934,33 @@ async fn leasing_worker_complete_settles_task() {
     assert_eq!(completed.status, TaskStatus::Completed);
     assert_eq!(completed.worker_id, None); // lease cleared
     assert_eq!(completed.lease_expires_at, None);
-    // The owning Task state resumes via CompleteState.
+    // The settle is deferred: `CompleteTask` writes `TaskCompleted` and hands the finished task to its
+    // owning activity. The next dispatch is what resumes the state — the hand-off's owner reaction
+    // reads the task's own terminal row, which the fold above wrote.
+    let hand_off = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Command(Command::HandleChildFinished { owner, child }) => {
+                Some(Command::HandleChildFinished {
+                    owner: owner.clone(),
+                    child: child.clone(),
+                })
+            }
+            _ => None,
+        })
+        .expect("a settled task hands itself to its owning activity");
+    for entry in &entries {
+        if let EntryPayload::Event(event) = &entry.payload {
+            Projector::new().apply(&mut storage, event).await;
+        }
+    }
+    let resumed = dispatch_command(&storage, hand_off).await;
     assert!(
-        entries.iter().any(|e| matches!(
+        resumed.iter().any(|e| matches!(
             &e.payload,
             EntryPayload::Command(Command::CompleteState(CompleteState { .. }))
         )),
-        "a settled task should resume its state"
+        "a settled task should resume its state: {resumed:?}"
     );
 }
 
@@ -2948,8 +2969,8 @@ async fn complete_without_a_live_owning_activity_is_refused() {
     let mut storage = InMemoryStorage::new();
     let task = ulid::Ulid::new();
     // The task is seeded owned by an activity that was never written — the owning row is gone. The
-    // settle has no container to hand itself to, so the handler must answer that *before* it logs a
-    // `TaskCompleted` nothing could resume.
+    // settle itself is deferred, so `CompleteTask` records `TaskCompleted` and hands the task to an
+    // owner that is not there; the hand-off is what refuses, naming the row it could not reach.
     seed_task(
         &mut storage,
         task,
@@ -2968,7 +2989,26 @@ async fn complete_without_a_live_owning_activity_is_refused() {
         }),
     )
     .await;
-    let rejects: Vec<_> = entries
+    let hand_off = entries
+        .iter()
+        .find_map(|e| match &e.payload {
+            EntryPayload::Command(Command::HandleChildFinished { owner, child }) => {
+                Some(Command::HandleChildFinished {
+                    owner: owner.clone(),
+                    child: child.clone(),
+                })
+            }
+            _ => None,
+        })
+        .expect("the settle hands itself to its owning activity");
+    assert!(
+        entries
+            .iter()
+            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskCompleted(_)))),
+        "the terminal event is written before the deferred hand-off: {entries:?}"
+    );
+    let refused = dispatch_command(&storage, hand_off).await;
+    let rejects: Vec<_> = refused
         .iter()
         .filter_map(|e| match &e.payload {
             EntryPayload::Reject(rej) => Some(rej),
@@ -2978,24 +3018,12 @@ async fn complete_without_a_live_owning_activity_is_refused() {
     assert_eq!(
         rejects.len(),
         1,
-        "an ownerless settle must produce exactly one Reject: {entries:?}"
+        "a hand-off to a gone owner must produce exactly one Reject: {refused:?}"
     );
     assert_eq!(
         rejects[0].rejection_type,
-        RejectionType::NotFound,
-        "the container's own `open` names the gone owner it refused"
-    );
-    assert!(
-        !entries
-            .iter()
-            .any(|e| matches!(&e.payload, EntryPayload::Event(Event::TaskCompleted(_)))),
-        "the terminal event must not be written when nothing can resume it: {entries:?}"
-    );
-    let t = storage.get_task(&task_ref(task)).await.unwrap().unwrap();
-    assert_eq!(
-        t.status,
-        TaskStatus::Running,
-        "a refused settle must leave the task leased for its worker"
+        RejectionType::InvalidState,
+        "a gone owner is the lifecycle disagreeing with the log, not a missing command target"
     );
 }
 

@@ -1,9 +1,7 @@
 use serde_json::Value;
 use spica_asl::State;
 
-use super::Container;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::storage::ReadonlyStorageTxn;
 use crate::types::activity::{Activity, ActivityKind};
 use crate::types::command::{
     Command, CompleteState, TerminateState, TerminateThread, TerminationReason,
@@ -23,6 +21,9 @@ pub(crate) struct ActivityElementBehavior {
 }
 
 impl ActivityElementBehavior {
+    pub(crate) fn new(activity: ObjectRef<ActivityKind>) -> Self {
+        Self { activity }
+    }
     /// Hand the settle to the state that fronts this activity — its own
     /// [`StateHandler::child_completed`](crate::elements::state_handler::StateHandler::child_completed),
     /// the one place a per-state reaction lives.
@@ -55,8 +56,7 @@ impl ActivityElementBehavior {
                 &variables,
                 child.clone(),
             )
-            .await;
-        Ok(())
+            .await
     }
 
     /// A `Wait`'s resume deadline elapsed, or a `Task`'s `TimeoutSeconds` did: the two effects the
@@ -75,7 +75,7 @@ impl ActivityElementBehavior {
     ) -> Result<(), ProcessingError> {
         let Some(act) = ctx.storage.get_activity(&self.activity).await? else {
             return Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
+                RejectionType::NotFound,
                 format!(
                     "activity_element: activity {} is gone from under its deadline",
                     self.activity
@@ -132,16 +132,10 @@ impl ActivityElementBehavior {
                 }
             }
             ActivityStatus::Completing => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.activity.as_raw_object_ref().clone(),
-                });
-                Ok(())
+                Self::finish_completing(ctx, out, self.activity.clone()).await
             }
             ActivityStatus::Terminating(_) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.activity.as_raw_object_ref().clone(),
-                });
-                Ok(())
+                Self::finish_terminating(ctx, out, self.activity.clone()).await
             }
             ActivityStatus::Completed | ActivityStatus::Terminated(_) => {
                 Err(ProcessingError::Rejected(
@@ -208,11 +202,8 @@ impl ActivityElementBehavior {
     /// the last drains, a `Map` refills a freed `MaxConcurrency` slot before it converges, and a `Task`
     /// completes on its call's payload.
     ///
-    /// A settle landing once the activity is finishing advances that finish instead — the state would be
-    /// replenishing under a machine that already decided to stop — and one landing after it finished is
-    /// a late cleanup of a child nothing waits for any more. The kind check keeps the pair honest: the
-    /// state's own type names the kind it can be settled by, and any other kind is the row and the
-    /// lifecycle disagreeing.
+    /// The kind check keeps the pair honest: the state's own type names the kind it can be settled by,
+    /// and any other kind is the row and the lifecycle disagreeing.
     async fn settle_child(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -239,56 +230,39 @@ impl ActivityElementBehavior {
                 ),
             ));
         }
-        match &act.status {
-            ActivityStatus::Running => {
-                self.hand_to_state(ctx, out, act, thread, state_def, child)
-                    .await
-            }
-            ActivityStatus::Completing => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.activity.as_raw_object_ref().clone(),
-                });
-                Ok(())
-            }
-            ActivityStatus::Terminating(_) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.activity.as_raw_object_ref().clone(),
-                });
-                Ok(())
-            }
-            ActivityStatus::Completed | ActivityStatus::Terminated(_) => Ok(()),
-        }
+        self.hand_to_state(ctx, out, act, thread, state_def, child)
+            .await
     }
 
-    /// Advance an activity that a settled child drained and a `ContinueTerminate` named: the failure
-    /// side of the deferred hop, mirroring [`Self::continue_complete`].
+    /// Advance a `Terminating` activity a finished child drained — the failure side of the deferred
+    /// `HandleChildFinished` hop, mirroring [`Self::finish_completing`].
     ///
     /// The hop lands only on a `Terminating` activity — its reason was fixed when the teardown began, so
     /// nothing here re-derives it. A row that still holds children has each taken down by its own kind's
     /// verb; a drained one runs its state's `after_terminating`, which owns both the terminal and the
     /// relay to the owning thread that the deferred `terminate` step owes.
-    pub(crate) async fn continue_terminate(
+    pub(crate) async fn finish_terminating(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         node: ObjectRef<ActivityKind>,
     ) -> Result<(), ProcessingError> {
         // A read fault is the dispatch's — returned, so the leader owns retry/refusal. A missing row is
-        // a real refusal: the Continue names the node a settled child drained, so a gone row means the
+        // a real refusal: the hop names the node a settled child drained, so a gone row means the
         // command's own precondition failed rather than "already closed".
         let Some(act) = ctx.storage.get_activity(&node).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
-                format!("continue_terminate: activity {node} not found"),
+                format!("finish_terminating: activity {node} not found"),
             ));
         };
         // The hop lands only on a `Terminating` activity — one that a settled child drained (see
-        // `ActivityElementBehavior::after_child_completed`). Any other status means the row
+        // `ActivityElementBehavior::on_child_finished`). Any other status means the row
         // moved under the read above; the reason itself stays on the row, so nothing re-derives it.
         if !matches!(act.status, ActivityStatus::Terminating(_)) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "continue_terminate: activity {node} is not terminating (status {:?})",
+                    "finish_terminating: activity {node} is not terminating (status {:?})",
                     act.status
                 ),
             ));
@@ -300,7 +274,7 @@ impl ActivityElementBehavior {
             .get_children(act.meta.object_ref().into_raw_object_ref())
             .await?;
         if !children.is_empty() {
-            // Unreachable by construction — a Continue is issued only for a drained node — so this is
+            // Unreachable by construction — the hop is dispatched only for a drained node — so this is
             // the row moving under the read. Each child is taken down by its own verb with `Cancelled`:
             // the node is being flushed, not failing, so a bystander must not carry the reason its
             // ancestor died of and, with a `Catch`, route a failure that was never its own (the same
@@ -317,7 +291,7 @@ impl ActivityElementBehavior {
                         task: child.clone().typed::<TaskKind>(),
                     }),
                     kind => panic!(
-                        "continue_terminate: activity {node} owns a live {kind} child {child}; an \
+                        "finish_terminating: activity {node} owns a live {kind} child {child}; an \
                          activity's children are only a fan-out Thread or a Task"
                     ),
                 }
@@ -339,7 +313,7 @@ impl ActivityElementBehavior {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
-                        "continue_terminate: owning thread {owner} of activity {node} does not exist"
+                        "finish_terminating: owning thread {owner} of activity {node} does not exist"
                     ),
                 ));
             }
@@ -352,7 +326,7 @@ impl ActivityElementBehavior {
             Err(e) => {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
-                    format!("continue_terminate: thread {owner} cannot resolve its machine: {e}"),
+                    format!("finish_terminating: thread {owner} cannot resolve its machine: {e}"),
                 ));
             }
         };
@@ -364,7 +338,7 @@ impl ActivityElementBehavior {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
-                        "continue_terminate: state {:?} is not defined by the machine that thread {owner} binds to: {e}",
+                        "finish_terminating: state {:?} is not defined by the machine that thread {owner} binds to: {e}",
                         activity_value.state_path
                     ),
                 ));
@@ -378,7 +352,7 @@ impl ActivityElementBehavior {
                 state_def,
                 State::Task(_) | State::Wait(_) | State::Parallel(_) | State::Map(_)
             ),
-            "continue_terminate: activity {node} deferred on state {state_def:?}, which owns no children"
+            "finish_terminating: activity {node} deferred on state {state_def:?}, which owns no children"
         );
         let handler = ctx
             .state_handlers
@@ -394,47 +368,47 @@ impl ActivityElementBehavior {
         Ok(())
     }
 
-    /// Advance an activity that a settled child drained and a `ContinueComplete` named: the success
-    /// side of the deferred hop, mirroring [`Self::continue_terminate`].
+    /// Advance a `Completing` activity a finished child drained — the success side of the deferred
+    /// `HandleChildFinished` hop, mirroring [`Self::finish_terminating`].
     ///
     /// The hop lands only on a `Completing` activity (`ActivityStatus::Completing` is entered *by* that
     /// very settle). A row that still holds children has each taken down by its own kind's verb with
     /// `Cancelled`; a drained one runs its state's `after_completing`, which owns both the terminal and
     /// the relay up the owner chain.
-    pub(crate) async fn continue_complete(
+    pub(crate) async fn finish_completing(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         node: ObjectRef<ActivityKind>,
     ) -> Result<(), ProcessingError> {
         // A read fault is the dispatch's — returned, so the leader owns retry/refusal. A missing row is
-        // a real refusal: the Continue names the node a settled child drained, so a gone row means the
+        // a real refusal: the hop names the node a settled child drained, so a gone row means the
         // command's own precondition failed rather than "already closed".
         let Some(act) = ctx.storage.get_activity(&node).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
-                format!("continue_complete: activity {node} not found"),
+                format!("finish_completing: activity {node} not found"),
             ));
         };
         // The hop lands only on a `Completing` node — one that a settled child drained (see
-        // `ActivityElementBehavior::after_child_completed`). Any other status means the row
+        // `ActivityElementBehavior::on_child_finished`). Any other status means the row
         // moved under the read above, leaving this command nothing to apply.
         if !matches!(act.status, ActivityStatus::Completing) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "continue_complete: activity {node} is not completing (status {:?})",
+                    "finish_completing: activity {node} is not completing (status {:?})",
                     act.status
                 ),
             ));
         }
         // The live children are read from the ownership-edge index, not off the row (see
-        // `continue_terminate`).
+        // `finish_terminating`).
         let children = ctx
             .storage
             .get_children(act.meta.object_ref().into_raw_object_ref())
             .await?;
         if !children.is_empty() {
-            // Unreachable by construction — a Continue is issued only for a drained node — so this is
+            // Unreachable by construction — the hop is dispatched only for a drained node — so this is
             // the row moving under the read. Each child is taken down by its own verb with `Cancelled`:
             // the node is being flushed, not failing, so a bystander must not carry a failure a state's
             // own `Catch` could route.
@@ -450,7 +424,7 @@ impl ActivityElementBehavior {
                         task: child.clone().typed::<TaskKind>(),
                     }),
                     kind => panic!(
-                        "continue_complete: activity {node} owns a live {kind} child {child}; an \
+                        "finish_completing: activity {node} owns a live {kind} child {child}; an \
                          activity's children are only a fan-out Thread or a Task"
                     ),
                 }
@@ -472,7 +446,7 @@ impl ActivityElementBehavior {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
-                        "continue_complete: owning thread {owner} of activity {node} does not exist"
+                        "finish_completing: owning thread {owner} of activity {node} does not exist"
                     ),
                 ));
             }
@@ -485,7 +459,7 @@ impl ActivityElementBehavior {
             Err(e) => {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
-                    format!("continue_complete: thread {owner} cannot resolve its machine: {e}"),
+                    format!("finish_completing: thread {owner} cannot resolve its machine: {e}"),
                 ));
             }
         };
@@ -497,7 +471,7 @@ impl ActivityElementBehavior {
                 return Err(ProcessingError::Rejected(
                     RejectionType::NotFound,
                     format!(
-                        "continue_complete: state {:?} is not defined by the machine that thread {owner} binds to: {e}",
+                        "finish_completing: state {:?} is not defined by the machine that thread {owner} binds to: {e}",
                         activity_value.state_path
                     ),
                 ));
@@ -512,7 +486,7 @@ impl ActivityElementBehavior {
                 state_def,
                 State::Parallel(_) | State::Map(_) | State::Task(_)
             ),
-            "continue_complete: activity {node} deferred on state {state_def:?}, which owns no children"
+            "finish_completing: activity {node} deferred on state {state_def:?}, which owns no children"
         );
         let handler = ctx
             .state_handlers
@@ -530,83 +504,65 @@ impl ActivityElementBehavior {
     }
 }
 
-impl Container for ActivityElementBehavior {
-    type Owner = ActivityKind;
-
-    async fn open(
-        storage: &dyn ReadonlyStorageTxn,
-        owner: ObjectRef<Self::Owner>,
-    ) -> Result<Self, ProcessingError> {
-        // The activity is the seam's own existence check (see `Container::open`): an activity that is
-        // gone is refused here, uniformly for every caller whose settle would have nothing to land on.
-        // The call site picks this impl from the owner's kind, and the parameter's own type is that
-        // kind — an owner of another kind is unrepresentable rather than a case to check.
-        if storage.get_activity(&owner).await?.is_none() {
-            return Err(ProcessingError::Rejected(
-                RejectionType::NotFound,
-                format!("activity_element: activity {owner} is gone"),
-            ));
-        }
-        Ok(Self { activity: owner })
-    }
-
-    async fn after_child_completed(
-        &self,
+impl ActivityElementBehavior {
+    /// Hand a finished child to its owning activity — the deferred
+    /// [`Command::HandleChildFinished`] hop. A still-`Running` activity makes its state's decision; one
+    /// already `Completing`/`Terminating` advances that finish (the state must not replenish under a
+    /// machine that already decided to stop); one already finished refuses the stale hand-off.
+    pub(crate) async fn on_child_finished(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
+        activity: ObjectRef<ActivityKind>,
         child: &RawObjectRef,
     ) -> Result<(), ProcessingError> {
-        // The activity was resolved *before* the settle's own terminal event was written, and this
-        // re-read runs in that same batch — so a row that is gone here is the lifecycle disagreeing with
-        // the log rather than a settle to ignore. Refused, never no-op'ed: the terminal is already on
-        // this batch, and a silent success would leave it unexplained. A fault is the leader's to retry.
-        let Some(act) = ctx.storage.get_activity(&self.activity).await? else {
+        let this = Self { activity };
+        // A row that is gone here is the lifecycle disagreeing with the log rather than a hand-off to
+        // ignore — refused, never no-op'ed, so the durable log records why nothing followed.
+        let Some(act) = ctx.storage.get_activity(&this.activity).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "activity_element: activity {} is gone from under its settled child",
-                    self.activity
+                    "activity_element: activity {} is gone from under its finished child",
+                    this.activity
                 ),
             ));
         };
-
-        // What a settle *means* is the state's own affair, so the state's **type** is what picks the arm
-        // below — and each arm then decides by the activity's own status, because which statuses a state
-        // can even be settled in differ per state. A state's deadline is not a child in this relation:
-        // its fire reaches `on_deadline_fired`.
-        let (thread, state_def) = self.state_of(ctx, &act).await?;
-        match &state_def {
-            State::Task(_) | State::Parallel(_) | State::Map(_) => {
-                self.settle_child(ctx, out, &act, &thread, &state_def, child)
-                    .await
+        match &act.status {
+            ActivityStatus::Running => {
+                // What a finish *means* is the state's own affair, so the state's **type** picks the
+                // reaction. A state that owns no children in the settle relation cannot be handed one:
+                // a `Wait`'s resume instant is a field, not a child.
+                let (thread, state_def) = this.state_of(ctx, &act).await?;
+                match &state_def {
+                    State::Task(_) | State::Parallel(_) | State::Map(_) => {
+                        this.settle_child(ctx, out, &act, &thread, &state_def, child)
+                            .await
+                    }
+                    _ => Err(ProcessingError::Rejected(
+                        RejectionType::InvalidState,
+                        format!(
+                            "activity_element: activity {} finished a child {child}, but state {:?} \
+                             owns no children",
+                            this.activity, act.state_path
+                        ),
+                    )),
+                }
             }
-            // Only a state that owns children in the settle relation can have one settle: a `Task` its
-            // invocation, a `Parallel`/`Map` its fan-out. A `Wait` owns none (its resume instant is a
-            // field, not a child), and every other state type has nothing a settle could come from —
-            // so the row and the lifecycle disagree.
-            _ => Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!(
-                    "activity_element: activity {} settled a child {child}, but state {:?} owns no \
-                     children",
-                    self.activity, act.state_path
-                ),
-            )),
+            ActivityStatus::Completing => Self::finish_completing(ctx, out, this.activity).await,
+            ActivityStatus::Terminating(_) => {
+                Self::finish_terminating(ctx, out, this.activity).await
+            }
+            ActivityStatus::Completed | ActivityStatus::Terminated(_) => {
+                Err(ProcessingError::Rejected(
+                    RejectionType::InvalidState,
+                    format!(
+                        "activity_element: activity {} finished a child {child} while {}",
+                        this.activity,
+                        act.status.phase()
+                    ),
+                ))
+            }
         }
-    }
-
-    /// The activity's reaction is the completed hook **verbatim**: how a child settled is not what
-    /// decides an activity's next move, only *that* it settled. A terminated child is exactly how a
-    /// `Map`/`Parallel` learns one of its items/branches went down (`child_completed` reads the child's
-    /// own terminal status to tell a finished item from a failed one), so routing the two outcomes to
-    /// different arms would leave a fan-out waiting forever on a settle it was never shown.
-    async fn after_child_terminated(
-        &self,
-        ctx: &mut HandlerContext<'_>,
-        out: &mut Collector<'_>,
-        child: &RawObjectRef,
-    ) -> Result<(), ProcessingError> {
-        self.after_child_completed(ctx, out, child).await
     }
 }
 #[cfg(test)]
@@ -619,7 +575,7 @@ mod settle_tests {
     use spica_storage::InMemoryStorage;
     use spica_testing::MockReadonlyStorageTxn;
 
-    use super::{ActivityElementBehavior, Container};
+    use super::ActivityElementBehavior;
     use crate::RejectionType;
     use crate::StatePath;
     use crate::StorageError;
@@ -829,13 +785,12 @@ mod settle_tests {
         store
     }
 
-    /// Drive one hook over a working overlay seeded with `store` — the leader's shape, so the assertion
-    /// reads the command the container emitted, not merely an intent. The hook's own outcome comes back
-    /// too: an arm that refuses is as much the container's answer as one that emits.
+    /// Drive the child-finish hop over a working overlay seeded with `store` — the leader's shape, so
+    /// the assertion reads the command the owner emitted, not merely an intent. The hop's own outcome
+    /// comes back too: an arm that refuses is as much the owner's answer as one that emits.
     async fn settle(
         store: InMemoryStorage,
         child: &RawObjectRef,
-        terminated: bool,
     ) -> (Result<(), ProcessingError>, Vec<EntryPayload>) {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(at()));
         let ids: Arc<dyn IdGenerator> = Arc::new(CountingIdGenerator::new());
@@ -849,9 +804,6 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ActivityElementBehavior::open(&work, activity_ref())
-            .await
-            .expect("the seeded activity resolves its container");
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: &work,
@@ -860,15 +812,9 @@ mod settle_tests {
             definitions: &mut definitions,
             state_handlers: &state_handlers,
         };
-        let result = if terminated {
-            container
-                .after_child_terminated(&mut ctx, &mut out, child)
-                .await
-        } else {
-            container
-                .after_child_completed(&mut ctx, &mut out, child)
-                .await
-        };
+        let result =
+            ActivityElementBehavior::on_child_finished(&mut ctx, &mut out, activity_ref(), child)
+                .await;
         drop(ctx);
         let chain = out
             .into_entries()
@@ -878,9 +824,8 @@ mod settle_tests {
         (result, chain)
     }
 
-    /// Drive the **completed** hook against a mock store answering the one owner read, with the container
-    /// built directly — the shape a vanished owner needs, since `open` refuses that same missing row
-    /// before any hook could be reached.
+    /// Drive the child-finish hop against a mock store answering only the reads it makes — the shape a
+    /// vanished owner or a storage fault needs.
     async fn hook_over(
         store: &dyn ReadonlyStorageTxn,
         child: &RawObjectRef,
@@ -891,9 +836,6 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ActivityElementBehavior {
-            activity: activity_ref(),
-        };
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: store,
@@ -902,33 +844,12 @@ mod settle_tests {
             definitions: &mut definitions,
             state_handlers: &state_handlers,
         };
-        container
-            .after_child_completed(&mut ctx, &mut out, child)
-            .await
+        ActivityElementBehavior::on_child_finished(&mut ctx, &mut out, activity_ref(), child).await
     }
 
-    /// A settle with no live owner is refused up front: `open` names the gone owner, so a caller whose
-    /// settle would have nothing to land on answers the absence before it writes its terminal.
-    #[tokio::test]
-    async fn a_missing_owner_has_no_container() {
-        let store = InMemoryStorage::new();
-        let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
-        let Err(ProcessingError::Rejected(ty, reason)) =
-            ActivityElementBehavior::open(&work, activity_ref()).await
-        else {
-            panic!("an open that did not read a missing row");
-        };
-        assert_eq!(ty, RejectionType::NotFound);
-        assert!(
-            reason.contains("is gone"),
-            "the refusal names the gone owner: {reason}"
-        );
-    }
-
-    /// A read that **faults** stays a fault, never a missing owner. The two answers are what the callers
-    /// refuse on: a missing row is a decision they record, a fault is one the leader retries — so folding
-    /// the fault into the missing-owner arm would turn a hiccup into a refusal. Pinned here rather than
-    /// per caller, since every handler answers it through this one contract.
+    /// A read that **faults** stays a fault, never a missing owner. A missing row is a decision the hop
+    /// records, a fault is one the leader retries — folding the fault into the missing-owner arm would
+    /// turn a hiccup into a refusal.
     #[tokio::test]
     async fn a_faulted_owner_read_is_not_a_missing_owner() {
         let mut store = MockReadonlyStorageTxn::new();
@@ -936,20 +857,18 @@ mod settle_tests {
             .expect_get_activity()
             .times(1)
             .return_once(|_| Err(StorageError::Backend("injected storage fault".to_string())));
+        let result = hook_over(&store, task_ref().as_raw_object_ref()).await;
         assert!(
-            matches!(
-                ActivityElementBehavior::open(&store, activity_ref()).await,
-                Err(ProcessingError::Unexpected(_))
-            ),
+            matches!(result, Err(ProcessingError::Unexpected(_))),
             "a fault must surface as Unexpected, not read as a missing row"
         );
     }
 
-    /// An activity gone from under its settled child refuses the settle instead of no-op'ing it: the
-    /// terminal is already on this attempt's batch, so a silent success would leave the log saying the
-    /// child settled with nothing after it.
+    /// An activity gone from under its finished child refuses the hand-off instead of no-op'ing it:
+    /// every command owes an entry, so a silent success would leave the log saying the child finished
+    /// with nothing after it.
     #[tokio::test]
-    async fn a_vanished_activity_refuses_the_settle() {
+    async fn a_vanished_activity_refuses_the_hand_off() {
         let mut store = MockReadonlyStorageTxn::new();
         store
             .expect_get_activity()
@@ -957,11 +876,11 @@ mod settle_tests {
             .return_once(|_| Ok(None));
         let result = hook_over(&store, task_ref().as_raw_object_ref()).await;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
-            panic!("a vanished activity must refuse the settle: {result:?}");
+            panic!("a vanished activity must refuse the hand-off: {result:?}");
         };
         assert_eq!(ty, RejectionType::InvalidState);
         assert!(
-            reason.contains("is gone from under its settled child"),
+            reason.contains("is gone from under its finished child"),
             "the refusal names what it could not relay to: {reason}"
         );
     }
@@ -976,7 +895,7 @@ mod settle_tests {
             &childless_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), false).await;
+        let (result, chain) = settle(store, &task_child()).await;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a settle under a childless state must be refused: {result:?}");
         };
@@ -998,7 +917,7 @@ mod settle_tests {
             &task_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), false).await;
+        let (result, chain) = settle(store, &task_child()).await;
         result.expect("the hook relays the settle");
         assert_eq!(
             chain,
@@ -1027,7 +946,7 @@ mod settle_tests {
                 .put_thread(seeded_scope())
                 .await
                 .expect("the in-memory store seeds a thread row");
-            let (result, _) = settle(store, &task_child(), false).await;
+            let (result, _) = settle(store, &task_child()).await;
             let Err(ProcessingError::Rejected(ty, reason)) = result else {
                 panic!("a settle whose definition cannot be resolved must be refused: {result:?}");
             };
@@ -1039,50 +958,54 @@ mod settle_tests {
         }
     }
 
-    /// A `Completing` activity with a child still in flight still advances: the Continue names the
-    /// activity this settle belongs to, and its own handler takes down whatever is left and stops short
-    /// of advancing — so the settle that drains the activity last is the one that completes it.
+    /// A `Completing` activity's remaining child is swept before the finish can advance: the sweep is
+    /// by child kind, not by the state type, because the activity is being flushed rather than failed.
     #[tokio::test]
-    async fn a_settled_child_advances_a_completing_activity_before_the_drain() {
+    async fn a_finished_child_sweeps_what_a_completing_activity_still_holds() {
         let store = store_in_scope(
             seeded_activity(ActivityStatus::Completing, None, 1),
             &task_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), false).await;
-        result.expect("the hook relays the settle");
+        let (result, chain) = settle(store, &task_child()).await;
+        result.expect("the hand-off advances the finish");
         assert_eq!(
             chain,
-            vec![EntryPayload::Command(Command::ContinueComplete {
-                owner: activity_ref().into_raw_object_ref(),
-            })]
+            vec![EntryPayload::Command(Command::TerminateThread(
+                crate::types::command::TerminateThread {
+                    thread: object_ref::<ThreadKind>("thread", 200),
+                    reason: TerminationReason::Cancelled,
+                }
+            ))]
         );
     }
 
     /// The same for a fan-out: `Completing` is not the state's to decide, whichever state fronts the
-    /// activity, so the Continue is emitted without consulting it.
+    /// activity, so the remaining children are swept without consulting it.
     #[tokio::test]
-    async fn a_settled_child_advances_a_completing_fanout() {
+    async fn a_finished_child_sweeps_a_completing_fanout() {
         let store = store_in_scope(
             seeded_activity(ActivityStatus::Completing, None, 1),
             &fanout_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &thread_child(), false).await;
-        result.expect("the hook relays the settle");
+        let (result, chain) = settle(store, &thread_child()).await;
+        result.expect("the hand-off advances the finish");
         assert_eq!(
             chain,
-            vec![EntryPayload::Command(Command::ContinueComplete {
-                owner: activity_ref().into_raw_object_ref(),
-            })]
+            vec![EntryPayload::Command(Command::TerminateThread(
+                crate::types::command::TerminateThread {
+                    thread: object_ref::<ThreadKind>("thread", 200),
+                    reason: TerminationReason::Cancelled,
+                }
+            ))]
         );
     }
 
-    /// A terminated child advances a `Terminating` owner into its ContinueTerminate — child still in
-    /// flight or not: the Continue names the activity this settle belongs to, and its own handler takes
-    /// down whatever is left and stops short of advancing.
+    /// A finished child under a `Terminating` activity that still holds one sweeps it, exactly as the
+    /// success side sweeps what a `Completing` activity still holds.
     #[tokio::test]
-    async fn a_terminated_child_advances_a_terminating_activity_before_the_drain() {
+    async fn a_finished_child_sweeps_what_a_terminating_activity_still_holds() {
         let store = store_in_scope(
             seeded_activity(
                 ActivityStatus::Terminating(TerminationReason::Cancelled),
@@ -1092,19 +1015,22 @@ mod settle_tests {
             &task_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), true).await;
-        result.expect("the hook relays the settle");
+        let (result, chain) = settle(store, &task_child()).await;
+        result.expect("the hand-off advances the teardown");
         assert_eq!(
             chain,
-            vec![EntryPayload::Command(Command::ContinueTerminate {
-                owner: activity_ref().into_raw_object_ref(),
-            })]
+            vec![EntryPayload::Command(Command::TerminateThread(
+                crate::types::command::TerminateThread {
+                    thread: object_ref::<ThreadKind>("thread", 200),
+                    reason: TerminationReason::Cancelled,
+                }
+            ))]
         );
     }
 
-    /// A *completed* child under a `Terminating` activity advances that teardown just the same: the
-    /// activity's direction was fixed when the teardown began, and a bystander's settle does not reopen
-    /// it.
+    /// A *completed* child under a drained `Terminating` activity advances that teardown: the activity's
+    /// direction was fixed when the teardown began, and a bystander's finish does not reopen it. The
+    /// terminal is its state's own `after_terminating`, which also hands the activity up to its thread.
     #[tokio::test]
     async fn a_completed_child_advances_a_terminating_activity() {
         let store = store_in_scope(
@@ -1116,33 +1042,38 @@ mod settle_tests {
             &task_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), false).await;
-        result.expect("the hook relays the settle");
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::ContinueTerminate {
-                owner: activity_ref().into_raw_object_ref(),
-            })]
-        );
+        let (result, chain) = settle(store, &task_child()).await;
+        result.expect("the hand-off advances the teardown");
+        let [
+            EntryPayload::Event(crate::types::event::Event::StateTerminated { .. }),
+            EntryPayload::Command(Command::HandleChildFinished { owner, child }),
+        ] = &chain[..]
+        else {
+            panic!("the state's terminate lands and hands the activity up: {chain:?}");
+        };
+        assert_eq!(owner, &thread_owner().into_raw_object_ref());
+        assert_eq!(child, &activity_ref().into_raw_object_ref());
     }
 
-    /// A settled child under an activity that has already finished is left alone: the activity will
-    /// never act again, and what reaches it here is a late cleanup — the exit that gave up on an
-    /// in-flight call disposes of it by resolving to a `CancelTask`, which lands after the finish.
-    /// Refusing that would drop the cancellation of a child that is still live.
+    /// A finished child under an activity that has already finished refuses the hand-off: the activity
+    /// will never act again, and a command must answer rather than leave its finish unexplained.
     #[tokio::test]
-    async fn a_settled_child_under_a_finished_activity_is_left_alone() {
+    async fn a_finished_child_under_a_finished_activity_is_refused() {
         for status in [
             ActivityStatus::Completed,
             ActivityStatus::Terminated(TerminationReason::Cancelled),
         ] {
             let store = store_in_scope(seeded_activity(status, None, 0), &task_definition()).await;
-            let (result, chain) = settle(store, &task_child(), false).await;
-            result.expect("a finished activity has nothing to move");
+            let (result, chain) = settle(store, &task_child()).await;
+            let Err(ProcessingError::Rejected(ty, reason)) = result else {
+                panic!("a finished activity must refuse the hand-off: {result:?}");
+            };
+            assert_eq!(ty, RejectionType::InvalidState);
             assert!(
-                chain.is_empty(),
-                "a finished activity emits nothing: {chain:?}"
+                reason.contains("finished a child"),
+                "the refusal names the stale hand-off: {reason}"
             );
+            assert!(chain.is_empty(), "the refusal emits nothing: {chain:?}");
         }
     }
 
@@ -1162,9 +1093,7 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ActivityElementBehavior::open(&work, activity_ref())
-            .await
-            .expect("the seeded activity resolves its container");
+        let container = ActivityElementBehavior::new(activity_ref());
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: &work,
@@ -1308,7 +1237,7 @@ mod settle_tests {
             &wait_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &task_child(), false).await;
+        let (result, chain) = settle(store, &task_child()).await;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a settle under a `Wait` must be refused: {result:?}");
         };
@@ -1329,7 +1258,7 @@ mod settle_tests {
             &task_definition(),
         )
         .await;
-        let (result, chain) = settle(store, &thread_child(), false).await;
+        let (result, chain) = settle(store, &thread_child()).await;
         let Err(ProcessingError::Rejected(ty, reason)) = result else {
             panic!("a foreign child under a `Task` must be refused: {result:?}");
         };

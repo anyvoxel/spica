@@ -1,16 +1,14 @@
 mod activate_state;
 mod complete_state;
-mod continue_complete;
-mod continue_terminate;
 mod dispatch;
 #[cfg(test)]
 pub(crate) mod fixtures;
+mod handle_child_finished;
 mod terminate_state;
 
 pub use activate_state::ActivateStateHandler;
 pub use complete_state::CompleteStateHandler;
-pub use continue_complete::ContinueCompleteHandler;
-pub use continue_terminate::ContinueTerminateHandler;
+pub use handle_child_finished::HandleChildFinishedHandler;
 pub use terminate_state::TerminateStateHandler;
 
 pub(crate) use dispatch::{build_state_handlers, dispatch_command};

@@ -446,19 +446,21 @@ pub enum Command {
     /// in flight). Idempotent — a no-op if the task already settled.
     CancelTask { task: ObjectRef<TaskKind> },
 
-    /// Continue a drained-and-finishing `owner`'s **success** drain on a later round. Issued by the
-    /// one-hop child-settled reactor (see `Container::after_child_completed`) the moment it observes the
-    /// `owner` is `Completing` with no remaining children; the `ContinueCompleteHandler` emits the
-    /// owner's terminal next round and issues a follow-up Continue for *its* owner. Replaces the old
-    /// inline recursive cascade with one hop per round (Zeebe's `COMPLETE_ELEMENT` decoupling), so
-    /// convergence no longer recurses up the owner chain on the call stack.
-    ContinueComplete { owner: RawObjectRef },
-
-    /// Continue a drained-and-finishing `owner`'s **failure** drain on a later round — the
-    /// `Terminating` analogue of [`ContinueComplete`](Command::ContinueComplete). The `reason` is
-    /// recovered from the `owner`'s `Terminating(reason)` status at drain time (single source of
-    /// truth), so it is deliberately not carried.
-    ContinueTerminate { owner: RawObjectRef },
+    /// Hand a finished `child` to its `owner` on a later round — the durable form of the owner-side
+    /// `on_child_finished` callback. Whoever settled the child appends this instead of reacting
+    /// inline, so a parent's reaction never recurses up the owner chain inside the batch that wrote
+    /// the child's terminal (Zeebe's `COMPLETE_ELEMENT` decoupling): one hop per round, at any
+    /// owner-chain depth.
+    ///
+    /// The child is carried, not its outcome: the handler reads the child's own terminal row
+    /// (`Completed` vs `Terminated` + reason) — the single source of truth — and the owner decides
+    /// from it what the finish means: a still-`Running` owner makes its state decision (replenish,
+    /// aggregate, complete, tear down), a `Completing`/`Terminating` owner advances its drain, and an
+    /// owner that already finished refuses the stale hand-off.
+    HandleChildFinished {
+        owner: RawObjectRef,
+        child: RawObjectRef,
+    },
 }
 
 impl Command {
@@ -487,8 +489,7 @@ impl Command {
             | Command::FailTask(_)
             | Command::TriggerDeadline { .. }
             | Command::CancelTask { .. }
-            | Command::ContinueComplete { .. }
-            | Command::ContinueTerminate { .. } => None,
+            | Command::HandleChildFinished { .. } => None,
         }
     }
 }

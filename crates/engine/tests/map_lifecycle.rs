@@ -13,8 +13,9 @@ use spica_engine::{
     CompleteExecution, CompleteState, CompleteThread, CreateExecution, CreateFlow, EntryPayload,
     Event, Execution, ExecutionCreated, ExecutionError, ExecutionKind, ExecutionStatus, Flow,
     FlowCreated, FlowStatus, FlowVersion, FlowVersionCreated, FlowVersionKind, MapActivityState,
-    ObjectKind, RuntimeError, SpawnThread, StateTransitioned, TerminateExecution, TerminateState,
-    TerminateThread, TerminationReason, Thread, ThreadKind, ThreadStatus, WaitActivityState,
+    ObjectKind, RuntimeError, SpawnThread, StateChildSettled, StateTransitioned,
+    TerminateExecution, TerminateState, TerminateThread, TerminationReason, Thread, ThreadKind,
+    ThreadStatus, WaitActivityState,
 };
 
 #[rustfmt::skip]
@@ -112,6 +113,7 @@ async fn map_over_items_aggregates_in_item_order() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -132,6 +134,7 @@ async fn map_over_items_aggregates_in_item_order() {
                         total: 3,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -350,10 +353,10 @@ async fn map_over_items_aggregates_in_item_order() {
                     output: Some(json!(3)),
                 },
             }),
-            EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
-                output: json!(3),
-            })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(10), "lifecycle_execution-6")
@@ -384,10 +387,10 @@ async fn map_over_items_aggregates_in_item_order() {
                     output: Some(json!(1)),
                 },
             }),
-            EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
-                output: json!(1),
-            })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-6", 10),
+            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(11), "lifecycle_execution-7")
@@ -418,6 +421,18 @@ async fn map_over_items_aggregates_in_item_order() {
                     output: Some(json!(2)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
+            }),
+            EntryPayload::Command(Command::CompleteThread(CompleteThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
+                output: json!(3),
+            })),
+            EntryPayload::Command(Command::CompleteThread(CompleteThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
+                output: json!(1),
+            })),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 output: json!(2),
@@ -448,6 +463,10 @@ async fn map_over_items_aggregates_in_item_order() {
                     output: Some(json!(3)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
@@ -473,6 +492,10 @@ async fn map_over_items_aggregates_in_item_order() {
                     input: json!(1),
                     output: Some(json!(1)),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
@@ -500,6 +523,22 @@ async fn map_over_items_aggregates_in_item_order() {
                     output: Some(json!(2)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+            }),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            })),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+            })),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+            })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!([3, 1, 2]),
@@ -523,6 +562,7 @@ async fn map_over_items_aggregates_in_item_order() {
                             (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7)),
                             (2, ref_to::<ThreadKind>("lifecycle_execution-4", 8)),
                         ]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)],
                     })),
                     retry_state: None,
                     output: None,
@@ -547,10 +587,15 @@ async fn map_over_items_aggregates_in_item_order() {
                             (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7)),
                             (2, ref_to::<ThreadKind>("lifecycle_execution-4", 8)),
                         ]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)],
                     })),
                     retry_state: None,
                     output: Some(json!([3, 1, 2])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -581,6 +626,10 @@ async fn map_over_items_aggregates_in_item_order() {
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1, 2])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -709,6 +758,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -729,6 +779,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         total: 2,
                         max_concurrency: 1,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -825,6 +876,10 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                     output: Some(json!(3)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 output: json!(3),
@@ -855,6 +910,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                     output: Some(json!(3)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            }),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            })),
             EntryPayload::Command(Command::SpawnThread(SpawnThread {
                 owner: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -946,6 +1009,10 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                     output: Some(json!(1)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+            }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-4", 8),
                 output: json!(1),
@@ -976,6 +1043,14 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                     output: Some(json!(1)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+            }),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8),
+            })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!([3, 1]),
@@ -995,6 +1070,7 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         total: 2,
                         max_concurrency: 1,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-4", 8))]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)],
                     })),
                     retry_state: None,
                     output: None,
@@ -1015,10 +1091,15 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                         total: 2,
                         max_concurrency: 1,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-4", 8))]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-4", 8)],
                     })),
                     retry_state: None,
                     output: Some(json!([3, 1])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -1049,6 +1130,10 @@ async fn map_with_max_concurrency_one_replenishes_per_settle() {
                     input: json!({"n": 1}),
                     output: Some(json!([3, 1])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -1176,6 +1261,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1196,6 +1282,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1220,6 +1307,7 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1240,10 +1328,15 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: Some(json!([])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -1274,6 +1367,10 @@ async fn map_with_no_items_converges_to_an_empty_array() {
                     input: json!({"n": 1}),
                     output: Some(json!([])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -1400,6 +1497,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1420,6 +1518,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                         total: 2,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1577,10 +1676,10 @@ async fn map_defaults_its_items_to_its_array_input() {
                     output: Some(json!(10)),
                 },
             }),
-            EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
-                output: json!(10),
-            })),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-4", 8),
+            }),
             EntryPayload::Event(Event::StateCompleting {
                 activity: Activity {
                     meta: meta(uid(9), "lifecycle_execution-5")
@@ -1611,6 +1710,14 @@ async fn map_defaults_its_items_to_its_array_input() {
                     output: Some(json!(20)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-5", 9),
+            }),
+            EntryPayload::Command(Command::CompleteThread(CompleteThread {
+                thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
+                output: json!(10),
+            })),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-3", 7),
                 output: json!(20),
@@ -1641,6 +1748,10 @@ async fn map_defaults_its_items_to_its_array_input() {
                     output: Some(json!(10)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Event(Event::ThreadCompleting {
                 thread: Thread {
                     meta: meta(uid(7), "lifecycle_execution-3")
@@ -1667,6 +1778,18 @@ async fn map_defaults_its_items_to_its_array_input() {
                     output: Some(json!(20)),
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+            }),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            })),
+            EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+            })),
             EntryPayload::Command(Command::CompleteState(CompleteState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 output: json!([10, 20]),
@@ -1686,6 +1809,7 @@ async fn map_defaults_its_items_to_its_array_input() {
                         total: 2,
                         max_concurrency: 0,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7)],
                     })),
                     retry_state: None,
                     output: None,
@@ -1706,10 +1830,15 @@ async fn map_defaults_its_items_to_its_array_input() {
                         total: 2,
                         max_concurrency: 0,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
+                        settled: vec![flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6), flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7)],
                     })),
                     retry_state: None,
                     output: Some(json!([10, 20])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::CompleteThread(CompleteThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -1740,6 +1869,10 @@ async fn map_defaults_its_items_to_its_array_input() {
                     input: json!([10, 20]),
                     output: Some(json!([10, 20])),
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::CompleteExecution(CompleteExecution {
                 execution: ref_to::<ExecutionKind>("lifecycle_execution", 3),
@@ -1871,6 +2004,7 @@ async fn map_item_failure_fails_the_run() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -1891,6 +2025,7 @@ async fn map_item_failure_fails_the_run() {
                         total: 2,
                         max_concurrency: 1,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -2014,6 +2149,10 @@ async fn map_item_failure_fails_the_run() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-3", 7),
+            }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 reason: TerminationReason::Failed {
@@ -2062,6 +2201,10 @@ async fn map_item_failure_fails_the_run() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
@@ -2093,6 +2236,7 @@ async fn map_item_failure_fails_the_run() {
                         total: 2,
                         max_concurrency: 1,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6))]),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -2119,10 +2263,15 @@ async fn map_item_failure_fails_the_run() {
                         total: 2,
                         max_concurrency: 1,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6))]),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -2171,6 +2320,10 @@ async fn map_item_failure_fails_the_run() {
                     input: json!({"n": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),
@@ -2331,6 +2484,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -2351,6 +2505,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         total: 2,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -2679,6 +2834,10 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-6", 10),
+            }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-2", 6),
                 reason: TerminationReason::Failed {
@@ -2727,6 +2886,10 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-2", 6),
+            }),
             EntryPayload::Command(Command::TerminateState(TerminateState {
                 activity: ref_to::<ActivityKind>("lifecycle_execution-1", 5),
                 reason: TerminationReason::Failed {
@@ -2758,6 +2921,7 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         total: 2,
                         max_concurrency: 0,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
@@ -2817,8 +2981,9 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
+            EntryPayload::Command(Command::HandleChildFinished {
                 owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-7", 11),
             }),
             EntryPayload::Event(Event::ThreadTerminated {
                 thread: Thread {
@@ -2833,8 +2998,9 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     output: None,
                 },
             }),
-            EntryPayload::Command(Command::ContinueTerminate {
+            EntryPayload::Command(Command::HandleChildFinished {
                 owner: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-3", 7),
             }),
             EntryPayload::Event(Event::StateTerminated {
                 activity: Activity {
@@ -2857,10 +3023,15 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                         total: 2,
                         max_concurrency: 0,
                         children: indexed_refs(&[(0, ref_to::<ThreadKind>("lifecycle_execution-2", 6)), (1, ref_to::<ThreadKind>("lifecycle_execution-3", 7))]),
+                        settled: Vec::new(),
                     })),
                     retry_state: None,
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {   // Root Thread
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -2909,6 +3080,10 @@ async fn map_failure_stops_a_sibling_still_in_flight() {
                     input: json!({"n": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),
@@ -3062,6 +3237,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -3090,6 +3266,7 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
@@ -3112,10 +3289,15 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                         total: 0,
                         max_concurrency: 0,
                         children: Default::default(),
+                        settled: Default::default(),
                     })),
                     retry_state: None,
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
+                child: flat_ref_to(ObjectKind::Activity, "lifecycle_execution-1", 5),
             }),
             EntryPayload::Command(Command::TerminateThread(TerminateThread {
                 thread: ref_to::<ThreadKind>("lifecycle_execution-0", 4),
@@ -3152,6 +3334,10 @@ async fn map_with_a_negative_max_concurrency_is_a_definition_error() {
                     input: json!({"n": 1}),
                     output: None,
                 },
+            }),
+            EntryPayload::Command(Command::HandleChildFinished {
+                owner: flat_ref_to(ObjectKind::Execution, "lifecycle_execution", 3),
+                child: flat_ref_to(ObjectKind::Thread, "lifecycle_execution-0", 4),
             }),
             EntryPayload::Command(Command::TerminateExecution(TerminateExecution {
                 name: name("lifecycle_execution"),

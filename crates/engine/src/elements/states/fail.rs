@@ -5,8 +5,6 @@ use spica_asl::{FailState, State};
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::Activity;
 use crate::Variables;
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::eval_string_or_expr;
@@ -42,9 +40,8 @@ struct FailStateElementBehavior<'a> {
 impl StateHandler for FailStateElementBehavior<'_> {
     /// (3.4) A `Fail` owns no child at all, so there is nothing to wait on: the whole complete path —
     /// decide the reason, emit the activity's failure ed, then terminate the owning scope — runs here
-    /// in one go, with no child count. Nothing reaches this state through the deferred drain either
-    /// (see `crate::handlers::continue_complete`): that hop exists to advance a state whose children
-    /// settled, and this one has none to settle.
+    /// in one go, with no child count. Nothing reaches this state through `HandleChildFinished`
+    /// either: that hop exists to advance a state whose children finished, and this one has none.
     ///
     /// A decision failure is turned into a terminate here rather than returned: the activity is
     /// already `Completing`, so there is no later hop to report it from.
@@ -69,8 +66,6 @@ impl StateHandler for FailStateElementBehavior<'_> {
         // Resolve the owning scope's container *before* any terminal event, so an entitled settle is
         // answered while the activity is still intact. An activity's owner slot admits only a
         // `Thread`, so the container is read directly.
-        let owner = activity_value.meta.owner.clone();
-        let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
 
         // Emit the activity's failure ed. `StateTerminating` + `StateTerminated` replace the
         // `StateCompleted` a successful complete would emit. Each status is advanced in place on the
@@ -98,9 +93,10 @@ impl StateHandler for FailStateElementBehavior<'_> {
 
         // Hand the settled activity to its owning thread's container; the scope's own termination
         // follows from the state's failure (see `ThreadElementBehavior::after_child_terminated`).
-        thread_container
-            .after_child_terminated(ctx, out, &activity_ref)
-            .await?;
+        out.append_command(Command::HandleChildFinished {
+            owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+            child: activity_ref,
+        });
         Ok(())
     }
 
@@ -108,13 +104,11 @@ impl StateHandler for FailStateElementBehavior<'_> {
     // terminal, and relay the settle up to the owning thread.
     async fn after_terminating(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        _ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
-        let container =
-            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
@@ -125,9 +119,10 @@ impl StateHandler for FailStateElementBehavior<'_> {
             activity: terminated,
         })
         .await;
-        container
-            .after_child_terminated(ctx, out, &activity_ref)
-            .await?;
+        out.append_command(Command::HandleChildFinished {
+            owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+            child: activity_ref,
+        });
         Ok(())
     }
 }
@@ -197,7 +192,7 @@ mod tests {
     use super::super::harness::*;
     use super::*;
     use crate::ActivityState;
-    use crate::types::command::{Command, CompleteState, TerminateThread};
+    use crate::types::command::{Command, CompleteState};
     use crate::types::event::Event;
     use crate::types::meta::HasRawObjectRef;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus};
@@ -253,10 +248,10 @@ mod tests {
         );
     }
 
-    /// The finish terminates the activity **and** its owning scope from one step: the activity's
-    /// failure ed (`StateTerminating` → `StateTerminated`, replacing the `StateCompleted` a success
-    /// would emit), then the scope's termination — here a `TerminateThread`, because the activity's
-    /// owner is a thread. A `Fail` with no `Error` names itself with the spec's default.
+    /// The finish terminates the activity **and** hands it to its owning scope from one step: the
+    /// activity's failure path (`StateTerminating` → `StateTerminated`, replacing the `StateCompleted`
+    /// a success would emit), then the deferred hand-off that lets the scope — here a thread — go down
+    /// with the same reason. A `Fail` with no `Error` names itself with the spec's default.
     #[tokio::test]
     async fn complete_terminates_the_activity_and_its_owner_scope() {
         let completed = complete(
@@ -294,10 +289,10 @@ mod tests {
                 EntryPayload::Event(Event::StateTerminated {
                     activity: terminated
                 }),
-                EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    thread: thread_ref(),
-                    reason,
-                })),
+                EntryPayload::Command(Command::HandleChildFinished {
+                    owner: thread_ref().into_raw_object_ref(),
+                    child: minted_activity_ref().into_raw_object_ref(),
+                }),
             ]
         );
         let row = completed
@@ -338,13 +333,22 @@ mod tests {
         assert!(
             matches!(
                 completed.chain().last(),
-                Some(EntryPayload::Command(Command::TerminateThread(TerminateThread {
-                    reason: actual,
-                    ..
-                }))) if *actual == reason
+                Some(EntryPayload::Command(Command::HandleChildFinished { .. }))
             ),
-            "the evaluated Error/Cause reach the scope termination: {:?}",
+            "the failure hands the terminated activity to its owning scope: {:?}",
             completed.chain().last()
+        );
+
+        // The failure's context rides the activity's own terminal row: the deferred hand-off carries
+        // no reason, so the owner reads what happened off this row rather than off the command.
+        let row = completed
+            .activity(&minted_activity_ref())
+            .await
+            .expect("the failure folds the activity row");
+        assert_eq!(
+            row.status,
+            ActivityStatus::Terminated(reason),
+            "the evaluated Error/Cause reach the activity's termination"
         );
 
         // The activity carries no `activity_state` of its own: a leaf `Fail` seeds none, so the

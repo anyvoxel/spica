@@ -168,9 +168,14 @@ pub trait StateHandler: Send + Sync {
     }
 
     /// A child node of this state reached a terminal state while the state is `Running` — the
-    /// **replenish** half of the child-settled reaction, reached from the owning activity's container
-    /// (see `ActivityElementBehavior::settle_running`, which routes a settle to the four states that own
-    /// children). A state that owns no children keeps the default no-op, since no settle can reach it.
+    /// **replenish** half of the child-settled reaction, reached from the owning activity's element
+    /// (see `ActivityElementBehavior::on_child_finished`, which routes a settle to the states that own
+    /// children: `Task`, `Parallel` and `Map`). A state that owns no children keeps the default no-op,
+    /// since no settle can reach it.
+    ///
+    /// The settle arrives on its own command, so it owes the log an answer (see
+    /// `Leader::dispatch_once`): a state that decides nothing yet still records that it consumed the
+    /// settle (`Event::StateChildSettled`), and one whose row disagrees with the log refuses.
     async fn child_completed(
         &self,
         _ctx: &mut HandlerContext<'_>,
@@ -179,7 +184,8 @@ pub trait StateHandler: Send + Sync {
         _activity_value: &Activity,
         _variables: &Variables,
         _child: RawObjectRef,
-    ) {
+    ) -> Result<(), ProcessingError> {
+        Ok(())
     }
 
     // ── complete hooks — the only per-state variation of the complete step ──

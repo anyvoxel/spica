@@ -29,7 +29,7 @@
 //! `TODO(multi-node)` markers.
 use tracing::debug;
 
-use crate::applier::{ApplierContext, dispatch_event};
+use crate::appliers::{ApplierContext, dispatch_event};
 use crate::log::Timestamp;
 use crate::processing::ProcessingHandles;
 use crate::storage::StorageTxn;

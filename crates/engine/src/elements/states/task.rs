@@ -3,23 +3,20 @@ use serde_json::Value;
 use spica_asl::{State, StatePath, TaskState};
 
 use super::super::state_handler::{FailureRouting, StateHandler, StateHandlerFactory};
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::handlers::eval_string_or_expr;
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    ActivateState, ActivateTask, Command, CompleteState, CompleteThread, TerminateState,
-    TerminationReason,
+    ActivateState, ActivateTask, Command, CompleteState, TerminateState, TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
 use crate::types::event::{Event, StateTransitioned, VariablesAssigned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::task::TaskKind;
-use crate::{Activity, ActivityStatus, Variables};
+use crate::{Activity, ActivityStatus, RejectionType, Variables};
 
 pub struct TaskStateHandlerFactory;
 
@@ -163,14 +160,14 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         activity_value: &Activity,
         _variables: &Variables,
         child: RawObjectRef,
-    ) {
+    ) -> Result<(), ProcessingError> {
         if child.kind != ObjectKind::Task {
-            tracing::warn!(
-                activity = %activity,
-                child = %child,
-                "task state settled by a child that is not its invocation; no reaction"
-            );
-            return;
+            // The activity's only live child is its invocation, so a settle of anything else means the
+            // lifecycle disagrees with the log — refused, so the hand-off records why nothing followed.
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("task state: activity {activity} settled by a non-task child {child}"),
+            ));
         }
         out.append_command(Command::CompleteState(CompleteState {
             activity,
@@ -179,6 +176,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
         }));
+        Ok(())
     }
 
     /// A `Task`'s complete step runs here in one go, mirroring `Pass`/`Succeed`/`Wait`: the task's
@@ -236,16 +234,17 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                     completed.mark_completed(output.clone(), out.now()).is_ok(),
                     "the complete step that dispatched this after_completing opened the activity as Completing"
                 );
+                let activity_ref = completed.meta.object_ref().into_raw_object_ref();
                 out.append_event(Event::StateCompleted {
                     activity: completed,
                 })
                 .await;
                 // `End` routes to the owner thread's completion rather than a sibling hop, so it
-                // carries no `StateTransitioned` marker.
-                out.append_command(Command::CompleteThread(CompleteThread {
-                    thread: activity_value.meta.owner.clone(),
-                    output,
-                }));
+                // carries no `StateTransitioned` marker; the finish itself is handed over deferred.
+                out.append_command(Command::HandleChildFinished {
+                    owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                    child: activity_ref,
+                });
             }
             // No route at all: the definition is malformed, so unwind the finishing activity and let
             // its owner thread's container carry the scope down with the failure.
@@ -253,8 +252,6 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 let reason = TerminationReason::Failed {
                     error: ExecutionError::Runtime(RuntimeError::NoTerminal),
                 };
-                let owner = activity_value.meta.owner.clone();
-                let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
                 let mut terminated = activity_value.clone();
                 debug_assert!(
                     terminated
@@ -275,9 +272,10 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                     activity: terminated,
                 })
                 .await;
-                thread_container
-                    .after_child_terminated(ctx, out, &activity_ref)
-                    .await?;
+                out.append_command(Command::HandleChildFinished {
+                    owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                    child: activity_ref,
+                });
             }
         }
         Ok(())
@@ -311,8 +309,6 @@ impl StateHandler for TaskStateElementBehavior<'_> {
             }
         }
         if pending == 0 {
-            let container =
-                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -323,9 +319,10 @@ impl StateHandler for TaskStateElementBehavior<'_> {
                 activity: terminated,
             })
             .await;
-            container
-                .after_child_terminated(ctx, out, &activity_ref)
-                .await?;
+            out.append_command(Command::HandleChildFinished {
+                owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                child: activity_ref,
+            });
         } else {
             tracing::debug!(
                 activity = %activity_value.meta.object_ref(),

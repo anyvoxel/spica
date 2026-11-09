@@ -58,7 +58,7 @@ pub use wait::{WaitSeconds, WaitState, WaitTimestamp};
 /// existing state and be reachable, every non-terminal state must have a `Next` (or `End`), and —
 /// for `Wait` — `Seconds`/`Timestamp` are mutually exclusive and exactly one must be present.
 /// Once this validator exists and callers submit through it, replace the engine's runtime
-/// defenses (e.g. the `Seconds ⇄ Timestamp` checks in `crates/engine/src/handlers/states/wait.rs`)
+/// defenses (e.g. the `Seconds ⇄ Timestamp` checks in `crates/engine/src/elements/states/wait.rs`)
 /// with the assumption that a definition is well-formed at activation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase")]

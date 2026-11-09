@@ -2,8 +2,8 @@
 //!
 //! Storage is a pure fold of the [`Event`] stream; the [`StreamProcessor`](crate::StreamProcessor) rebuilds the
 //! execution tree by applying each event. Mirroring the [`Command`](crate::types::command::Command)
-//! dispatch, projection is split into per-`Event` applier implementations (each in
-//! [`appliers`]), keeping each event's fold rule local.
+//! dispatch in `handlers`, projection is split into per-`Event` applier implementations (siblings of
+//! this file), keeping each event's fold rule local.
 //!
 //! An applier is a **pure function of the fold**: it mutates the store only. External side effects are
 //! *derived* elsewhere from the durable event itself — e.g. an `ExecutionCreated` carries the
@@ -15,13 +15,11 @@
 //! A storage implementation needs only supply the read/mutate primitives ([`Storage`](crate::Storage));
 //! the applier dispatch is a single exhaustive [`dispatch_event`] match.
 
-mod appliers;
+use super::*;
 
 use crate::log::Timestamp;
 use crate::types::error::ExecutionError;
 use crate::types::event::Event;
-
-use appliers::*;
 
 /// Route one `Event` to its applier's fold. Exhaustive: every variant maps to an inherent applier
 /// method (`XApplier::apply`), so adding an `Event` variant fails to compile until a match arm
@@ -54,6 +52,7 @@ pub async fn dispatch_event(
         Event::StateTerminated { activity } => StateTerminatedApplier.apply(ctx, activity).await,
         Event::VariablesAssigned(p) => VariablesAssignedApplier.apply(ctx, p).await,
         Event::StateTransitioned(p) => StateTransitionedApplier.apply(ctx, p).await,
+        Event::StateChildSettled(p) => StateChildSettledApplier.apply(ctx, p).await,
         Event::TaskActivated { task } => TaskActivatedApplier.apply(ctx, task).await,
         Event::TasksClaimed(p) => TasksClaimedApplier.apply(ctx, p).await,
         Event::TaskCompleted(p) => TaskCompletedApplier.apply(ctx, p).await,

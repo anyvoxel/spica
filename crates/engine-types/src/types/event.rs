@@ -7,7 +7,7 @@ use crate::types::execution::Execution;
 use crate::types::flow::Flow;
 use crate::types::flow_version::FlowVersion;
 use crate::types::id::RequestId;
-use crate::types::meta::ObjectRef;
+use crate::types::meta::{ObjectRef, RawObjectRef};
 use crate::types::task::Task;
 use crate::types::thread::{Thread, ThreadKind};
 use crate::types::variables::Variables;
@@ -45,6 +45,13 @@ pub struct VariablesAssigned {
 pub struct StateTransitioned {
     pub activity: ObjectRef<ActivityKind>,
     pub next: jsonptr::PointerBuf,
+}
+
+/// Payload of [`Event::StateChildSettled`] — which fan-out activity consumed which child's settle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateChildSettled {
+    pub activity: ObjectRef<ActivityKind>,
+    pub child: RawObjectRef,
 }
 
 /// Payload of [`Event::TasksClaimed`] — a worker's granted batch plus its correlation key.
@@ -216,6 +223,13 @@ pub enum Event {
     /// names the target path but not the new activity). The foldable data (`output`, `next`) lives on
     /// the following command's bookkeeping; the applier is a no-op, mirroring `StateActivated`.
     StateTransitioned(StateTransitioned),
+
+    /// A fan-out state (`Parallel`/`Map`) consumed one child's settle. The child's hand-off is
+    /// deferred, so several settles can be dispatched after every child row already reads terminal,
+    /// and none of them could tell from the children how many settles came before it — the state's
+    /// progress is recorded here instead, folded onto the activity's own `settled` list, and that
+    /// count drives replenishment and convergence.
+    StateChildSettled(StateChildSettled),
 
     // ── Task (external-resource call, M2 lifecycle) ──────────────────────────────
     /// A `Task` state invoked its `Resource` and the lifecycle stream records the full event-carried

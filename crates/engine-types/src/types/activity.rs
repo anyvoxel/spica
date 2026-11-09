@@ -6,7 +6,7 @@ use serde_with::skip_serializing_none;
 
 use crate::types::command::TerminationReason;
 use crate::types::execution::ExecutionKind;
-use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef};
+use crate::types::meta::{ObjectKind, ObjectKindMarker, ObjectMeta, ObjectRef, RawObjectRef};
 use crate::types::task::RetryState;
 use crate::types::thread::ThreadKind;
 use spica_asl::StatePath;
@@ -88,14 +88,20 @@ pub enum ActivityState {
     Wait(WaitActivityState),
 }
 
-/// A `Parallel` state's activity-level runtime repository — the ordered fan-out mapping. The
-/// shared activity value already carries the lifecycle skeleton; this payload holds only the
-/// `Parallel`-specific state that exists because this activity is executing a `Parallel`.
+/// A `Parallel` state's activity-level runtime repository — the ordered fan-out mapping and the
+/// settles this activity has consumed. The shared activity value already carries the lifecycle
+/// skeleton; this payload holds only the `Parallel`-specific state that exists because this activity
+/// is executing a `Parallel`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ParallelActivityState {
     /// Branch index → child thread, populated by `Event::ThreadCreated` (from each thread's own
     /// `index`) as branches fan out, so convergence can aggregate outputs in declaration order.
     pub branches: HashMap<usize, ObjectRef<ThreadKind>>,
+    /// The settles this activity has consumed, in arrival order (folded from
+    /// `Event::StateChildSettled`). The child-finish hand-off is deferred, so several settles can be
+    /// dispatched after every branch row already reads terminal — "the last branch has settled" is
+    /// therefore this list reaching `branches.len()`, not the children set draining.
+    pub settled: Vec<RawObjectRef>,
 }
 
 /// A `Wait` state's activity-level runtime repository — the absolute instant the wait resumes.
@@ -123,10 +129,11 @@ pub struct WaitActivityState {
 ///   `Event::ThreadCreated` as items fan out (the same path `Parallel` branches take), so
 ///   convergence can aggregate item outputs in index order.
 ///
-/// The running `completed`/`failed` tallies are deliberately **not** stored here — they are derived
-/// live from the terminal status of the `children` executions. This keeps the projection
-/// redundancy-free: a follower can rebuild the tallies from each child's own terminal event, so no
-/// separate settle bookkeeping event is needed.
+/// The running `failed` outcome is still read from each child's own row, but the *progress* tally
+/// cannot be: the child-finish hand-off is deferred, so a settle is dispatched after its item's row
+/// already reads terminal, and every pending settle would see the same finished item set. `settled`
+/// therefore records the settles this activity has consumed, and its length is the progress the
+/// replenish loop and convergence step on.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MapActivityState {
     pub items: Vec<Value>,
@@ -134,6 +141,9 @@ pub struct MapActivityState {
     pub max_concurrency: usize,
     /// Item index → child thread, populated by `ThreadCreated` as items fan out.
     pub children: HashMap<usize, ObjectRef<ThreadKind>>,
+    /// The settles this activity has consumed, in arrival order (folded from
+    /// `Event::StateChildSettled`).
+    pub settled: Vec<RawObjectRef>,
 }
 
 /// The [`ObjectKindMarker`] tying an [`Activity`]'s meta to [`ObjectKind::Activity`].

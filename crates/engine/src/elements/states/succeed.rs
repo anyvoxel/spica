@@ -3,8 +3,6 @@ use serde_json::Value;
 use spica_asl::{State, SucceedState};
 
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::types::command::{Command, TerminateState, TerminationReason};
@@ -65,8 +63,6 @@ impl StateHandler for SucceedStateElementBehavior<'_> {
         };
         // Resolve the owning thread's container *before* emitting the terminal, so an entitled settle
         // is answered while the activity is still intact (see `FailStateElementBehavior::after_completing`).
-        let owner = activity_value.meta.owner.clone();
-        let thread_container = ThreadElementBehavior::open(ctx.storage, owner).await?;
         let mut completed = activity_value.clone();
         debug_assert!(
             completed.mark_completed(output, out.now()).is_ok(),
@@ -78,11 +74,12 @@ impl StateHandler for SucceedStateElementBehavior<'_> {
         })
         .await;
         // The threaded scope's own completion follows from the terminal's settle (see
-        // `ThreadElementBehavior::after_child_completed`): `Succeed` carries no `Next`, so completing the
+        // `ThreadElementBehavior::on_child_finished`): `Succeed` carries no `Next`, so completing the
         // thread with the projected output is the state's one and only route.
-        thread_container
-            .after_child_completed(ctx, out, &activity_ref)
-            .await?;
+        out.append_command(Command::HandleChildFinished {
+            owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+            child: activity_ref,
+        });
         Ok(())
     }
 
@@ -90,13 +87,11 @@ impl StateHandler for SucceedStateElementBehavior<'_> {
     // terminal, and relay the settle up to the owning thread.
     async fn after_terminating(
         &self,
-        ctx: &mut HandlerContext<'_>,
+        _ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         activity_value: &Activity,
         _variables: &Variables,
     ) -> Result<(), ProcessingError> {
-        let container =
-            ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
         let mut terminated = activity_value.clone();
         debug_assert!(
             terminated.mark_terminated(out.now()).is_ok(),
@@ -107,9 +102,10 @@ impl StateHandler for SucceedStateElementBehavior<'_> {
             activity: terminated,
         })
         .await;
-        container
-            .after_child_terminated(ctx, out, &activity_ref)
-            .await?;
+        out.append_command(Command::HandleChildFinished {
+            owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+            child: activity_ref,
+        });
         Ok(())
     }
 }
@@ -149,7 +145,7 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::{Command, CompleteState, CompleteThread};
+    use crate::types::command::{Command, CompleteState};
     use crate::types::event::Event;
     use crate::{ActivityStatus, EntryPayload, ThreadStatus};
 
@@ -195,9 +191,9 @@ mod tests {
         );
     }
 
-    /// The finish projects `Output` and — with `end() == Some(true)` — routes to the owner's
-    /// completion: `CompleteThread` carrying the projected result, with no `StateTransitioned` marker,
-    /// because a terminal hop has no successor to name.
+    /// The finish projects `Output` and — with `end() == Some(true)` — hands the completed activity to
+    /// its owning scope, with no `StateTransitioned` marker, because a terminal hop has no successor to
+    /// name.
     #[tokio::test]
     async fn complete_projects_its_output_and_completes_the_owner() {
         let state = succeed_state(Some(json!({ "done": "{% $states.input.n %}" })));
@@ -223,10 +219,10 @@ mod tests {
                     activity: completing
                 }),
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
-                    output: json!({ "done": 1.0 }),
-                })),
+                EntryPayload::Command(Command::HandleChildFinished {
+                    owner: thread_ref().into_raw_object_ref(),
+                    child: minted_activity_ref().into_raw_object_ref(),
+                }),
             ]
         );
         assert_eq!(
@@ -251,16 +247,14 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(
-                completed.chain().last(),
-                Some(EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    output,
-                    ..
-                }))) if *output == result
-            ),
-            "the raw result reaches the owner unprojected: {:?}",
-            completed.chain().last()
+        let row = completed
+            .activity(&minted_activity_ref())
+            .await
+            .expect("the finish folds the completed row");
+        assert_eq!(
+            row.output,
+            Some(result),
+            "the raw result reaches the activity's own row unprojected"
         );
     }
 }

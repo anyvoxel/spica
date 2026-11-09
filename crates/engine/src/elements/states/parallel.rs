@@ -4,19 +4,17 @@ use spica_asl::{ParallelState, State};
 
 use super::super::state_handler::{StateHandler, StateHandlerFactory};
 use crate::RejectionType;
-use crate::elements::Container;
-use crate::elements::ThreadElementBehavior;
 use crate::eval_env::EvalEnv;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
 use crate::log::Timestamp;
 use crate::types::activity::ActivityKind;
 use crate::types::command::{
-    ActivateState, Command, CompleteState, CompleteThread, SpawnThread, TerminateState,
-    TerminateThread, TerminationReason,
+    ActivateState, Command, CompleteState, SpawnThread, TerminateState, TerminateThread,
+    TerminationReason,
 };
 use crate::types::context::States;
 use crate::types::error::{ExecutionError, RuntimeError};
-use crate::types::event::{Event, StateTransitioned};
+use crate::types::event::{Event, StateChildSettled, StateTransitioned};
 use crate::types::meta::{HasRawObjectRef, ObjectKind, ObjectRef, RawObjectRef};
 use crate::types::thread::ThreadKind;
 use crate::{Activity, ActivityState, Variables};
@@ -164,17 +162,19 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                 .is_ok(),
             "the complete that dispatched this after_completing opened the activity as Completing"
         );
+        let activity_ref = completed.meta.object_ref().into_raw_object_ref();
         out.append_event(Event::StateCompleted {
             activity: completed,
         })
         .await;
-        // The routing owns the owner notification: an `End` completes the owning thread (whose own
-        // container then advances the scope), a `Next` activates the successor state.
+        // The routing owns the owner notification: an `End` hands the finish to the owning thread as
+        // a deferred hop (whose own container then advances the scope), a `Next` activates the
+        // successor state.
         if self.state.end == Some(true) {
-            out.append_command(Command::CompleteThread(CompleteThread {
-                thread: activity_value.meta.owner.clone(),
-                output: output_value,
-            }));
+            out.append_command(Command::HandleChildFinished {
+                owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                child: activity_ref,
+            });
         } else if let Some(next) = self.state.next.as_deref() {
             // The successor lives as a sibling of this state in the same enclosing `States` table —
             // that table is this activity's `state_path` minus its own leaf.
@@ -226,8 +226,6 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         // A childless container has nothing to sweep, so it closes now: the terminal, then the relay to
         // its owner thread's container, which advances the scope.
         if children.is_empty() {
-            let container =
-                ThreadElementBehavior::open(ctx.storage, activity_value.meta.owner.clone()).await?;
             let mut terminated = activity_value.clone();
             debug_assert!(
                 terminated.mark_terminated(out.now()).is_ok(),
@@ -238,9 +236,10 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                 activity: terminated,
             })
             .await;
-            container
-                .after_child_terminated(ctx, out, &activity_ref)
-                .await?;
+            out.append_command(Command::HandleChildFinished {
+                owner: activity_value.meta.owner.clone().into_raw_object_ref(),
+                child: activity_ref,
+            });
             return Ok(());
         }
 
@@ -332,16 +331,17 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         false
     }
 
-    /// The **convergence** hook, dispatched by the inline child-settled reaction's Running arm on every
-    /// branch settle:
+    /// The **convergence** hook, dispatched by the activity element's Running arm on every branch
+    /// settle:
     ///
+    /// - a branch that already has a recorded settle is a duplicate hand-off, refused;
     /// - if **any** branch has failed, fail the whole `Parallel` on that settle — while the survivors
     ///   may still be in flight (mirroring `fail.rs`, whose own TerminateState + TerminateExecution
     ///   sweep cancels those surviving sibling branches);
-    /// - otherwise, once the last branch has settled and drained this activity's child set,
-    ///   aggregate each branch's output (in `Branches` declaration order) into an array and issue the
-    ///   `CompleteState` that carries it as the state's raw result — the projection and routing then
-    ///   belong to `after_completing`.
+    /// - otherwise record the settle, and once it is the last branch's, aggregate each branch's output
+    ///   (in `Branches` declaration order) into an array and issue the `CompleteState` that carries it
+    ///   as the state's raw result — the projection and routing then belong to `after_completing`;
+    /// - otherwise the settle advanced nothing but its own record.
     async fn child_completed(
         &self,
         ctx: &mut HandlerContext<'_>,
@@ -349,20 +349,35 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         activity: ObjectRef<ActivityKind>,
         activity_value: &Activity,
         _variables: &Variables,
-        _child: RawObjectRef,
-    ) {
-        let Some(act) = ctx.storage.get_activity(&activity).await.ok().flatten() else {
-            return; // activity gone — nothing to converge.
+        child: RawObjectRef,
+    ) -> Result<(), ProcessingError> {
+        // A vanished activity or a foreign repository means the lifecycle disagrees with the log, not
+        // that there is nothing to do — refused, so the durable answer names the disagreement.
+        let Some(act) = ctx.storage.get_activity(&activity).await? else {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("parallel: activity {activity} is gone from under its settled branch"),
+            ));
         };
         // The owning activity's branch fan-out (branch index -> child execution) is both the
         // convergence map and the settle's outcome table: the last `ThreadCreated` wrote it (from each
         // thread's own `index`). Order by branch index so the aggregated output array matches the
         // declared `Branches` order.
-        // A non-`Parallel` repository here is an internal fault (a Parallel always fans out while
-        // still `Running`); nothing to aggregate — defer.
         let Some(ActivityState::Parallel(progress)) = act.activity_state.as_ref() else {
-            return;
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!(
+                    "parallel: activity {activity} settled a branch {child}, but its row carries no \
+                     Parallel repository"
+                ),
+            ));
         };
+        if progress.settled.contains(&child) {
+            return Err(ProcessingError::Rejected(
+                RejectionType::InvalidState,
+                format!("parallel: activity {activity} already consumed {child}'s settle"),
+            ));
+        }
         let mut entries: Vec<(usize, ObjectRef<ThreadKind>)> = progress
             .branches
             .iter()
@@ -394,7 +409,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                     ))),
                 };
                 self.fail_parallel(out, activity_value, reason).await;
-                return;
+                return Ok(());
             };
             if let Some(reason) = child.status.termination_reason() {
                 // A failed / cancelled branch fails the whole `Parallel`; the recorded `reason` becomes
@@ -402,27 +417,22 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                 // stops the surviving sibling branches.
                 self.fail_parallel(out, activity_value, reason.clone())
                     .await;
-                return;
+                return Ok(());
             }
             branches.push(child);
         }
 
-        // Everything settled successfully so far — but the inline child-settled reaction dispatches a
-        // `Running` activity's `child_completed` on *every* child settle (so a `Map` can replenish one
-        // slot at a time). A `Parallel` fans every branch out up front, so it only owns its convergence
-        // once the *last* branch has drained its children; any earlier invocation (other siblings
-        // still in flight) is a no-op here.
-        let children = match ctx
-            .storage
-            .get_children(activity_value.meta.object_ref().into_raw_object_ref())
-            .await
-        {
-            Ok(children) => children,
-            // A read fault is not a convergence decision; defer, so the next child settle re-runs this.
-            Err(_) => return,
-        };
-        if !children.is_empty() {
-            return; // sibling branches still in flight — not converged yet.
+        // This settle is the activity's to record whether or not it converges: the children's own
+        // rows all read terminal by now, so the recorded list is the only durable trace of how many
+        // settles the fan-out has consumed.
+        out.append_event(Event::StateChildSettled(StateChildSettled {
+            activity: activity.clone(),
+            child: child.clone(),
+        }))
+        .await;
+        if progress.settled.len() + 1 < progress.branches.len() {
+            // Sibling branches still to be consumed: this settle advanced only its own record.
+            return Ok(());
         }
 
         let mut outputs = Vec::with_capacity(branches.len());
@@ -434,7 +444,7 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
                 // fault; fail the Parallel rather than aggregate a partial result.
                 self.fail_parallel(out, activity_value, TerminationReason::Cancelled)
                     .await;
-                return;
+                return Ok(());
             }
         }
 
@@ -442,9 +452,10 @@ impl StateHandler for ParallelStateElementBehavior<'_> {
         // becomes the `CompleteState` raw result — the finish itself belongs to `after_completing`, so
         // projection and routing live in one place for every way a Parallel can converge.
         out.append_command(Command::CompleteState(CompleteState {
-            activity: activity.clone(),
+            activity,
             output: Value::Array(outputs),
         }));
+        Ok(())
     }
 }
 
@@ -479,7 +490,6 @@ mod tests {
 
     use super::super::harness::*;
     use super::*;
-    use crate::types::command::CompleteThread;
     use crate::types::meta::HasRawObjectRef;
     use crate::types::thread::Thread;
     use crate::{ActivityStatus, EntryPayload, ParallelActivityState, ThreadStatus};
@@ -634,10 +644,10 @@ mod tests {
                     activity: completing
                 }),
                 EntryPayload::Event(Event::StateCompleted { activity: done }),
-                EntryPayload::Command(Command::CompleteThread(CompleteThread {
-                    thread: thread_ref(),
-                    output: json!({ "ignored": true }),
-                })),
+                EntryPayload::Command(Command::HandleChildFinished {
+                    owner: thread_ref().into_raw_object_ref(),
+                    child: minted_activity_ref().into_raw_object_ref(),
+                }),
             ]
         );
     }
@@ -674,6 +684,8 @@ mod tests {
             seeded_input(),
             ActivityState::Parallel(ParallelActivityState {
                 branches: fan_out(true),
+                // Branch 0's settle was consumed earlier; the call under test is branch 1's.
+                settled: vec![child_ref(0).into_raw_object_ref()],
             }),
             ActivityStatus::Running,
             [],
@@ -707,12 +719,16 @@ mod tests {
 
         assert_eq!(
             completed.chain(),
-            vec![EntryPayload::Command(Command::CompleteState(
-                CompleteState {
+            vec![
+                EntryPayload::Event(Event::StateChildSettled(StateChildSettled {
+                    activity: minted_activity_ref(),
+                    child: child_ref(1).into_raw_object_ref(),
+                })),
+                EntryPayload::Command(Command::CompleteState(CompleteState {
                     activity: minted_activity_ref(),
                     output: json!([{ "i": 0 }, { "i": 1 }]),
-                }
-            ))]
+                })),
+            ]
         );
     }
 
@@ -738,6 +754,7 @@ mod tests {
                 seeded_input(),
                 ActivityState::Parallel(ParallelActivityState {
                     branches: fan_out(false),
+                    settled: Vec::new(),
                 }),
                 ActivityStatus::Running,
                 [child_ref(0).into_raw_object_ref()],
@@ -769,7 +786,8 @@ mod tests {
     }
 
     /// A settle that leaves a sibling attached is not the convergence point: the container's result
-    /// would be missing a branch, so the hook does nothing and waits for the branch that drains last.
+    /// would be missing a branch, so the hook absorbs the settle and waits for the branch that drains
+    /// last.
     #[tokio::test]
     async fn child_settle_before_the_last_branch_converges_nothing() {
         let mut store = InMemoryStorage::new();
@@ -780,6 +798,7 @@ mod tests {
                 seeded_input(),
                 ActivityState::Parallel(ParallelActivityState {
                     branches: fan_out(false),
+                    settled: Vec::new(),
                 }),
                 ActivityStatus::Running,
                 // Branch 1 is still attached, so the drain is incomplete.
@@ -800,10 +819,15 @@ mod tests {
         )
         .await;
 
-        assert!(
-            completed.chain().is_empty(),
-            "a mid-flight settle emits nothing: {:?}",
-            completed.chain()
+        assert_eq!(
+            completed.chain(),
+            vec![EntryPayload::Event(Event::StateChildSettled(
+                StateChildSettled {
+                    activity: minted_activity_ref(),
+                    child: child_ref(0).into_raw_object_ref(),
+                }
+            ))],
+            "a mid-flight settle is absorbed, and its hand-off still answers the log"
         );
     }
 

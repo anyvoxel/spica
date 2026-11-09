@@ -1,6 +1,4 @@
-use super::Container;
 use crate::handler::{Collector, HandlerContext, ProcessingError};
-use crate::storage::ReadonlyStorageTxn;
 use crate::types::command::{
     ActivateState, Command, CompleteExecution, CreateExecution, TerminateExecution,
     TerminateThread, TerminationReason,
@@ -11,192 +9,123 @@ use crate::types::execution::ExecutionKind;
 use crate::types::meta::{
     HasRawObjectRef, NoOwner, ObjectKind, ObjectMeta, ObjectRef, RawObjectRef,
 };
-use crate::types::thread::ThreadKind;
+use crate::types::thread::{ThreadKind, ThreadStatus};
 use crate::{ExecutionStatus, RejectionType, StatePath, Timestamp};
 
 /// The behavior of an `Execution` — the run at the root of the object graph.
 ///
-/// Two faces of one element, gathered here from where they were split before: the **container** side
-/// (what a run does when its root thread settles) and the **deadline** side (what its own
-/// `TimeoutSeconds` fire means — see `on_deadline_fired`),
-/// plus the **command** side: the `TerminateExecution`/`CompleteExecution` verbs that open its teardown
-/// or its finish, and the `Continue*` hops that advance each. A run owns one kind of child in the settle
-/// relation — its **root thread**, the run's own top-level scope — and its deadline stands beside that
-/// relation rather than inside it, exactly as Zeebe's timer subscriptions act on their host element.
-/// There is no state-specific half — a run has no container state to replenish — so the settle hooks
-/// only decide what an individual settle *means* to a still-`Running` run: its scope going down
-/// abnormally starts the run's teardown, and its scope finishing successfully closes it. A run already
-/// winding down instead converges through its own `Completing`/`Terminating` to decide.
+/// The **child** side: a run's only child in the settle relation is its **root thread**, the run's own
+/// top-level scope, handed over as a deferred [`Command::HandleChildFinished`] — never an inline
+/// callback, so a scope closing cannot recurse into the run inside the batch that closed it. The
+/// **deadline** side stands beside that relation as Zeebe's timer subscriptions stand beside their host
+/// element (see `on_deadline_fired`). There is no state-specific half — a run has no container state to
+/// replenish — so what a finished child *means* is decided by the child's own terminal: a scope
+/// finishing closes the run, one going down abnormally takes the run with the same reason. A run
+/// already winding down instead converges through its own `Completing`/`Terminating` to decide.
 pub(crate) struct ExecutionElementBehavior {
     execution: ObjectRef<ExecutionKind>,
 }
 
-impl Container for ExecutionElementBehavior {
-    type Owner = ExecutionKind;
-
-    async fn open(
-        storage: &dyn ReadonlyStorageTxn,
-        owner: ObjectRef<Self::Owner>,
-    ) -> Result<Self, ProcessingError> {
-        // The run is the seam's own existence check (see `Container::open`): a run that is gone is
-        // refused here, uniformly for every caller whose settle would have nothing to land on.
-        if storage.get_execution(&owner).await?.is_none() {
-            return Err(ProcessingError::Rejected(
-                RejectionType::NotFound,
-                format!("execution_element: execution {owner} is gone"),
-            ));
-        }
-        Ok(Self { execution: owner })
+impl ExecutionElementBehavior {
+    pub(crate) fn new(execution: ObjectRef<ExecutionKind>) -> Self {
+        Self { execution }
     }
 
-    async fn after_child_completed(
-        &self,
+    /// Hand a finished child to its owning run — the deferred `HandleChildFinished` hop. A run owns one
+    /// kind of child, its root **thread**, so that thread's own terminal row is the single source of
+    /// truth for what the finish means: `Completed` closes the run on the thread's output, `Terminated`
+    /// takes it down with the same reason. A run already finishing advances that finish instead, and a
+    /// terminal one refuses the stale hand-off.
+    pub(crate) async fn on_child_finished(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
+        execution: ObjectRef<ExecutionKind>,
         child: &RawObjectRef,
     ) -> Result<(), ProcessingError> {
-        // The run was resolved *before* the settle's own terminal event was written, and this re-read
-        // runs in that same batch — so a row that is gone here is the lifecycle disagreeing with the log
-        // rather than a settle to ignore. Refused, never no-op'ed: the terminal is already on this batch,
-        // and a silent success would leave it unexplained. A fault is the leader's to retry.
-        let Some(exec) = ctx.storage.get_execution(&self.execution).await? else {
+        let this = Self { execution };
+        // A row that is gone here is the lifecycle disagreeing with the log rather than a hand-off to
+        // ignore — refused, never no-op'ed, so the durable log records why nothing followed.
+        let Some(exec) = ctx.storage.get_execution(&this.execution).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "execution_element: execution {} is gone from under its settled child",
-                    self.execution
+                    "execution_element: execution {} is gone from under its finished child",
+                    this.execution
                 ),
             ));
         };
-
-        // Every cell below is one `(child kind, run status)` pair, and the pair is the whole decision: a
-        // run's deadline is not a child in this relation — its fire reaches `on_deadline_fired` — so the
-        // settle seen here is its root thread's. Whether the run has *drained* is not checked here: a
-        // `Continue*` cell names the run this settle is advancing, and that command's own handler takes
-        // down anything still attached and stops short of advancing, so the settle that finally drains
-        // the run is the one that advances it.
-        match (child.kind, &exec.status) {
-            // The run's own top-level scope finished, so the run closes on its output — folded onto the
-            // thread's row by the `ThreadCompleted` applier in this same batch.
-            (ObjectKind::Thread, ExecutionStatus::Running) => {
-                let output = match ctx
+        match &exec.status {
+            ExecutionStatus::Running => {
+                if child.kind != ObjectKind::Thread {
+                    return Err(ProcessingError::Rejected(
+                        RejectionType::InvalidState,
+                        format!(
+                            "execution_element: execution {} finished a {} child {child}; a run owns \
+                             only its root thread",
+                            this.execution, child.kind
+                        ),
+                    ));
+                }
+                let Some(thread) = ctx
                     .storage
                     .get_thread(&child.clone().typed::<ThreadKind>())
-                    .await
-                {
-                    Ok(Some(thread)) => thread.output.clone().unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::Value::Null,
+                    .await?
+                else {
+                    return Err(ProcessingError::Rejected(
+                        RejectionType::NotFound,
+                        format!(
+                            "execution_element: execution {} finished a child {child}, but its \
+                             thread row is gone",
+                            this.execution
+                        ),
+                    ));
                 };
-                out.append_command(Command::CompleteExecution(CompleteExecution {
-                    execution: self.execution.clone(),
-                    output,
-                }));
-                Ok(())
+                match &thread.status {
+                    // A terminal that projects no value folds as no `output` at all, hence the `Null`
+                    // fallback: the run still closes on its root scope, where a none-event would
+                    // strand it.
+                    ThreadStatus::Completed => {
+                        out.append_command(Command::CompleteExecution(CompleteExecution {
+                            execution: this.execution,
+                            output: thread.output.clone().unwrap_or(serde_json::Value::Null),
+                        }));
+                        Ok(())
+                    }
+                    // The root thread *is* the run's top-level scope, so the run goes down with the
+                    // reason its own scope went down with — read off that scope rather than invented.
+                    ThreadStatus::Terminated(reason) => {
+                        out.append_command(Command::TerminateExecution(TerminateExecution {
+                            name: this.execution.name().clone(),
+                            uid: Some(this.execution.uid()),
+                            reason: reason.clone(),
+                        }));
+                        Ok(())
+                    }
+                    // A child that has not finished cannot have been handed over: the row and the
+                    // lifecycle disagree.
+                    status => Err(ProcessingError::Rejected(
+                        RejectionType::InvalidState,
+                        format!(
+                            "execution_element: execution {} finished a child {child} that is still \
+                             {status:?}",
+                            this.execution
+                        ),
+                    )),
+                }
             }
-            // Already finishing: this settle is what advances the run. A run already closing does not
-            // reopen as a timeout or a completion.
-            (ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
+            // Already finishing: this hand-off advances the run — what stays attached, if anything, is
+            // the finish's own business.
+            ExecutionStatus::Completing => Self::finish_completing(ctx, out, this.execution).await,
+            ExecutionStatus::Terminating(_) => {
+                Self::finish_terminating(ctx, out, this.execution).await
             }
-            // A run enters `Completing` only through `CompleteExecution`, which the root thread's own
-            // settle issues — and which detaches that thread — so a second settling root thread would be
-            // a second root scope. The row and the lifecycle disagree, and the batch is refused rather
-            // than advanced.
-            (ObjectKind::Thread, ExecutionStatus::Completing) => Err(ProcessingError::Rejected(
+            // A run that already finished has no child left to hand over: the row and the lifecycle
+            // disagree, and the batch is refused rather than advanced.
+            status => Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "execution_element: execution {} is completing with a settling root thread {child}",
-                    self.execution
-                ),
-            )),
-            // A terminal run has no child left to settle, and a run owns no third kind: either way the
-            // settle has nothing to mean.
-            (kind, status) => Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!(
-                    "execution_element: execution {} settled a {kind} child {child} while {status:?}",
-                    self.execution
-                ),
-            )),
-        }
-    }
-
-    /// The abnormal-terminal reaction. A run's only termination-triggering child is its **root
-    /// thread**: that thread *is* the run's own top-level scope, so its abnormal terminal is the
-    /// run's, and a run still `Running` has no teardown of its own to advance — this settle is what
-    /// must start one. Every other cell is the success hook's, reached through the same pair.
-    async fn after_child_terminated(
-        &self,
-        ctx: &mut HandlerContext<'_>,
-        out: &mut Collector<'_>,
-        child: &RawObjectRef,
-    ) -> Result<(), ProcessingError> {
-        let Some(exec) = ctx.storage.get_execution(&self.execution).await? else {
-            return Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!(
-                    "execution_element: execution {} is gone from under its settled child",
-                    self.execution
-                ),
-            ));
-        };
-        match (child.kind, &exec.status) {
-            // The reason is read off the settled thread's own status, exactly as the run's *output* is
-            // read off it on the success path: the teardown the run begins then carries the reason its
-            // own top-level scope went down with, rather than one the container would have to invent.
-            (ObjectKind::Thread, ExecutionStatus::Running) => {
-                let reason = match ctx
-                    .storage
-                    .get_thread(&child.clone().typed::<ThreadKind>())
-                    .await
-                {
-                    Ok(Some(thread)) => thread.status.termination_reason().cloned(),
-                    _ => None,
-                };
-                let Some(reason) = reason else {
-                    tracing::debug!(
-                        execution = %self.execution,
-                        child = %child,
-                        "settled thread carries no termination reason; no reaction"
-                    );
-                    return Ok(());
-                };
-                out.append_command(Command::TerminateExecution(TerminateExecution {
-                    name: self.execution.name().clone(),
-                    uid: Some(self.execution.uid()),
-                    reason,
-                }));
-                Ok(())
-            }
-            // A teardown swept the root thread and the thread relays that settle back here; the run then
-            // advances its own teardown.
-            (ObjectKind::Thread, ExecutionStatus::Terminating(_)) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
-            }
-            // A run enters `Completing` only through `CompleteExecution`, which the root thread's own
-            // settle issues — and which detaches that thread — so a second settling root thread would be
-            // a second root scope. The row and the lifecycle disagree, and the batch is refused rather
-            // than advanced.
-            (ObjectKind::Thread, ExecutionStatus::Completing) => Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!(
-                    "execution_element: execution {} is completing with a settling root thread {child}",
-                    self.execution
-                ),
-            )),
-            // A terminal run has no child left to settle, and a run owns no third kind: either way the
-            // settle has nothing to mean.
-            (kind, status) => Err(ProcessingError::Rejected(
-                RejectionType::InvalidState,
-                format!(
-                    "execution_element: execution {} settled a {kind} child {child} while {status:?}",
-                    self.execution
+                    "execution_element: execution {} finished a child {child} while {status:?}",
+                    this.execution
                 ),
             )),
         }
@@ -241,16 +170,10 @@ impl ExecutionElementBehavior {
             // A deadline that fires under a run already finishing is late, not decisive: the run does
             // not reopen as a timeout, it only advances the finish it already began.
             ExecutionStatus::Completing => {
-                out.append_command(Command::ContinueComplete {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
+                Self::finish_completing(ctx, out, self.execution.clone()).await
             }
             ExecutionStatus::Terminating(_) => {
-                out.append_command(Command::ContinueTerminate {
-                    owner: self.execution.as_raw_object_ref().clone(),
-                });
-                Ok(())
+                Self::finish_terminating(ctx, out, self.execution.clone()).await
             }
             status => Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
@@ -335,8 +258,8 @@ impl ExecutionElementBehavior {
             .get_children(exec.meta.object_ref().into_raw_object_ref())
             .await?;
         // Nothing owns the drain: the run lands its teardown in this same batch, with no sweep to issue
-        // and no later `ContinueTerminate` to wait for. Checked before the sweep so the terminal is
-        // never deferred on a set that was empty all along.
+        // and no later hand-off to wait for. Checked before the sweep so the terminal is never deferred
+        // on a set that was empty all along.
         if children.is_empty() {
             // The terminal advances the very value the teardown produced — that is where the reason was
             // fixed — so it is moved, not re-read. It cannot decline: the value was set `Terminating`
@@ -361,8 +284,8 @@ impl ExecutionElementBehavior {
             match child.kind {
                 // The execution's single root Thread (the top-level owner) is swept here too:
                 // terminating the run must tear down the root thread's whole subtree, after which the
-                // thread relays its settle back (via its `ThreadContainer`) letting this execution drain and
-                // emit its own terminal. Swept, not failing — the reason the *run* died already rides
+                // thread hands its finish back (via `HandleChildFinished`) letting this execution drain
+                // and emit its own terminal. Swept, not failing — the reason the *run* died already rides
                 // this execution's own `Terminating(reason)`, so the thread carries `Cancelled` rather
                 // than being recorded as the author of the failure.
                 ObjectKind::Thread => {
@@ -468,8 +391,8 @@ impl ExecutionElementBehavior {
         // whose work is done has none: any child here is the row's child set disagreeing with the
         // lifecycle rather than a child to wait on. Refused rather than swept or ignored — sweeping
         // turns a success into a failure cascade, and ignoring closes the run with a live child. A
-        // refusal strands nothing: the child's own settle drains the run through its
-        // `ExecutionElementBehavior` → `ContinueComplete`.
+        // refusal strands nothing: the child's own finish drains the run through
+        // `HandleChildFinished`.
         if let Some(child) = children.iter().next() {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
@@ -487,18 +410,18 @@ impl ExecutionElementBehavior {
     /// The **failure** side of the deferred drain-continuation for a run: settles a run that a settled
     /// child drained, emitting its `ExecutionTerminated`. The reason was fixed when the teardown began
     /// (`mark_terminating`), so this hop only advances the stored value rather than re-deriving one.
-    pub(crate) async fn continue_terminate(
+    pub(crate) async fn finish_terminating(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         node: ObjectRef<ExecutionKind>,
     ) -> Result<(), ProcessingError> {
         // A read fault is the dispatch's — returned, so the leader owns retry/refusal. A missing row is
-        // a real refusal: the Continue names the run a settled child drained, so a gone row means the
+        // a real refusal: the hand-off names the run a finished child drained, so a gone row means the
         // command's own precondition failed rather than "already closed".
         let Some(exec) = ctx.storage.get_execution(&node).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
-                format!("continue_terminate: execution {node} not found"),
+                format!("finish_terminating: execution {node} not found"),
             ));
         };
         // The hop lands only on a `Terminating` run; any other status means the row moved under the
@@ -507,7 +430,7 @@ impl ExecutionElementBehavior {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "continue_terminate: execution {node} is not terminating (status {:?})",
+                    "finish_terminating: execution {node} is not terminating (status {:?})",
                     exec.status
                 ),
             ));
@@ -521,7 +444,7 @@ impl ExecutionElementBehavior {
         if !children.is_empty() {
             // A run's only direct child is its root thread, so a child still attached here is the
             // thread's own teardown not being done yet: the sweep takes it down again and this hop
-            // stops short of advancing, so only the Continue that lands on the drained run terminates
+            // stops short of advancing, so only the hand-off that lands on the drained run terminates
             // it. Any other kind is the row disagreeing with the lifecycle — fail loud rather than
             // sweep a child the run cannot own. The thread carries `Cancelled`, for the reason the
             // `Terminating` activity's arm gives.
@@ -534,7 +457,7 @@ impl ExecutionElementBehavior {
                         }))
                     }
                     kind => panic!(
-                        "continue_terminate: execution {node} owns a live {kind} child {child}; a \
+                        "finish_terminating: execution {node} owns a live {kind} child {child}; a \
                          run's only child is its root Thread"
                     ),
                 }
@@ -549,7 +472,7 @@ impl ExecutionElementBehavior {
         if let Err(reason) = terminated_execution.mark_terminated(ctx.now()) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
-                format!("continue_terminate: execution {node} cannot be terminated: {reason}"),
+                format!("finish_terminating: execution {node} cannot be terminated: {reason}"),
             ));
         }
         out.append_event(Event::ExecutionTerminated {
@@ -563,18 +486,18 @@ impl ExecutionElementBehavior {
     /// The **success** side of the deferred drain-continuation for a run: settles a run that a settled
     /// child drained, emitting its `ExecutionCompleted`. The output was fixed when the finish began
     /// (`mark_completing`), so this hop only advances the stored value.
-    pub(crate) async fn continue_complete(
+    pub(crate) async fn finish_completing(
         ctx: &mut HandlerContext<'_>,
         out: &mut Collector<'_>,
         node: ObjectRef<ExecutionKind>,
     ) -> Result<(), ProcessingError> {
         // A read fault is the dispatch's — returned, so the leader owns retry/refusal. A missing row is
-        // a real refusal: the Continue names the run a settled child drained, so a gone row means the
+        // a real refusal: the hand-off names the run a finished child drained, so a gone row means the
         // command's own precondition failed rather than "already closed".
         let Some(exec) = ctx.storage.get_execution(&node).await? else {
             return Err(ProcessingError::Rejected(
                 RejectionType::NotFound,
-                format!("continue_complete: execution {node} not found"),
+                format!("finish_completing: execution {node} not found"),
             ));
         };
         // The hop lands only on a `Completing` run — one that a settled child drained (see
@@ -583,7 +506,7 @@ impl ExecutionElementBehavior {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
                 format!(
-                    "continue_complete: execution {node} is not completing (status {:?})",
+                    "finish_completing: execution {node} is not completing (status {:?})",
                     exec.status
                 ),
             ));
@@ -599,7 +522,7 @@ impl ExecutionElementBehavior {
         // Fail loud rather than close the run with a live child.
         if let Some(child) = children.iter().next() {
             panic!(
-                "continue_complete: execution {node} owns a live {} child {child}; a completing \
+                "finish_completing: execution {node} owns a live {} child {child}; a completing \
                  run owns nothing",
                 child.kind
             );
@@ -612,7 +535,7 @@ impl ExecutionElementBehavior {
         if let Err(reason) = completed_execution.mark_completed(ctx.now()) {
             return Err(ProcessingError::Rejected(
                 RejectionType::InvalidState,
-                format!("continue_complete: execution {node} cannot be completed: {reason}"),
+                format!("finish_completing: execution {node} cannot be completed: {reason}"),
             ));
         }
         out.append_event(Event::ExecutionCompleted {
@@ -790,7 +713,7 @@ mod settle_tests {
     use spica_storage::InMemoryStorage;
     use spica_testing::MockReadonlyStorageTxn;
 
-    use super::{Container, ExecutionElementBehavior};
+    use super::ExecutionElementBehavior;
     use crate::EntryPayload;
     use crate::RejectionType;
     use crate::StatePath;
@@ -847,8 +770,8 @@ mod settle_tests {
         }
     }
 
-    /// A seeded execution row with `children` live children still attached — the drain the `Continue*`
-    /// hop must see. A run is the root of its tree, so it fills no owner slot.
+    /// A seeded execution row with `children` live children still attached — the drain a finish must
+    /// see. A run is the root of its tree, so it fills no owner slot.
     fn seeded_execution(status: ExecutionStatus, children: usize) -> Seeded<Execution> {
         let execution = Execution {
             meta: ObjectMeta::builder(execution_ref().uid())
@@ -890,9 +813,7 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ExecutionElementBehavior::open(&work, execution_ref())
-            .await
-            .expect("the seeded execution resolves its container");
+        let container = ExecutionElementBehavior::new(execution_ref());
         {
             let mut ctx = HandlerContext {
                 env: &mut env,
@@ -926,9 +847,7 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ExecutionElementBehavior {
-            execution: execution_ref(),
-        };
+        let container = ExecutionElementBehavior::new(execution_ref());
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: store,
@@ -946,11 +865,11 @@ mod settle_tests {
         (result, chain)
     }
 
-    /// Drive the **completed** hook against a mock store answering the reads the cell needs, with the
-    /// container built directly: the shapes that need this (a vanished row, a `Thread` child, a
-    /// terminal run) are the ones `open` cannot hand a container back for. Returns the hook's own
-    /// outcome beside the chain it emitted, so a refusal and a command are asserted the same way.
-    async fn hook_over(
+    /// Drive `on_child_finished` against a mock store answering the reads the hand-off needs. The
+    /// shapes that need this (a vanished row, a terminal run) are the ones a seeded working overlay
+    /// cannot express. Returns the outcome beside the chain emitted, so a refusal and a command are
+    /// asserted the same way.
+    async fn hand_off_over(
         store: &dyn ReadonlyStorageTxn,
         child: &RawObjectRef,
     ) -> (Result<(), ProcessingError>, Vec<EntryPayload>) {
@@ -960,9 +879,6 @@ mod settle_tests {
         let mut env = EvalEnv::new();
         let mut definitions = HashMap::new();
         let state_handlers = build_state_handlers();
-        let container = ExecutionElementBehavior {
-            execution: execution_ref(),
-        };
         let mut ctx = HandlerContext {
             env: &mut env,
             storage: store,
@@ -971,9 +887,9 @@ mod settle_tests {
             definitions: &mut definitions,
             state_handlers: &state_handlers,
         };
-        let result = container
-            .after_child_completed(&mut ctx, &mut out, child)
-            .await;
+        let result =
+            ExecutionElementBehavior::on_child_finished(&mut ctx, &mut out, execution_ref(), child)
+                .await;
         let chain = out
             .into_entries()
             .into_iter()
@@ -982,25 +898,30 @@ mod settle_tests {
         (result, chain)
     }
 
-    /// A settle with no live owner is refused up front: `open` names the gone owner, so a caller whose
-    /// settle would have nothing to land on answers the absence before it writes its terminal.
+    /// A run that is gone from under its finished child refuses the hand-off instead of no-op'ing it:
+    /// every command owes an entry, and a silent success would leave the log saying the child finished
+    /// with nothing after it.
     #[tokio::test]
-    async fn a_missing_owner_has_no_container() {
-        let store = InMemoryStorage::new();
-        let work = WorkingState::new(store.begin_txn().expect("the in-memory store begins a txn"));
-        let Err(ProcessingError::Rejected(ty, reason)) =
-            ExecutionElementBehavior::open(&work, execution_ref()).await
-        else {
-            panic!("an open that did not read a missing row");
+    async fn a_vanished_execution_refuses_the_hand_off() {
+        let mut store = MockReadonlyStorageTxn::new();
+        store
+            .expect_get_execution()
+            .times(1)
+            .return_once(|_| Ok(None));
+        let result = hand_off_over(&store, thread_ref().as_raw_object_ref())
+            .await
+            .0;
+        let Err(ProcessingError::Rejected(ty, reason)) = result else {
+            panic!("a vanished run must refuse the hand-off: {result:?}");
         };
-        assert_eq!(ty, RejectionType::NotFound);
+        assert_eq!(ty, RejectionType::InvalidState);
         assert!(
-            reason.contains("is gone"),
+            reason.contains("is gone from under its finished child"),
             "the refusal names the gone owner: {reason}"
         );
     }
 
-    /// A read that **faults** stays a fault, never a missing owner (see `ActivityElementBehavior`'s sibling).
+    /// A read that **faults** stays a fault, never a missing owner.
     #[tokio::test]
     async fn a_faulted_execution_read_is_not_a_missing_owner() {
         let mut store = MockReadonlyStorageTxn::new();
@@ -1008,19 +929,16 @@ mod settle_tests {
             .expect_get_execution()
             .times(1)
             .return_once(|_| Err(StorageError::Backend("injected storage fault".to_string())));
+        let result = hand_off_over(&store, thread_ref().as_raw_object_ref())
+            .await
+            .0;
         assert!(
-            matches!(
-                ExecutionElementBehavior::open(&store, execution_ref()).await,
-                Err(ProcessingError::Unexpected(_))
-            ),
+            matches!(result, Err(ProcessingError::Unexpected(_))),
             "a fault must surface as Unexpected, not read as a missing row"
         );
     }
 
-    /// A run that is gone from under its settled child refuses the settle instead of no-op'ing it: the
-    /// terminal is already on this attempt's batch, so a silent success would leave the log saying the
-    /// child settled with nothing after it. The container is built directly — `open` refuses the same
-    /// missing row before any hook could be reached.
+    /// A run that is gone from under its own deadline refuses the fire instead of no-op'ing it.
     #[tokio::test]
     async fn a_vanished_execution_refuses_the_deadline() {
         let mut store = MockReadonlyStorageTxn::new();
@@ -1039,26 +957,45 @@ mod settle_tests {
         );
     }
 
-    /// A run cannot be `Completing` with its root thread still settling: a run enters `Completing` only
-    /// through `CompleteExecution`, which *that* thread's own settle issues — so a second settling thread
-    /// would be a second root scope, and a run has the one. The lifecycle disagreeing with the row is a
-    /// refusal, not a crash: the command that carried this settle is answered by a `Reject` entry.
+    /// A hand-off landing on a run already finishing advances that finish: the run closes now that
+    /// nothing is left to wait for.
     #[tokio::test]
-    async fn a_settling_root_thread_under_a_completing_execution_is_refused() {
+    async fn a_finished_child_advances_a_completing_execution() {
         let mut store = MockReadonlyStorageTxn::new();
+        // The hop reads the run, then the drained finish re-reads it under the same guard.
+        store.expect_get_execution().times(2).return_const(Ok(Some(
+            seeded_execution(ExecutionStatus::Completing, 0).row,
+        )));
         store
-            .expect_get_execution()
+            .expect_get_children()
             .times(1)
-            .return_once(|_| Ok(Some(seeded_execution(ExecutionStatus::Completing, 0).row)));
-        let result = hook_over(&store, thread_ref().as_raw_object_ref()).await.0;
-        let Err(ProcessingError::Rejected(ty, reason)) = result else {
-            panic!("a second settling root thread must be refused: {result:?}");
+            .return_once(|_| Ok(std::collections::HashSet::new()));
+        let (result, chain) = hand_off_over(&store, thread_ref().as_raw_object_ref()).await;
+        result.expect("the hand-off advances the finish");
+        let [EntryPayload::Event(crate::types::event::Event::ExecutionCompleted { execution })] =
+            &chain[..]
+        else {
+            panic!("the drained finish lands its terminal: {chain:?}");
         };
-        assert_eq!(ty, RejectionType::InvalidState);
-        assert!(
-            reason.contains("settling root thread"),
-            "the refusal names the impossible pair: {reason}"
-        );
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+    }
+
+    /// A `Completing` run owns nothing: a hand-off still holding a child is the row disagreeing with
+    /// the lifecycle, and a completing run can never sweep one.
+    #[tokio::test]
+    #[should_panic(expected = "a completing run owns nothing")]
+    async fn a_live_child_under_a_completing_execution_is_refused() {
+        let mut store = MockReadonlyStorageTxn::new();
+        // The hop reads the run, then the drained finish re-reads it under the same guard.
+        store.expect_get_execution().times(2).return_const(Ok(Some(
+            seeded_execution(ExecutionStatus::Completing, 1).row,
+        )));
+        store.expect_get_children().times(1).return_once(|_| {
+            Ok(std::collections::HashSet::from([
+                thread_ref().into_raw_object_ref()
+            ]))
+        });
+        let _ = hand_off_over(&store, thread_ref().as_raw_object_ref()).await;
     }
 
     /// A `Running` run's deadline firing is a timeout, not a close: the run goes down `TimedOut` with a
@@ -1095,7 +1032,7 @@ mod settle_tests {
             .expect_get_thread()
             .times(1)
             .return_once(|_| Ok(Some(seeded_thread(json!({ "answer": 42 })))));
-        let (result, chain) = hook_over(&store, thread_ref().as_raw_object_ref()).await;
+        let (result, chain) = hand_off_over(&store, thread_ref().as_raw_object_ref()).await;
         result.expect("the hook closes the run on its thread's output");
         assert_eq!(
             chain,
@@ -1129,32 +1066,17 @@ mod settle_tests {
         );
     }
 
-    /// A deadline under a `Completing` run that has just drained advances the run's own finish — the
-    /// one-hop `ContinueComplete` the deadline reaction issues for it.
+    /// A deadline under a `Completing` run that has drained advances the run's own finish: the fire is
+    /// late, so it closes the run rather than reopening it as a timeout.
     #[tokio::test]
     async fn a_fired_deadline_advances_a_drained_completing_execution() {
         let chain = deadline_over(seeded_execution(ExecutionStatus::Completing, 0)).await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::ContinueComplete {
-                owner: execution_ref().into_raw_object_ref(),
-            })]
-        );
-    }
-
-    /// A run that is already finishing advances on **every** deadline outcome, drained or not: whether
-    /// the drain is complete is the `Continue*` hop's own business — it takes down whatever is still
-    /// attached and stops short of advancing — so an early `Continue` costs a hop, never the run's
-    /// convergence.
-    #[tokio::test]
-    async fn a_fired_deadline_advances_a_completing_execution_before_the_drain() {
-        let chain = deadline_over(seeded_execution(ExecutionStatus::Completing, 1)).await;
-        assert_eq!(
-            chain,
-            vec![EntryPayload::Command(Command::ContinueComplete {
-                owner: execution_ref().into_raw_object_ref(),
-            })]
-        );
+        let [EntryPayload::Event(crate::types::event::Event::ExecutionCompleted { execution })] =
+            &chain[..]
+        else {
+            panic!("the drained finish lands its terminal: {chain:?}");
+        };
+        assert_eq!(execution.status, ExecutionStatus::Completed);
     }
 }
 

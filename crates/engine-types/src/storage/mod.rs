@@ -211,7 +211,7 @@ pub trait Storage: Send + Sync {
 }
 
 /// A write-scoped, **owned** projection transaction, handed to an event applier
-/// (crate::applier) during exactly one Event fold.
+/// (crate::appliers) during exactly one Event fold.
 ///
 /// It is created by [`Storage::begin_txn`] and returned as a `Box<dyn StorageTxn>`. It exposes
 /// **only** the projection fold operations — reads fall through to the committed store; writes
