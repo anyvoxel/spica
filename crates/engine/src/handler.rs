@@ -44,8 +44,8 @@ pub struct Collector<'a> {
     /// The clock this batch's envelope stamps are read from — see [`Self::now`].
     clock: Arc<dyn Clock>,
     /// The engine's injected [`IdGenerator`] — the one legitimate source of a fresh `uid`. Every
-    /// object a dispatch names mints here, so a test can substitute predictable ids and pin the
-    /// chain it expects (see [`Self::mint`]).
+    /// object a dispatch creates takes its uid here, so a test can substitute predictable ids and pin
+    /// the chain it expects (see [`Self::next_uid`]).
     ids: Arc<dyn IdGenerator>,
 }
 
@@ -85,7 +85,7 @@ impl<'a> Collector<'a> {
 
     /// A fresh `uid` for an object this batch creates, read from the injected [`IdGenerator`] — see
     /// [`Self::now`] for why the emit helpers that carry only the collector need their own accessor.
-    pub(crate) fn mint(&self) -> ulid::Ulid {
+    pub(crate) fn next_uid(&self) -> ulid::Ulid {
         self.ids.next_ulid()
     }
 
@@ -237,12 +237,11 @@ impl HandlerContext<'_> {
         self.clock.now()
     }
 
-    // TODO：这个函数的名称并不太合适
     /// A fresh `uid` for an object this dispatch creates, read from the injected [`IdGenerator`] —
     /// see [`Self::clock`] for why ids, like time, are an input rather than an ambient read. Kept as
     /// a method so a handler never has to remember which of the two (this or the [`Collector`]) to
-    /// mint from, and so the two agree on the generator they read.
-    pub fn mint(&self) -> ulid::Ulid {
+    /// draw a uid from, and so the two agree on the generator they read.
+    pub fn next_uid(&self) -> ulid::Ulid {
         self.ids.next_ulid()
     }
 

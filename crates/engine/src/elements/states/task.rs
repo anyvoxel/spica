@@ -112,7 +112,7 @@ impl StateHandler for TaskStateElementBehavior<'_> {
         };
 
         let activity = activity_value.meta.object_ref();
-        let task_uid = out.mint();
+        let task_uid = out.next_uid();
         // The task's reference is minted with a name derived from the owning execution's plain base
         // (finding #13), exactly like the activity (#3) names — not the opaque
         // `child-<uid>` handle. `execution` is the tree anchor, so a branch task still names its

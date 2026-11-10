@@ -584,7 +584,7 @@ impl ExecutionElementBehavior {
         // The uid is NOT carried in the command — replay stays deterministic because the produced
         // `ExecutionCreated` lands in the same atomic batch as this command (committed ⇒ conclusive,
         // never re-dispatched), so a re-dispatch mints a fresh consistent uid.
-        let uid: ulid::Ulid = ctx.mint();
+        let uid: ulid::Ulid = ctx.next_uid();
         let id = ObjectRef::<ExecutionKind>::new(name.clone(), uid);
 
         // Resolve the machine this execution binds to. This is the first use of the version in a fresh
@@ -659,7 +659,7 @@ impl ExecutionElementBehavior {
         // through the same walk a fan-out thread does. Its completion/termination bridges back to
         // the Execution (see `complete_thread`/`terminate_thread`), so the externally-addressed root
         // still settles through `wait_for_execution`.
-        let root_uid: ulid::Ulid = ctx.mint();
+        let root_uid: ulid::Ulid = ctx.next_uid();
         let root_name = id
             .name()
             .base()

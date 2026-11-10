@@ -83,9 +83,9 @@ impl FlowElementBehavior {
         // flow's first version is always ordinal 1 (its object name `{flow_name}-1`); the flow's
         // `meta.uid` is a distinct fresh ulid from the version's. `created_at` is stamped now and
         // carried on both rows.
-        let flow_uid = ctx.mint();
+        let flow_uid = ctx.next_uid();
         let flow_version = FlowVersion::version_name(name, 1);
-        let flow_version_uid = ctx.mint();
+        let flow_version_uid = ctx.next_uid();
         let created_at = ctx.now();
         // The owner reference both rows are minted against: the flow's plain name plus its fresh uid,
         // bundled once so the flow's own meta and its first version's owner cannot disagree on it.
