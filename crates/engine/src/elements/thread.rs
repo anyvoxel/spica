@@ -593,7 +593,7 @@ impl ThreadElementBehavior {
         // Mint the child's uid and its stable RawObjectRef up front: the child `Thread` row is
         // keyed by that reference, and the sibling `ActivateState` entry must name the same run
         // before the `ThreadCreated` applier builds the entity.
-        let uid: ulid::Ulid = ctx.mint();
+        let uid: ulid::Ulid = ctx.next_uid();
         // Name the thread as a child of its owning execution (the #3/#11/#13 convention, applied to
         // threads): the generated name's plain base is the owning execution's name, inherited
         // verbatim through every nesting level — so a branch thread still names its root run — and

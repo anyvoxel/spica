@@ -339,7 +339,7 @@ pub trait StateHandler: Send + Sync {
             activity_state: None,
             retry_state: None,
             output: None,
-            meta: ObjectMeta::builder(ctx.mint())
+            meta: ObjectMeta::builder(ctx.next_uid())
                 .name(
                     execution
                         .name()
